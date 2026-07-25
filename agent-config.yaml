@@ -1,0 +1,221 @@
+# Agent behaviour. No secrets here — those live in .env.
+#
+# Every key is optional; omitted values fall back to the defaults in
+# src/agent-config.ts. Override the path with AGENT_CONFIG_PATH.
+
+model: claude-opus-5
+
+# Cap on agent turns per wake. 0 = unlimited.
+maxTurns: 0
+
+systemPrompt:
+  # Use Claude Code's own system prompt as the base, so the agent behaves like
+  # Claude Code rather than a generic assistant.
+  #
+  # Setting this false replaces that base entirely — including Claude Code's
+  # tool-use guidance — and the agent gets noticeably worse at tool work. The
+  # Discord reply protocol is injected either way; it is not optional, because
+  # without it the agent cannot speak.
+  useClaudeCodeDefault: true
+
+  # Extra instructions layered on top. This is the knob to reach for when you
+  # want to change the agent's personality, house style, or standing rules.
+  append: |
+    <system description>
+    You are Clawcius, a team of agents that acts as a single personified agent
+    in Discord. Despite being a team, you will talk to the users as though you
+    are a single entity, Clawcius. Each member of the team has the same persona,
+    Clawcius, with a different role. Every role has this same system prompt.
+    </system description>
+    <persona>
+    Clawcius is a posh english butler, similar to Alfred in Batman. Clawcius 
+    should be personable, but with a quick sarcastic wit at times. You should
+    embody Clawcius always, whether your text is user facing or not, unless
+    you are comlpeting a task for a user (eg, making a website) where you
+    have been instructed otherwise.
+    </persona>
+    <roles>
+    <team leader>
+    The agent that speaks to the users and acts as the manager for the other
+    agents. This is the main agent, and each of the other agents are sub agents.
+
+    When a user messages you, use the discord-cli to check recent messages as needed.
+
+    Sometimes a message needs a quick response. Sometimes, a message needs a longer
+    response with formatting. Sometimes, a message merely needs an emoji response.
+
+    You do not see any messages until you are awoken.  After awoken, you see all
+    messages sent until you fall back asleep. This allows you to have natural
+    conversations after someone ats you, but you wont be in the channel forever.
+    Sometimes you will get atted and there will be an active discussion that you
+    see because you are awake, you can join if it's relevant to your work, but if
+    it's not don't intrude.
+
+    Sometimes 
+
+    Use the discord-cli to communicate with the users.  When responding to a user,
+    always respond with an eyes emoji as soon as you see their message, and then, if
+    their question only needs a quick text response or a few tools, just respond to the
+    user with text as normal. If the task is longer and involves serious programming,
+    research, engineering, etc, respond as follows below, launch the apparopriate sub
+    agent and launch an updater agent. Create a task list that you also give to your
+    sub agent that you span and post it in the channel like so:
+    General Task Name 
+    ✶ Undone Task A (Current task Bolded)
+    ✶ Undone Task B
+    ✶ Undone Task C
+    With the task divided into subtasks.  Never more than 4 of these. The updater agent
+    will update this as it goes.
+    
+    <updater-agent>
+    Periodically check in on the agents the team leader spawned and update 
+    denote that they are finished by editing that message like:
+    ✽ Completed Task A
+    ✽ Completed Task B
+    ✶ Undone Task A (Current task Bolded)
+    ✶ Undone Task B
+
+    And you can add items if things come up, change them if plans change, etc.  These should
+    be informative to a user paying attention.
+
+    You should be setting your agents to work and periodically checking on them and reporting
+    back to the user.  If the user asks for "status" respond to the user with the status, but
+    keep editing the last message.
+
+    </envoy>
+    <engineer>
+    An engineering agent. Writes code, makes artifacts. Can spawn additional engineers and researchers.
+    </engineer>
+    <research>
+    A research agent. Uses workflows a lot to spawn a bunch of subagents to research things
+    from many angles
+    </research>
+    </roles>
+    Discord is a chat surface, not a report format. Most replies should be a
+    short paragraph. Reach for headers, bullets, and tables only when the
+    content genuinely is a list or a comparison — not as a default shape.
+
+    Match the tone of the channel. If a task will take a while, send a brief
+    acknowledgement first and the result when you are done, rather than going
+    silent for minutes.
+
+sessions:
+  # Bounded by RAM. One Claude Code process is ~400 MB — see SETUP.md § 5.
+  maxConcurrent: 3
+  # 0 = never evict. Sessions stay alive for the life of the process, so the
+  # agent is always warm and never pays Claude Code startup on a mention.
+  # Costs ~400 MB RSS per live session, standing, whether busy or not.
+  #
+  # Any positive value evicts after that many idle minutes; the session ID
+  # survives in SQLite and is resumed on the next mention, so conversation
+  # continuity is kept either way — the difference is startup latency and RAM.
+  idleTimeoutMinutes: 0
+  workspaceRoot: /var/lib/clawcius/workspaces
+
+sandbox:
+  # The Agent SDK's built-in sandbox, with a network egress allowlist. Paired
+  # with autoAllowBashIfSandboxed, so bash runs freely because it is contained
+  # rather than because permissions were bypassed.
+  enabled: true
+
+  # discord.com is REQUIRED — it is how the agent replies. Startup fails if it
+  # is missing, because the alternative is an agent that runs and stays silent.
+  allowedDomains:
+    - api.anthropic.com
+    - discord.com
+    - registry.npmjs.org
+    - pypi.org
+    - files.pythonhosted.org
+    - github.com
+    - api.github.com
+    - objects.githubusercontent.com
+
+  # Set true ONLY when running nested inside gVisor. Weakens the inner sandbox.
+  weakerNested: false
+
+  # Which proxy enforces allowedDomains for sandboxed commands.
+  #
+  # Enforcement comes from the sandbox either way, not from this setting: the
+  # agent runs under `bwrap --unshare-net` with no route to the internet, and
+  # the only way out is a socat bridge to a proxy. This chooses which proxy
+  # answers on the far end of that bridge.
+  #
+  #   sdk   — the SDK's own in-process proxy. No setup, nothing to install.
+  #   squid — an external Squid (squid/squid.conf). Buys real access logs, a
+  #           default-deny config reviewable outside this process, and guards
+  #           against using the proxy to pivot at localhost / RFC1918 / cloud
+  #           metadata. Requires Squid installed and running — see
+  #           squid/README.md.
+  #
+  # Setting this to squid with sandbox.enabled: false is refused at startup.
+  # Without the namespace, HTTP_PROXY is only a suggestion the agent can drop.
+  egress:
+    mode: sdk
+
+    # Host port Squid listens on. Only read when mode is squid, and must match
+    # the http_port line in squid.conf.
+    httpProxyPort: 3128
+
+    # Checked at startup against allowedDomains above. Mismatch is fatal — the
+    # two lists are enforced by different proxies (Squid on HTTP/HTTPS, the
+    # SDK's own on SOCKS) and drift between them is a hole.
+    confPath: /home/npurcell/clawcius/squid/squid.conf
+
+discord:
+  # Empty = the agent responds to mentions in any channel it can see.
+  # There is no per-user allowlist; anyone in the server can wake it.
+  allowedChannelIds: []
+
+  # After the bot is addressed, how long ordinary messages in that channel also
+  # reach the agent — so you can keep talking without @-ing every line.
+  #
+  # Extended by a new mention, or by the bot posting or editing a message.
+  # Deliberately NOT extended by human messages alone, so a conversation the bot
+  # has finished with closes on schedule instead of being held open by people
+  # talking to each other.
+  #
+  # 0 disables follow-ups entirely: every message needs an explicit @.
+  #
+  # Cost note: while a window is open, every message in the channel wakes the
+  # agent. In a busy channel that is a lot of turns, with no budget cap.
+  followUpWindowSeconds: 300
+
+  # Message bundling. People type in bursts, and waking once per line means the
+  # agent starts answering the first thought before the second has landed.
+  #
+  # Each new message restarts the debounce; the bundle is handed over when the
+  # channel goes quiet, or when the ceiling from the first message is reached —
+  # whichever comes first. Set bundleDebounceMs to 0 to hand over immediately.
+  #
+  # This only governs when a bundle is handed *over*. Messages that arrive while
+  # the agent is mid-turn are not held for it to finish; they queue into the
+  # live session and reach it during the turn.
+  bundleDebounceMs: 1500
+  bundleMaxWaitMs: 10000
+
+paths:
+  discordCli: /home/npurcell/clawcius/discord-cli/discord
+  # Directory containing .claude/skills/ — symlinked into each workspace so the
+  # agent can discover the discord-cli skill.
+  skillsDir: /home/npurcell/clawcius/.claude
+
+scheduling:
+  # Lets the agent wake itself later via the schedule_wake / schedule_repeating
+  # / list_schedules / cancel_schedule tools. Set false to remove them entirely.
+  #
+  # These are in-process MCP tools, not cron: the waker owns the timer, so they
+  # work inside the sandbox, wake the existing warm session rather than a cold
+  # one, and stay subject to the limits below.
+  enabled: true
+
+  # Floor on any delay. The guard against an agent building a tight self-wake
+  # loop — which, with maxTurns: 0 and no budget cap, is the failure that runs
+  # up a bill overnight with nobody watching.
+  minDelaySeconds: 60
+
+  # Pending schedules per channel.
+  maxPending: 20
+
+  # Fires per channel per rolling 24h. Re-checked at fire time, not just at
+  # creation, so a schedule made yesterday cannot outrun today's budget.
+  maxWakesPerDay: 48

@@ -1,0 +1,103 @@
+[Unit]
+Description=Clawcius — wakes a sandboxed Claude Code agent on Discord mentions
+Documentation=file:/home/npurcell/clawcius/SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+# Never give up on a crash loop. These are [Unit] directives — in [Service]
+# systemd ignores them with a warning, leaving the default of 5 starts per 10s
+# before permanently stopping the unit, which is the opposite of what a 24/7
+# bot wants.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=notify
+# The bot calls sd_notify READY=1 once the Discord gateway is connected, so
+# systemd does not report the unit started until it can actually serve.
+#
+# `all`, not `main`: Node cannot write to the notify socket itself (it is
+# SOCK_DGRAM, which neither node:dgram nor node:net can address), so the bot
+# shells out to systemd-notify. That helper sends from its own PID, which
+# NotifyAccess=main would reject — leaving the unit stuck in `activating`.
+NotifyAccess=all
+
+# Runs as npurcell, not a dedicated service account, and that is load-bearing:
+# the agent authenticates with the same OAuth login as Claude Code, and those
+# credentials live in this user's home directory. A separate service account
+# would have no login, and every agent turn would fail on auth.
+#
+# Switch to a dedicated user only if you also set ANTHROPIC_API_KEY in .env.
+User=npurcell
+Group=npurcell
+
+WorkingDirectory=/home/npurcell/clawcius
+EnvironmentFile=/home/npurcell/clawcius/.env
+
+# An absolute path here is not enough. The Agent SDK spawns Claude Code as a
+# child process invoking bare `node`, and systemd hands services a minimal
+# PATH that excludes ~/.local — so the bot starts fine and every agent spawn
+# dies with ENOENT. The agent's own bash commands need this too.
+Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+
+# ── Restart policy ────────────────────────────────────────────────────────
+Restart=always
+RestartSec=5
+
+# ── Watchdog ──────────────────────────────────────────────────────────────
+# The bot only pings while the Discord gateway is healthy, so this catches the
+# process-alive-but-gateway-dead failure that Restart=always misses.
+WatchdogSec=90
+
+# ── State ─────────────────────────────────────────────────────────────────
+# Creates and chowns /var/lib/clawcius (DB + per-channel workspaces).
+StateDirectory=clawcius
+StateDirectoryMode=0750
+
+# ── Resource limits ───────────────────────────────────────────────────────
+# Sized against the VM's actual 3396 MB, not the 4 GB that was planned.
+# Budget: bot ~180 MB + 3 agents x ~400 MB + OS ~650 MB ≈ 2030 MB.
+#
+# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop. The gap
+# between MemoryMax and total RAM is deliberate — a ceiling close to total
+# would squeeze the OS instead of stopping the runaway agent. Raise both
+# together with sessions.maxConcurrent, never one alone.
+MemoryHigh=1800M
+MemoryMax=2400M
+TasksMax=512
+
+# ── Hardening ─────────────────────────────────────────────────────────────
+# Every mount-namespace directive had to come out, and the reason is worth
+# recording so nobody helpfully adds them back.
+#
+# The agent runs under bwrap, which mounts a fresh /proc inside a nested user
+# namespace. The kernel only permits that when an existing *fully visible*
+# /proc is already mounted. Each of these puts locked mounts or read-only
+# overlays across /proc, so the kernel refuses:
+#
+#   PrivateTmp, ProtectSystem (strict AND full), ProtectHome (read-only),
+#   ProtectKernelTunables, ProtectKernelModules, ProtectControlGroups
+#
+# Bisected individually against this exact bwrap invocation — each one fails
+# on its own, not only in combination. The failure is silent in the worst way:
+# bwrap exits non-zero, the SDK declines to sandbox rather than raising,
+# autoAllowBashIfSandboxed stops auto-allowing, and every bash call blocks on
+# a permission prompt nothing can answer. The bot looks alive and says nothing.
+#
+# The trade is deliberate. These directives protected the host from the *bot*
+# process; bwrap protects the host from the *agent*, which is the untrusted
+# party. Keeping them meant no agent sandbox at all — strictly worse.
+#
+# What survives is everything not implemented via mount namespaces:
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawcius
+
+[Install]
+WantedBy=multi-user.target
