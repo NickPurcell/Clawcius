@@ -71,8 +71,17 @@ def slim_message(msg):
 
     attachments = msg.get("attachments") or []
     if attachments:
+        # Enough to decide whether to download without a second --full round
+        # trip: what it is, how large, and the id to name it by.
         out["attachments"] = [
-            {"filename": a.get("filename"), "url": a.get("url")} for a in attachments
+            {
+                "id": a.get("id"),
+                "filename": a.get("filename"),
+                "size": a.get("size"),
+                "content_type": a.get("content_type"),
+                "url": a.get("url"),
+            }
+            for a in attachments
         ]
 
     if author.get("bot"):
@@ -119,13 +128,52 @@ def messages_table(messages):
             f"{m['id']:<20} {_short_ts(m.get('ts')):<12} "
             f"{(m.get('author') or ''):<{author_w}}  {content}{reacts}"
         )
+        lines.extend(_attachment_lines(m.get("attachments")))
     return "\n".join(lines)
+
+
+def _attachment_lines(attachments):
+    """One indented line per attachment, so a file is visible without --full."""
+    lines = []
+    for att in attachments or []:
+        bits = [att.get("filename") or "(unnamed)"]
+        if att.get("size") is not None:
+            bits.append(human_size(att.get("size")))
+        if att.get("content_type"):
+            bits.append(att["content_type"])
+        if att.get("id"):
+            bits.append(f"id {att['id']}")
+        lines.append("    ↳ " + "  ".join(bits))
+    return lines
+
+
+def downloads_table(saved):
+    if not saved:
+        return "(nothing downloaded)"
+    return "\n".join(
+        f"{human_size(f.get('size')):>10}  {(f.get('content_type') or ''):<24}  {f.get('path')}"
+        for f in saved
+    )
 
 
 def channels_table(channels):
     if not channels:
         return "(no channels visible to this bot)"
     return "\n".join(f"{c['id']:<20} #{c['name']}" for c in channels)
+
+
+def human_size(num):
+    """Bytes in the units a person reads. Binary units, as Discord counts them."""
+    if num is None:
+        return "?"
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
 
 
 def kv_table(data):

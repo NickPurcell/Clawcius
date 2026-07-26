@@ -16,10 +16,11 @@ Design rules, in case they are not obvious from the code:
 """
 
 import argparse
+import select
 import sys
 from datetime import datetime, timezone
 
-from . import config, render, resolve
+from . import config, download, render, resolve, upload
 from .api import Client
 from .errors import CONFIRM_REQUIRED, OK, VALIDATION_ERROR, CliError, ValidationError
 
@@ -190,21 +191,23 @@ def _scan_history(client, channel_id, predicate, limit, max_scan, stop_before=No
 
 
 def cmd_send(args):
-    content = _resolve_text(args.text)
+    files = upload.load_files(args.file, max_total_bytes=args.max_upload_bytes)
+    content = _resolve_text(args.text, allow_empty=bool(files))
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(channel_id, content)
+        sent = client.send_message(channel_id, content, files=files)
     _out(render.slim_message(sent), lambda m: f"sent {m['id']}")
 
 
 def cmd_reply(args):
     message_id = resolve.validate_snowflake(args.message, "message id")
-    content = _resolve_text(args.text)
+    files = upload.load_files(args.file, max_total_bytes=args.max_upload_bytes)
+    content = _resolve_text(args.text, allow_empty=bool(files))
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(channel_id, content, reply_to=message_id)
+        sent = client.send_message(channel_id, content, reply_to=message_id, files=files)
     _out(render.slim_message(sent), lambda m: f"replied {m['id']}")
 
 
@@ -257,6 +260,65 @@ def cmd_delete(args):
 
         client.delete_message(channel_id, message_id)
     _out({"ok": True, "deleted": message_id}, lambda d: f"deleted {d['deleted']}")
+
+
+def cmd_download(args):
+    """Save attachments to disk, either a whole message's worth or one URL.
+
+    The URL form exists because attachment links are signed and expire: when a
+    caller already holds a fresh URL there is no reason to spend a round trip
+    re-reading the message to rediscover it.
+    """
+    if args.max_bytes < 1:
+        raise ValidationError("--max-bytes must be at least 1.")
+
+    if args.url:
+        if args.channel or args.message:
+            raise ValidationError(
+                "--url cannot be combined with --channel or --message.",
+                remediation="Use --url on its own, or --channel with --message.",
+            )
+        out_dir = download.ensure_dir(args.out)
+        saved = [
+            download.fetch(
+                args.url, out_dir, max_bytes=args.max_bytes, overwrite=args.overwrite
+            )
+        ]
+        _out(saved, render.downloads_table)
+        return
+
+    if not (args.channel and args.message):
+        raise ValidationError(
+            "Nothing to download.",
+            remediation="Pass --channel and --message together, or --url with an attachment URL.",
+        )
+
+    message_id = resolve.validate_snowflake(args.message, "message id")
+    guild_id = config.get_guild_id()
+    with Client() as client:
+        channel_id = resolve.resolve_channel(client, guild_id, args.channel)
+        message = client.get_message(channel_id, message_id)
+
+    attachments = message.get("attachments") or []
+    if not attachments:
+        raise ValidationError(
+            f"Message {message_id} has no attachments.",
+            remediation="Run 'discord read --channel <name>' to find one that does.",
+        )
+
+    out_dir = download.ensure_dir(args.out)
+    saved = []
+    for attachment in attachments:
+        record = download.fetch(
+            attachment.get("url"),
+            out_dir,
+            filename=attachment.get("filename"),
+            max_bytes=args.max_bytes,
+            overwrite=args.overwrite,
+        )
+        record["attachment_id"] = attachment.get("id")
+        saved.append(record)
+    _out(saved, render.downloads_table)
 
 
 def cmd_config_show(args):
@@ -326,11 +388,35 @@ def build_parser():
     p = add("send", cmd_send, "Send a message to a channel. Reads stdin when --text is omitted.")
     p.add_argument("--channel", "-c", required=True, help="Channel name or ID.")
     p.add_argument("--text", "-t", help="Message text. If omitted, read from stdin.")
+    p.add_argument(
+        "--file", "-f", action="append", metavar="PATH",
+        help="File to attach. Repeat for up to 10. Text is optional when a file is attached.",
+    )
+    p.add_argument(
+        "--max-upload-bytes", type=int, default=upload.MAX_UPLOAD_BYTES,
+        help=(
+            "Client-side size ceiling for the whole message. Default 10 MiB, which is "
+            "the limit on an unboosted server; raise it to 52428800 or 104857600 on a "
+            "server at boost tier 2 or 3."
+        ),
+    )
 
     p = add("reply", cmd_reply, "Reply to a specific message.")
     p.add_argument("--message", "-m", required=True, help="ID of the message to reply to.")
     p.add_argument("--channel", "-c", required=True, help="Channel name or ID containing that message.")
     p.add_argument("--text", "-t", help="Reply text. If omitted, read from stdin.")
+    p.add_argument(
+        "--file", "-f", action="append", metavar="PATH",
+        help="File to attach. Repeat for up to 10. Text is optional when a file is attached.",
+    )
+    p.add_argument(
+        "--max-upload-bytes", type=int, default=upload.MAX_UPLOAD_BYTES,
+        help=(
+            "Client-side size ceiling for the whole message. Default 10 MiB, which is "
+            "the limit on an unboosted server; raise it to 52428800 or 104857600 on a "
+            "server at boost tier 2 or 3."
+        ),
+    )
 
     p = add("react", cmd_react, "Add a reaction to a message.")
     p.add_argument("--message", "-m", required=True, help="ID of the message to react to.")
@@ -346,6 +432,27 @@ def build_parser():
     p.add_argument("--message", "-m", required=True, help="ID of the message to delete.")
     p.add_argument("--channel", "-c", required=True, help="Channel name or ID containing that message.")
     p.add_argument("--confirm", action="store_true", help="Required to actually delete.")
+
+    p = add("download", cmd_download, "Save a message's attachments to disk.")
+    p.add_argument("--channel", "-c", help="Channel name or ID containing the message.")
+    p.add_argument("--message", "-m", help="ID of the message whose attachments to save.")
+    p.add_argument(
+        "--url",
+        help="Download one attachment URL directly, instead of --channel/--message.",
+    )
+    p.add_argument(
+        "--out", default=".", metavar="DIR",
+        help="Directory to write into, created if absent. Default: the current directory. "
+             "(-o is taken by --output.)",
+    )
+    p.add_argument(
+        "--max-bytes", type=int, default=download.DEFAULT_MAX_BYTES,
+        help=f"Refuse an attachment larger than this. Default {download.DEFAULT_MAX_BYTES}.",
+    )
+    p.add_argument(
+        "--overwrite", action="store_true",
+        help="Replace an existing file of the same name instead of refusing.",
+    )
 
     cfg = add("config", None, "Inspect and set local configuration.")
     cfg_sub = cfg.add_subparsers(dest="subcommand", metavar="<subcommand>", required=True)
@@ -369,8 +476,21 @@ def build_parser():
 # -- helpers ---------------------------------------------------------------
 
 
-def _resolve_text(text):
+def _resolve_text(text, allow_empty=False):
+    """Message text from --text or stdin.
+
+    `allow_empty` is set when the message carries an attachment, and it changes
+    how hard we are willing to wait for stdin. Without a file, blocking on stdin
+    is correct -- text is the only thing the message could be, so there is
+    nothing to do but wait for it. With a file the caption is optional, and
+    blocking is a trap: an unattended caller that never redirects stdin (a
+    script, a service, an agent shelling out) has a pipe that is neither a tty
+    nor ever written to, and read() there hangs forever rather than erroring.
+    So when a file is attached we only take stdin that is already there.
+    """
     if text is None:
+        if allow_empty and not _stdin_ready():
+            return ""
         if sys.stdin.isatty():
             raise ValidationError(
                 "No message text provided.",
@@ -379,6 +499,8 @@ def _resolve_text(text):
         text = sys.stdin.read()
     text = text.rstrip("\n")
     if not text.strip():
+        if allow_empty:
+            return ""
         raise ValidationError(
             "Message text is empty.",
             remediation="Discord rejects empty messages. Provide non-whitespace content.",
@@ -389,6 +511,23 @@ def _resolve_text(text):
             remediation="Split it into multiple messages.",
         )
     return text
+
+
+def _stdin_ready():
+    """Is there input on stdin we can take without waiting?
+
+    A tty is never "ready": the human has not typed yet, and treating an empty
+    terminal as an empty caption would swallow the prompt. Anything else is
+    asked with a zero timeout, so a pipe nobody will ever write to reports as
+    empty instead of blocking the process forever.
+    """
+    if sys.stdin.isatty():
+        return False
+    try:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        return True  # not selectable: fall back to the blocking read
+    return bool(readable)
 
 
 def _parse_since(value):

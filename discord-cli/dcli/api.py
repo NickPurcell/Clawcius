@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import config
+from . import config, upload
 from .errors import AuthError, CliError
 
 BASE_URL = "https://discord.com/api/v10"
@@ -36,11 +36,20 @@ class Client:
         self.close()
 
     def request(self, method, path, params=None, body=None):
-        url = BASE_URL + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
         payload = json.dumps(body).encode("utf-8") if body is not None else None
+        return self._send(method, _url(path, params), payload, "application/json")
 
+    def request_multipart(self, method, path, body, content_type, params=None):
+        """Send a pre-encoded multipart body (see upload.build_multipart).
+
+        Uploads need a different Content-Type and a body that is not JSON, but
+        they need exactly the same rate-limit and error handling as everything
+        else -- hence the shared _send below rather than a second copy of the
+        retry loop that would drift out of step with it.
+        """
+        return self._send(method, _url(path, params), body, content_type)
+
+    def _send(self, method, url, payload, content_type):
         for attempt in range(MAX_RETRIES):
             req = urllib.request.Request(
                 url,
@@ -49,7 +58,7 @@ class Client:
                 headers={
                     "Authorization": f"Bot {self.token}",
                     "User-Agent": USER_AGENT,
-                    "Content-Type": "application/json",
+                    "Content-Type": content_type,
                     "Content-Length": str(len(payload) if payload else 0),
                 },
             )
@@ -114,8 +123,13 @@ class Client:
     def guild_channels(self, guild_id):
         return self.get(f"/guilds/{guild_id}/channels")
 
-    def send_message(self, channel_id, content, reply_to=None):
-        payload = {"content": content}
+    def send_message(self, channel_id, content, reply_to=None, files=None):
+        """Post a message, with attachments when `files` is non-empty.
+
+        `files` is what upload.load_files returns. With attachments the content
+        may legitimately be empty -- a picture is a message.
+        """
+        payload = {"content": content or ""}
         if reply_to:
             # fail_if_not_exists=False degrades to a plain message rather than
             # erroring if the target was deleted between read and reply.
@@ -123,7 +137,13 @@ class Client:
                 "message_id": reply_to,
                 "fail_if_not_exists": False,
             }
-        return self.request("POST", f"/channels/{channel_id}/messages", body=payload)
+        path = f"/channels/{channel_id}/messages"
+        if not files:
+            return self.request("POST", path, body=payload)
+
+        payload["attachments"] = upload.attachments_metadata(files)
+        body, content_type = upload.build_multipart(payload, files)
+        return self.request_multipart("POST", path, body, content_type)
 
     def edit_message(self, channel_id, message_id, content):
         return self.request(
@@ -149,6 +169,13 @@ class Client:
         return self.request(
             "PUT", f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
         )
+
+
+def _url(path, params=None):
+    url = BASE_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return url
 
 
 def _decode(raw):

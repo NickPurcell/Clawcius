@@ -40,16 +40,64 @@ To put `discord` on your PATH permanently, either symlink this script or
 | `channels` | List text channels visible to the bot |
 | `read` | Recent messages in a channel, newest first |
 | `search` | Filter a channel's history by text, author, or date |
-| `send` | Post a message (reads stdin if `--text` is omitted) |
-| `reply` | Reply to a specific message |
+| `send` | Post a message (reads stdin if `--text` is omitted), with optional `--file` attachments |
+| `reply` | Reply to a specific message, with optional `--file` attachments |
 | `react` | Add a reaction |
 | `edit` | Edit one of the bot's own messages |
 | `delete` | Delete a message (requires `--confirm`) |
+| `download` | Save a message's attachments to disk |
 | `whoami` | Bot identity and configured server |
 | `guilds` | Servers the bot belongs to |
 | `config show` / `config set-guild` | Inspect and set configuration |
 
 `--channel` takes a name or an ID. Run `discord <command> --help` for flags.
+
+## Attachments
+
+`send` and `reply` take `--file`, repeatable up to Discord's limit of ten per
+message. Text is optional once a file is attached, because a picture is a
+message.
+
+```bash
+./discord send --channel general --file diagram.png
+./discord send --channel general --file before.png --file after.png --text "the fix"
+```
+
+An upload whose attachments total more than 10 MiB is refused before anything is
+sent. That is the per-message ceiling on an unboosted server; boost tier 2
+raises it to 50 MiB and tier 3 to 100 MiB, and nothing the bot can cheaply read
+says which applies, so the tool assumes the floor rather than spending an entire
+upload to earn an HTTP 413. `--max-upload-bytes` lifts it where the server is
+known to be boosted.
+
+`download` saves attachments back to disk, by message or by URL:
+
+```bash
+./discord download --channel general --message 1234567890123456789 --out ./inbox
+./discord download --url 'https://cdn.discordapp.com/attachments/...?ex=...&is=...&hm=...'
+```
+
+`--out` defaults to the current directory and is created if it does not exist.
+It is spelled long because `-o` is already `--output`. An existing file of the
+same name is not replaced without `--overwrite`, and the transfer is streamed
+and abandoned the moment it passes `--max-bytes` (default 100 MiB), so a
+mis-declared `Content-Length` cannot be used to fill the disk.
+
+Attachment filenames come from whoever uploaded them and are treated as such:
+directory components are stripped, `.` and `..` are refused outright, and the
+resolved path must still land inside `--out` — which also catches a symlink
+planted there earlier. Nothing is written outside the directory you named.
+
+Attachment URLs are signed with `ex`/`is`/`hm` parameters and **expire**. A URL
+copied from an older `read` will come back 403 or 404; pass `--channel` and
+`--message` instead and the tool fetches a current one. Those requests go to
+`cdn.discordapp.com` and `media.discordapp.net` rather than `discord.com`, and
+deliberately carry no bot token — the signature in the query string is the
+credential, and the CDN has no business with ours.
+
+`read` and `search` list each attachment's filename, size, content type and id
+in their ordinary output, so finding out that a message has a file no longer
+requires `--full`.
 
 ## Design notes
 
@@ -91,8 +139,13 @@ stderr; a capped scan is reported as capped rather than as "no results". If this
 becomes the bottleneck, the fix is a local SQLite FTS index behind the same
 `search` interface.
 
-Not implemented: file uploads, DMs, threads, pins, and live tailing. Tailing is
-the only one that needs a Gateway websocket connection; everything else is REST.
+Not implemented: DMs, threads, pins, and live tailing. Tailing is the only one
+that needs a Gateway websocket connection; everything else is REST.
+
+Uploads are held in memory in full. At a 10 MiB ceiling that is unremarkable,
+and it is what lets the multipart boundary be checked against the actual bytes
+before it is used; raising `--max-upload-bytes` on a boosted server raises the
+memory cost with it. Downloads stream and do not.
 
 ## Agent skill
 
