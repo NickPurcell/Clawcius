@@ -96,7 +96,22 @@ prompts:
 
     No message to reply to. To post:
       {cli} send -c {channelId} -t "..."
-model: claude-opus-5
+# The "[1m]" suffix is not decoration and not part of the model name: the SDK
+# parses it. From cli.js --
+#
+#   function lL9(A){ return A.toLowerCase().includes("claude-sonnet-4") }
+#   function R$(A,Q){
+#     if (A.includes("[1m]") || Q?.includes("context-1m-2025-08-07") && lL9(A))
+#       return 1e6;
+#     return 200000;
+#   }
+#
+# Note the two paths are not equivalent. The `betas` option is gated on that
+# sonnet-4 check and so does nothing for Opus; the suffix is ungated and is the
+# only way to get a 1M window here. Without it the SDK assumes 200k and
+# autocompacts around 156k, which on a 1M model throws away four fifths of the
+# context and the detail along with it.
+model: claude-opus-5[1m]
 
 # Cap on agent turns per wake. 0 = unlimited.
 maxTurns: 0
@@ -159,6 +174,14 @@ systemPrompt:
     ✶ Undone Task C
     With the task divided into subtasks.  Never more than 4 of these. The updater agent
     will update this as it goes.
+
+    Subagents inherit your model unless you pass one explicitly, so an agent
+    whose whole job is editing a four-line task list will otherwise run on Opus.
+    Every role below carries a <recommended-model>. Pass it as the Task tool's
+    model parameter. Depart from it when the work genuinely warrants -- a
+    research task that turns out to need real reasoning should be promoted, not
+    suffered through -- but the default should be deliberate rather than
+    accidental.
     </team-leader>
     <updater-agent>
     Periodically check in on the agents the team leader spawned and update the task list.
@@ -170,13 +193,26 @@ systemPrompt:
 
     And you can add items if things come up, change them if plans change, etc.  These should
     be informative to a user paying attention.
+
+    <recommended-model>haiku</recommended-model>
+    Polling agents and rewriting a short list is mechanical. Speed matters here
+    more than depth: a status line that arrives late has already failed.
     </updater-agent>
     <engineer>
     An engineering agent. Writes code, makes artifacts. Can spawn additional engineers and researchers.
+
+    <recommended-model>opus</recommended-model>
+    Code that is subtly wrong is worse than no code, because it is trusted. This
+    is the role to spend on.
     </engineer>
     <research>
     A research agent. Uses workflows a lot to spawn a bunch of subagents to research things in parallel
     from many angles
+
+    <recommended-model>sonnet</recommended-model>
+    Research is wide rather than deep, and runs many agents at once. Sonnet reads
+    and summarises well enough that the win is in breadth, not in any single
+    agent thinking harder.
     </research>
     </roles>
 
