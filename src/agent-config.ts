@@ -37,7 +37,47 @@ export type SystemPromptConfig = {
  */
 export type EgressMode = 'sdk' | 'squid';
 
+/**
+ * Every piece of text the agent receives from us, as templates.
+ *
+ * These live in config rather than code because they are content, not
+ * mechanism — the wording of a wake, how a message renders, what the standing
+ * instructions say. Placeholders are `{name}` and are validated at startup, so
+ * a typo fails the boot with the offending key named instead of shipping a
+ * literal `{chanel_id}` into the model's context.
+ */
+export type PromptTemplates = {
+  /** Standing instructions, prepended to systemPrompt.append. */
+  protocol: string;
+  /**
+   * Rides along on every wake, via `{roleNotice}` in the wake templates.
+   *
+   * Every agent in the team shares one system prompt, so nothing in it says
+   * *which* role is reading. Wake messages are the one channel that reaches
+   * only the main agent — subagents are spawned by it and never woken by the
+   * waker — which makes this the right place to say so. Set it empty to drop
+   * the line entirely.
+   */
+  roleNotice: string;
+  /** Wake message for incoming Discord messages. */
+  messageWake: string;
+  /** How one message inside a bundle renders. */
+  messageLine: string;
+  /** Wake message for a schedule the agent set for itself. */
+  scheduleWake: string;
+};
+
+/** Placeholders each template may use. Anything else is a startup error. */
+export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[]> = {
+  protocol: ['cli'],
+  roleNotice: [],
+  messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
+  messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
+  scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
+};
+
 export type AgentConfig = {
+  prompts: PromptTemplates;
   model: string;
   /** 0 means unlimited — no turn cap is sent to the SDK at all. */
   maxTurns: number;
@@ -85,6 +125,18 @@ export type AgentConfig = {
     discordCli: string;
     skillsDir: string;
   };
+  rules: {
+    /** Deterministic message automation, evaluated before any LLM wake. */
+    enabled: boolean;
+    /** Hot-reloaded on write. Absent file simply means no automation. */
+    path: string;
+  };
+  git: {
+    /** Author name on commits the agent makes. */
+    userName: string;
+    /** Author email. Keep it distinct from yours so agent commits are obvious. */
+    userEmail: string;
+  };
   scheduling: {
     /** Expose the self-wake tools to the agent at all. */
     enabled: boolean;
@@ -97,7 +149,74 @@ export type AgentConfig = {
   };
 };
 
+const DEFAULT_PROMPTS: PromptTemplates = {
+  protocol: `## Speaking in Discord
+
+You are in a Discord server. You are woken when messages arrive in a channel you
+are part of, and when a wake you scheduled comes due.
+
+Your ordinary text output is not shown to anyone — it is private scratch space.
+Words reach Discord only when you run the \`discord\` CLI:
+
+    {cli} reply -c <channel_id> -m <message_id> -t "..."
+
+For long or multi-line bodies, omit \`-t\` and pipe the text on stdin:
+
+    printf '%s' "$BODY" | {cli} reply -c <channel_id> -m <message_id>
+
+\`reply\` threads under a specific message. \`send -c <channel_id>\` posts to the
+channel without threading — use it when there is no message to reply to, such as
+a scheduled wake. A skill documents the full CLI; read it before your first call
+in a session.
+
+Your working directory persists between wakes. Use it for notes and
+intermediate work.
+
+## Waking yourself later
+
+\`schedule_wake\`, \`schedule_repeating\`, \`list_schedules\` and
+\`cancel_schedule\` arrange for you to be woken in the future. The prompt you
+supply is what your future self receives, so write it as a self-contained
+instruction rather than a reference to the current conversation.
+
+There are limits on how often and how many wakes you may schedule. A rejected
+call says which limit it hit.`,
+
+  roleNotice:
+    'You are the team leader — the main agent for this channel. This wake is ' +
+    'addressed to you; subagents you spawn are never woken this way.',
+
+  messageWake: `{roleNotice}
+
+{count} new {plural}:
+
+{messages}
+
+channel_id: {channelId}
+latest message_id: {latestMessageId}
+
+To reply to the latest:
+  {cli} reply -c {channelId} -m {latestMessageId} -t "..."`,
+
+  messageLine: '[{time}] {author}: {content}',
+
+  scheduleWake: `{roleNotice}
+
+Scheduled wake.
+
+channel_id:  {channelId}
+schedule_id: {scheduleId}
+repeats:     {repeats}
+
+Your instruction to yourself:
+{prompt}
+
+No message to reply to. To post:
+  {cli} send -c {channelId} -t "..."`,
+};
+
 const DEFAULTS: AgentConfig = {
+  prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
   maxTurns: 0,
   systemPrompt: {
@@ -142,6 +261,14 @@ const DEFAULTS: AgentConfig = {
   paths: {
     discordCli: '/home/npurcell/clawcius/discord-cli/discord',
     skillsDir: '/home/npurcell/clawcius/.claude',
+  },
+  rules: {
+    enabled: true,
+    path: '/home/npurcell/clawcius/rules.yaml',
+  },
+  git: {
+    userName: 'Clawcius',
+    userEmail: 'clawcius@users.noreply.github.com',
   },
   scheduling: {
     enabled: true,
@@ -205,6 +332,33 @@ function strList(raw: unknown, path: string, fallback: string[]): string[] {
   });
 }
 
+/**
+ * A prompt template, with its placeholders checked against what the renderer
+ * will actually supply.
+ *
+ * Failing here rather than at render time is the point: an unknown placeholder
+ * would otherwise reach the model as a literal `{chanel_id}`, which looks like
+ * the agent misread something rather than like a config typo.
+ */
+function template(raw: unknown, key: keyof PromptTemplates, fallback: string): string {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string') throw new ConfigError(`prompts.${key}`, 'must be a string');
+
+  const allowed = new Set(PROMPT_PLACEHOLDERS[key]);
+  const used = [...raw.matchAll(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g)].map((m) => m[1] as string);
+  const unknown = [...new Set(used)].filter((name) => !allowed.has(name));
+
+  if (unknown.length > 0) {
+    throw new ConfigError(
+      `prompts.${key}`,
+      `uses unknown placeholder${unknown.length > 1 ? 's' : ''} ` +
+        `${unknown.map((u) => `{${u}}`).join(', ')}. ` +
+        `Available here: ${[...allowed].map((a) => `{${a}}`).join(', ')}`,
+    );
+  }
+  return raw;
+}
+
 function section(raw: unknown, path: string): Record<string, unknown> {
   if (raw === undefined || raw === null) return {};
   if (!isRecord(raw)) throw new ConfigError(path, 'must be a mapping');
@@ -236,8 +390,18 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
   const scheduling = section(root['scheduling'], 'scheduling');
+  const git = section(root['git'], 'git');
+  const rules = section(root['rules'], 'rules');
+  const prompts = section(root['prompts'], 'prompts');
 
   const config: AgentConfig = {
+    prompts: {
+      protocol: template(prompts['protocol'], 'protocol', DEFAULT_PROMPTS.protocol),
+      roleNotice: template(prompts['roleNotice'], 'roleNotice', DEFAULT_PROMPTS.roleNotice),
+      messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
+      messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
+      scheduleWake: template(prompts['scheduleWake'], 'scheduleWake', DEFAULT_PROMPTS.scheduleWake),
+    },
     model: str(root['model'], 'model', DEFAULTS.model),
     maxTurns: num(root['maxTurns'], 'maxTurns', DEFAULTS.maxTurns, 0),
     systemPrompt: {
@@ -326,6 +490,14 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     paths: {
       discordCli: str(paths['discordCli'], 'paths.discordCli', DEFAULTS.paths.discordCli),
       skillsDir: str(paths['skillsDir'], 'paths.skillsDir', DEFAULTS.paths.skillsDir),
+    },
+    rules: {
+      enabled: bool(rules['enabled'], 'rules.enabled', DEFAULTS.rules.enabled),
+      path: str(rules['path'], 'rules.path', DEFAULTS.rules.path),
+    },
+    git: {
+      userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
+      userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
     },
     scheduling: {
       enabled: bool(scheduling['enabled'], 'scheduling.enabled', DEFAULTS.scheduling.enabled),

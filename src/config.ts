@@ -36,6 +36,18 @@ export const config = {
     guildId: required('DISCORD_GUILD_ID'),
   },
 
+  /**
+   * Optional GitHub token for the agent, so it can clone and push over HTTPS.
+   *
+   * HTTPS rather than SSH deliberately: the agent runs under
+   * `bwrap --unshare-net` whose only route out is a bridge to an HTTP proxy.
+   * SSH is not HTTP, so `git@github.com` has no path out of the sandbox at
+   * all. HTTPS goes over CONNECT like every other allowed request.
+   */
+  github: {
+    token: process.env['GITHUB_TOKEN'] ?? '',
+  },
+
   storage: {
     dbPath: process.env['CLAWCIUS_DB_PATH'] ?? '/var/lib/clawcius/clawcius.db',
   },

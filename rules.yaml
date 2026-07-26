@@ -1,0 +1,67 @@
+# Deterministic message automation — no LLM, no tokens, no wake.
+#
+# Every Discord message is checked against these before any decision to wake
+# Clawcius. A rule that fires acts immediately, in milliseconds, for free.
+#
+# Edits take effect on save. No restart, no rebuild. A malformed file is
+# rejected and the previous good set stays live, so a typo cannot leave the bot
+# inert — check the log for `[rules] reload FAILED`.
+#
+# These are DATA, not code. There is deliberately no action that runs a
+# command: the waker is unsandboxed and holds the bot token, so a rule that
+# could execute would be a way out of the agent's sandbox.
+#
+# ── Conditions (`when`) ───────────────────────────────────────────────────
+#   contains   case-insensitive substring
+#   matches    regex, case-insensitive
+#   channel    channel id, or a list of them
+#   author     author id, or a list of them
+#   allowBots  set true to also match messages from bots (default false)
+#
+# At least one condition is required — a rule with none would fire on
+# everything, and startup rejects it.
+#
+# ── Actions (`do`) ────────────────────────────────────────────────────────
+#   - react: "👀"                            add a reaction
+#   - reply: "text"                          reply to the message
+#   - send:  { channel: "<id>", text: "…" }  post to another channel
+#   - log:   "text"                          write to the journal only
+#
+# Text supports {author} {authorId} {content} {channelId} {messageId}.
+#
+# ── Other keys ────────────────────────────────────────────────────────────
+#   stopWake         default TRUE — the rule handles it and Clawcius is not
+#                    woken. Set false to act *and* still wake him.
+#   cooldownSeconds  minimum gap between firings, per channel. Worth setting
+#                    on anything that replies, or a busy channel becomes spam.
+
+rules: []
+
+# ── Examples ──────────────────────────────────────────────────────────────
+# Delete `rules: []` above and uncomment to use.
+#
+# rules:
+#   # Acknowledge deploy failures instantly, and don't spend a turn on it.
+#   - name: deploy-failed
+#     when:
+#       contains: "deploy failed"
+#     do:
+#       - react: "🚨"
+#     cooldownSeconds: 30
+#
+#   # React to a CI bot, then hand off to Clawcius to actually investigate.
+#   - name: ci-red
+#     when:
+#       matches: "build (failed|broke|is red)"
+#       allowBots: true
+#     do:
+#       - react: "👀"
+#     stopWake: false
+#
+#   # Mirror anything tagged #announce into another channel, silently.
+#   - name: mirror-announcements
+#     when:
+#       contains: "#announce"
+#     do:
+#       - send: { channel: "123456789012345678", text: "{author}: {content}" }
+#       - log: "mirrored a message from {author}"

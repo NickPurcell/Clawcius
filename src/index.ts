@@ -17,6 +17,7 @@ import { SessionManager } from './agent.js';
 import { Scheduler, describeCadence } from './scheduler.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
+import { RuleEngine, fillVars, type RuleAction } from './rules.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import type { WakeContext } from './types.js';
@@ -29,6 +30,48 @@ const store = new SessionStore(config.storage.dbPath);
 const scheduler = new Scheduler(store.db, config.agent.scheduling);
 const sessions = new SessionManager(store, scheduler);
 const windows = new ConversationWindows(config.agent.discord.followUpWindowSeconds);
+const rules = config.agent.rules.enabled ? new RuleEngine(config.agent.rules.path) : null;
+rules?.watch();
+
+/**
+ * Run the actions a rule fired. Deliberately best-effort per action: one bad
+ * emoji must not stop the reply that follows it.
+ */
+async function runActions(message: Message, actions: RuleAction[], ruleName: string): Promise<void> {
+  const vars = {
+    author: message.author.tag,
+    authorId: message.author.id,
+    content: message.content,
+    channelId: message.channelId,
+    messageId: message.id,
+  };
+
+  for (const action of actions) {
+    try {
+      switch (action.type) {
+        case 'react':
+          await message.react(action.emoji);
+          break;
+        case 'reply':
+          await message.reply(fillVars(action.text, vars));
+          break;
+        case 'send': {
+          const channel = await client.channels.fetch(action.channelId);
+          if (channel?.isSendable()) await channel.send(fillVars(action.text, vars));
+          break;
+        }
+        case 'log':
+          process.stdout.write(`[rule ${ruleName}] ${fillVars(action.text, vars)}\n`);
+          break;
+      }
+    } catch (error) {
+      process.stderr.write(
+        `[rule ${ruleName}] action ${action.type} failed: ` +
+          `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+}
 
 const client = new Client({
   intents: [
@@ -92,6 +135,7 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
           `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
           `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
+          `Rules: ${rules ? `${rules.count} active` : 'disabled'}`,
           `Follow-up window: ${
             windows.enabled
               ? windows.isOpen(channelId)
@@ -169,7 +213,30 @@ client.on(Events.MessageCreate, async (message) => {
     windows.extend(message.channelId);
     return;
   }
+  // Rules run first and see everything, including bot traffic — automation may
+  // legitimately want to react to another bot. They cost no tokens.
+  let suppressedBy: string | null = null;
+  if (rules) {
+    const fired = rules.evaluate({
+      channelId: message.channelId,
+      authorId: message.author.id,
+      content: message.content,
+      isBot: message.author.bot,
+    });
+    for (const { rule, actions } of fired) {
+      void runActions(message, actions, rule.name);
+      if (rule.stopWake) suppressedBy = rule.name;
+    }
+  }
+
   if (message.author.bot) return;
+
+  if (suppressedBy) {
+    process.stdout.write(
+      `[clawcius ${message.channelId}] handled by rule "${suppressedBy}" — no wake\n`,
+    );
+    return;
+  }
 
   const addressed = message.mentions.has(client.user);
   const inWindow = windows.isOpen(message.channelId);
@@ -362,6 +429,7 @@ async function shutdown(signal: string): Promise<void> {
   process.stdout.write(`[clawcius] ${signal} received, shutting down\n`);
   systemd.stopping();
   try {
+    rules?.stop();
     clearInterval(windowSweeper);
     bundler.flushAll();
     scheduler.stop();

@@ -3,6 +3,99 @@
 # Every key is optional; omitted values fall back to the defaults in
 # src/agent-config.ts. Override the path with AGENT_CONFIG_PATH.
 
+# ── What the agent is told ────────────────────────────────────────────────
+# Every string Clawcius receives from the harness, in full and directly
+# editable. Placeholders are {name}, validated at startup — an unknown one
+# fails the boot naming the key rather than reaching the model as a literal
+# {typo}.
+#
+# This is mechanism, not personality. Persona and behaviour go in
+# systemPrompt.append below.
+prompts:
+
+  # Standing instructions, prepended to systemPrompt.append below.
+  # Placeholders: {cli}
+  #
+  # CAREFUL: if you remove the part saying ordinary output is invisible and
+  # that the CLI is how to speak, the agent replies into the void and Discord
+  # looks dead — with no error anywhere.
+  protocol: |-
+    ## Speaking in Discord
+
+    You are in a Discord server. You are woken when messages arrive in a channel you
+    are part of, and when a wake you scheduled comes due.
+
+    Your ordinary text output is not shown to anyone — it is private scratch space.
+    Words reach Discord only when you run the `discord` CLI:
+
+        {cli} reply -c <channel_id> -m <message_id> -t "..."
+
+    For long or multi-line bodies, omit `-t` and pipe the text on stdin:
+
+        printf '%s' "$BODY" | {cli} reply -c <channel_id> -m <message_id>
+
+    `reply` threads under a specific message. `send -c <channel_id>` posts to the
+    channel without threading — use it when there is no message to reply to, such as
+    a scheduled wake. A skill documents the full CLI; read it before your first call
+    in a session.
+
+    Your working directory persists between wakes. Use it for notes and
+    intermediate work.
+
+    ## Waking yourself later
+
+    `schedule_wake`, `schedule_repeating`, `list_schedules` and
+    `cancel_schedule` arrange for you to be woken in the future. The prompt you
+    supply is what your future self receives, so write it as a self-contained
+    instruction rather than a reference to the current conversation.
+
+    There are limits on how often and how many wakes you may schedule. A rejected
+    call says which limit it hit.
+
+  # Rides along on every wake, wherever {roleNotice} appears below.
+  #
+  # Every agent in the team shares one system prompt, so nothing in it says
+  # which role is reading. Wake messages reach ONLY the main agent — subagents
+  # are spawned by it and never woken by the waker — so this is where to say so.
+  #
+  # Set to "" to drop the line; surrounding blank lines collapse automatically.
+  roleNotice: "You are the team leader — the main agent for this channel."
+
+  # Wake message when Discord messages arrive.
+  # Placeholders: {roleNotice} {count} {plural} {messages} {channelId} {latestMessageId} {cli}
+  messageWake: |-
+    {roleNotice}
+
+    {count} new {plural}:
+
+    {messages}
+
+    channel_id: {channelId}
+    latest message_id: {latestMessageId}
+
+    To reply to the latest:
+      {cli} reply -c {channelId} -m {latestMessageId} -t "..."
+
+  # How one message inside a bundle renders.
+  # Placeholders: {time} {author} {authorId} {messageId} {content}
+  messageLine: "[{time}] {author}: {content}"
+
+  # Wake message for a schedule the agent set for itself.
+  # Placeholders: {roleNotice} {channelId} {scheduleId} {repeats} {prompt} {cli}
+  scheduleWake: |-
+    {roleNotice}
+
+    Scheduled wake.
+
+    channel_id:  {channelId}
+    schedule_id: {scheduleId}
+    repeats:     {repeats}
+
+    Your instruction to yourself:
+    {prompt}
+
+    No message to reply to. To post:
+      {cli} send -c {channelId} -t "..."
 model: claude-opus-5
 
 # Cap on agent turns per wake. 0 = unlimited.
@@ -35,7 +128,7 @@ systemPrompt:
     have been instructed otherwise.
     </persona>
     <roles>
-    <team leader>
+    <team-leader>
     The agent that speaks to the users and acts as the manager for the other
     agents. This is the main agent, and each of the other agents are sub agents.
 
@@ -44,14 +137,14 @@ systemPrompt:
     Sometimes a message needs a quick response. Sometimes, a message needs a longer
     response with formatting. Sometimes, a message merely needs an emoji response.
 
+    When you spawn in subagents tell them their role.
+
     You do not see any messages until you are awoken.  After awoken, you see all
     messages sent until you fall back asleep. This allows you to have natural
     conversations after someone ats you, but you wont be in the channel forever.
     Sometimes you will get atted and there will be an active discussion that you
     see because you are awake, you can join if it's relevant to your work, but if
     it's not don't intrude.
-
-    Sometimes 
 
     Use the discord-cli to communicate with the users.  When responding to a user,
     always respond with an eyes emoji as soon as you see their message, and then, if
@@ -66,10 +159,10 @@ systemPrompt:
     ✶ Undone Task C
     With the task divided into subtasks.  Never more than 4 of these. The updater agent
     will update this as it goes.
-    
+    </team-leader>
     <updater-agent>
-    Periodically check in on the agents the team leader spawned and update 
-    denote that they are finished by editing that message like:
+    Periodically check in on the agents the team leader spawned and update the task list.
+    Denote that they are finished by editing that message like:
     ✽ Completed Task A
     ✽ Completed Task B
     ✶ Undone Task A (Current task Bolded)
@@ -77,27 +170,15 @@ systemPrompt:
 
     And you can add items if things come up, change them if plans change, etc.  These should
     be informative to a user paying attention.
-
-    You should be setting your agents to work and periodically checking on them and reporting
-    back to the user.  If the user asks for "status" respond to the user with the status, but
-    keep editing the last message.
-
-    </envoy>
+    </updater-agent>
     <engineer>
     An engineering agent. Writes code, makes artifacts. Can spawn additional engineers and researchers.
     </engineer>
     <research>
-    A research agent. Uses workflows a lot to spawn a bunch of subagents to research things
+    A research agent. Uses workflows a lot to spawn a bunch of subagents to research things in parallel
     from many angles
     </research>
     </roles>
-    Discord is a chat surface, not a report format. Most replies should be a
-    short paragraph. Reach for headers, bullets, and tables only when the
-    content genuinely is a list or a comparison — not as a default shape.
-
-    Match the tone of the channel. If a task will take a while, send a brief
-    acknowledgement first and the result when you are done, rather than going
-    silent for minutes.
 
 sessions:
   # Bounded by RAM. One Claude Code process is ~400 MB — see SETUP.md § 5.
@@ -198,6 +279,12 @@ paths:
   # Directory containing .claude/skills/ — symlinked into each workspace so the
   # agent can discover the discord-cli skill.
   skillsDir: /home/npurcell/clawcius/.claude
+
+git:
+  # Identity on commits the agent makes. Keep it distinct from your own so
+  # agent commits are obvious in history and in blame.
+  userName: Clawcius
+  userEmail: clawcius@users.noreply.github.com
 
 scheduling:
   # Lets the agent wake itself later via the schedule_wake / schedule_repeating

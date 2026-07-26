@@ -67,6 +67,46 @@ function linkSkills(workspacePath: string): void {
   }
 }
 
+/**
+ * Git configuration for the agent, injected purely through the environment.
+ *
+ * `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` is git's own mechanism for config with
+ * no file behind it. That matters twice over: the token never lands on disk,
+ * and the service user's own ~/.gitconfig is left completely alone — the agent
+ * gets its own identity without inheriting or clobbering yours.
+ *
+ * The credential helper is scoped to github.com and reads GITHUB_TOKEN at call
+ * time, so the token appears in no URL, no remote, and no reflog.
+ *
+ * HTTPS only. The agent has no route out except the proxy bridge, and SSH is
+ * not HTTP — `git@github.com` cannot leave the sandbox at all.
+ */
+function gitEnv(): Record<string, string> {
+  const entries: Array<[string, string]> = [
+    ['user.name', config.agent.git.userName],
+    ['user.email', config.agent.git.userEmail],
+  ];
+
+  if (config.github.token) {
+    entries.push([
+      'credential.https://github.com.helper',
+      '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f',
+    ]);
+    // Rewrite SSH remotes to HTTPS, so a repo cloned with a git@ URL — or an
+    // agent reaching for the SSH form out of habit — still works instead of
+    // hanging against a route that does not exist.
+    entries.push(['url.https://github.com/.insteadOf', 'git@github.com:']);
+  }
+
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
+  entries.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value;
+  });
+  if (config.github.token) env['GITHUB_TOKEN'] = config.github.token;
+  return env;
+}
+
 export type AgentEvents = {
   /** Fired for each tool the agent runs — used for logging and send-detection. */
   onToolUse: (toolName: string, input: Record<string, unknown>) => void;
@@ -173,6 +213,7 @@ export class AgentSession {
         DISCORD_TOKEN: config.discord.token,
         DISCORD_GUILD_ID: config.discord.guildId,
         DISCORD_CLI_HOME: join(this.workspacePath, '.discord-cli'),
+        ...gitEnv(),
       },
       stderr: (data: string) => {
         process.stderr.write(`[agent ${this.channelId}] ${data}`);

@@ -1,0 +1,16 @@
+# Allow npurcell to manage the clawcius service without a password.
+#
+# Scope is deliberately narrow: named unit, fixed verbs, absolute path. It
+# grants no new privilege — clawcius.service runs as npurcell, so anyone who
+# can restart it could already achieve the same by editing dist/ and waiting.
+#
+# daemon-reload is included because the unit file changes often during setup;
+# it only re-reads unit files and starts nothing.
+#
+# Install:  sudo install -m 0440 -o root -g root \
+#             /home/npurcell/clawcius/ops/clawcius-sudoers \
+#             /etc/sudoers.d/clawcius
+npurcell ALL=(root) NOPASSWD: /usr/bin/systemctl restart clawcius.service, \
+                              /usr/bin/systemctl start clawcius.service, \
+                              /usr/bin/systemctl stop clawcius.service, \
+                              /usr/bin/systemctl daemon-reload
