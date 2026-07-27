@@ -34,6 +34,12 @@ export type WakeContext =
     };
 
 export type TurnSummary = {
+  /**
+   * Set when the turn ended because the API refused it — a revoked OAuth
+   * token, an exhausted rate limit. Distinct from `isError`, which stays false
+   * for these: the SDK considers the turn to have completed normally.
+   */
+  apiError?: string | null;
   isError: boolean;
   costUsd: number;
   numTurns: number;

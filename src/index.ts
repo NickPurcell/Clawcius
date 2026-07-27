@@ -213,6 +213,18 @@ function deliver(channelId: string, buffered: BufferedMessage[]): void {
       onDone: (summary) => {
         sessions.persist(channelId);
         const seconds = (summary.durationMs / 1000).toFixed(1);
+        if (summary.apiError) {
+          // Loud and separate: the turn "succeeded" as far as the SDK is
+          // concerned, so the success line below is about to claim everything
+          // is fine. From Discord this is indistinguishable from the agent
+          // deciding not to answer.
+          process.stderr.write(
+            `[clawcius ${channelId}] API REFUSED THE TURN — the agent never ran\n` +
+              `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
+              `  If this is an auth error: the container holds its OAuth token in\n` +
+              `  memory, and a host-side refresh revokes it. Fix: docker restart clawcius-agent\n`,
+          );
+        }
         process.stdout.write(
           `[clawcius ${channelId}] turn ${summary.subtype} in ${seconds}s ` +
             `$${summary.costUsd.toFixed(4)} (spoke=${summary.sentMessage})\n`,

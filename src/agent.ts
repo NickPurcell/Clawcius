@@ -165,6 +165,7 @@ export class AgentSession {
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
   #sentThisTurn = false;
+  #apiErrorThisTurn: string | null = null;
   /** tool_use ids of in-flight discord CLI calls, awaiting their results. */
   #discordCalls = new Map<string, string>();
 
@@ -270,6 +271,23 @@ export class AgentSession {
       }
 
       case 'assistant': {
+        // An API-level failure — a revoked OAuth token, a rate limit — arrives
+        // as an ordinary assistant message carrying the error as text. The
+        // turn then ends with subtype "success" and is_error false, so without
+        // this it is logged as a successful turn that happened to say nothing.
+        // That is the worst possible rendering of "your credentials are dead":
+        // in Discord it looks exactly like the agent choosing not to reply.
+        //
+        // The cost is the tell — an auth failure spends no tokens at all — but
+        // the message itself is the honest signal.
+        if ((message.message as { isApiErrorMessage?: boolean }).isApiErrorMessage === true) {
+          const detail = message.message.content
+            .map((b) => (b.type === 'text' ? b.text : ''))
+            .join(' ')
+            .trim();
+          this.#apiErrorThisTurn = detail || 'API error with no detail';
+        }
+
         for (const block of message.message.content) {
           if (block.type !== 'tool_use') continue;
 
@@ -330,6 +348,7 @@ export class AgentSession {
           durationMs: message.duration_ms,
           subtype: message.subtype,
           sentMessage: this.#sentThisTurn,
+          apiError: this.#apiErrorThisTurn,
         });
         break;
       }
@@ -344,6 +363,7 @@ export class AgentSession {
     this.lastActiveAt = Date.now();
     this.busy = true;
     this.#sentThisTurn = false;
+    this.#apiErrorThisTurn = null;
     this.#discordCalls.clear();
     try {
       this.#queue.push(buildWakeMessage(context), this.#sessionId);
