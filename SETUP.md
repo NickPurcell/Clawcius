@@ -1,222 +1,79 @@
 # Clawcius — setup
 
-An @mention in Discord wakes a long-lived, sandboxed Claude Code agent. The
-agent replies by invoking the `discord` CLI itself.
+An @mention in Discord wakes a long-lived Claude Code agent that lives inside a
+persistent gVisor container. The agent replies by invoking the `discord` CLI
+itself.
 
 ```
-@mention → [waker] → wakes agent with context
-                          ↓
-                   agent reasons, then
-                   bash: discord reply -c <channel> -m <msg> -t …
-                          ↓
-                      Discord
+                    host                    gVisor container
+@mention ─┐                          ┆
+          ├─→ waker ──docker exec──→ ┆  agent (warm, persistent)
+self-wake ┘   (gateway, tokens)      ┆    ├─→ discord CLI
+                                     ┆    └─→ cron, daemons
+                                     ┆              │
+                                     ┆      Squid allowlist ─→ internet
 ```
 
-The waker is deliberately thin: it authorizes the mention, hands the agent
-context, and gets out of the way. It never composes or sends replies. The one
-exception is the no-reply fallback — if a turn ends without the agent having
-called the CLI, the waker posts a notice, because from the user's side silence
-is indistinguishable from a dead bot.
-
-**Two halves.** `discord-cli/` (Python, stdlib-only) is yours; the waker and
-agent wiring (`src/`, TypeScript) is here. `.claude/skills/discord-cli/SKILL.md`
-is the single source of truth for the CLI's interface — `src/prompt.ts`
-deliberately does not restate any of it, so the two cannot drift.
-
-`src/` typechecks and builds against the installed SDK
-(`@anthropic-ai/claude-agent-sdk@0.1.77`, `discord.js@14.27.0`). What remains
-needs root, a reboot, or the CLI.
+**Two halves.** `discord-cli/` (Python, stdlib-only) and `src/` (the waker,
+TypeScript). `.claude/skills/` is the source of truth for what the agent knows
+about its own tools — `src/prompt.ts` deliberately restates none of it.
 
 ---
 
-## 1. The sandbox decision — read this first
+## 1. Containment
 
-There is one architectural choice still open, and it changes what you install.
+The agent process runs **inside** the container, not on the host. That matters
+more than it sounds: an earlier design used the Agent SDK's sandbox, which
+wraps each *bash command* in a throwaway `bwrap` namespace while the agent
+process itself — and `Read`, `Write`, `WebFetch`, every MCP tool — ran
+unconfined. Only shell commands were contained.
 
-**The Agent SDK spawns Claude Code as a child process of the bot.** It does not
-containerize anything by itself. So "put the agent in gVisor" resolves to one of
-three shapes:
+Now the whole agent is inside gVisor, whose userspace kernel intercepts
+syscalls, so the boundary covers every tool and `WebFetch`/`WebSearch` are no
+longer an egress hole.
 
-### Option A — SDK sandbox only (no gVisor)
+### Egress is topology, not configuration
 
-The SDK ships its own sandbox: `sandbox.enabled` plus
-`network.allowedDomains`, an egress allowlist enforced per agent. Paired with
-`autoAllowBashIfSandboxed`, the agent runs bash freely *because* it is
-contained — a materially better posture than blanket `bypassPermissions`.
+```
+clawcius-internal   --internal, 172.31.250.0/24, NO route out
+  ├── clawcius-agent   (agent; proxy env points at squid)
+  └── clawcius-squid   (also on clawcius-egress, which does have a route)
+```
 
-- **Requires `bwrap` and `socat` on PATH.** `bwrap` is present on this VM;
-  `socat` is not. Startup preflight refuses to boot without both — see
-  § Egress below for why this is fatal rather than a warning.
-- On by default via `sandbox.enabled: true` in `agent-config.yaml`.
-- Weakest isolation of the three, but a real egress allowlist and no kernel-level
-  trust in the agent's syscalls.
-- **Start here.** Get the bot working, then decide if you want more.
+Squid is the only reachable thing with a way out, so the allowlist is
+enforcement rather than advice. Verified: unsetting `HTTPS_PROXY`,
+`--noproxy '*'`, and connecting by raw IP all fail with no route. Filtering is
+on the CONNECT target — no TLS interception, so no CA key on this box.
 
-### Option B — one gVisor container for the whole bot
+Allowlist lives in `squid/squid.conf`; `docker/up.sh` rebuilds the stack.
 
-Run bot + all agents inside a single `--runtime=runsc` container.
+### What gVisor does not contain
 
-- Simple; one container to manage.
-- All threads share a kernel boundary — thread isolation is only the SDK
-  sandbox and separate `cwd`s.
-- Nesting the SDK sandbox inside gVisor may require
-  `sandbox.weakerNested: true`, which weakens the inner sandbox. Either accept
-  that, or set `sandbox.enabled: false` and let gVisor + Docker network policy
-  be the only boundary.
+It contains the **kernel**, not directories you hand it. The container mounts
+the workspace read-write and the host user's OAuth credentials, so anything
+that compromises the agent can use or exfiltrate those. That trade was made
+deliberately so the agent bills to the Claude Code plan.
 
-### Option C — one gVisor container per agent
-
-The SDK exposes `spawnClaudeCodeProcess?: (options: SpawnOptions) => SpawnedProcess`
-in `Options`. That hook lets you launch each agent via
-`docker run --runtime=runsc …` instead of a local subprocess.
-
-- Strongest isolation: per-thread kernel boundary, per-thread network policy.
-- Most work, and container start cost lands on the first message of each thread
-  (this is what a warm pool would amortize).
-- Not implemented yet — the hook is the integration point when you want it.
-
-**Recommendation:** ship Option A, measure, then move to C if you want real
-per-thread isolation. B is a middle ground that costs most of C's complexity
-without its main benefit.
+**Never mount the docker socket into the container.** It would let the agent
+start a privileged container mounting `/`, which makes gVisor decorative.
 
 ---
 
-## 1a. Egress — how it actually works
-
-**Verified empirically on this VM, not inferred from the types.**
-
-The SDK sandbox does not police outbound traffic with environment variables. On
-Linux it runs the agent under `bwrap` with `--unshare-net`, so the process has
-**no route to the internet at all**, then uses `socat` to bridge a Unix socket
-inside the namespace to a host-side HTTP/SOCKS proxy that enforces
-`sandbox.allowedDomains`.
-
-That design is why it holds up: there is no network to bypass the proxy *to*.
-Connecting to a raw IP does not evade the allowlist, because no route exists.
-Nor does `unset HTTPS_PROXY` — that does not uncover a second way out, it just
-breaks the only one.
-
-**Which proxy sits on the far end of that bridge is configurable.** The SDK's
-`SandboxNetworkConfig` takes an `httpProxyPort`, documented as "port of an
-external HTTP proxy to use instead of starting a local one… the external proxy
-must handle domain filtering". Setting it makes the SDK skip its own proxy and
-bridge to yours. That is the whole Squid integration — see § 1c.
-
-### The failure mode that bit us
-
-`socat` is **not installed on this VM**, and the SDK does not raise when its
-sandbox dependencies are missing — it silently declines to sandbox. Because
-`autoAllowBashIfSandboxed` only auto-allows bash *when the sandbox genuinely
-applied*, every bash call then blocks on a permission prompt with nothing there
-to answer it. Confirmed by running an agent turn: the tool call came back
-`blocked pending approval` and never executed.
-
-In Discord that presents as a bot that reacts 👀 to your mention and then never
-speaks — a very long way from its actual cause.
-
-Both configured paths were therefore broken:
-
-| Config | Behaviour on this VM |
-|---|---|
-| `sandbox.enabled: true` | Sandbox silently inactive, bash blocked, **agent cannot reply at all** |
-| `sandbox.enabled: false` + `bypassPermissions` | Bash runs, **egress completely uncontrolled** — verified reaching a non-allowlisted host, HTTP 200 |
-
-### Fix
+## 1a. Running it
 
 ```sh
-sudo apt-get install -y socat
+docker/up.sh        # networks + squid + agent container
+docker/down.sh      # stop both containers
+docker/snapshot.sh  # commit the agent container's writable layer to an image
 ```
 
-`src/preflight.ts` now refuses to start when `sandbox.enabled` is true and
-either binary is missing, so this cannot recur silently.
+`runtime: container` in `agent-config.yaml` selects this path. `runtime: host`
+exists for debugging only and confines nothing but shell commands.
 
-### Remaining caveat once socat is installed
-
-This SDK build ships no `vendor/seccomp/{x64,arm64}/apply-seccomp` binary, so
-seccomp filtering is unavailable and the sandbox runs in `allowAllUnixSockets`
-mode. Its own warning describes this as "less restrictive but still provides
-filesystem and network isolation" — domain egress control is intact; what is
-lost is blocking of arbitrary Unix-socket connections. Worth knowing if you
-later expose something like a Docker socket on this host.
-
-### What is *not* covered
-
-Egress control applies to the **agent** only. The waker process itself has
-unrestricted network access, and there is no host firewall or gVisor layer
-beneath either. Under Option A the SDK sandbox is the entire boundary.
-
-More precisely, it applies to the agent's **bash commands**. The sandbox is a
-command wrapper — the SDK wraps each Bash invocation in `bwrap`. Claude Code's
-own process is not wrapped, so `WebFetch` and `WebSearch`, which run in that
-parent process, do not pass through the allowlist or through Squid. The SDK's
-own type docs say as much: network access for those is governed by `WebFetch`
-permission rules, not by sandbox settings. If you need them constrained, that
-is a permissions job, not an egress one.
-
----
-
-## 1c. Egress — choosing the proxy
-
-`sandbox.egress.mode` in `agent-config.yaml` selects which proxy enforces
-`allowedDomains`. Both modes are equally *enforcing*, because in both the
-enforcement comes from `--unshare-net` rather than from the proxy. What differs
-is operability.
-
-| | `sdk` (default) | `squid` |
-|---|---|---|
-| Setup | None | `apt-get install squid`, one config file |
-| Allowlist lives in | `agent-config.yaml` only | Both files, pinned equal at startup |
-| Access log | None | `/var/log/squid/access.log`, per request |
-| Blocks pivot to localhost / RFC1918 / cloud metadata | No | Yes |
-| Blocks CONNECT to non-443 ports | No | Yes |
-| Extra moving part that can fail | No | Yes — a dead Squid means zero egress |
-
-**Choose `sdk` when** you want the fewest moving parts, or you are still getting
-the bot working at all. It is the default for that reason.
-
-**Choose `squid` when** you want an audit trail of what the agent actually
-reached, or an allowlist reviewable and changeable without touching the bot's
-config, or the SSRF guards. The instance-metadata block is the strongest single
-argument: `169.254.169.254` is usually the most valuable thing an
-egress-restricted process can still reach, and `sdk` mode does not block it.
-
-Install and verification: **`squid/README.md`**.
-
-### The one configuration that is refused
-
-`egress.mode: squid` with `sandbox.enabled: false` fails at startup rather than
-running. Without the namespace there is no bridge, `HTTP_PROXY` reverts to being
-advisory, and the agent can step around it with `unset HTTPS_PROXY` or
-`curl --noproxy '*'`. That setup reads as egress control in the config file and
-in `!status` while providing none — worse than no proxy at all, because it is
-believed. Startup names the contradiction and exits.
-
-### HTTPS is filtered without decryption
-
-The agent's traffic is essentially all TLS, which arrives as `CONNECT
-host:443`. Squid matches the allowlist against that hostname and then splices
-bytes; it never decrypts, and there is no CA key on this box.
-
-The tradeoff: a client that CONNECTs to an allowlisted host and then sends a
-different SNI inside the tunnel is not detected. Catching that needs `ssl_bump
-peek` with an `ssl::server_name` ACL — which still requires no CA if you only
-splice, but does require a Squid built against OpenSSL. Ubuntu's stock `squid`
-is built `--with-gnutls` (verified on this VM), so it would mean switching to
-the `squid-openssl` package. Not worth it for the current threat model.
-
-### Startup guards
-
-`src/preflight.ts` refuses to boot on each of these, because every one of them
-presents in Discord as a bot that reacts 👀 and then never speaks:
-
-- `bwrap` or `socat` missing while the sandbox is on.
-- Squid not listening on `egress.httpProxyPort`. The sandbox leaves no route
-  but the bridge, so a dead proxy is **total** egress loss — including
-  `discord.com`. Verified: with Squid stopped, even an allowlisted domain fails.
-- `squid.conf` and `sandbox.allowedDomains` listing different domains. The two
-  are enforced by different proxies — Squid on HTTP/HTTPS, the SDK's own on the
-  SOCKS path, which stays active because Squid speaks no SOCKS — so drift is a
-  real gap in whichever direction it runs.
+Startup **refuses** `runtime: container` together with `sandbox.enabled: true`:
+the SDK sandbox is redundant inside gVisor and cannot work anyway, because
+`apply-seccomp` needs a nested user namespace that this host's
+`kernel.apparmor_restrict_unprivileged_userns=1` denies.
 
 ---
 
@@ -290,134 +147,94 @@ sudo -u npurcell claude -p 'say ok' >/dev/null && echo 'auth OK'
 
 ---
 
-## 3. Post-reboot install (needs sudo)
+## 3. Installing on a fresh host
 
-The VM has no passwordless sudo, so these are yours to run. Nothing here is
-needed for Option A, except `socat` — which the sandbox does need:
-
-```sh
-sudo apt-get install -y socat
-```
-
-### Squid (only for `egress.mode: squid`)
-
-Full runbook, with each command explained, in **`squid/README.md`**. In short:
-
-```sh
-sudo apt-get install -y squid socat
-sudo cp -n /etc/squid/squid.conf /etc/squid/squid.conf.dpkg-orig
-sudo install -m 0644 /home/npurcell/clawcius/squid/squid.conf /etc/squid/squid.conf
-sudo squid -k parse            # validate before restarting — a dead squid = no egress
-sudo systemctl enable --now squid
-```
-
-### Docker + gVisor (Options B and C only)
+Everything below needs root. The build itself does not.
 
 ```sh
 # Docker
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg
+sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
   | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
   | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 
-# gVisor
-(
-  set -e
-  cd "$(mktemp -d)"
-  ARCH=$(uname -m)
-  URL=https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}
-  curl -fsSLO ${URL}/runsc ${URL}/runsc.sha512 \
-             ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
-  sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
-  sudo install -o root -g root -m 0755 runsc containerd-shim-runsc-v1 /usr/local/bin/
-)
+# gVisor — note --remote-name-all; plain -O only applies to the first URL
+( set -e; cd "$(mktemp -d)"
+  URL=https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)
+  curl -fsSL --remote-name-all \
+    ${URL}/runsc ${URL}/runsc.sha512 \
+    ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
+  sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
+  sudo install -o root -g root -m 0755 runsc containerd-shim-runsc-v1 /usr/local/bin/ )
 
-# Register runsc as a Docker runtime and restart the daemon
 sudo /usr/local/bin/runsc install
 sudo systemctl restart docker
-
-# Verify
-docker run --rm --runtime=runsc alpine uname -a
+sudo usermod -aG docker npurcell     # docker group is effectively root on the host
 ```
 
-Add your user to the `docker` group if you go with Option C:
+### Build the images
 
 ```sh
-sudo usermod -aG docker npurcell
+cp node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude docker/claude
+cp squid/squid.conf docker/squid.conf
+cd docker
+docker build -t clawcius-agent:latest .
+docker build -f Dockerfile.squid -t clawcius-squid:latest .
 ```
 
-### gVisor platform choice
+Both copies are gitignored — they are build-context artifacts, not sources.
+The `claude` binary is ~275 MB and must not go into the repo.
 
-This VM has nested virt (`/dev/kvm` present, AMD-V exposed), so both platforms
-are available:
-
-- `systrap` — runsc's default, no KVM dependency
-- `kvm` — often faster for syscall-heavy work, which Claude Code is
-
-Benchmark both against a real agent run before committing:
+### Install the units
 
 ```sh
-sudo runsc install -- --platform=kvm    # then restart docker and compare
-```
-
-Keep `sessions.workspaceRoot` on the local VM disk. gVisor's file I/O overhead
-stacked on an NFS/SMB mount back to the pool will make every `grep` and `read`
-visibly slow.
-
----
-
-## 3. Install the service
-
-```sh
-sudo cp systemd/clawcius.service /etc/systemd/system/
+sudo cp systemd/clawcius-container.service \
+        systemd/clawcius-snapshot.service \
+        systemd/clawcius-snapshot.timer \
+        systemd/clawcius.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now clawcius
-journalctl -u clawcius -f
+sudo systemctl enable --now clawcius-container.service
+sudo systemctl enable --now clawcius.service
+sudo systemctl enable --now clawcius-snapshot.timer
 ```
 
-`Type=notify` means `systemctl start` blocks until the Discord gateway is
-actually connected — a failed login shows up as a failed start, not a
-"running" unit that does nothing.
+`clawcius-container.service` is `Before=clawcius.service`, and the waker
+`Requires=docker.service`. Without that ordering you get a bot that connects to
+Discord and then fails every turn on `docker exec` — which reads as a Discord
+problem rather than a boot-order one.
 
 ---
 
 ## 3b. How the agent reaches the `discord` CLI
 
-`dcli` is pure stdlib — no typer, no httpx, no venv. The `discord-cli/discord`
-shim runs straight from the checkout, so **there is no install step**. The agent
-invokes it by absolute path (`paths.discordCli`, defaulting to the checkout).
+`dcli` is pure stdlib — no venv, no install step. The checkout is mounted
+read-only into the container at its host path, so `paths.discordCli` resolves
+identically either side.
 
-Three pieces have to line up, and all three are wired already:
+Three things must line up, and all three are wired:
 
-**1. Environment.** The waker passes `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, and
-`DISCORD_CLI_HOME` (`<workspace>/.discord-cli`) into the agent. Your `config.py`
-precedence — env first, then file — means no config file is needed.
+**Environment.** `DISCORD_TOKEN`, `DISCORD_GUILD_ID` and `GITHUB_TOKEN` reach
+the container through `--env-file`, so daemons the agent writes can use them
+too, not just the agent process.
 
-**2. Skill discovery.** The agent's `cwd` is its per-channel workspace, not this
-repo, and the SDK defaults to isolation mode where *no* filesystem settings load
-at all. So two things are set: `settingSources: ['project']` in `agent.ts`, and
-a `.claude` symlink created in each workspace pointing at this repo's. Without
-both, the agent never sees `discord-cli/SKILL.md` and has no idea how to speak.
+**Skill discovery.** The agent's `cwd` is its per-channel workspace, and the
+SDK defaults to isolation mode where no filesystem settings load. So
+`settingSources: ['project']` is set and a `.claude` symlink is created in each
+workspace pointing at the repo's — which is mounted read-only.
 
-**3. Egress.** `discord.com` is in `sandbox.allowedDomains`.
-Removing it leaves an agent that runs fine and can never say anything.
+**Egress.** `discord.com` is in `squid/squid.conf`. Remove it and the agent
+runs fine and can never say anything.
 
 Verify the whole chain:
 
 ```sh
-sudo -u npurcell /home/npurcell/clawcius/discord-cli/discord whoami
+docker exec clawcius-agent /home/npurcell/clawcius/discord-cli/discord whoami
 ```
 
-Under Option B or C, the CLI and the skill both need to exist in the container
-image, and `paths.discordCli` / `paths.skillsDir` point at their paths there.
-
----
 
 ## 4. Discord app setup
 
@@ -438,7 +255,7 @@ the bot can see.
 
 ---
 
-## 5. Memory budget (4 GB VM)
+## 5. Memory budget
 
 Measured on this box: one Claude Code process is ~383 MB RSS.
 
@@ -452,12 +269,14 @@ Measured on this box: one Claude Code process is ~383 MB RSS.
  ~2.0 GB   leaves headroom on 4 GB
 ```
 
-Add **~97 MB** for Squid under `egress.mode: squid` (measured on this box with
+Squid adds ~97 MB (measured on this box with
 caching off — see `squid/README.md`). It comes out of the OS slice above, not
 the agents'.
 
-`sessions.maxConcurrent: 3` in `agent-config.yaml` is sized for this, with
-`MemoryMax=2800M` in the unit as a backstop. Add ~50–100 MB per agent for gVisor under Option C.
+`sessions.maxConcurrent: 3` in `agent-config.yaml` is sized for this. Two
+ceilings back it up: `MemoryMax=2400M` on the waker unit, and `--memory=2g` on
+the agent container (plus 256m for Squid). The container limit is the one that
+matters now — the agents live there. gVisor adds roughly 50–100 MB per container on top.
 Raise both together, never one alone.
 
 After the reboot, drop swappiness — swapping a Node heap costs hundreds of ms
@@ -490,102 +309,43 @@ server-side (5 minutes, or an hour) and independent of process lifetime.
 
 ## 6b. Self-scheduling
 
-The Agent SDK ships no `ScheduleWakeup`/`CronCreate` equivalent — those are
-harness capabilities, not model capabilities. `src/scheduler.ts` plus
-`src/tools.ts` supply that piece as in-process MCP tools:
+No bespoke scheduler. The agent has cron inside its container and asks to be
+woken by writing a file:
 
-| Tool | Purpose |
-|---|---|
-| `schedule_wake` | One-shot wake after a delay |
-| `schedule_repeating` | Recurring, by `interval_seconds` or `daily_at` (HH:MM) |
-| `list_schedules` | Pending wakes for this channel |
-| `cancel_schedule` | Cancel by id |
+```sh
+0 9 * * *  echo '{"channel":"<id>","prompt":"post the briefing"}' \
+             > /var/lib/clawcius/run/wake/$(date +%s).json
+```
 
-Built this way rather than as cron for three reasons: it sidesteps the setgid
-`crontab` + `NoNewPrivileges` + sandbox-namespace problem entirely; it wakes the
-**existing warm session** instead of spawning a cold headless agent; and the
-limits live in the same process that already enforces concurrency.
+The waker watches that directory (`fs.watch`, plus a 5s sweep because gVisor's
+gofer does not reliably deliver inotify for writes made inside the sandbox),
+consumes each request, and starts a turn. `wake.maxPerHour` still applies — a
+request is a request, not a command, so this cannot be used to escape the
+concurrency cap.
 
-Firing is a 15-second poll over SQLite rather than one `setTimeout` per
-schedule — timers do not survive a restart, and delays beyond ~24.8 days
-overflow `setTimeout`'s 32-bit millisecond argument and fire immediately.
-
-The MCP server is constructed **per channel**, closing over the channel id, so
-the agent cannot schedule a wake into a channel it is not currently serving.
-
-### Limits, and why they matter here
-
-With `maxTurns: 0`, no budget cap, sessions that never die, and 24/7 uptime, a
-self-scheduling agent is the exact shape that runs up an unattended bill. Three
-guards, all in `agent-config.yaml`:
-
-| Key | Default | Guards against |
-|---|---|---|
-| `minDelaySeconds` | 60 | Tight self-wake loops |
-| `maxPending` | 20 | Unbounded schedule accumulation |
-| `maxWakesPerDay` | 48 | Sustained burn — re-checked at fire time, not only at creation, so yesterday's schedule cannot outrun today's budget |
-
-A rejected call returns the reason to the agent, and the system prompt tells it
-not to route around the limit by chaining short wakes or switching channels.
-
-### A scheduled wake has no message to reply to
-
-`discord reply` needs a message id, and a scheduled wake has none. The wake
-message says so explicitly and directs the agent to `discord send -c <channel>`.
-`WakeContext` is a discriminated union (`kind: 'mention' | 'schedule'`) so this
-cannot be got wrong silently.
-
-Commands are handled by the waker, not the agent — mention the bot, then:
-
-| Command                 | Effect                                       |
-|-------------------------|----------------------------------------------|
-| `@bot !stop`            | Interrupt the current turn                   |
-| `@bot !reset`           | Drop the session; next mention starts fresh  |
-| `@bot !status`          | Sessions, model, turn cap, eviction, sandbox |
-| `@bot !schedules`       | Pending self-scheduled wakes in this channel |
-| `@bot !unschedule <id>` | Cancel one                                   |
-
-Reactions give immediate feedback before the agent has produced anything:
-👀 woken, 🚫 channel not in `discord.allowedChannelIds`.
-
----
+A unix socket was the original design. gVisor blocks connections to host unix
+sockets, correctly, since one would be a hole straight through the sandbox
+boundary; a bind-mounted directory needs no such exception.
 
 ## Known gaps
 
-- **Never run end-to-end.** Agent turns have been exercised directly — the
-  egress tests above, and a live agent successfully calling `schedule_wake` and
-  `list_schedules` with the row verified in SQLite — but no Discord mention has
-  ever reached one. First mention is the real test.
-- **`daily_at` uses the server's local timezone.** Set `Environment=TZ=...` in
-  the unit file to change it; there is no per-schedule timezone.
-- **`socat` must be installed** before the bot will start with the sandbox on.
-  See § Egress.
-- **Squid mode is unverified against the installed package.** The config, the
-  allowlist behaviour, the SSRF guards, the socat bridge chain, and a real agent
-  turn were all verified against Squid 7.2 unpacked into a scratch directory and
-  run as an unprivileged user, because there is no sudo here. What that does not
-  cover is the packaged install path: AppArmor, the `proxy` user's ownership of
-  `/var/log/squid`, and the systemd unit. Run `squid/README.md` § Verifying it
-  works after installing.
-- **`WebFetch` / `WebSearch` bypass the allowlist entirely** — they run in the
-  parent process rather than in sandboxed bash. See § 1a.
-- **`pyproject.toml` declares stale deps** — `typer` and `httpx` are listed but
-  nothing imports them since the move to argparse + urllib. Harmless for the
-  shim; wrong for anyone who `pip install`s the package.
-- **Send-detection is a regex** (`(^|[\s/])discord\s+(reply|send)\b` in
-  `src/agent.ts`) driving the no-reply fallback. Verified against absolute-path,
-  bare, and piped invocations. If the CLI gains an alias or the agent wraps the
-  call in a script, the pattern needs updating — otherwise the fallback fires on
-  a turn that did in fact reply.
-- **Threads are unsupported by the CLI.** A mention inside a thread passes the
-  thread ID as `channel_id`, which Discord's REST API may accept, but it is
-  untested — treat thread replies as unverified.
-- **Warm sandbox pool** — the biggest remaining latency win. Only relevant
-  under Option C.
-- **Option C spawn hook** — `spawnClaudeCodeProcess` is unimplemented.
-- **No effort control.** `Options` has no `effort` field and the bundled Claude
-  Code CLI exposes no `--effort` flag, so there is nothing to wire it to. The
-  knob was removed rather than left as dead config. Revisit if a future SDK
-  release adds it.
-- **Prompt caching is not verified.** Long-lived sessions should be getting
-  cache reads; check `usage` on the result messages before assuming.
+- **Not exercised end-to-end since the container migration.** Agent turns,
+  egress enforcement, session resume and self-wake are each verified, but no
+  Discord @mention has been served from inside the container yet.
+- **`rules.yaml` is empty and arguably redundant.** The deterministic rule
+  engine predates the container; the agent can now write a real daemon with a
+  gateway connection instead. The engine stays because it is a zero-latency
+  path that needs no agent involvement at all, but it is no longer the obvious
+  answer.
+- **The `sandbox:` block in `agent-config.yaml` is vestigial** in container
+  mode. `allowedDomains` there is not what enforces egress — `squid/squid.conf`
+  is. Keeping them in sync is currently manual.
+- **The container's OAuth mount is a real exposure.** `.credentials.json` is
+  mounted read-write so token refresh works, which means a compromised agent
+  can use or exfiltrate it. Accepted deliberately to keep billing on the plan.
+- **gVisor overhead is unmeasured.** `systrap` is the default platform; this
+  host has nested virt so the `kvm` platform is also available. The agent is
+  file-I/O heavy and no benchmark has been run.
+- **Snapshots are untested as a restore path.** `docker/snapshot.sh` produces
+  images (~2 GB each, 8 retained), but restoring from one has never been
+  rehearsed.

@@ -135,6 +135,7 @@ export async function preflight(): Promise<void> {
 
   if (config.agent.runtime === 'container') {
     const name = config.agent.container.name;
+    const proxy = 'clawcius-squid';
     if (!onPath('docker')) {
       problems.push(
         'runtime is "container" but docker is not on PATH.\n' +
@@ -144,8 +145,19 @@ export async function preflight(): Promise<void> {
       problems.push(
         `runtime is "container" but container "${name}" is ${containerStatus(name)}.\n` +
           '    Every agent turn spawns `docker exec` into it, so nothing can run.\n' +
-          '    Fix:  docker/run-container.sh\n' +
+          '    Fix:  docker/up.sh\n' +
           '    Check: docker ps -a --filter name=' + name,
+      );
+    } else if (!containerRunning(proxy)) {
+      // The agent sits on a --internal network whose only route out is Squid.
+      // With the proxy down it has zero egress: it wakes, works, and cannot
+      // reach discord.com to reply. Same signature as every other silent
+      // failure this file exists to prevent.
+      problems.push(
+        `the egress proxy "${proxy}" is ${containerStatus(proxy)}.\n` +
+          '    The agent network has no route out except through it, so the agent\n' +
+          '    would wake and be unable to reach Discord at all.\n' +
+          '    Fix:  docker/up.sh',
       );
     }
   }

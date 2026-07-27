@@ -4,9 +4,14 @@ A Discord bot that wakes a long-lived, sandboxed Claude Code agent. The agent
 replies by driving a CLI itself — nothing pipes its output to Discord.
 
 ```
-@mention ─┐
-          ├─→ waker ─→ warm agent session ─→ bash: discord reply … ─→ Discord
-schedule ─┘
+                    host                    gVisor container
+@mention ─┐                          ┆
+          ├─→ waker ──docker exec──→ ┆  agent (warm, persistent)
+self-wake ┘   (gateway, tokens)      ┆    │
+                                     ┆    ├─→ discord CLI ─┐
+                                     ┆    └─→ cron, daemons ┤
+                                     ┆                      ▼
+                                     ┆              Squid allowlist ─→ Discord
 ```
 
 Two halves:
@@ -31,20 +36,26 @@ arrives as one turn rather than three.
 SQLite across restarts. Nothing obliges it to reply; silence is a normal
 outcome.
 
-**Schedules itself.** The Agent SDK ships no `ScheduleWakeup` equivalent, so
-four in-process MCP tools supply it, bounded by a delay floor, a pending cap,
-and a per-day ceiling re-checked at fire time.
+**Schedules itself.** No bespoke scheduler: the agent has cron inside its
+container and asks to be woken by dropping a JSON file in a watched directory.
+A rate limit still applies — a request is a request, not a command.
 
 ## Containment
 
-The agent runs under `bwrap --unshare-net` — no route to the internet at all.
-The only way out is a socat bridge to a proxy that enforces a domain allowlist,
-which is why the allowlist is enforcement rather than advice: there is no
-network to bypass the proxy *to*. Either the SDK's own proxy or an external
-Squid can answer on the far end (`sandbox.egress.mode`).
+The agent process lives inside a persistent **gVisor** container. gVisor
+intercepts syscalls in userspace, so nothing the agent does reaches the host
+kernel — and because the whole process is inside, the boundary covers every
+tool rather than only shell commands.
 
-Known gap: `WebFetch` and `WebSearch` run in the parent process, outside the
-per-bash sandbox, and do not pass through the proxy.
+Egress is enforced by topology rather than configuration. The container sits on
+a Docker `--internal` network with no route to the outside; **Squid** is the
+only reachable thing that has one, and it enforces a domain allowlist on the
+CONNECT target with no TLS interception. Unsetting the proxy variables, passing
+`--noproxy '*'`, or connecting by raw IP all simply fail — there is no second
+route to find.
+
+The container is long-lived on purpose: cron jobs, daemons and Discord bots the
+agent writes keep running between turns, with no model in the loop.
 
 ## Configuration
 
@@ -66,4 +77,11 @@ See [SETUP.md](SETUP.md) — prerequisites, the sandbox decision, authentication
 the systemd unit, and the memory budget. [`squid/README.md`](squid/README.md)
 covers the optional external proxy.
 
-Requires Node 22+, `bwrap`, `socat`, and Python 3.11+.
+Requires Node 22+, Docker with the `runsc` (gVisor) runtime, and Python 3.11+.
+
+## Recovery
+
+The container is disposable. Code the agent writes lives in git; the container's
+own state — packages, cron entries — is snapshotted nightly by a host-side timer
+the agent cannot reach. A wedged container is `docker rm` plus `docker/up.sh`
+away from clean, with the workspace volume untouched.

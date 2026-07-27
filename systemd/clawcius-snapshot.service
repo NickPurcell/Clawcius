@@ -1,0 +1,14 @@
+[Unit]
+Description=Snapshot the Clawcius agent container
+After=clawcius-container.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=npurcell
+Group=npurcell
+SupplementaryGroups=docker
+ExecStart=/home/npurcell/clawcius/docker/snapshot.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawcius-snapshot
