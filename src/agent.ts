@@ -281,10 +281,14 @@ export class AgentSession {
         // The cost is the tell — an auth failure spends no tokens at all — but
         // the message itself is the honest signal.
         if ((message.message as { isApiErrorMessage?: boolean }).isApiErrorMessage === true) {
-          const detail = message.message.content
-            .map((b) => (b.type === 'text' ? b.text : ''))
-            .join(' ')
-            .trim();
+          // Iterated rather than mapped: `content` is a union of array types,
+          // so `.map` has no single call signature and its parameter lands as
+          // an implicit any, which fails the build under noImplicitAny.
+          const parts: string[] = [];
+          for (const block of message.message.content) {
+            if (block.type === 'text') parts.push(block.text);
+          }
+          const detail = parts.join(' ').trim();
           this.#apiErrorThisTurn = detail || 'API error with no detail';
         }
 
