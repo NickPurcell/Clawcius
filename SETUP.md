@@ -67,13 +67,15 @@ docker/down.sh      # stop both containers
 docker/snapshot.sh  # commit the agent container's writable layer to an image
 ```
 
-`runtime: container` in `agent-config.yaml` selects this path. `runtime: host`
-exists for debugging only and confines nothing but shell commands.
+This is the only way the agent runs — there is no host mode. A local child
+process would have confined nothing but shell commands, leaving `Read`,
+`Write`, `WebFetch` and the agent process itself unconfined, which is a
+footgun rather than a debugging aid.
 
-Startup **refuses** `runtime: container` together with `sandbox.enabled: true`:
-the SDK sandbox is redundant inside gVisor and cannot work anyway, because
-`apply-seccomp` needs a nested user namespace that this host's
-`kernel.apparmor_restrict_unprivileged_userns=1` denies.
+`docker/up.sh` also re-copies `squid/squid.conf` into the build context and
+rebuilds `clawcius-squid` before starting it, so an allowlist edit takes
+effect by running that one script. The layer cache makes it near-instant when
+the config has not changed.
 
 ---
 
@@ -84,16 +86,19 @@ Two files, on purpose:
 | File | Holds | Commit it? |
 |---|---|---|
 | `.env` | Discord token, guild ID, optionally an API key | **No** |
-| `agent-config.yaml` | Model, turn cap, system prompt, sandbox, sessions | **Yes** |
+| `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | **Yes** |
+| `squid/squid.conf` | The egress allowlist — the only copy of it | **Yes** |
 
 Changing the agent's personality should be a reviewable diff, not an edit to a
 file full of secrets. Every key in the YAML is optional and falls back to the
 defaults in `src/agent-config.ts`; the loader validates types and fails at
 startup with the offending path named, rather than at the first mention.
 
-One validation is deliberately fatal: `sandbox.allowedDomains` must contain
-`discord.com`. Without it the agent starts, runs, and silently cannot speak —
-a miserable thing to debug from the Discord side.
+Egress is **not** configured here. The allowlist lives only in
+`squid/squid.conf`, because a second copy in the YAML was a list that had to
+agree with the enforcing one and silently did not. `discord.com` must stay on
+it — without it the agent starts, runs, and silently cannot speak, which is a
+miserable thing to debug from the Discord side.
 
 ### System prompt
 
@@ -332,14 +337,15 @@ boundary; a bind-mounted directory needs no such exception.
 - **Not exercised end-to-end since the container migration.** Agent turns,
   egress enforcement, session resume and self-wake are each verified, but no
   Discord @mention has been served from inside the container yet.
-- **`rules.yaml` is empty and arguably redundant.** The deterministic rule
-  engine predates the container; the agent can now write a real daemon with a
-  gateway connection instead. The engine stays because it is a zero-latency
-  path that needs no agent involvement at all, but it is no longer the obvious
-  answer.
-- **The `sandbox:` block in `agent-config.yaml` is vestigial** in container
-  mode. `allowedDomains` there is not what enforces egress — `squid/squid.conf`
-  is. Keeping them in sync is currently manual.
+- **The media allowlist is broad and unverified against live sites.** X,
+  Instagram, TikTok and YouTube are allowed along with their CDN domains, but
+  no download has been run through the proxy yet. Extractors change hostnames
+  without notice; `docker logs clawcius-squid | grep TCP_DENIED` names whatever
+  is missing.
+- **`.fbcdn.net` is wider than Instagram.** It is Meta's shared CDN, and
+  Instagram media genuinely lands there depending on which edge answers, so
+  allowing only `.cdninstagram.com` gives intermittent failures. The cost is
+  that other Meta-hosted content is reachable too.
 - **The container's OAuth mount is a real exposure.** `.credentials.json` is
   mounted read-write so token refresh works, which means a compromised agent
   can use or exfiltrate it. Accepted deliberately to keep billing on the plan.

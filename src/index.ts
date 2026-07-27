@@ -1,5 +1,5 @@
 /**
- * Clawcius — wakes a sandboxed Claude Code agent on Discord mentions.
+ * Clawcius — wakes a containerised Claude Code agent on Discord mentions.
  *
  * This process is deliberately thin. It listens on the gateway, authorizes the
  * mention, and hands the agent context. It does not compose or send replies —
@@ -17,61 +17,17 @@ import { SessionManager } from './agent.js';
 import { WakeSpool } from './wake-spool.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
-import { RuleEngine, fillVars, type RuleAction } from './rules.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import type { WakeContext } from './types.js';
 
-// Fail before touching Discord if the sandbox cannot actually work. Async
-// because the Squid check has to probe whether the proxy is actually listening.
+// Fail before touching Discord if the container stack is not actually up —
+// a missing agent or proxy container reads as a bot that never answers.
 await preflight();
 
 const store = new SessionStore(config.storage.dbPath);
 const sessions = new SessionManager(store);
 const windows = new ConversationWindows(config.agent.discord.followUpWindowSeconds);
-const rules = config.agent.rules.enabled ? new RuleEngine(config.agent.rules.path) : null;
-rules?.watch();
-
-/**
- * Run the actions a rule fired. Deliberately best-effort per action: one bad
- * emoji must not stop the reply that follows it.
- */
-async function runActions(message: Message, actions: RuleAction[], ruleName: string): Promise<void> {
-  const vars = {
-    author: message.author.tag,
-    authorId: message.author.id,
-    content: message.content,
-    channelId: message.channelId,
-    messageId: message.id,
-  };
-
-  for (const action of actions) {
-    try {
-      switch (action.type) {
-        case 'react':
-          await message.react(action.emoji);
-          break;
-        case 'reply':
-          await message.reply(fillVars(action.text, vars));
-          break;
-        case 'send': {
-          const channel = await client.channels.fetch(action.channelId);
-          if (channel?.isSendable()) await channel.send(fillVars(action.text, vars));
-          break;
-        }
-        case 'log':
-          process.stdout.write(`[rule ${ruleName}] ${fillVars(action.text, vars)}\n`);
-          break;
-      }
-    } catch (error) {
-      process.stderr.write(
-        `[rule ${ruleName}] action ${action.type} failed: ` +
-          `${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    }
-  }
-}
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -134,9 +90,7 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
           `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
           `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
-          `Rules: ${rules ? `${rules.count} active` : 'disabled'}`,
-          `Runtime: ${config.agent.runtime}` +
-            (config.agent.runtime === 'container' ? ` (${config.agent.container.name})` : ''),
+          `Container: ${config.agent.container.name}`,
           `Follow-up window: ${
             windows.enabled
               ? windows.isOpen(channelId)
@@ -144,17 +98,9 @@ async function handleCommand(message: Message, command: string): Promise<boolean
                 : `closed (${config.agent.discord.followUpWindowSeconds}s when open)`
               : 'disabled'
           }`,
-          `Sandbox: ${config.agent.sandbox.enabled ? 'SDK sandbox on' : 'outer boundary only'}`,
-          // Naming the enforcing proxy matters: "uncontrolled" here is the
+          // Naming the enforcing proxy matters: "uncontrolled" here would be the
           // difference between a contained agent and one with open egress.
-          `Egress: ${
-            config.agent.sandbox.enabled
-              ? config.agent.sandbox.egress.mode === 'squid'
-                ? `Squid allowlist (127.0.0.1:${config.agent.sandbox.egress.httpProxyPort}), ` +
-                  `${config.agent.sandbox.allowedDomains.length} domains`
-                : `SDK proxy allowlist, ${config.agent.sandbox.allowedDomains.length} domains`
-              : 'uncontrolled'
-          }`,
+          `Egress: Squid allowlist (${config.agent.container.name} has no other route)`,
           persisted
             ? `This channel: session ${persisted.sessionId.slice(0, 8)}…`
             : 'This channel: no session yet',
@@ -186,30 +132,7 @@ client.on(Events.MessageCreate, async (message) => {
     windows.extend(message.channelId);
     return;
   }
-  // Rules run first and see everything, including bot traffic — automation may
-  // legitimately want to react to another bot. They cost no tokens.
-  let suppressedBy: string | null = null;
-  if (rules) {
-    const fired = rules.evaluate({
-      channelId: message.channelId,
-      authorId: message.author.id,
-      content: message.content,
-      isBot: message.author.bot,
-    });
-    for (const { rule, actions } of fired) {
-      void runActions(message, actions, rule.name);
-      if (rule.stopWake) suppressedBy = rule.name;
-    }
-  }
-
   if (message.author.bot) return;
-
-  if (suppressedBy) {
-    process.stdout.write(
-      `[clawcius ${message.channelId}] handled by rule "${suppressedBy}" — no wake\n`,
-    );
-    return;
-  }
 
   const addressed = message.mentions.has(client.user);
   const inWindow = windows.isOpen(message.channelId);
@@ -401,7 +324,6 @@ async function shutdown(signal: string): Promise<void> {
   process.stdout.write(`[clawcius] ${signal} received, shutting down\n`);
   systemd.stopping();
   try {
-    rules?.stop();
     wakeSpool?.stop();
     clearInterval(windowSweeper);
     bundler.flushAll();

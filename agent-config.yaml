@@ -112,15 +112,13 @@ prompts:
 # autocompacts around 156k, which on a 1M model throws away four fifths of the
 # context and the detail along with it.
 # ── Where the agent runs ──────────────────────────────────────────────────
-# container — inside the persistent gVisor container (docker/run-container.sh).
-#             The whole agent is contained, not just its bash commands, and
-#             daemons and cron jobs it starts survive between turns.
-# host      — local child process with the SDK's per-bash-command bwrap
-#             sandbox. Debugging only: it confines shell commands and nothing
-#             else, leaving Read/Write/WebFetch and the agent process itself
-#             running unconfined on the host.
-runtime: container
-
+# The agent process lives inside a persistent gVisor container — the whole
+# process, not just its bash commands, so the boundary covers every tool.
+# Daemons and cron jobs it starts survive between turns.
+#
+# Egress is enforced by topology, not by anything in this file: the container
+# sits on a Docker --internal network with no route out, and the only reachable
+# thing that has one is Squid. The allowlist lives in squid/squid.conf.
 container:
   name: clawcius-agent
   claudePath: /usr/local/bin/claude
@@ -242,55 +240,6 @@ sessions:
   # continuity is kept either way — the difference is startup latency and RAM.
   idleTimeoutMinutes: 0
   workspaceRoot: /var/lib/clawcius/workspaces
-
-sandbox:
-  # The Agent SDK's built-in sandbox, with a network egress allowlist. Paired
-  # with autoAllowBashIfSandboxed, so bash runs freely because it is contained
-  # rather than because permissions were bypassed.
-  enabled: false
-
-  # discord.com is REQUIRED — it is how the agent replies. Startup fails if it
-  # is missing, because the alternative is an agent that runs and stays silent.
-  allowedDomains:
-    - api.anthropic.com
-    - discord.com
-    - registry.npmjs.org
-    - pypi.org
-    - files.pythonhosted.org
-    - github.com
-    - api.github.com
-    - objects.githubusercontent.com
-
-  # Set true ONLY when running nested inside gVisor. Weakens the inner sandbox.
-  weakerNested: false
-
-  # Which proxy enforces allowedDomains for sandboxed commands.
-  #
-  # Enforcement comes from the sandbox either way, not from this setting: the
-  # agent runs under `bwrap --unshare-net` with no route to the internet, and
-  # the only way out is a socat bridge to a proxy. This chooses which proxy
-  # answers on the far end of that bridge.
-  #
-  #   sdk   — the SDK's own in-process proxy. No setup, nothing to install.
-  #   squid — an external Squid (squid/squid.conf). Buys real access logs, a
-  #           default-deny config reviewable outside this process, and guards
-  #           against using the proxy to pivot at localhost / RFC1918 / cloud
-  #           metadata. Requires Squid installed and running — see
-  #           squid/README.md.
-  #
-  # Setting this to squid with sandbox.enabled: false is refused at startup.
-  # Without the namespace, HTTP_PROXY is only a suggestion the agent can drop.
-  egress:
-    mode: sdk
-
-    # Host port Squid listens on. Only read when mode is squid, and must match
-    # the http_port line in squid.conf.
-    httpProxyPort: 3128
-
-    # Checked at startup against allowedDomains above. Mismatch is fatal — the
-    # two lists are enforced by different proxies (Squid on HTTP/HTTPS, the
-    # SDK's own on SOCKS) and drift between them is a hole.
-    confPath: /home/npurcell/clawcius/squid/squid.conf
 
 discord:
   # Empty = the agent responds to mentions in any channel it can see.

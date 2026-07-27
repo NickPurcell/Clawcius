@@ -225,45 +225,15 @@ export class AgentSession {
       options.resume = resumeSessionId;
     }
 
-    // In container mode the agent process itself lives inside gVisor, so the
-    // SDK's per-bash-command sandbox is neither needed nor usable. Startup
-    // refuses the combination, so reaching here means it is off.
-    if (config.agent.runtime === 'container') {
-      options.spawnClaudeCodeProcess = containerSpawner({
-        name: config.agent.container.name,
-        claudePath: config.agent.container.claudePath,
-      });
-      // Containment is the container's; skip the permission prompts that would
-      // otherwise block every tool call with nothing there to answer them.
-      options.permissionMode = 'bypassPermissions';
-      options.allowDangerouslySkipPermissions = true;
-    }
-
-    if (config.agent.sandbox.enabled) {
-      const { egress } = config.agent.sandbox;
-      options.sandbox = {
-        enabled: true,
-        autoAllowBashIfSandboxed: true,
-        network: {
-          allowedDomains: [...config.agent.sandbox.allowedDomains],
-          // With `httpProxyPort` set, the SDK skips starting its own HTTP proxy
-          // and bridges the sandbox namespace to this port instead — Squid.
-          // The enforcement is unchanged either way: bwrap --unshare-net means
-          // the bridge is the only route out, so whichever proxy answers on the
-          // far end is the one that decides what the agent can reach.
-          //
-          // Note there is no socksProxyPort here, deliberately: Squid speaks no
-          // SOCKS, so the SDK keeps its own SOCKS proxy on the ALL_PROXY path.
-          // That proxy enforces `allowedDomains`, which preflight pins to be
-          // identical to Squid's allowlist — see src/preflight.ts.
-          ...(egress.mode === 'squid' ? { httpProxyPort: egress.httpProxyPort } : {}),
-        },
-        ...(config.agent.sandbox.weakerNested ? { enableWeakerNestedSandbox: true } : {}),
-      };
-    } else {
-      options.permissionMode = 'bypassPermissions';
-      options.allowDangerouslySkipPermissions = true;
-    }
+    // The agent process itself lives inside gVisor, so containment is the
+    // container's job. Permission prompts would only block every tool call
+    // with nothing there to answer them.
+    options.spawnClaudeCodeProcess = containerSpawner({
+      name: config.agent.container.name,
+      claudePath: config.agent.container.claudePath,
+    });
+    options.permissionMode = 'bypassPermissions';
+    options.allowDangerouslySkipPermissions = true;
 
     return options;
   }

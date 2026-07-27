@@ -19,6 +19,13 @@ docker network inspect "$INTERNAL" >/dev/null 2>&1 \
 docker network inspect "$EGRESS" >/dev/null 2>&1 \
   || docker network create "$EGRESS" >/dev/null
 
+# The allowlist lives in squid/squid.conf and is baked into the image, so an
+# edit there is inert until the image is rebuilt. Syncing and rebuilding on
+# every up.sh removes that failure mode rather than documenting it: the layer
+# cache makes this ~a second when the config has not changed.
+cp ../squid/squid.conf ./squid.conf
+docker build -q -f Dockerfile.squid -t clawcius-squid:latest . >/dev/null
+
 # Squid straddles both networks: reachable from the agent, and the only thing
 # on that side with a route out.
 docker rm -f clawcius-squid >/dev/null 2>&1 || true

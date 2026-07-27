@@ -22,22 +22,6 @@ export type SystemPromptConfig = {
 };
 
 /**
- * Which proxy enforces the egress allowlist for sandboxed commands.
- *
- * Both modes are enforcing, and for the same reason: the SDK sandbox runs the
- * agent under `bwrap --unshare-net`, so it has no route to the internet at all
- * and the only reachable endpoint is a socat bridge to the proxy. The choice
- * below is only *which* proxy sits on the far end of that bridge.
- *
- * - `sdk`   — the SDK's own in-process HTTP proxy. Zero setup, allowlist comes
- *             straight from `allowedDomains`.
- * - `squid` — an external Squid. The SDK skips starting its own proxy and
- *             bridges to Squid instead. Buys real access logs, SSRF/pivot
- *             guards, and an allowlist reviewable outside this process.
- */
-export type EgressMode = 'sdk' | 'squid';
-
-/**
  * Every piece of text the agent receives from us, as templates.
  *
  * These live in config rather than code because they are content, not
@@ -76,20 +60,7 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
 };
 
-/**
- * Where the agent process runs.
- *
- * - `container` — inside the persistent gVisor container. The whole agent is
- *   contained, every tool included, and its daemons and cron jobs survive
- *   between turns.
- * - `host` — as a local child process, with the SDK's per-bash-command bwrap
- *   sandbox. Retained only for debugging; it confines shell commands and
- *   nothing else.
- */
-export type AgentRuntime = 'container' | 'host';
-
 export type AgentConfig = {
-  runtime: AgentRuntime;
   container: {
     name: string;
     /** In-container path to the claude binary. */
@@ -105,22 +76,6 @@ export type AgentConfig = {
     /** 0 means never evict — sessions stay alive until the bot restarts. */
     idleTimeoutMinutes: number;
     workspaceRoot: string;
-  };
-  sandbox: {
-    enabled: boolean;
-    allowedDomains: string[];
-    weakerNested: boolean;
-    egress: {
-      mode: EgressMode;
-      /** Host port Squid listens on. Only consulted when mode is `squid`. */
-      httpProxyPort: number;
-      /**
-       * The squid.conf whose allowlist must match `allowedDomains`. Preflight
-       * parses it and refuses to start on drift — the two lists are enforced
-       * by different proxies and a gap between them is a hole.
-       */
-      confPath: string;
-    };
   };
   discord: {
     /** Empty means every channel the bot can see. */
@@ -142,12 +97,6 @@ export type AgentConfig = {
   paths: {
     discordCli: string;
     skillsDir: string;
-  };
-  rules: {
-    /** Deterministic message automation, evaluated before any LLM wake. */
-    enabled: boolean;
-    /** Hot-reloaded on write. Absent file simply means no automation. */
-    path: string;
   };
   git: {
     /** Author name on commits the agent makes. */
@@ -238,7 +187,6 @@ No message to reply to. To post:
 };
 
 const DEFAULTS: AgentConfig = {
-  runtime: 'container',
   container: {
     name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
@@ -255,30 +203,6 @@ const DEFAULTS: AgentConfig = {
     idleTimeoutMinutes: 0,
     workspaceRoot: '/var/lib/clawcius/workspaces',
   },
-  sandbox: {
-    enabled: true,
-    allowedDomains: [
-      'api.anthropic.com',
-      // Required — this is how the agent replies. Without it the agent runs
-      // fine and can never say anything.
-      'discord.com',
-      'registry.npmjs.org',
-      'pypi.org',
-      'files.pythonhosted.org',
-      'github.com',
-      'api.github.com',
-      'objects.githubusercontent.com',
-    ],
-    weakerNested: false,
-    egress: {
-      // `sdk` keeps the previously-working path as the default. Switching to
-      // `squid` requires Squid to be installed and running first — see
-      // squid/README.md.
-      mode: 'sdk',
-      httpProxyPort: 3128,
-      confPath: '/home/npurcell/clawcius/squid/squid.conf',
-    },
-  },
   discord: {
     allowedChannelIds: [],
     followUpWindowSeconds: 300,
@@ -288,10 +212,6 @@ const DEFAULTS: AgentConfig = {
   paths: {
     discordCli: '/home/npurcell/clawcius/discord-cli/discord',
     skillsDir: '/home/npurcell/clawcius/.claude',
-  },
-  rules: {
-    enabled: true,
-    path: '/home/npurcell/clawcius/rules.yaml',
   },
   git: {
     userName: 'Clawcius',
@@ -411,18 +331,14 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const root = section(parsed, 'root');
   const prompt = section(root['systemPrompt'], 'systemPrompt');
   const sessions = section(root['sessions'], 'sessions');
-  const sandbox = section(root['sandbox'], 'sandbox');
-  const egress = section(sandbox['egress'], 'sandbox.egress');
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
   const wake = section(root['wake'], 'wake');
   const git = section(root['git'], 'git');
-  const rules = section(root['rules'], 'rules');
   const prompts = section(root['prompts'], 'prompts');
   const container = section(root['container'], 'container');
 
   const config: AgentConfig = {
-    runtime: oneOf(root['runtime'], 'runtime', DEFAULTS.runtime, ['container', 'host'] as const),
     container: {
       name: str(container['name'], 'container.name', DEFAULTS.container.name),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
@@ -463,37 +379,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         DEFAULTS.sessions.workspaceRoot,
       ),
     },
-    sandbox: {
-      enabled: bool(sandbox['enabled'], 'sandbox.enabled', DEFAULTS.sandbox.enabled),
-      allowedDomains: strList(
-        sandbox['allowedDomains'],
-        'sandbox.allowedDomains',
-        DEFAULTS.sandbox.allowedDomains,
-      ),
-      weakerNested: bool(
-        sandbox['weakerNested'],
-        'sandbox.weakerNested',
-        DEFAULTS.sandbox.weakerNested,
-      ),
-      egress: {
-        mode: oneOf(egress['mode'], 'sandbox.egress.mode', DEFAULTS.sandbox.egress.mode, [
-          'sdk',
-          'squid',
-        ]),
-        httpProxyPort: num(
-          egress['httpProxyPort'],
-          'sandbox.egress.httpProxyPort',
-          DEFAULTS.sandbox.egress.httpProxyPort,
-          1,
-          65535,
-        ),
-        confPath: str(
-          egress['confPath'],
-          'sandbox.egress.confPath',
-          DEFAULTS.sandbox.egress.confPath,
-        ),
-      },
-    },
     discord: {
       allowedChannelIds: strList(
         discord['allowedChannelIds'],
@@ -523,10 +408,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       discordCli: str(paths['discordCli'], 'paths.discordCli', DEFAULTS.paths.discordCli),
       skillsDir: str(paths['skillsDir'], 'paths.skillsDir', DEFAULTS.paths.skillsDir),
     },
-    rules: {
-      enabled: bool(rules['enabled'], 'rules.enabled', DEFAULTS.rules.enabled),
-      path: str(rules['path'], 'rules.path', DEFAULTS.rules.path),
-    },
     git: {
       userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
       userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
@@ -548,45 +429,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     );
   }
 
-  if (config.runtime === 'container' && config.sandbox.enabled) {
-    throw new Error(
-      'agent-config.yaml: runtime is "container" but sandbox.enabled is true.\n' +
-        '  The SDK sandbox wraps each bash command in bwrap. Inside gVisor that is\n' +
-        '  redundant — the whole agent is already contained — and it cannot work:\n' +
-        '  apply-seccomp needs a nested user namespace, which AppArmor denies here.\n' +
-        '  Set sandbox.enabled: false. Egress is enforced by the container network.',
-    );
-  }
-
-  if (config.sandbox.enabled && !config.sandbox.allowedDomains.includes('discord.com')) {
-    // Worth failing loudly: the agent would start, run, and be unable to reply,
-    // which is a confusing thing to debug from the Discord side.
-    throw new Error(
-      'agent-config.yaml: sandbox.allowedDomains must include "discord.com" — ' +
-        'without it the agent cannot send messages.',
-    );
-  }
-
-  if (config.sandbox.egress.mode === 'squid' && !config.sandbox.enabled) {
-    // This is the failure this whole feature exists to avoid.
-    //
-    // Squid only *enforces* because the SDK sandbox puts the agent in a network
-    // namespace with no route, leaving the bridge to Squid as the only way out.
-    // With sandbox.enabled false there is no namespace, the agent keeps full
-    // direct connectivity, and HTTP_PROXY becomes a suggestion it can ignore
-    // with `unset HTTPS_PROXY` or `curl --noproxy '*'`.
-    //
-    // That configuration looks like egress control in `!status` and in the
-    // config file while providing none, which is worse than running with no
-    // proxy at all. Refuse it rather than let it be believed.
-    throw new Error(
-      'agent-config.yaml: sandbox.egress.mode is "squid" but sandbox.enabled is false. ' +
-        'Squid only enforces in combination with the SDK sandbox, which is what removes ' +
-        "the agent's direct route to the network. Without it the proxy is advisory and " +
-        'the agent can bypass it trivially. Set sandbox.enabled: true, or set ' +
-        'sandbox.egress.mode: sdk.',
-    );
-  }
 
   return config;
 }

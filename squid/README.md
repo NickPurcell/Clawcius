@@ -1,11 +1,12 @@
 # Squid egress control for Clawcius
 
-An access-control proxy for the agent's outbound traffic. Default-deny, with an
-allowlist that must match `sandbox.allowedDomains` in `agent-config.yaml`.
+An access-control proxy for the agent's outbound traffic. Default-deny, and
+`squid/squid.conf` is the **only** copy of the allowlist — nothing in
+`agent-config.yaml` mirrors it any more.
 
-This is an **alternative** to the SDK's own built-in proxy, not a replacement
-for the sandbox. Set `sandbox.egress.mode` in `agent-config.yaml` to choose.
-See SETUP.md § 1a for when to pick which.
+It runs as its own container (`clawcius-squid`) straddling two Docker
+networks: `clawcius-internal`, which the agent is on and which has no gateway
+out, and `clawcius-egress`, which does. See SETUP.md § 1a.
 
 ---
 
@@ -15,135 +16,66 @@ Setting `HTTPS_PROXY` on a process is advisory. Any program that ignores the
 variable — or a shell that runs `unset HTTPS_PROXY`, or `curl --noproxy '*'` —
 goes straight around it. On its own, that is not egress control.
 
-What makes it enforcement here is the SDK sandbox underneath it:
+What makes it enforcement here is the network topology underneath it:
 
 ```
-                  bwrap --unshare-net
-        ┌──────────────────────────────────────┐
-        │  agent's network namespace           │
-        │  NO route to the internet at all     │
-        │                                      │
-        │  HTTPS_PROXY=http://localhost:3128 ──┼──> socat TCP-LISTEN:3128
-        └──────────────────────────────────────┘         │
-                                                         │  (unix socket,
-                                                         │   bind-mounted in)
-                                                         ▼
-             host:  socat UNIX-LISTEN:/tmp/claude-http-*.sock
-                                                         │
-                                                         ▼
-                              Squid  127.0.0.1:3128   ── allowlist ──> internet
+        clawcius-internal (--internal: no gateway, no route out)
+        ┌────────────────────────────────┐
+        │  clawcius-agent                │
+        │  gVisor; no default route      │
+        │  HTTPS_PROXY=172.31.250.2:3128 ┼──┐
+        └────────────────────────────────┘  │
+                                            ▼
+                             clawcius-squid  172.31.250.2:3128
+                                            │  allowlist
+                                            ▼
+        clawcius-egress (ordinary bridge) ──────────────> internet
 ```
 
-The agent's namespace has no default route and no DNS. Unsetting the proxy
-variables does not reveal a second path out; it just breaks the only one. That
-is the property being relied on, and it is why `sandbox.enabled: false` with
-`egress.mode: squid` is **refused at startup** — that combination genuinely is
-advisory-only, and it would look like protection while providing none.
+`clawcius-internal` is a `--internal` Docker network: it has no gateway, so
+the agent container has no default route to anything but the other containers
+on it. Unsetting `HTTP_PROXY`/`HTTPS_PROXY` does not reveal a second path out;
+it just breaks the only one. Passing `--noproxy '*'` and dialling raw IPs fail
+the same way. That topology, not any setting, is what makes this enforcement.
 
-### Two port 3128s
-
-They are different sockets and it matters when debugging:
-
-| Where | What | Set by |
-|---|---|---|
-| Inside the agent's namespace | `socat TCP-LISTEN:3128` | Hardcoded by the SDK |
-| On the host | Squid's `http_port 127.0.0.1:3128` | `squid.conf` + `egress.httpProxyPort` |
-
-Only the host one is configurable. If you move Squid to another port, change
-`sandbox.egress.httpProxyPort` to match — the in-namespace 3128 stays as it is.
+Squid listens on `172.31.250.2:3128` — a fixed address on the internal
+network, pinned so the agent's proxy variables cannot drift out from under it.
 
 ---
 
 ## Install
 
-Everything below needs root. There is no passwordless sudo on this box, so run
-these yourself.
+Nothing to install. Squid runs as a container built from
+`docker/Dockerfile.squid`, and `docker/up.sh` builds it, wires both networks
+and starts it:
 
 ```sh
-# 1. Squid, plus socat — which the SDK sandbox needs for the bridge above and
-#    which is NOT installed on this VM. Without socat the sandbox silently does
-#    not apply and the agent cannot run bash at all. (See SETUP.md § Egress.)
-sudo apt-get update
-sudo apt-get install -y squid socat
-
-# 2. Keep the distro's config around. Ours is standalone and replaces it
-#    wholesale, so this is the only copy you get of the original.
-sudo cp -n /etc/squid/squid.conf /etc/squid/squid.conf.dpkg-orig
-
-# 3. Install the Clawcius config.
-#    Standard paths are used throughout (/var/log/squid, /var/spool/squid,
-#    /run/squid.pid) specifically so Ubuntu's AppArmor profile for squid keeps
-#    working. Moving the logs elsewhere means editing that profile too.
-sudo install -m 0644 -o root -g root \
-  /home/npurcell/clawcius/squid/squid.conf /etc/squid/squid.conf
-
-# 4. Check it parses BEFORE restarting. A bad config leaves squid dead, and a
-#    dead squid means the agent has zero egress — it cannot even reach Discord.
-sudo squid -k parse
-
-# 5. Start it, and have it come back after reboot.
-sudo systemctl enable --now squid
-
-# 6. Confirm it is listening on loopback only. Expect exactly one line, bound
-#    to 127.0.0.1 — if it says 0.0.0.0 you have published an open relay.
-sudo ss -ltnp | grep 3128
+docker/up.sh
 ```
 
-### Cap Squid's memory (recommended on this VM)
+The config is baked into the image at build time from `squid/squid.conf`, so
+there is no `/etc/squid/squid.conf` on the host to keep in step and no
+`squid -k reconfigure` to run — changing the allowlist means rebuilding, which
+`up.sh` does for you.
 
-**Measured on this box: ~97 MB RSS**, idle and under light load, with caching
-off. That is not free on 1.6 GB — budget for it alongside the ~400 MB per agent
-in SETUP.md § 5. Most of it is Squid's fixed footprint rather than anything
-`cache_mem` controls, so tuning the config further will not move it much.
-
-A ceiling stops it growing into the agents' headroom:
+Check it came up and is enforcing:
 
 ```sh
-sudo systemctl edit squid
-```
-
-Add, save, then `sudo systemctl restart squid`:
-
-```ini
-[Service]
-MemoryMax=192M
-```
-
-192M leaves roughly 2x measured headroom. Do not set it near 97M — Squid would
-be OOM-killed under load, and a dead Squid means the agent has no egress at all.
-
-### Start Squid before the bot
-
-`preflight` refuses to boot the bot when Squid is not listening, so at reboot
-the bot would crash-loop until Squid happened to come up. Ordering removes the
-race:
-
-```sh
-sudo systemctl edit clawcius
-```
-
-```ini
-[Unit]
-Wants=squid.service
-After=squid.service
+docker ps --filter name=clawcius-squid
+docker logs clawcius-squid | tail -20
 ```
 
 ---
 
 ## Turn it on in Clawcius
 
-Squid does nothing for the agent until the bot is told to use it. In
-`agent-config.yaml`:
+Nothing to turn on. There is no setting that selects Squid — the agent is on a
+network whose only route out is the proxy, so it is either reachable or the
+agent has no egress at all. `src/preflight.ts` refuses to start the bot when
+the proxy container is down, because that state reads in Discord as a bot that
+wakes and never speaks.
 
-```yaml
-sandbox:
-  enabled: true          # required — see "Why this is enforcement" above
-  egress:
-    mode: squid
-    httpProxyPort: 3128
-```
-
-Then rebuild and restart:
+After an allowlist change:
 
 ```sh
 cd /home/npurcell/clawcius && npm run build
@@ -158,27 +90,22 @@ config file is missing, or if the two allowlists disagree.
 
 ## Changing the allowlist
 
-The allowlist exists in **two files** and they must stay identical. The bot
-refuses to start if they drift, so you cannot get this half-done silently — but
-you do have to edit both.
+The allowlist exists in exactly one place: the block between the
+`clawcius-allowlist-begin` / `-end` markers in `squid/squid.conf`, one
+`acl clawcius_allowed dstdomain <host>` line per entry.
 
-1. `agent-config.yaml` → `sandbox.allowedDomains`
-2. `/etc/squid/squid.conf` → the block between the
-   `clawcius-allowlist-begin` / `-end` markers, one `acl clawcius_allowed
-   dstdomain <host>` line per entry.
-
-Then:
+`docker/squid.conf` is a gitignored copy taken at build time and baked into
+the image, so an edit is inert until the image is rebuilt. `docker/up.sh` does
+the copy and the rebuild itself, so the whole workflow is:
 
 ```sh
-sudo squid -k parse        # validate first; never reconfigure into a syntax error
-sudo squid -k reconfigure  # apply without dropping established tunnels
+$EDITOR squid/squid.conf
+docker/up.sh                 # re-copies, rebuilds, restarts both containers
 sudo systemctl restart clawcius
 ```
 
-Keep the repo copy (`squid/squid.conf`) in step as well — that is the file
-`sandbox.egress.confPath` points at and the one preflight actually reads. If
-you edit only `/etc/squid/squid.conf`, preflight will compare against a stale
-file and can pass while the live proxy differs.
+`src/preflight.ts` warns at startup if the source and the build copy have
+drifted anyway.
 
 **Matching rules.** An entry with no leading dot is an exact host match, so
 `github.com` does not cover `raw.githubusercontent.com`. For a whole subtree
@@ -297,7 +224,15 @@ sudo tail -5 /var/log/squid/access.log
 Both requests must appear — the allowed one as `TCP_TUNNEL/200`, the blocked
 one as `TCP_DENIED/403`. If the agent reported success for `example.com`, or if
 neither line is in the log, the traffic did not go through Squid and egress is
-**not** controlled. Stop and check that `sandbox.enabled` is `true`.
+**not** controlled. Stop and check that the agent container is actually on
+`clawcius-internal`:
+
+```sh
+docker inspect -f '{{json .NetworkSettings.Networks}}' clawcius-agent | jq keys
+```
+
+It must list `clawcius-internal` and nothing else. A second network is a
+second route, and the allowlist stops meaning anything.
 
 ---
 
@@ -312,15 +247,17 @@ neither line is in the log, the traffic did not go through Squid and egress is
   allowlisted name that resolves into private space is blocked too.
 - Connecting to a raw IP to dodge the name check: there is no matching
   `dstdomain`, so it is denied.
-- Reaching the proxy from anywhere but this host — it binds loopback only.
+- Reaching the proxy from off-box — it is published on no host port, only on
+  the two Docker networks.
 
 **Not prevented:**
 
 - **The waker's own traffic.** The bot process (`src/`) is not sandboxed and
   talks to Discord's gateway directly. Squid governs the agent only.
-- **`WebFetch` / `WebSearch`.** Those run in the parent Claude Code process, not
-  in sandboxed bash, so they never touch Squid. They are governed by permission
-  rules instead — the SDK's own docs say so. Only Bash egress is proxied.
+- **Nothing about the agent is exempt.** This used to carve out `WebFetch` and
+  `WebSearch`, which ran in the parent process outside the per-bash sandbox.
+  The whole Claude Code process now runs inside the container, so every tool it
+  has goes through the same network and the same proxy.
 - **Domain fronting.** Filtering is on the CONNECT target hostname and there is
   no TLS interception, so a client that CONNECTs to an allowlisted host and then
   presents a different SNI inside the tunnel is not caught. Closing this needs
@@ -330,22 +267,24 @@ neither line is in the log, the traffic did not go through Squid and egress is
   available without switching to the `squid-openssl` package.
 - **Content.** An allowlisted host is allowed entirely. `github.com` means all
   of GitHub, including pushing whatever the agent likes to a repo.
-- **Unix sockets.** This SDK build ships no seccomp helper, so the sandbox runs
-  in `allowAllUnixSockets` mode. Nothing here changes that; keep privileged
-  sockets such as a Docker socket off this host.
+- **What is mounted in.** The proxy governs the network, not the filesystem.
+  The OAuth credentials and the workspace are bind-mounted into the container
+  and Squid has no view of them; never bind-mount a Docker socket.
 
 ---
 
 ## Troubleshooting
 
-**Bot will not start, "nothing is listening on 127.0.0.1:3128".**
-Squid is down. `systemctl status squid`, then `sudo tail -30
-/var/log/squid/cache.log`. Almost always a config error caught by
-`sudo squid -k parse`.
+**Bot will not start, "the egress proxy is exited/missing".**
+Squid is down, so the agent would have zero egress. `docker logs
+clawcius-squid` — almost always a config error, which a dead container shows
+as a `FATAL` line at the end of the log. Fix `squid/squid.conf` and rerun
+`docker/up.sh`.
 
-**Bot will not start, "the egress allowlists disagree".**
-The message names the exact domains and which file each is missing from. Fix
-both files, `sudo squid -k reconfigure`, restart the bot.
+**A site fails and you think it is allowlisted.**
+`docker logs clawcius-squid | grep TCP_DENIED` names the exact host that was
+refused. This is usually a CDN hostname rather than the site itself — the page
+loads and the media fetch is denied.
 
 **Squid will not start: `FATAL: http_port: IPv6 is not available`.**
 This host has `net.ipv6.conf.lo.disable_ipv6 = 1`, so binding `[::1]` is fatal.

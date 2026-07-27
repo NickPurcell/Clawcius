@@ -61,7 +61,8 @@ agent writes keep running between turns, with no model in the loop.
 
 | File | Holds | Committed |
 |---|---|---|
-| `agent-config.yaml` | Model, turn cap, system prompt, sandbox, sessions, scheduling | yes |
+| `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
+| `squid/squid.conf` | The egress allowlist — the only copy | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 
 Behaviour and persona live in `systemPrompt.append`. The code contributes only
@@ -73,9 +74,9 @@ authenticates with the same OAuth login as Claude Code.
 
 ## Setup
 
-See [SETUP.md](SETUP.md) — prerequisites, the sandbox decision, authentication,
-the systemd unit, and the memory budget. [`squid/README.md`](squid/README.md)
-covers the optional external proxy.
+See [SETUP.md](SETUP.md) — prerequisites, authentication, the systemd units,
+and the memory budget. [`squid/README.md`](squid/README.md) covers the egress
+proxy and how to change the allowlist.
 
 Requires Node 22+, Docker with the `runsc` (gVisor) runtime, and Python 3.11+.
 

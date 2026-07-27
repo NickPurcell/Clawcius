@@ -73,28 +73,24 @@ MemoryMax=2400M
 TasksMax=512
 
 # ── Hardening ─────────────────────────────────────────────────────────────
-# Every mount-namespace directive had to come out, and the reason is worth
-# recording so nobody helpfully adds them back.
+# Deliberately moderate, and the reason has changed — read this before
+# tightening it.
 #
-# The agent runs under bwrap, which mounts a fresh /proc inside a nested user
-# namespace. The kernel only permits that when an existing *fully visible*
-# /proc is already mounted. Each of these puts locked mounts or read-only
-# overlays across /proc, so the kernel refuses:
+# These directives were originally removed because the agent ran under bwrap,
+# which mounts a fresh /proc in a nested user namespace and needs an existing
+# fully-visible /proc to do it. PrivateTmp, ProtectSystem, ProtectHome,
+# ProtectKernelTunables, ProtectKernelModules and ProtectControlGroups each
+# broke that independently (bisected against the exact invocation).
 #
-#   PrivateTmp, ProtectSystem (strict AND full), ProtectHome (read-only),
-#   ProtectKernelTunables, ProtectKernelModules, ProtectControlGroups
+# bwrap is gone. The agent is inside a gVisor container and this unit is only
+# the waker, so most of them could now come back. The one that still needs
+# care is ProtectSystem=strict: the waker reaches the agent over
+# /run/docker.sock, and connecting to a unix socket needs write permission on
+# the socket inode, which a read-only /run denies. Anything added here must be
+# verified with an actual `systemctl restart` and a real @mention, not by
+# reading — a broken waker looks exactly like a Discord outage.
 #
-# Bisected individually against this exact bwrap invocation — each one fails
-# on its own, not only in combination. The failure is silent in the worst way:
-# bwrap exits non-zero, the SDK declines to sandbox rather than raising,
-# autoAllowBashIfSandboxed stops auto-allowing, and every bash call blocks on
-# a permission prompt nothing can answer. The bot looks alive and says nothing.
-#
-# The trade is deliberate. These directives protected the host from the *bot*
-# process; bwrap protects the host from the *agent*, which is the untrusted
-# party. Keeping them meant no agent sandbox at all — strictly worse.
-#
-# What survives is everything not implemented via mount namespaces:
+# What is set today:
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 RemoveIPC=true
