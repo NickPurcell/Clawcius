@@ -87,6 +87,18 @@ export type AgentConfig = {
      */
     followUpWindowSeconds: number;
     /**
+     * Channels where a follow-up window may open at all. Empty means every
+     * channel, which is the historical behaviour.
+     *
+     * This exists because the window is extended by the bot's own traffic, and
+     * the bot account is shared with automations. An automation posting to a
+     * channel therefore opens a window there, after which *every* message in
+     * that channel wakes the agent until it expires — uncapped, and in a busy
+     * channel, expensive. Naming the channels where conversation is wanted
+     * keeps automation output from dragging the agent into one.
+     */
+    followUpChannelIds: string[];
+    /**
      * Wait this long after a message before handing the bundle to the agent,
      * restarting on each new message. 0 hands every message over immediately.
      */
@@ -206,6 +218,7 @@ const DEFAULTS: AgentConfig = {
   discord: {
     allowedChannelIds: [],
     followUpWindowSeconds: 300,
+    followUpChannelIds: [],
     bundleDebounceMs: 1500,
     bundleMaxWaitMs: 10000,
   },
@@ -390,6 +403,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'discord.followUpWindowSeconds',
         DEFAULTS.discord.followUpWindowSeconds,
         0,
+      ),
+      followUpChannelIds: strList(
+        discord['followUpChannelIds'],
+        'discord.followUpChannelIds',
+        DEFAULTS.discord.followUpChannelIds,
       ),
       bundleDebounceMs: num(
         discord['bundleDebounceMs'],

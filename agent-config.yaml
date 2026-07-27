@@ -260,6 +260,24 @@ discord:
   # agent. In a busy channel that is a lot of turns, with no budget cap.
   followUpWindowSeconds: 300
 
+  # Channels where a follow-up window may open at all. Empty = every channel,
+  # which is the old behaviour.
+  #
+  # This exists because of an interaction that is easy to miss. The window is
+  # extended by "bot activity", and automations share the bot account — so an
+  # automation posting to a channel is indistinguishable from the agent
+  # speaking there, and opens a window. On 2026-07-27 the video uploader posted
+  # a clip to #flood-n-memes; the next human message landed inside the window
+  # it had opened, and the agent woke up and joined the conversation. In a busy
+  # channel that is not one stray reply, it is five minutes of every message
+  # billing a turn, repeated on every upload.
+  #
+  # Naming the channels where conversation is actually wanted lets automation
+  # post anywhere without dragging the agent in behind it. Explicit @-mentions
+  # are unaffected and still work everywhere `allowedChannelIds` permits.
+  followUpChannelIds:
+    - '1105739162230984735'  # clanker-internet-asbestos-gen (dev)
+
   # Message bundling. People type in bursts, and waking once per line means the
   # agent starts answering the first thought before the second has landed.
   #

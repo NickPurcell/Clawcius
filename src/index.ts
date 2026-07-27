@@ -27,7 +27,10 @@ await preflight();
 
 const store = new SessionStore(config.storage.dbPath);
 const sessions = new SessionManager(store);
-const windows = new ConversationWindows(config.agent.discord.followUpWindowSeconds);
+const windows = new ConversationWindows(
+  config.agent.discord.followUpWindowSeconds,
+  config.agent.discord.followUpChannelIds,
+);
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -92,11 +95,13 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
           `Container: ${config.agent.container.name}`,
           `Follow-up window: ${
-            windows.enabled
-              ? windows.isOpen(channelId)
-                ? `open, ${windows.remainingSeconds(channelId)}s left`
-                : `closed (${config.agent.discord.followUpWindowSeconds}s when open)`
-              : 'disabled'
+            !windows.enabled
+              ? 'disabled'
+              : !windows.allows(channelId)
+                ? 'not permitted in this channel'
+                : windows.isOpen(channelId)
+                  ? `open, ${windows.remainingSeconds(channelId)}s left`
+                  : `closed (${config.agent.discord.followUpWindowSeconds}s when open)`
           }`,
           // Naming the enforcing proxy matters: "uncontrolled" here would be the
           // difference between a contained agent and one with open egress.

@@ -14,23 +14,49 @@
  * State is in memory rather than SQLite. A window is a few minutes of chat
  * context; if the bot restarts, the right behaviour is for it to stop listening
  * to messages that were never addressed to it.
+ *
+ * Windows can be confined to named channels. That matters because "bot
+ * activity" includes automations, which share the bot account: a video uploader
+ * posting to a busy channel would otherwise open a window there and have every
+ * subsequent message wake the agent, uncapped. Confining conversation to the
+ * channels meant for it lets automation run anywhere without that consequence.
  */
 
 export class ConversationWindows {
   #expiry = new Map<string, number>();
   #durationMs: number;
+  #allowed: ReadonlySet<string> | null;
 
-  constructor(durationSeconds: number) {
+  /**
+   * @param durationSeconds Window length. 0 disables follow-ups entirely.
+   * @param allowedChannelIds Channels that may open a window. Empty or omitted
+   *   means every channel, which is the historical behaviour.
+   */
+  constructor(durationSeconds: number, allowedChannelIds: readonly string[] = []) {
     this.#durationMs = durationSeconds * 1000;
+    this.#allowed = allowedChannelIds.length > 0 ? new Set(allowedChannelIds) : null;
   }
 
   get enabled(): boolean {
     return this.#durationMs > 0;
   }
 
-  /** Open or extend the window on a channel. No-op when disabled. */
+  /** May a window open on this channel at all? */
+  allows(channelId: string): boolean {
+    return this.#allowed === null || this.#allowed.has(channelId);
+  }
+
+  /**
+   * Open or extend the window on a channel. No-op when disabled, and no-op on
+   * channels outside the allowlist.
+   *
+   * The check lives here rather than at the call sites deliberately: there are
+   * several places that extend a window, and a future one added by someone
+   * unaware of this rule should be safe by default rather than a quiet leak.
+   */
   extend(channelId: string): void {
     if (!this.enabled) return;
+    if (!this.allows(channelId)) return;
     this.#expiry.set(channelId, Date.now() + this.#durationMs);
   }
 
