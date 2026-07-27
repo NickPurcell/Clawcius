@@ -62,10 +62,29 @@ start a privileged container mounting `/`, which makes gVisor decorative.
 ## 1a. Running it
 
 ```sh
-docker/up.sh        # networks + squid + agent container
-docker/down.sh      # stop both containers
-docker/snapshot.sh  # commit the agent container's writable layer to an image
+docker/up.sh              # networks + squid + agent container
+docker/up.sh --recreate   # same, but discard the agent's writable layer first
+docker/down.sh            # stop the agent, remove squid
+docker/down.sh --destroy  # also remove the agent and its writable layer
+docker/snapshot.sh        # commit the agent's writable layer to an image
 ```
+
+The agent container is **reused, never silently recreated**. Its writable
+layer holds every package the agent apt-installed, every crontab it wrote and
+every daemon it set up; `docker rm` throws all of that away. `down.sh`
+therefore stops it rather than removing it, which matters because
+`clawcius-container.service` runs `down.sh` on every stop and restart — the
+earlier unconditional `rm -f` meant each reboot silently reset the agent to
+the base image.
+
+Squid is the opposite: recreated every run, because its config is baked into
+the image at build time and it has no state worth keeping. That is also how an
+allowlist edit takes effect.
+
+The cost of reuse is that edits to the flags in `run-container.sh` — mounts,
+memory, environment — do not reach a container that already exists. A changed
+`.env` is the common case, so it is detected and reported at startup rather
+than left to look like a credentials bug.
 
 This is the only way the agent runs — there is no host mode. A local child
 process would have confined nothing but shell commands, leaving `Read`,

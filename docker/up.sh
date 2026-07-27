@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # Bring up the whole agent stack: networks, Squid, then the agent container.
 #
-# Idempotent by design — it tears down and recreates rather than trying to
-# reconcile, so an unclean shutdown does not leave a half-state that needs a
-# human to untangle.
+# Idempotent, and safe to run on a live stack.
+#
+# Squid is recreated every time: its config is baked into the image, so this is
+# how an allowlist edit takes effect, and it has no state to lose.
+#
+# The agent container is REUSED if it exists — see run-container.sh. Its
+# writable layer is where the agent's packages, crontabs and daemons live, so
+# recreating it on every boot would make "persistent sandbox" a fiction. Pass
+# --recreate to force a clean one.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+AGENT_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --recreate) AGENT_ARGS+=(--recreate) ;;
+    *) echo "usage: $(basename "$0") [--recreate]" >&2; exit 2 ;;
+  esac
+done
 
 INTERNAL=clawcius-internal
 EGRESS=clawcius-egress
@@ -36,4 +50,4 @@ docker run -d --name clawcius-squid \
   clawcius-squid:latest >/dev/null
 docker network connect "$EGRESS" clawcius-squid
 
-./run-container.sh
+./run-container.sh "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"

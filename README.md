@@ -82,7 +82,15 @@ Requires Node 22+, Docker with the `runsc` (gVisor) runtime, and Python 3.11+.
 
 ## Recovery
 
-The container is disposable. Code the agent writes lives in git; the container's
-own state — packages, cron entries — is snapshotted nightly by a host-side timer
-the agent cannot reach. A wedged container is `docker rm` plus `docker/up.sh`
-away from clean, with the workspace volume untouched.
+The container is persistent, and resetting it is deliberate. `up.sh` reuses an
+existing container and `down.sh` stops rather than removes it, so packages the
+agent installed and crontabs it wrote survive restarts and reboots — otherwise
+"persistent sandbox" would be a fiction.
+
+Code the agent writes lives in git; the writable layer is snapshotted nightly
+by a host-side timer the agent cannot reach. A wedged container is one flag
+from clean, with the workspace mount untouched:
+
+```sh
+docker/up.sh --recreate   # discard the writable layer, rebuild from the image
+```

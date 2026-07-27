@@ -6,9 +6,29 @@
 # attaches per session with `docker exec`; this container only has to outlive
 # them.
 #
-# Treat it as disposable. Everything worth keeping is on the workspace mount or
-# pushed to git — a wedged container should be replaced, not repaired.
+# An existing container is REUSED, not recreated. That is the whole point of a
+# persistent sandbox: packages the agent apt-installed, crontabs it wrote and
+# daemons it started live in the writable layer, and `docker rm` throws all of
+# it away. This script used to `rm -f` unconditionally, which meant every boot
+# silently reset the agent to the base image.
+#
+# Recreating is still the right answer for a wedged container — it is just a
+# deliberate act now:
+#
+#     docker/run-container.sh --recreate
+#
+# The cost of reuse is that changes to the flags below (mounts, memory, env)
+# do not reach a container that already exists. Env changes are the common
+# case, so a stale .env is detected and reported rather than left to confuse.
 set -euo pipefail
+
+RECREATE=0
+for arg in "$@"; do
+  case "$arg" in
+    --recreate) RECREATE=1 ;;
+    *) echo "usage: $(basename "$0") [--recreate]" >&2; exit 2 ;;
+  esac
+done
 
 NAME=clawcius-agent
 IMAGE=clawcius-agent:latest
@@ -48,7 +68,60 @@ mkdir -p "$WAKE_DIR"
 [ -f "$CLAUDE_CREDS" ]    || { echo "missing $CLAUDE_CREDS — is the host logged in?" >&2; exit 1; }
 [ -d "$CLAUDE_PROJECTS" ] || { echo "missing $CLAUDE_PROJECTS" >&2; exit 1; }
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
+STATE=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)
+
+if [ "$RECREATE" = 1 ] && [ "$STATE" != missing ]; then
+  echo "--recreate: destroying the existing container and its writable layer"
+  docker rm -f "$NAME" >/dev/null
+  STATE=missing
+fi
+
+# Warn when .env has been edited since the container last started. Reuse means
+# the process inside is still holding the old values — a rotated token or a new
+# PAT will not have reached it, and that failure looks like a permissions bug
+# rather than a stale process.
+warn_stale_env() {
+  local started env_epoch started_epoch
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null) || return 0
+  started_epoch=$(date -d "$started" +%s 2>/dev/null) || return 0
+  env_epoch=$(stat -c %Y "$ENV_FILE" 2>/dev/null) || return 0
+  if [ "$env_epoch" -gt "$started_epoch" ]; then
+    echo "  WARNING: $ENV_FILE changed after this container started."
+    echo "           It is still running with the old environment."
+    echo "           Apply it with:  docker/run-container.sh --recreate"
+  fi
+}
+
+case "$STATE" in
+  running)
+    echo "reusing $NAME (already running)"
+    warn_stale_env
+    docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
+    exit 0
+    ;;
+  paused)
+    docker unpause "$NAME" >/dev/null
+    echo "unpaused $NAME"
+    warn_stale_env
+    exit 0
+    ;;
+  missing)
+    ;;
+  dead)
+    echo "$NAME is in the 'dead' state and cannot be started." >&2
+    echo "Recreate it (this discards its writable layer):" >&2
+    echo "    docker/run-container.sh --recreate" >&2
+    exit 1
+    ;;
+  *)
+    # exited or created — start it back up with its layer intact.
+    docker start "$NAME" >/dev/null
+    echo "restarted $NAME (writable layer preserved)"
+    warn_stale_env
+    docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
+    exit 0
+    ;;
+esac
 
 # clawcius-internal has NO gateway to the outside. The only reachable thing
 # with a route out is Squid, which enforces the domain allowlist. That is what
@@ -83,5 +156,5 @@ docker run -d \
 # decorative. If it ever needs host-side work done, that goes through the
 # waker's wake socket instead.
 
-echo "started $NAME"
+echo "created $NAME from $IMAGE"
 docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
