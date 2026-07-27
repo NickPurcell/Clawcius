@@ -1,0 +1,14 @@
+# Egress proxy for the agent container.
+#
+# Squid is the only thing the agent can reach that has a route to the internet,
+# so it is where the domain allowlist is enforced. Filtering is on the CONNECT
+# target, with no TLS interception — no CA key lives on this box.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends squid \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/log/squid /var/spool/squid \
+    && chown -R proxy:proxy /var/log/squid /var/spool/squid
+COPY squid.conf /etc/squid/squid.conf
+EXPOSE 3128
+# -N foreground, -d1 log to stdout so `docker logs` shows denials.
+CMD ["squid", "-N", "-d1", "-f", "/etc/squid/squid.conf"]

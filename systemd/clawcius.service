@@ -1,8 +1,12 @@
 [Unit]
 Description=Clawcius — wakes a sandboxed Claude Code agent on Discord mentions
 Documentation=file:/home/npurcell/clawcius/SETUP.md
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# The agent runs via `docker exec`, so the daemon must be up first. Requires,
+# not Wants: without docker there is no agent, and failing loudly at boot beats
+# a bot that connects to Discord and then cannot answer anything.
+Requires=docker.service
 
 # Never give up on a crash loop. These are [Unit] directives — in [Service]
 # systemd ignores them with a warning, leaving the default of 5 starts per 10s

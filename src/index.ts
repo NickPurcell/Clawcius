@@ -14,7 +14,7 @@ import { Client, Events, GatewayIntentBits, Partials, type Message } from 'disco
 import { config } from './config.js';
 import { SessionStore } from './store.js';
 import { SessionManager } from './agent.js';
-import { Scheduler, describeCadence } from './scheduler.js';
+import { WakeSpool } from './wake-spool.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { RuleEngine, fillVars, type RuleAction } from './rules.js';
@@ -27,8 +27,7 @@ import type { WakeContext } from './types.js';
 await preflight();
 
 const store = new SessionStore(config.storage.dbPath);
-const scheduler = new Scheduler(store.db, config.agent.scheduling);
-const sessions = new SessionManager(store, scheduler);
+const sessions = new SessionManager(store);
 const windows = new ConversationWindows(config.agent.discord.followUpWindowSeconds);
 const rules = config.agent.rules.enabled ? new RuleEngine(config.agent.rules.path) : null;
 rules?.watch();
@@ -136,6 +135,8 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
           `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
           `Rules: ${rules ? `${rules.count} active` : 'disabled'}`,
+          `Runtime: ${config.agent.runtime}` +
+            (config.agent.runtime === 'container' ? ` (${config.agent.container.name})` : ''),
           `Follow-up window: ${
             windows.enabled
               ? windows.isOpen(channelId)
@@ -158,34 +159,6 @@ async function handleCommand(message: Message, command: string): Promise<boolean
             ? `This channel: session ${persisted.sessionId.slice(0, 8)}…`
             : 'This channel: no session yet',
         ].join('\n'),
-      );
-      return true;
-    }
-
-    case 'schedules': {
-      const schedules = scheduler.list(channelId);
-      if (schedules.length === 0) {
-        await message.reply('No scheduled wakes in this channel.');
-        return true;
-      }
-      await message.reply(
-        [
-          `${schedules.length}/${config.agent.scheduling.maxPending} scheduled:`,
-          ...schedules.map(
-            (s) =>
-              `\`${s.id}\` ${describeCadence(s)} — next <t:${Math.floor(s.nextRunAt / 1000)}:R>` +
-              ` — ${s.prompt.slice(0, 80)}`,
-          ),
-        ].join('\n'),
-      );
-      return true;
-    }
-
-    case 'unschedule': {
-      const id = message.content.trim().split(/\s+/).pop() ?? '';
-      const removed = scheduler.cancel(channelId, id);
-      await message.reply(
-        removed ? `Cancelled \`${id}\`.` : `No schedule \`${id}\` in this channel.`,
       );
       return true;
     }
@@ -347,55 +320,6 @@ const bundler = new MessageBundler(
   deliver,
 );
 
-scheduler.start((schedule) => {
-  const cadence = describeCadence(schedule);
-  process.stdout.write(
-    `[clawcius ${schedule.channelId}] scheduled wake ${schedule.id} (${cadence})\n`,
-  );
-
-  try {
-    const session = sessions.acquire(schedule.channelId, {
-      onToolUse: (toolName) => {
-        process.stdout.write(`[clawcius ${schedule.channelId}] tool: ${toolName}\n`);
-      },
-      onCliFailure: (command, output) => {
-        process.stderr.write(
-          `[clawcius ${schedule.channelId}] discord CLI FAILED — nothing was posted\n` +
-            `  cmd: ${command.replace(/\s+/g, ' ').slice(0, 200)}\n` +
-            `  out: ${output.replace(/\s+/g, ' ').slice(0, 300)}\n`,
-        );
-      },
-      onDone: (summary) => {
-        sessions.persist(schedule.channelId);
-        process.stdout.write(
-          `[clawcius ${schedule.channelId}] scheduled turn ${summary.subtype} ` +
-            `$${summary.costUsd.toFixed(4)} (sent=${summary.sentMessage})\n`,
-        );
-      },
-      onError: (error) => {
-        process.stderr.write(`[clawcius ${schedule.channelId}] ${error.message}\n`);
-      },
-    });
-
-    session.wake({
-      kind: 'schedule',
-      channelId: schedule.channelId,
-      scheduleId: schedule.id,
-      prompt: schedule.prompt,
-      ...(schedule.intervalSeconds !== null || schedule.dailyAt !== null
-        ? { repeats: cadence }
-        : {}),
-    });
-  } catch (error) {
-    // Capacity or startup failure. Log it — there is no user waiting on this
-    // one, so there is nobody to apologise to.
-    process.stderr.write(
-      `[clawcius ${schedule.channelId}] scheduled wake skipped: ` +
-        `${error instanceof Error ? error.message : String(error)}\n`,
-    );
-  }
-});
-
 // Editing a message is Discord API activity too — the agent's progress
 // checklists work by editing, and those should keep the conversation alive.
 client.on(Events.MessageUpdate, (_old, updated) => {
@@ -406,6 +330,54 @@ client.on(Events.MessageUpdate, (_old, updated) => {
 
 const windowSweeper = setInterval(() => windows.sweep(), 60_000);
 windowSweeper.unref();
+
+/**
+ * Wake requests from inside the container.
+ *
+ * The agent schedules itself with cron and curls this socket. Limits still
+ * apply here — a request is a request, not a command, so it cannot be used to
+ * escape the concurrency cap.
+ */
+const wakeCounts = new Map<string, number[]>();
+
+const wakeSpool = config.agent.wake.enabled
+  ? new WakeSpool(config.agent.wake.spoolDir, ({ channelId, prompt }) => {
+      const now = Date.now();
+      const recent = (wakeCounts.get(channelId) ?? []).filter((t) => now - t < 3_600_000);
+      if (recent.length >= config.agent.wake.maxPerHour) {
+        return { accepted: false, detail: `rate limit: ${config.agent.wake.maxPerHour}/hour` };
+      }
+      recent.push(now);
+      wakeCounts.set(channelId, recent);
+
+      try {
+        const session = sessions.acquire(channelId, {
+          onToolUse: (tool) => process.stdout.write(`[clawcius ${channelId}] ${tool}\n`),
+          onCliFailure: (cmd, out) =>
+            process.stderr.write(`[clawcius ${channelId}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`),
+          onDone: (summary) => {
+            sessions.persist(channelId);
+            process.stdout.write(
+              `[clawcius ${channelId}] self-wake turn ${summary.subtype} ` +
+                `$${summary.costUsd.toFixed(4)} (spoke=${summary.sentMessage})\n`,
+            );
+          },
+          onError: (error) => {
+            process.stderr.write(`[clawcius ${channelId}] ${error.message}\n`);
+            void sessions.release(channelId);
+          },
+        });
+        session.wake({ kind: 'schedule', channelId, scheduleId: 'self', prompt });
+        return { accepted: true, detail: 'woken' };
+      } catch (error) {
+        return {
+          accepted: false,
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    })
+  : null;
+wakeSpool?.start();
 
 client.once(Events.ClientReady, (ready) => {
   process.stdout.write(`[clawcius] logged in as ${ready.user.tag}\n`);
@@ -430,9 +402,9 @@ async function shutdown(signal: string): Promise<void> {
   systemd.stopping();
   try {
     rules?.stop();
+    wakeSpool?.stop();
     clearInterval(windowSweeper);
     bundler.flushAll();
-    scheduler.stop();
     await sessions.shutdown();
     store.close();
     await client.destroy();

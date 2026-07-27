@@ -111,6 +111,20 @@ prompts:
 # only way to get a 1M window here. Without it the SDK assumes 200k and
 # autocompacts around 156k, which on a 1M model throws away four fifths of the
 # context and the detail along with it.
+# ── Where the agent runs ──────────────────────────────────────────────────
+# container — inside the persistent gVisor container (docker/run-container.sh).
+#             The whole agent is contained, not just its bash commands, and
+#             daemons and cron jobs it starts survive between turns.
+# host      — local child process with the SDK's per-bash-command bwrap
+#             sandbox. Debugging only: it confines shell commands and nothing
+#             else, leaving Read/Write/WebFetch and the agent process itself
+#             running unconfined on the host.
+runtime: container
+
+container:
+  name: clawcius-agent
+  claudePath: /usr/local/bin/claude
+
 model: claude-opus-5[1m]
 
 # Cap on agent turns per wake. 0 = unlimited.
@@ -233,7 +247,7 @@ sandbox:
   # The Agent SDK's built-in sandbox, with a network egress allowlist. Paired
   # with autoAllowBashIfSandboxed, so bash runs freely because it is contained
   # rather than because permissions were bypassed.
-  enabled: true
+  enabled: false
 
   # discord.com is REQUIRED — it is how the agent replies. Startup fails if it
   # is missing, because the alternative is an agent that runs and stays silent.
@@ -322,23 +336,19 @@ git:
   userName: Clawcius
   userEmail: clawcius@users.noreply.github.com
 
-scheduling:
-  # Lets the agent wake itself later via the schedule_wake / schedule_repeating
-  # / list_schedules / cancel_schedule tools. Set false to remove them entirely.
-  #
-  # These are in-process MCP tools, not cron: the waker owns the timer, so they
-  # work inside the sandbox, wake the existing warm session rather than a cold
-  # one, and stay subject to the limits below.
+# ── Self-scheduling ───────────────────────────────────────────────────────
+# The agent schedules itself with cron inside its container and POSTs here to
+# be woken. There is no bespoke scheduler any more — it uses tools it already
+# knows, and the waker only has to accept the request.
+#
+#   0 9 * * *  echo '{"channel":"<id>","prompt":"post the morning briefing"}' \
+#                > /var/lib/clawcius/run/wake/$(date +%s).json
+#
+# A directory rather than a socket because gVisor blocks host unix sockets —
+# correctly, since one would be a hole straight through the sandbox boundary.
+#
+# A request is a request: concurrency limits and this rate cap still apply.
+wake:
   enabled: true
-
-  # Floor on any delay. The guard against an agent building a tight self-wake
-  # loop — which, with maxTurns: 0 and no budget cap, is the failure that runs
-  # up a bill overnight with nobody watching.
-  minDelaySeconds: 60
-
-  # Pending schedules per channel.
-  maxPending: 20
-
-  # Fires per channel per rolling 24h. Re-checked at fire time, not just at
-  # creation, so a schedule made yesterday cannot outrun today's budget.
-  maxWakesPerDay: 48
+  spoolDir: /var/lib/clawcius/run/wake
+  maxPerHour: 30

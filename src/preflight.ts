@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { config } from './config.js';
+import { containerRunning, containerStatus } from './container.js';
 
 function onPath(binary: string): boolean {
   try {
@@ -131,6 +132,23 @@ function checkSquidEgress(problems: string[]): Promise<void> {
 
 export async function preflight(): Promise<void> {
   const problems: string[] = [];
+
+  if (config.agent.runtime === 'container') {
+    const name = config.agent.container.name;
+    if (!onPath('docker')) {
+      problems.push(
+        'runtime is "container" but docker is not on PATH.\n' +
+          '    Fix:  install docker, or set runtime: host in agent-config.yaml.',
+      );
+    } else if (!containerRunning(name)) {
+      problems.push(
+        `runtime is "container" but container "${name}" is ${containerStatus(name)}.\n` +
+          '    Every agent turn spawns `docker exec` into it, so nothing can run.\n' +
+          '    Fix:  docker/run-container.sh\n' +
+          '    Check: docker ps -a --filter name=' + name,
+      );
+    }
+  }
 
   if (config.agent.sandbox.enabled) {
     const missing = ['bwrap', 'socat'].filter((binary) => !onPath(binary));

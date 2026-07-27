@@ -76,7 +76,25 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
 };
 
+/**
+ * Where the agent process runs.
+ *
+ * - `container` — inside the persistent gVisor container. The whole agent is
+ *   contained, every tool included, and its daemons and cron jobs survive
+ *   between turns.
+ * - `host` — as a local child process, with the SDK's per-bash-command bwrap
+ *   sandbox. Retained only for debugging; it confines shell commands and
+ *   nothing else.
+ */
+export type AgentRuntime = 'container' | 'host';
+
 export type AgentConfig = {
+  runtime: AgentRuntime;
+  container: {
+    name: string;
+    /** In-container path to the claude binary. */
+    claudePath: string;
+  };
   prompts: PromptTemplates;
   model: string;
   /** 0 means unlimited — no turn cap is sent to the SDK at all. */
@@ -137,15 +155,19 @@ export type AgentConfig = {
     /** Author email. Keep it distinct from yours so agent commits are obvious. */
     userEmail: string;
   };
-  scheduling: {
-    /** Expose the self-wake tools to the agent at all. */
+  wake: {
+    /**
+     * Unix socket the agent POSTs to in order to be woken later.
+     *
+     * Replaces the old MCP scheduler: inside its container the agent has cron
+     * and daemons, so it schedules itself with tools it already knows and we
+     * only have to accept the request.
+     */
     enabled: boolean;
-    /** Floor on any delay — stops the agent building a tight wake loop. */
-    minDelaySeconds: number;
-    /** Cap on pending schedules per channel. */
-    maxPending: number;
-    /** Cap on fires per channel per rolling 24h. */
-    maxWakesPerDay: number;
+    /** Directory the agent drops wake-request JSON files into. */
+    spoolDir: string;
+    /** Cap on accepted wake requests per channel per rolling hour. */
+    maxPerHour: number;
   };
 };
 
@@ -216,6 +238,11 @@ No message to reply to. To post:
 };
 
 const DEFAULTS: AgentConfig = {
+  runtime: 'container',
+  container: {
+    name: 'clawcius-agent',
+    claudePath: '/usr/local/bin/claude',
+  },
   prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
   maxTurns: 0,
@@ -270,11 +297,10 @@ const DEFAULTS: AgentConfig = {
     userName: 'Clawcius',
     userEmail: 'clawcius@users.noreply.github.com',
   },
-  scheduling: {
+  wake: {
     enabled: true,
-    minDelaySeconds: 60,
-    maxPending: 20,
-    maxWakesPerDay: 48,
+    spoolDir: '/var/lib/clawcius/run/wake',
+    maxPerHour: 30,
   },
 };
 
@@ -389,12 +415,18 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const egress = section(sandbox['egress'], 'sandbox.egress');
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
-  const scheduling = section(root['scheduling'], 'scheduling');
+  const wake = section(root['wake'], 'wake');
   const git = section(root['git'], 'git');
   const rules = section(root['rules'], 'rules');
   const prompts = section(root['prompts'], 'prompts');
+  const container = section(root['container'], 'container');
 
   const config: AgentConfig = {
+    runtime: oneOf(root['runtime'], 'runtime', DEFAULTS.runtime, ['container', 'host'] as const),
+    container: {
+      name: str(container['name'], 'container.name', DEFAULTS.container.name),
+      claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
+    },
     prompts: {
       protocol: template(prompts['protocol'], 'protocol', DEFAULT_PROMPTS.protocol),
       roleNotice: template(prompts['roleNotice'], 'roleNotice', DEFAULT_PROMPTS.roleNotice),
@@ -499,23 +531,10 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
       userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
     },
-    scheduling: {
-      enabled: bool(scheduling['enabled'], 'scheduling.enabled', DEFAULTS.scheduling.enabled),
-      minDelaySeconds: num(
-        scheduling['minDelaySeconds'],
-        'scheduling.minDelaySeconds',
-        DEFAULTS.scheduling.minDelaySeconds,
-        1,
-      ),
-      maxPending: num(
-        scheduling['maxPending'], 'scheduling.maxPending', DEFAULTS.scheduling.maxPending, 1,
-      ),
-      maxWakesPerDay: num(
-        scheduling['maxWakesPerDay'],
-        'scheduling.maxWakesPerDay',
-        DEFAULTS.scheduling.maxWakesPerDay,
-        1,
-      ),
+    wake: {
+      enabled: bool(wake['enabled'], 'wake.enabled', DEFAULTS.wake.enabled),
+      spoolDir: str(wake['spoolDir'], 'wake.spoolDir', DEFAULTS.wake.spoolDir),
+      maxPerHour: num(wake['maxPerHour'], 'wake.maxPerHour', DEFAULTS.wake.maxPerHour, 1),
     },
   };
 
@@ -526,6 +545,16 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     throw new Error(
       'agent-config.yaml: discord.bundleMaxWaitMs must be >= discord.bundleDebounceMs — ' +
         'a lower ceiling would flush every bundle before the debounce could coalesce anything.',
+    );
+  }
+
+  if (config.runtime === 'container' && config.sandbox.enabled) {
+    throw new Error(
+      'agent-config.yaml: runtime is "container" but sandbox.enabled is true.\n' +
+        '  The SDK sandbox wraps each bash command in bwrap. Inside gVisor that is\n' +
+        '  redundant — the whole agent is already contained — and it cannot work:\n' +
+        '  apply-seccomp needs a nested user namespace, which AppArmor denies here.\n' +
+        '  Set sandbox.enabled: false. Egress is enforced by the container network.',
     );
   }
 

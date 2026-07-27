@@ -22,8 +22,7 @@ import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
 import { buildSystemPrompt, buildWakeMessage } from './prompt.js';
-import { createSchedulerServer } from './tools.js';
-import type { Scheduler } from './scheduler.js';
+import { containerSpawner } from './container.js';
 import type { SessionStore } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
@@ -172,19 +171,15 @@ export class AgentSession {
   lastActiveAt = Date.now();
   busy = false;
 
-  #scheduler: Scheduler;
-
   constructor(
     channelId: string,
     workspacePath: string,
     resumeSessionId: string | undefined,
     events: AgentEvents,
-    scheduler: Scheduler,
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
     this.#events = events;
-    this.#scheduler = scheduler;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
@@ -220,14 +215,6 @@ export class AgentSession {
       },
     };
 
-    // Self-scheduling: an in-process MCP server, scoped to this channel so the
-    // agent cannot schedule wakes into a channel it is not serving.
-    if (config.agent.scheduling.enabled) {
-      options.mcpServers = {
-        'clawcius-scheduler': createSchedulerServer(this.channelId, this.#scheduler),
-      };
-    }
-
     // 0 means unlimited: omit the cap entirely rather than sending a zero,
     // which the SDK would read as "no turns allowed".
     if (config.agent.maxTurns > 0) {
@@ -236,6 +223,20 @@ export class AgentSession {
 
     if (isResumable(resumeSessionId)) {
       options.resume = resumeSessionId;
+    }
+
+    // In container mode the agent process itself lives inside gVisor, so the
+    // SDK's per-bash-command sandbox is neither needed nor usable. Startup
+    // refuses the combination, so reaching here means it is off.
+    if (config.agent.runtime === 'container') {
+      options.spawnClaudeCodeProcess = containerSpawner({
+        name: config.agent.container.name,
+        claudePath: config.agent.container.claudePath,
+      });
+      // Containment is the container's; skip the permission prompts that would
+      // otherwise block every tool call with nothing there to answer them.
+      options.permissionMode = 'bypassPermissions';
+      options.allowDangerouslySkipPermissions = true;
     }
 
     if (config.agent.sandbox.enabled) {
@@ -407,12 +408,10 @@ export class AgentSession {
 export class SessionManager {
   #sessions = new Map<string, AgentSession>();
   #store: SessionStore;
-  #scheduler: Scheduler;
   #sweeper: NodeJS.Timeout;
 
-  constructor(store: SessionStore, scheduler: Scheduler) {
+  constructor(store: SessionStore) {
     this.#store = store;
-    this.#scheduler = scheduler;
     this.#sweeper = setInterval(() => void this.#evictIdle(), 60_000);
     this.#sweeper.unref();
   }
@@ -452,7 +451,6 @@ export class SessionManager {
       workspacePath,
       resumeFrom,
       events,
-      this.#scheduler,
     );
 
     this.#sessions.set(channelId, session);
