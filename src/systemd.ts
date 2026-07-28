@@ -19,18 +19,32 @@ import { execFile } from 'node:child_process';
 
 const underSystemd = Boolean(process.env['NOTIFY_SOCKET']);
 let warnedUnavailable = false;
+let failures = 0;
 
 function notify(...assignments: string[]): void {
   if (!underSystemd) return;
 
   execFile('systemd-notify', assignments, { timeout: 2000 }, (error) => {
-    if (!error || warnedUnavailable) return;
-    // Warn once rather than on every heartbeat.
-    warnedUnavailable = true;
-    process.stderr.write(
-      `[systemd] notify failed (${error.message.split('\n')[0]}). ` +
-        'Readiness and watchdog reporting are disabled for this run.\n',
-    );
+    if (!error) {
+      failures = 0;
+      return;
+    }
+    failures += 1;
+
+    // Warning exactly once was hiding the worst case. Every watchdog ping goes
+    // through here, so if this starts failing -- fork failures under memory
+    // pressure, systemd-notify missing after an upgrade -- the pings stop,
+    // systemd kills the service, and with Restart=always it looks like a
+    // spontaneous restart with no cause in the journal. Warn on the first, then
+    // periodically, so a sustained outage stays visible without flooding it.
+    if (!warnedUnavailable || failures % 10 === 0) {
+      warnedUnavailable = true;
+      process.stderr.write(
+        `[systemd] notify failed x${failures} (${error.message.split('\n')[0]}) ` +
+          `for ${assignments.join(' ')}. Watchdog pings are not reaching systemd; ` +
+          'expect a kill and restart.\n',
+      );
+    }
   });
 }
 
