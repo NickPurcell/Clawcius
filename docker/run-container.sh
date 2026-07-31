@@ -129,6 +129,17 @@ esac
 # does not reveal a second path, it just removes the only one.
 PROXY=http://172.31.250.2:3128
 
+# The agent's wall clock. A named zone, never a fixed offset: the agent
+# schedules its own recurring work, and cron expressions are interpreted in
+# local time. On UTC, "9am" had to be written as 16:04 and would silently
+# become 8am for the operator when daylight saving ended. With a zone that
+# observes DST, 9am stays 9am through November without anyone remembering.
+#
+# It also stops the agent reporting timestamps in a clock nobody else is
+# reading, which cost an evening of confusion when 23:47 UTC was taken for
+# 23:47 local -- a seven-hour error in the middle of a timing investigation.
+AGENT_TZ="${AGENT_TZ:-America/Los_Angeles}"
+
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -140,6 +151,7 @@ docker run -d \
   -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
   -e CLAUDE_CONFIG_DIR="$AGENT_CLAUDE" \
   -e HOME=/home/agent \
+  -e TZ="$AGENT_TZ" \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$WAKE_DIR:$WAKE_DIR:rw" \
   -v "$CLAUDE_CREDS:$AGENT_CLAUDE/.credentials.json:rw" \
