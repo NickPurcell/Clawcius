@@ -63,7 +63,32 @@ CLAUDE_CREDS=/home/npurcell/.claude/.credentials.json
 CLAUDE_PROJECTS=/home/npurcell/.claude/projects
 AGENT_CLAUDE=/home/agent/.claude-agent
 
+# The agent's home, persisted on the host.
+#
+# The container is here for isolation, not for ephemerality. Anywhere the agent
+# naturally saves a file should still be there after a container recreate or a
+# host reboot — otherwise the isolation costs it a memory, which is not a trade
+# anyone asked for.
+#
+# Without this, /home/agent lives in the image's writable layer and is destroyed
+# on every recreate. On 2026-08-03 that silently took six days of saved game
+# state with it, and the only reason the session survived at all is that
+# projects/ was already mounted separately.
+#
+# uid 1000 matches AGENT_UID in the Dockerfile. If that ever changes, this
+# chown has to follow it or the agent cannot write to its own home.
+AGENT_HOME=/var/lib/clawcius/agent-home
+AGENT_UID=1000
+
 mkdir -p "$WAKE_DIR"
+
+# Seed the home directory before mounting over it. The image creates
+# .claude-agent and chowns home; a bind mount hides all of that, so the
+# structure has to exist on the host or the nested credential and projects
+# mounts have nowhere to land.
+mkdir -p "$AGENT_HOME/.claude-agent/projects"
+chown -R "$AGENT_UID:$AGENT_UID" "$AGENT_HOME" 2>/dev/null || \
+  echo "warning: could not chown $AGENT_HOME — the agent may not be able to write to its own home" >&2
 [ -d "$WORKSPACES" ]      || { echo "missing $WORKSPACES" >&2; exit 1; }
 [ -f "$CLAUDE_CREDS" ]    || { echo "missing $CLAUDE_CREDS — is the host logged in?" >&2; exit 1; }
 [ -d "$CLAUDE_PROJECTS" ] || { echo "missing $CLAUDE_PROJECTS" >&2; exit 1; }
@@ -152,6 +177,7 @@ docker run -d \
   -e CLAUDE_CONFIG_DIR="$AGENT_CLAUDE" \
   -e HOME=/home/agent \
   -e TZ="$AGENT_TZ" \
+  -v "$AGENT_HOME:/home/agent:rw" \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$WAKE_DIR:$WAKE_DIR:rw" \
   -v "$CLAUDE_CREDS:$AGENT_CLAUDE/.credentials.json:rw" \
