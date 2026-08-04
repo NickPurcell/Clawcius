@@ -31,6 +31,23 @@ const windows = new ConversationWindows(
   config.agent.discord.followUpWindowSeconds,
   config.agent.discord.followUpChannelIds,
 );
+const alwaysOnChannels = new Set(config.agent.discord.alwaysOnChannelIds);
+
+// An always-on channel that `allowedChannelIds` excludes wakes nothing at all.
+// That combination is always a mistake, and a silent one — the room simply
+// stays quiet — so say so at startup rather than at debugging time.
+{
+  const { allowedChannelIds } = config.agent.discord;
+  if (allowedChannelIds.length > 0) {
+    const unreachable = [...alwaysOnChannels].filter((id) => !allowedChannelIds.includes(id));
+    if (unreachable.length > 0) {
+      console.warn(
+        `[config] alwaysOnChannelIds ${unreachable.join(', ')} are not in allowedChannelIds — ` +
+          'they will never wake the agent. Add them there or clear allowedChannelIds.',
+      );
+    }
+  }
+}
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -94,6 +111,7 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
           `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
           `Container: ${config.agent.container.name}`,
+          `Always-on: ${alwaysOnChannels.has(channelId) ? 'yes — every message wakes me' : 'no'}`,
           `Follow-up window: ${
             !windows.enabled
               ? 'disabled'
@@ -139,24 +157,33 @@ client.on(Events.MessageCreate, async (message) => {
   }
   if (message.author.bot) return;
 
-  const addressed = message.mentions.has(client.user);
+  const mentioned = message.mentions.has(client.user);
+  // An always-on channel is a standing invitation: treat every message as if it
+  // had carried an @. Kept distinct from `mentioned` below, because stripping a
+  // mention that was never typed would eat real text.
+  const alwaysOn = alwaysOnChannels.has(message.channelId);
+  const addressed = mentioned || alwaysOn;
   const inWindow = windows.isOpen(message.channelId);
 
-  // Wake on an explicit mention, or on any message while a window is open.
-  // Without one of those the agent would fire on every message it can see.
+  // Wake on an explicit mention, in an always-on channel, or on any message
+  // while a window is open. Without one of those the agent would fire on every
+  // message it can see.
   if (!addressed && !inWindow) return;
 
   if (!isAuthorized(message)) return;
 
-  const stripped = addressed ? stripMention(message) : message.content.trim();
+  const stripped = mentioned ? stripMention(message) : message.content.trim();
   // An @ with no text is still someone getting your attention. Hand it over
   // and let the agent decide what to do with it, rather than the waker
-  // answering on its behalf.
-  const content = stripped || (addressed ? '(mentioned you, no text)' : '');
+  // answering on its behalf. A bare attachment in an always-on channel is the
+  // same situation without the @, so both get a placeholder rather than a drop.
+  const emptyPlaceholder = mentioned ? '(mentioned you, no text)' : '(no text)';
+  const content = stripped || (addressed ? emptyPlaceholder : '');
   if (!content) return;
 
   // Commands are handled by the waker, not the agent, and only when addressed —
-  // otherwise any '!' line in a live channel would hit them.
+  // otherwise any '!' line in a live channel would hit them. An always-on
+  // channel counts as addressed: the room exists to talk to the bot.
   if (addressed && content.startsWith('!')) {
     const handled = await handleCommand(message, content.slice(1).split(/\s+/)[0] ?? '');
     if (handled) {
@@ -166,8 +193,10 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // A fresh mention opens or extends the window. A follow-up does not: the
-  // window is anchored to bot activity, not to people talking near it.
-  if (addressed) windows.extend(message.channelId);
+  // window is anchored to bot activity, not to people talking near it. Keyed on
+  // `mentioned` rather than `addressed` so an always-on channel doesn't churn
+  // window state it never consults.
+  if (mentioned) windows.extend(message.channelId);
 
   bundler.add(message.channelId, {
     messageId: message.id,
