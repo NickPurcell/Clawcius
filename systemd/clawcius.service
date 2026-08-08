@@ -61,15 +61,16 @@ StateDirectory=clawcius
 StateDirectoryMode=0750
 
 # ── Resource limits ───────────────────────────────────────────────────────
-# Sized against the VM's actual 3396 MB, not the 4 GB that was planned.
-# Budget: bot ~180 MB + 3 agents x ~400 MB + OS ~650 MB ≈ 2030 MB.
+# Sized against the Contabo VPS's 12 GB (migrated 2026-08-08), replacing the
+# old 3.4 GB VM budget. Roomier on purpose: this box runs only the two agent
+# stacks, so the ceiling exists to stop a runaway, not to ration a shared VM.
 #
 # MemoryHigh throttles and reclaims first; MemoryMax is the hard stop. The gap
 # between MemoryMax and total RAM is deliberate — a ceiling close to total
 # would squeeze the OS instead of stopping the runaway agent. Raise both
 # together with sessions.maxConcurrent, never one alone.
-MemoryHigh=1800M
-MemoryMax=2400M
+MemoryHigh=3G
+MemoryMax=4G
 TasksMax=512
 
 # ── Hardening ─────────────────────────────────────────────────────────────

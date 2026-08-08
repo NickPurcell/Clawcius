@@ -209,6 +209,11 @@ PROXY=http://172.31.250.2:3128
 # 23:47 local -- a seven-hour error in the middle of a timing investigation.
 AGENT_TZ="${AGENT_TZ:-America/Los_Angeles}"
 
+# Dropped caps are the classic abuse set the agent has no use for. Not
+# --cap-drop=ALL: root execs in here run apt, and dpkg needs CHOWN,
+# SETUID/SETGID, DAC_OVERRIDE and FOWNER — dropping those breaks the
+# persistent-sandbox package story the snapshot timer exists to protect.
+
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -221,7 +226,6 @@ docker run -d \
   -e CLAUDE_CONFIG_DIR="$AGENT_CLAUDE" \
   -e HOME=/home/agent \
   -e TZ="$AGENT_TZ" \
-  -v "$AGENT_HOME:/home/agent:rw" \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$WAKE_DIR:$WAKE_DIR:rw" \
   -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \
@@ -230,6 +234,9 @@ docker run -d \
   -w "$WORKSPACES" \
   --memory="$MEMORY" \
   --pids-limit=512 \
+  --security-opt=no-new-privileges:true \
+  --cap-drop=NET_RAW --cap-drop=MKNOD --cap-drop=AUDIT_WRITE \
+  --cap-drop=NET_BIND_SERVICE --cap-drop=SYS_CHROOT \
   "$IMAGE" >/dev/null
 
 # Never mount the docker socket in here. It would let the agent start a

@@ -52,12 +52,11 @@ WatchdogSec=90
 StateDirectory=hamachi
 StateDirectoryMode=0750
 
-# Sized well below the main instance, which is budgeted for three concurrent
-# sessions. This one runs a single session on a VM with roughly 1.8 GB free and
-# 671 MB of swap already in use, so the ceiling is deliberately low: the point
-# is to stop a runaway here from pushing the main deployment into swap.
-MemoryHigh=600M
-MemoryMax=900M
+# Below the main instance (one session vs three), but no longer starved: the
+# old 600M/900M ceiling was rationing a 3.4 GB VM the instance shared with
+# everything else. On the 12 GB VPS the ceiling is for stopping a runaway.
+MemoryHigh=2G
+MemoryMax=3G
 TasksMax=256
 
 NoNewPrivileges=true
