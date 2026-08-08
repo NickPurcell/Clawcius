@@ -40,6 +40,11 @@ StateDirectoryMode=0750
 Environment=CLAWCIUS_CONTAINER=hamachi-agent
 Environment=CLAWCIUS_ENV_FILE=/home/npurcell/clawcius/.env.hamachi
 Environment=CLAWCIUS_STATE_DIR=/var/lib/hamachi
+# Its own image, not clawcius-agent:latest. The writable layers diverged the
+# moment each agent installed its first package, and the 2026-08-08 migration
+# shipped them as separate images. On a from-scratch deploy, tag the freshly
+# built image as both names.
+Environment=CLAWCIUS_IMAGE=hamachi-agent:latest
 # 3g on the 12 GB VPS. The old 1g ceiling was hit exactly (memory.peak ==
 # limit on 2026-08-07), so the real appetite is unknown — this is the
 # measurement headroom as much as the budget. Revisit after a normal week.
