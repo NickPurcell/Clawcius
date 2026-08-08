@@ -81,23 +81,6 @@ DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 AGENT_HOME=$CLAWCIUS_STATE/agent-home
 AGENT_CLAUDE=/home/agent/.claude-agent
 
-# The agent's home, persisted on the host.
-#
-# The container is here for isolation, not for ephemerality. Anywhere the agent
-# naturally saves a file should still be there after a container recreate or a
-# host reboot — otherwise the isolation costs it a memory, which is not a trade
-# anyone asked for.
-#
-# Without this, /home/agent lives in the image's writable layer and is destroyed
-# on every recreate. On 2026-08-03 that silently took six days of saved game
-# state with it, and the only reason the session survived at all is that
-# projects/ was already mounted separately.
-#
-# uid 1000 matches AGENT_UID in the Dockerfile. If that ever changes, this
-# chown has to follow it or the agent cannot write to its own home.
-AGENT_HOME=/var/lib/clawcius/agent-home
-AGENT_UID=1000
-
 mkdir -p "$WAKE_DIR"
 # Created rather than asserted. This used to hard-fail, which was right when
 # the path was a constant: /var/lib/clawcius comes from the unit's
