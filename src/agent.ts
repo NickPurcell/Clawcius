@@ -48,6 +48,75 @@ export function isResumable(sessionId: string | undefined): sessionId is string 
 }
 
 /**
+ * Retry policy for API-level refusals.
+ *
+ * In interactive Claude Code an API error stops the turn and the human types
+ * "continue". Nothing here played that part: the failure was invisible (see the
+ * detection site in #handle) so nothing ever retried, and a dead token rendered
+ * as the agent quietly ignoring people. These delays are that human.
+ *
+ * Split by kind because the two failures want opposite pacing:
+ *
+ * `auth` — the credential on disk has almost certainly already been replaced by
+ * the host's refresh, so waiting achieves nothing; the only question is whether
+ * the running process picks the new one up. One quick attempt answers it. If
+ * that fails the credential is genuinely dead and hammering it is pointless.
+ *
+ * `transient` — the server is asking for time. Back off properly.
+ */
+const AUTH_RETRY_DELAYS_MS: readonly number[] = [2_000];
+const TRANSIENT_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
+
+/** SDK error kinds that clear on their own if you wait. */
+const TRANSIENT_ERRORS: ReadonlySet<string> = new Set([
+  'rate_limit',
+  'overloaded',
+  'server_error',
+]);
+
+type RetryPlan = { kind: 'auth' | 'transient'; delays: readonly number[] };
+
+/**
+ * How to react to an SDK error kind, or null to give up.
+ *
+ * Everything unlisted — `billing_error`, `invalid_request`, `model_not_found`,
+ * `oauth_org_not_allowed` — is a standing condition that a retry cannot change.
+ * Retrying those burns quota to reproduce the same answer.
+ */
+export function retryPlanFor(errorKind: string): RetryPlan | null {
+  if (errorKind === 'authentication_failed') {
+    return { kind: 'auth', delays: AUTH_RETRY_DELAYS_MS };
+  }
+  if (TRANSIENT_ERRORS.has(errorKind)) {
+    return { kind: 'transient', delays: TRANSIENT_RETRY_DELAYS_MS };
+  }
+  return null;
+}
+
+/**
+ * Sent instead of the original message when a turn is retried after it had
+ * already started doing things.
+ *
+ * Replaying the user's message verbatim is only safe when the turn died before
+ * the agent acted — which is the common case, since an auth failure lands on
+ * the first API call and spends no tokens. When work *had* started, a verbatim
+ * replay invites the agent to do it twice: two commits, two Discord posts. The
+ * live session still holds the full transcript, so the honest instruction is
+ * "you were cut off, check what landed" rather than "here is the request again".
+ */
+const CONTINUATION_PROMPT = [
+  'SYSTEM: your previous turn was cut short by an API error partway through.',
+  'This is the waker speaking, not the user — no new request has arrived.',
+  '',
+  'The conversation above is intact, including tool calls you already made, and',
+  'their effects are real: files you wrote are still written, commits you made',
+  'are still made, and any Discord message you already sent was already sent.',
+  '',
+  'Check what actually landed before acting. Then finish what you were doing —',
+  'do not repeat completed work, and do not re-post anything.',
+].join('\n');
+
+/**
  * Make the project's skills visible from inside the workspace.
  *
  * `settingSources: ['project']` resolves relative to `cwd`, and `cwd` is the
@@ -113,6 +182,19 @@ export type AgentEvents = {
   onError: (error: Error) => void;
   /** A discord CLI call came back an error — the reply never landed. */
   onCliFailure: (command: string, output: string) => void;
+  /**
+   * This session cannot recover on its own and must be replaced.
+   *
+   * Raised when an auth failure survives its in-session retry, which is the
+   * observed behaviour rather than a guess: `claude` reads the credential once
+   * at startup and caches the access token for the life of the process, so
+   * when that token expires the process 401s forever while a freshly spawned
+   * one reads the very same file and works. Retrying inside it cannot win.
+   *
+   * `acted` reports whether the dead wake had already run tools, because it
+   * decides whether replaying into the new session is safe.
+   */
+  onNeedsRespawn: (acted: boolean) => void;
 };
 
 class PromptQueue implements AsyncIterable<SDKUserMessage> {
@@ -166,8 +248,29 @@ export class AgentSession {
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
   #sentThisTurn = false;
   #apiErrorThisTurn: string | null = null;
+  #apiErrorKindThisTurn: string | null = null;
+  /**
+   * Whether the agent has run any tool since the last real wake. Decides replay
+   * vs continuation on retry — see CONTINUATION_PROMPT.
+   *
+   * Sticky across retries, and that is the point: side effects are. If the
+   * first attempt committed and posted before dying, and two further attempts
+   * then died at the API before touching anything, resetting per turn would
+   * have the third replay the original request and do it all again. Once
+   * anything has landed, every later attempt has to continue rather than
+   * replay. Cleared only by wake(), never by a retry.
+   */
+  #actedSinceWake = false;
   /** tool_use ids of in-flight discord CLI calls, awaiting their results. */
   #discordCalls = new Map<string, string>();
+  /**
+   * The wake being served, kept so a retry can re-send it. Survives across
+   * retries and is only replaced by a genuinely new wake.
+   */
+  #lastContext: WakeContext | null = null;
+  /** Retries already spent on #lastContext. Reset by wake(), not by retries. */
+  #retries = 0;
+  #retryTimer: NodeJS.Timeout | null = null;
 
   lastActiveAt = Date.now();
   busy = false;
@@ -280,7 +383,18 @@ export class AgentSession {
         //
         // The cost is the tell — an auth failure spends no tokens at all — but
         // the message itself is the honest signal.
-        if ((message.message as { isApiErrorMessage?: boolean }).isApiErrorMessage === true) {
+        // The flag lives on the SDK *wrapper* (`SDKAssistantMessage.error`), a
+        // sibling of `message` — not inside it. Reading `message.message` here
+        // instead cost a silent outage: the check was always undefined, so a
+        // revoked token logged as `turn success` and looked, from Discord, like
+        // the agent choosing not to answer. Prefer this typed field over the
+        // untyped `isApiErrorMessage` that sits next to it.
+        //
+        // `max_output_tokens` is deliberately excluded: the turn ran and
+        // produced output, it just hit the ceiling. The SDK has its own
+        // continuation path for it, and dressing it up as a refusal would both
+        // misreport it and trigger a retry that repeats work.
+        if (message.error !== undefined && message.error !== 'max_output_tokens') {
           // Iterated rather than mapped: `content` is a union of array types,
           // so `.map` has no single call signature and its parameter lands as
           // an implicit any, which fails the build under noImplicitAny.
@@ -289,11 +403,18 @@ export class AgentSession {
             if (block.type === 'text') parts.push(block.text);
           }
           const detail = parts.join(' ').trim();
-          this.#apiErrorThisTurn = detail || 'API error with no detail';
+          this.#apiErrorThisTurn = detail || `API error with no detail (${message.error})`;
+          this.#apiErrorKindThisTurn = message.error;
         }
 
         for (const block of message.message.content) {
           if (block.type !== 'tool_use') continue;
+
+          // Any tool call means the wake had side effects, so a retry must
+          // continue rather than replay. Set before the call is even resolved:
+          // a tool that started and was cut off mid-flight is exactly the case
+          // a verbatim replay would double.
+          this.#actedSinceWake = true;
 
           const input = (block.input ?? {}) as Record<string, unknown>;
           const command = typeof input['command'] === 'string' ? input['command'] : '';
@@ -345,6 +466,17 @@ export class AgentSession {
 
       case 'result': {
         this.busy = false;
+
+        const plan =
+          this.#apiErrorKindThisTurn !== null
+            ? retryPlanFor(this.#apiErrorKindThisTurn)
+            : null;
+        const delay = plan?.delays[this.#retries];
+        // A closed session has no queue to push to, and a wake with no stored
+        // context has nothing to re-send.
+        const willRetry =
+          delay !== undefined && !this.#closed && this.#lastContext !== null;
+
         this.#events.onDone({
           isError: message.is_error,
           costUsd: message.total_cost_usd,
@@ -353,7 +485,26 @@ export class AgentSession {
           subtype: message.subtype,
           sentMessage: this.#sentThisTurn,
           apiError: this.#apiErrorThisTurn,
+          apiErrorKind: this.#apiErrorKindThisTurn,
+          retryScheduled: willRetry,
+          retryAttempt: willRetry ? this.#retries + 1 : 0,
         });
+
+        if (willRetry) {
+          this.#retries += 1;
+          this.#retryTimer = setTimeout(() => {
+            this.#retryTimer = null;
+            this.#rewake();
+          }, delay);
+          // Never hold the process open for a retry: a shutdown mid-backoff
+          // should exit, not linger.
+          this.#retryTimer.unref();
+        } else if (this.#apiErrorKindThisTurn === 'authentication_failed' && !this.#closed) {
+          // Out of retries on an auth failure. The token this process holds is
+          // dead and it will never pick up the live one, so the session itself
+          // is the thing that has to go. Someone above owns the session map.
+          this.#events.onNeedsRespawn(this.#actedSinceWake);
+        }
         break;
       }
 
@@ -362,15 +513,45 @@ export class AgentSession {
     }
   }
 
-  /** Wake the agent. */
+  /**
+   * Wake the agent on new input.
+   *
+   * Cancels any retry still pending from the previous wake: fresh input makes
+   * a replay of the old one both stale and confusing.
+   */
   wake(context: WakeContext): void {
+    this.#cancelRetry();
+    this.#lastContext = context;
+    this.#retries = 0;
+    // Only a genuine wake clears this — see the field for why a retry must not.
+    this.#actedSinceWake = false;
+    this.#push(buildWakeMessage(context));
+  }
+
+  /**
+   * Re-send the current wake after an API refusal.
+   *
+   * Replay or continuation depending on whether anything has already been done
+   * for this wake — the whole point of tracking #actedSinceWake.
+   */
+  #rewake(): void {
+    if (this.#closed || this.#lastContext === null) return;
+    const text = this.#actedSinceWake
+      ? CONTINUATION_PROMPT
+      : buildWakeMessage(this.#lastContext);
+    this.#push(text);
+  }
+
+  /** Shared turn setup: reset per-turn state, then hand the text over. */
+  #push(text: string): void {
     this.lastActiveAt = Date.now();
     this.busy = true;
     this.#sentThisTurn = false;
     this.#apiErrorThisTurn = null;
+    this.#apiErrorKindThisTurn = null;
     this.#discordCalls.clear();
     try {
-      this.#queue.push(buildWakeMessage(context), this.#sessionId);
+      this.#queue.push(text, this.#sessionId);
     } catch (error) {
       // The child transport can be dead — a failed spawn, or a process that
       // exited. Route it through onError so the caller can drop the session
@@ -381,7 +562,18 @@ export class AgentSession {
     }
   }
 
+  #cancelRetry(): void {
+    if (this.#retryTimer === null) return;
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = null;
+  }
+
   async interrupt(): Promise<void> {
+    // Before the busy check, not after: during a retry backoff the session is
+    // idle by design, so an early return here would leave `!stop` looking like
+    // it worked while a queued retry fired seconds later.
+    this.#cancelRetry();
+    this.#lastContext = null;
     if (!this.#query || !this.busy) return;
     await this.#query.interrupt();
     this.busy = false;
@@ -390,6 +582,7 @@ export class AgentSession {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#cancelRetry();
     this.#queue.close();
     try {
       await this.#consuming;

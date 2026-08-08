@@ -48,8 +48,30 @@ RUN groupadd -g ${AGENT_GID} agent \
 RUN mkdir -p /var/lib/clawcius/workspaces /home/npurcell/clawcius \
     && chown -R ${AGENT_UID}:${AGENT_GID} /var/lib/clawcius
 
-# The agent's own Claude home — deliberately not the host user's. Session
-# transcripts get copied in; the host's OAuth credentials stay out.
+# The agent's own Claude home. Nothing here is shared with the host user: not
+# settings, not history, and — as of 2026-08-04 — not the OAuth credential.
+#
+# The credential used to arrive from the host, first as a bind-mounted file and
+# then as a symlink into a mounted ~/.claude. Both failed, for reasons worth
+# recording so nobody reinstates them:
+#
+#   The file mount pinned an inode. A host token refresh writes a new file and
+#   renames it into place, so the container stayed bolted to the old one.
+#
+#   The directory mount plus symlink was supposed to fix that by resolving
+#   through the mount on each open. Under gVisor it does not. The gofer caches
+#   the dentry, so a host-side rename is still invisible inside the sandbox —
+#   measured on 2026-08-03, when hamachi-agent was reading a credential whose
+#   sha256 did not match the host's, six days stale, while the host's was
+#   current. Read-only made it worse: the container could not refresh for
+#   itself either, so its credential could only ever decay.
+#
+# The fix is to stop propagating a credential across the boundary at all. This
+# directory is bind-mounted from the instance's own state dir, read-write, and
+# the container is its only writer. It runs `claude auth login --claudeai`
+# once and from then on refreshes its own token exactly like Claude Code on any
+# other machine — same subscription, no API billing, no shared refresh-token
+# chain to invalidate anyone else's session.
 ENV CLAUDE_CONFIG_DIR=/home/agent/.claude-agent
 RUN mkdir -p ${CLAUDE_CONFIG_DIR} && chown -R ${AGENT_UID}:${AGENT_GID} /home/agent
 

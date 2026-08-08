@@ -19,7 +19,7 @@ import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
-import type { WakeContext } from './types.js';
+import type { TurnSummary, WakeContext } from './types.js';
 
 // Fail before touching Discord if the container stack is not actually up —
 // a missing agent or proxy container reads as a bot that never answers.
@@ -125,6 +125,10 @@ function silentEvents() {
     onDone: () => {},
     onError: () => {},
     onCliFailure: () => {},
+    // Reached only by `!stop`/`!status`, which acquire a session to look at or
+    // interrupt it rather than to run a turn. There is no wake in flight to
+    // rescue, so respawning here would be churn.
+    onNeedsRespawn: () => {},
   };
 }
 
@@ -180,13 +184,41 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 /**
+ * Say, in the channel, that a turn was refused and will not be retried.
+ *
+ * This process otherwise never speaks for the agent, and that restraint is
+ * deliberate. The exception earns itself: silence is the agent's normal way of
+ * declining to answer, so an outage wearing the same face is unreadable from
+ * Discord — the failure that started all this looked exactly like being
+ * ignored. Only terminal failures reach here; anything with a retry queued
+ * stays quiet, because it is not yet news.
+ */
+async function announceOutage(channelId: string, summary: TurnSummary): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased() || !('send' in channel)) return;
+    await channel.send(
+      `⚠️ I could not run that turn — the API refused it (\`${summary.apiErrorKind}\`). ` +
+        `Retries are exhausted or would not help, so this needs a look at the host.`,
+    );
+  } catch (error) {
+    // Best effort. If Discord is also unreachable the journal is the record,
+    // and throwing out of a completion handler would take the process with it.
+    process.stderr.write(
+      `[clawcius ${channelId}] could not announce outage: ` +
+        `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
+/**
  * Hand a coalesced bundle to the agent.
  *
  * Silence is a normal outcome — nothing here checks whether the agent replied,
  * and nothing posts on its behalf. Whether to speak is the agent's decision,
  * shaped by systemPrompt.append, not by this process.
  */
-function deliver(channelId: string, buffered: BufferedMessage[]): void {
+function deliver(channelId: string, buffered: BufferedMessage[], afterRespawn = false): void {
   if (buffered.length === 0) return;
 
   const context: WakeContext = {
@@ -224,11 +256,21 @@ function deliver(channelId: string, buffered: BufferedMessage[]): void {
           // is fine. From Discord this is indistinguishable from the agent
           // deciding not to answer.
           process.stderr.write(
-            `[clawcius ${channelId}] API REFUSED THE TURN — the agent never ran\n` +
+            `[clawcius ${channelId}] API REFUSED THE TURN (${summary.apiErrorKind}) — ` +
+              `the agent never ran\n` +
               `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
-              `  If this is an auth error: the container holds its OAuth token in\n` +
-              `  memory, and a host-side refresh revokes it. Fix: docker restart clawcius-agent\n`,
+              (summary.retryScheduled
+                ? `  retry ${summary.retryAttempt} queued\n`
+                : `  not retrying — this one does not clear on its own\n`),
           );
+          // A respawn is about to be attempted for auth failures, so that path
+          // owns the announcement. Saying "this needs a look at the host" here
+          // would cry outage at something about to fix itself.
+          const respawnWillHandleIt =
+            summary.apiErrorKind === 'authentication_failed' && !afterRespawn;
+          if (!summary.retryScheduled && !respawnWillHandleIt) {
+            void announceOutage(channelId, summary);
+          }
         }
         process.stdout.write(
           `[clawcius ${channelId}] turn ${summary.subtype} in ${seconds}s ` +
@@ -240,6 +282,40 @@ function deliver(channelId: string, buffered: BufferedMessage[]): void {
         // A session whose child process is gone can never recover. Drop it so
         // the next message spawns a fresh one instead of failing forever.
         void sessions.release(channelId);
+      },
+      onNeedsRespawn: (acted) => {
+        // Once per wake: afterRespawn suppresses a second round, so a genuinely
+        // dead credential fails twice and stops rather than spawning forever.
+        if (afterRespawn) {
+          // Log only. onDone has already announced this turn: on the respawned
+          // attempt `respawnWillHandleIt` is false, so its announceOutage call
+          // fires. Announcing here too put the same warning in the channel
+          // twice per failure — observed on 2026-08-03 as four identical
+          // messages in three seconds, which reads as a broken bot rather than
+          // a broken credential.
+          process.stderr.write(
+            `[clawcius ${channelId}] respawned session ALSO failed to authenticate — ` +
+              `the credential on disk is not usable. Needs a re-login on the host.\n`,
+          );
+          return;
+        }
+        process.stderr.write(
+          `[clawcius ${channelId}] stale token in a live session — respawning\n`,
+        );
+        void sessions.release(channelId).then(() => {
+          // Replay only when the dead turn had not acted yet. An auth failure
+          // normally lands on the first API call having spent nothing, which is
+          // why this is worth doing at all; but if tools had already run, the
+          // fresh session resumes a transcript whose work is already done and
+          // replaying the request would repeat it.
+          if (!acted) {
+            deliver(channelId, buffered, true);
+            return;
+          }
+          process.stderr.write(
+            `[clawcius ${channelId}] not replaying — the dead turn had already acted\n`,
+          );
+        });
       },
     });
 
@@ -297,6 +373,17 @@ const wakeSpool = config.agent.wake.enabled
             process.stderr.write(`[clawcius ${channelId}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`),
           onDone: (summary) => {
             sessions.persist(channelId);
+            // Retry itself lives in AgentSession, so scheduled wakes get it
+            // without asking. This only has to report what happened.
+            if (summary.apiError) {
+              process.stderr.write(
+                `[clawcius ${channelId}] self-wake REFUSED (${summary.apiErrorKind})\n` +
+                  `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
+                  (summary.retryScheduled
+                    ? `  retry ${summary.retryAttempt} queued\n`
+                    : `  not retrying\n`),
+              );
+            }
             process.stdout.write(
               `[clawcius ${channelId}] self-wake turn ${summary.subtype} ` +
                 `$${summary.costUsd.toFixed(4)} (spoke=${summary.sentMessage})\n`,
@@ -304,6 +391,16 @@ const wakeSpool = config.agent.wake.enabled
           },
           onError: (error) => {
             process.stderr.write(`[clawcius ${channelId}] ${error.message}\n`);
+            void sessions.release(channelId);
+          },
+          onNeedsRespawn: () => {
+            // Drop the session so the next wake gets a fresh process, but never
+            // replay a scheduled prompt: unlike a person's message, nobody is
+            // waiting on this one, and re-firing a schedule is how you get the
+            // same job run twice.
+            process.stderr.write(
+              `[clawcius ${channelId}] stale token on self-wake — dropping session\n`,
+            );
             void sessions.release(channelId);
           },
         });

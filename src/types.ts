@@ -40,6 +40,20 @@ export type TurnSummary = {
    * for these: the SDK considers the turn to have completed normally.
    */
   apiError?: string | null;
+  /**
+   * The SDK's machine-readable reason, e.g. `authentication_failed` or
+   * `rate_limit`. `apiError` is the human sentence; this is what decides
+   * whether the turn is worth retrying.
+   */
+  apiErrorKind?: string | null;
+  /**
+   * A retry is already queued for this turn, so the failure above is not the
+   * final word. Kept out of `isError` on purpose: callers that only report
+   * outcomes should say "retrying", not "failed".
+   */
+  retryScheduled?: boolean;
+  /** 1-based attempt number when `retryScheduled`, else 0. */
+  retryAttempt?: number;
   isError: boolean;
   costUsd: number;
   numTurns: number;

@@ -1,9 +1,18 @@
 node_modules/
 dist/
+# Per-instance env files each carry a bot token. The negation keeps the
+# template tracked — without it, adding .env.* silently untracks the one file
+# here that is meant to be committed.
 .env
+.env.*
+!.env.example
 *.log
 
 # SQLite + WAL sidecars
 *.db
 *.db-wal
 *.db-shm
+
+# OAuth client secrets never belong in the tree; a copy of the one that used
+# to sit here lives in the migration backup on the VPS.
+client_secret_*.json

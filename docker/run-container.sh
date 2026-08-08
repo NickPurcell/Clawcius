@@ -30,45 +30,97 @@ for arg in "$@"; do
   esac
 done
 
-NAME=clawcius-agent
-IMAGE=clawcius-agent:latest
-ENV_FILE=/home/npurcell/clawcius/.env
+# Every instance-specific value is overridable, defaulting to the original
+# deployment. That is deliberate: a second instance is config, not a forked
+# copy of this script, and the defaults mean instance 1 behaves exactly as it
+# did before any of this was parameterised.
+#
+# A second instance shares the image, the Squid proxy and the clawcius-internal
+# network — the allowlist is a property of the egress policy, not of who is
+# using it. What it must NOT share is the container, the workspaces or the
+# state directory; those are the sandbox.
+NAME=${CLAWCIUS_CONTAINER:-clawcius-agent}
+IMAGE=${CLAWCIUS_IMAGE:-clawcius-agent:latest}
+ENV_FILE=${CLAWCIUS_ENV_FILE:-/home/npurcell/clawcius/.env}
+MEMORY=${CLAWCIUS_CONTAINER_MEMORY:-2g}
 
 # Paths are mirrored host->container deliberately. Claude Code derives its
 # transcript directory from cwd, so a workspace mounted anywhere else would
 # silently start a new session instead of resuming.
-WORKSPACES=/var/lib/clawcius/workspaces
+CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
+WORKSPACES=$CLAWCIUS_STATE/workspaces
 # The agent drops wake-request JSON here; the waker watches it.
-WAKE_DIR=/var/lib/clawcius/run
+WAKE_DIR=$CLAWCIUS_STATE/run
 SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 
-# Two paths out of the host user's Claude home, rather than the whole thing.
+# The agent's Claude home, owned entirely by this instance.
 #
-# The operator asked to mount ~/.claude so the agent uses their OAuth login.
-# Mounting it wholesale worked, but the agent's Claude Code immediately wrote
-# a .claude.json into it — the agent and the host user would be sharing (and
-# overwriting) one config directory: settings, shell snapshots, history, todos.
+# The host's ~/.claude is NOT mounted any more. Sharing one OAuth credential
+# across the sandbox boundary was tried twice — bind-mounted file, then
+# directory-plus-symlink — and both left the container reading a stale
+# credential under gVisor while the host's was current. The Dockerfile carries
+# the full post-mortem.
 #
-# These two give the same result with far less collateral:
-#   .credentials.json  the OAuth login  (read-write; refresh rewrites it)
-#   projects/          session transcripts, so the existing session resumes
+# Now each instance keeps its own login here, read-write, with the container as
+# the only writer, so it refreshes its own token the way any Claude Code
+# install does. Still the user's Claude subscription via
+# `claude auth login --claudeai` — this is not API billing.
 #
-# Everything else the agent's Claude Code wants stays inside the container.
+# Two things fall out of that which are worth having on purpose:
 #
-# The security trade is unchanged and was accepted deliberately: whatever can
-# compromise the agent can read and modify those credentials. gVisor contains
-# the kernel, not a directory you hand it.
-CLAUDE_CREDS=/home/npurcell/.claude/.credentials.json
-CLAUDE_PROJECTS=/home/npurcell/.claude/projects
+#   The agent can no longer read the host's ~/.claude at all — not the
+#   credential, not the host user's session transcripts. That mount was a real
+#   widening and it is gone.
+#
+#   The agent's own transcripts stop being written into the host user's
+#   projects directory, where they were showing up alongside their own work.
+#
+# Persisted on the instance state dir rather than the container's writable
+# layer so `--recreate` does not log the agent out.
+AGENT_HOME=$CLAWCIUS_STATE/agent-home
 AGENT_CLAUDE=/home/agent/.claude-agent
 
 mkdir -p "$WAKE_DIR"
-[ -d "$WORKSPACES" ]      || { echo "missing $WORKSPACES" >&2; exit 1; }
-[ -f "$CLAUDE_CREDS" ]    || { echo "missing $CLAUDE_CREDS — is the host logged in?" >&2; exit 1; }
-[ -d "$CLAUDE_PROJECTS" ] || { echo "missing $CLAUDE_PROJECTS" >&2; exit 1; }
+# Created rather than asserted. This used to hard-fail, which was right when
+# the path was a constant: /var/lib/clawcius comes from the unit's
+# StateDirectory, so its absence meant something was wrong. Now that it is
+# derived from CLAWCIUS_STATE_DIR, a fresh instance legitimately has no
+# workspaces directory yet, and failing would make the first start of every new
+# deployment a manual step.
+#
+# The parent still has to exist and be ours — /var/lib is root-owned, so each
+# instance's unit declares StateDirectory and systemd creates the top level.
+mkdir -p "$WORKSPACES"
+# Created, not asserted: a brand-new instance has no agent home until its first
+# start, and `claude auth login` inside the container populates it. Asserting
+# would make the first start of every deployment a manual step.
+#
+# No credential check here any more. Whether this instance is logged in is a
+# question for `claude auth status` inside the container, not for the host —
+# the host's own login is no longer involved.
+mkdir -p "$AGENT_HOME/projects"
 
-STATE=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)
+# Existence and status asked separately, deliberately.
+#
+# The obvious one-liner is wrong:
+#
+#     STATE=$(docker inspect -f '{{...}}' "$NAME" 2>/dev/null || echo missing)
+#
+# On a container that does not exist, `docker inspect -f` still prints a
+# newline to stdout before failing, so the fallback appends to it and STATE
+# becomes "\nmissing". Command substitution strips trailing newlines, not
+# leading ones, so `case` never matches `missing` and falls through to the
+# start-an-existing-container branch — which then fails with "No such
+# container" on the one path that was supposed to create it.
+#
+# It stayed hidden because --recreate assigns STATE=missing directly; only a
+# genuinely first-time start reaches this.
+if docker inspect "$NAME" >/dev/null 2>&1; then
+  STATE=$(docker inspect -f '{{.State.Status}}' "$NAME")
+else
+  STATE=missing
+fi
 
 if [ "$RECREATE" = 1 ] && [ "$STATE" != missing ]; then
   echo "--recreate: destroying the existing container and its writable layer"
@@ -142,12 +194,11 @@ docker run -d \
   -e HOME=/home/agent \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$WAKE_DIR:$WAKE_DIR:rw" \
-  -v "$CLAUDE_CREDS:$AGENT_CLAUDE/.credentials.json:rw" \
-  -v "$CLAUDE_PROJECTS:$AGENT_CLAUDE/projects:rw" \
+  -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \
   -v "$SKILLS:$SKILLS:ro" \
   -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
   -w "$WORKSPACES" \
-  --memory=2g \
+  --memory="$MEMORY" \
   --pids-limit=512 \
   "$IMAGE" >/dev/null
 

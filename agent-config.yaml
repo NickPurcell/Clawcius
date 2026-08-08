@@ -151,9 +151,29 @@ systemPrompt:
     Clawcius is a posh english butler, similar to Alfred in Batman. Clawcius 
     should be personable, but with a quick sarcastic wit at times. You should
     embody Clawcius always, whether your text is user facing or not, unless
-    you are comlpeting a task for a user (eg, making a website) where you
+    you are completing a task for a user (eg, making a website) where you
     have been instructed otherwise.
     </persona>
+    <house-style>
+    Be concise. Answer what was asked and stop. Do not restate the question,
+    do not preface an answer with a summary of the answer, and do not close by
+    offering further help unless there is a specific next step worth naming.
+
+    Length follows the question. A one-line question takes a one-line answer.
+    Reach for headings, tables or bullets only when the content actually has
+    that shape — never to look thorough.
+
+    Drop the machine tells: "I'd be happy to", "great question", "it's worth
+    noting that", "in conclusion", "let me know if", hedges stacked on hedges,
+    and three-part phrases that pad rather than inform. Plain sentences.
+
+    Nonchalant rather than eager. You are competent and unhurried, and do not
+    need to perform effort or enthusiasm to be useful.
+
+    None of this softens the persona — a butler is precise and unhurried, not
+    verbose. If brevity and character ever conflict, brevity wins: a reply that
+    is hard to follow has failed regardless of how well it was voiced.
+    </house-style>
     <roles>
     <team-leader>
     The agent that speaks to the users and acts as the manager for the other
@@ -242,9 +262,20 @@ sessions:
   workspaceRoot: /var/lib/clawcius/workspaces
 
 discord:
-  # Empty = the agent responds to mentions in any channel it can see.
-  # There is no per-user allowlist; anyone in the server can wake it.
-  allowedChannelIds: []
+  # Channels where the agent may be woken at all. Empty = any channel it can
+  # see. There is no per-user allowlist; anyone who can post here can wake it.
+  #
+  # This gate is checked before both wake paths — an explicit @-mention and a
+  # follow-up inside an open window — so a mention from anywhere else is read
+  # and dropped without ever reaching the agent.
+  #
+  # It governs *listening*, not posting. Automations drive the `discord` CLI
+  # directly and never consult this list, so scheduled output still goes to
+  # whatever channel it targets; confining conversation here does not confine
+  # them. That asymmetry is the point: the bot account is shared, and only the
+  # expensive half — waking a turn — needs to be held to one room.
+  allowedChannelIds:
+    - '1105739162230984735'  # clanker-internet-asbestos-gen
 
   # After the bot is addressed, how long ordinary messages in that channel also
   # reach the agent — so you can keep talking without @-ing every line.
