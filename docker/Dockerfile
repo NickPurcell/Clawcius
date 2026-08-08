@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv \
       ripgrep jq ffmpeg \
       cron procps less nano \
+      tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Node for anything the agent writes in JS, and because Discord tooling

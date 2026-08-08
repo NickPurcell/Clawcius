@@ -81,6 +81,23 @@ DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 AGENT_HOME=$CLAWCIUS_STATE/agent-home
 AGENT_CLAUDE=/home/agent/.claude-agent
 
+# The agent's home, persisted on the host.
+#
+# The container is here for isolation, not for ephemerality. Anywhere the agent
+# naturally saves a file should still be there after a container recreate or a
+# host reboot — otherwise the isolation costs it a memory, which is not a trade
+# anyone asked for.
+#
+# Without this, /home/agent lives in the image's writable layer and is destroyed
+# on every recreate. On 2026-08-03 that silently took six days of saved game
+# state with it, and the only reason the session survived at all is that
+# projects/ was already mounted separately.
+#
+# uid 1000 matches AGENT_UID in the Dockerfile. If that ever changes, this
+# chown has to follow it or the agent cannot write to its own home.
+AGENT_HOME=/var/lib/clawcius/agent-home
+AGENT_UID=1000
+
 mkdir -p "$WAKE_DIR"
 # Created rather than asserted. This used to hard-fail, which was right when
 # the path was a constant: /var/lib/clawcius comes from the unit's
@@ -181,6 +198,17 @@ esac
 # does not reveal a second path, it just removes the only one.
 PROXY=http://172.31.250.2:3128
 
+# The agent's wall clock. A named zone, never a fixed offset: the agent
+# schedules its own recurring work, and cron expressions are interpreted in
+# local time. On UTC, "9am" had to be written as 16:04 and would silently
+# become 8am for the operator when daylight saving ended. With a zone that
+# observes DST, 9am stays 9am through November without anyone remembering.
+#
+# It also stops the agent reporting timestamps in a clock nobody else is
+# reading, which cost an evening of confusion when 23:47 UTC was taken for
+# 23:47 local -- a seven-hour error in the middle of a timing investigation.
+AGENT_TZ="${AGENT_TZ:-America/Los_Angeles}"
+
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -192,6 +220,8 @@ docker run -d \
   -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
   -e CLAUDE_CONFIG_DIR="$AGENT_CLAUDE" \
   -e HOME=/home/agent \
+  -e TZ="$AGENT_TZ" \
+  -v "$AGENT_HOME:/home/agent:rw" \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$WAKE_DIR:$WAKE_DIR:rw" \
   -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \

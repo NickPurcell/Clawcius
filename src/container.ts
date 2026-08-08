@@ -29,6 +29,10 @@ import type { SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sd
 const HOST_ONLY = new Set([
   'PATH',
   'HOME',
+  // The agent's timezone is set on the container and is deliberately not the
+  // host's. Forwarding this would let whatever the server happens to be set to
+  // silently win, and the agent schedules its own recurring work in local time.
+  'TZ',
   'PWD',
   'OLDPWD',
   'SHELL',

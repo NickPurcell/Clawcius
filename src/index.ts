@@ -417,18 +417,74 @@ const wakeSpool = config.agent.wake.enabled
 wakeSpool?.start();
 
 client.once(Events.ClientReady, (ready) => {
-  process.stdout.write(`[clawcius] logged in as ${ready.user.tag}\n`);
+  // Stamped with the pid and the boot time because Restart=always makes a
+  // crash and a deliberate restart look identical afterwards. Two of these
+  // close together is a crash loop; one at an odd hour is a crash. Either way
+  // every agent session died at that moment, which is the part that shows up
+  // as "the bot forgot everything overnight".
+  process.stdout.write(
+    `[clawcius] logged in as ${ready.user.tag} — pid ${process.pid}, ` +
+      `started ${new Date(Date.now() - process.uptime() * 1000).toISOString()}\n`,
+  );
   systemd.ready();
   systemd.status(`connected as ${ready.user.tag}`);
 });
 
 // Only pet the watchdog while the gateway is genuinely healthy, so a wedged
 // connection gets us restarted instead of sitting there looking alive.
+//
+// That restart is not free, and the cost is invisible from here: every live
+// agent session is a `claude` process this one spawned, so systemd killing us
+// destroys all of them. With Restart=always the service is back in five
+// seconds and the only evidence is that every conversation is now cold.
+//
+// So the skips are logged. A run of them ending in silence is what a watchdog
+// kill looks like in the journal, and without these lines there is nothing to
+// distinguish that from an OOM or a clean restart.
 const interval = systemd.watchdogIntervalMs;
 if (interval) {
+  let skippingSince: number | null = null;
+  let warnedImminent = false;
+
   const heartbeat = setInterval(() => {
-    if (client.isReady() && client.ws.ping >= 0) {
+    const ready = client.isReady();
+    const ping = client.ws.ping;
+    const healthy = ready && ping >= 0;
+
+    if (healthy) {
+      if (skippingSince !== null) {
+        const seconds = ((Date.now() - skippingSince) / 1000).toFixed(1);
+        process.stdout.write(
+          `[watchdog] gateway healthy again after ${seconds}s of skipped pings\n`,
+        );
+        skippingSince = null;
+        warnedImminent = false;
+      }
       systemd.watchdog();
+      return;
+    }
+
+    const why = !ready ? 'client not ready' : `ws.ping ${ping}`;
+    if (skippingSince === null) {
+      skippingSince = Date.now();
+      warnedImminent = false;
+      process.stdout.write(
+        `[watchdog] skipping ping: ${why}. ` +
+          `systemd kills us after ${(interval / 1000).toFixed(0)}s without one.\n`,
+      );
+      return;
+    }
+
+    // One more line once we are past halfway, so the journal shows how close
+    // it came rather than just that it started.
+    const elapsed = Date.now() - skippingSince;
+    if (!warnedImminent && elapsed > interval / 2) {
+      warnedImminent = true;
+      process.stderr.write(
+        `[watchdog] still skipping after ${(elapsed / 1000).toFixed(0)}s (${why}). ` +
+          `Kill expected at ${(interval / 1000).toFixed(0)}s; ` +
+          `all ${sessions.liveCount} live session(s) would be lost.\n`,
+      );
     }
   }, Math.max(interval / 3, 5000));
   heartbeat.unref();
