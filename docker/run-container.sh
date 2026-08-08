@@ -133,8 +133,13 @@ mkdir -p "$AGENT_HOME/projects"
 #
 # It stayed hidden because --recreate assigns STATE=missing directly; only a
 # genuinely first-time start reaches this.
-if docker inspect "$NAME" >/dev/null 2>&1; then
-  STATE=$(docker inspect -f '{{.State.Status}}' "$NAME")
+# `docker container inspect`, never bare `docker inspect`: the bare form
+# resolves ANY object type, and an image named after the container (exactly
+# what a migrated deployment has) matches — then .State.Status explodes on a
+# map with no State. Bare inspect only worked before because the container
+# always already existed on the original host.
+if docker container inspect "$NAME" >/dev/null 2>&1; then
+  STATE=$(docker container inspect -f '{{.State.Status}}' "$NAME")
 else
   STATE=missing
 fi
@@ -151,7 +156,7 @@ fi
 # rather than a stale process.
 warn_stale_env() {
   local started env_epoch started_epoch
-  started=$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null) || return 0
+  started=$(docker container inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null) || return 0
   started_epoch=$(date -d "$started" +%s 2>/dev/null) || return 0
   env_epoch=$(stat -c %Y "$ENV_FILE" 2>/dev/null) || return 0
   if [ "$env_epoch" -gt "$started_epoch" ]; then
