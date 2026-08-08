@@ -1,0 +1,60 @@
+[Unit]
+Description=Hamachi agent container (gVisor sandbox, SimpleTestServer)
+Documentation=file:/home/npurcell/clawcius/SETUP.md
+After=docker.service clawcius-container.service
+Requires=docker.service
+
+# Ordered after the main container unit, not independent of it. That unit owns
+# the shared pieces — the clawcius-internal network and the Squid proxy — and
+# this instance only creates its own agent container. Starting first would find
+# no network to attach to.
+#
+# Wants, not Requires: if the main stack is stopped deliberately this one should
+# fail on its own terms rather than drag the other back up.
+Wants=clawcius-container.service
+
+Before=hamachi.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=npurcell
+Group=npurcell
+SupplementaryGroups=docker
+WorkingDirectory=/home/npurcell/clawcius/docker
+
+# /var/lib is root-owned, so npurcell cannot create the instance state
+# directory itself. Declaring it here means systemd makes it before
+# run-container.sh runs, which then creates workspaces/ and run/ inside it.
+# Same directory the bot unit declares — systemd is idempotent about it.
+StateDirectory=hamachi
+StateDirectoryMode=0750
+
+# run-container.sh, not up.sh: up.sh also rebuilds Squid and recreates the
+# shared proxy, which would interrupt the main instance's egress every time
+# this unit started. The allowlist is shared policy and is not this instance's
+# to manage.
+#
+# Reuses an existing container rather than recreating it, same as instance 1 —
+# the writable layer is the sandbox and a restart must not reset it.
+Environment=CLAWCIUS_CONTAINER=hamachi-agent
+Environment=CLAWCIUS_ENV_FILE=/home/npurcell/clawcius/.env.hamachi
+Environment=CLAWCIUS_STATE_DIR=/var/lib/hamachi
+# 1g rather than the main instance's 2g. The VM has ~1.8 GB available and the
+# main deployment is budgeted for three concurrent sessions; this one runs one.
+Environment=CLAWCIUS_CONTAINER_MEMORY=1g
+ExecStart=/home/npurcell/clawcius/docker/run-container.sh
+
+# No ExecStop. Stopping this unit leaves the container running on purpose:
+# `docker rm` would discard the writable layer, and the daemons the agent
+# started are meant to outlive a service restart. Remove it by hand when you
+# actually mean to.
+
+TimeoutStartSec=180
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hamachi-container
+
+[Install]
+WantedBy=multi-user.target

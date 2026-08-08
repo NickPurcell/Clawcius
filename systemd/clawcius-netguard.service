@@ -1,0 +1,36 @@
+[Unit]
+Description=Clawcius sandbox network guard (host + inter-sandbox isolation)
+Documentation=file:/home/npurcell/clawcius/SETUP.md
+
+# After docker, because the DOCKER-USER chain does not exist until the daemon
+# has created it — the script fails outright without it.
+#
+# Before the container units so the rules are in place before any agent can
+# send a packet. A sandbox that is briefly unguarded at boot is a sandbox that
+# is unguarded, and boot is exactly when an agent with a crontab wakes up.
+After=docker.service
+Requires=docker.service
+Before=clawcius-container.service hamachi-container.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Root, unlike every other unit here. iptables is the reason: these rules
+# protect the host from the sandboxes, so they must live somewhere the
+# sandboxes' own user cannot edit.
+User=root
+
+ExecStart=/home/npurcell/clawcius/docker/netguard.sh
+
+# No ExecStop. Stopping this unit must not tear the rules down — systemd stops
+# units on package upgrades and dependency churn, and a stop that silently
+# unlocked the sandboxes would be the worst possible failure mode. Remove them
+# by hand if you actually mean to.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawcius-netguard
+
+[Install]
+WantedBy=multi-user.target

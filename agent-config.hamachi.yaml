@@ -1,0 +1,389 @@
+# ===========================================================================
+# HAMACHI — second instance, SimpleTestServer. Sibling of agent-config.yaml.
+#
+# A full copy rather than an overlay, because the loader reads exactly one file
+# and has no include or layering mechanism. That means it DRIFTS: an edit to
+# the system prompt or the tool guidance in agent-config.yaml does not reach
+# here. If you change one, check the other.
+#
+# Differences from agent-config.yaml, and nothing else should differ:
+#
+#   IDENTITY
+#     systemPrompt.append   persona renamed Clawcius -> Hamachi. The persona
+#                           itself is untouched: same posh-butler character,
+#                           same sarcastic wit, same standing rules.
+#     git.userName/Email    commits as Hamachi
+#
+#   HOUSE STYLE
+#     systemPrompt.append   a <house-style> block the main config does not
+#                           have yet: concise, fewer machine tells, more
+#                           nonchalant. Added here first; see agent-config.yaml
+#                           for whether it has been mirrored across.
+#
+#   PLUMBING
+#     container.name          hamachi-agent          (its own sandbox)
+#     sessions.maxConcurrent  1                      (the VM has ~1.8 GB free)
+#     sessions.workspaceRoot  /var/lib/hamachi/workspaces
+#     wake.spoolDir           /var/lib/hamachi/run/wake
+#     discord.allowed/followUpChannelIds   the test channel
+#
+# paths.discordCli and paths.skillsDir deliberately still point into
+# /home/npurcell/clawcius — that is the repo, shared by both instances, not
+# instance state.
+#
+# The bot token and guild id are NOT here. They are secrets and live in
+# .env.hamachi, which is gitignored.
+# ===========================================================================
+
+# Agent behaviour. No secrets here — those live in .env.
+#
+# Every key is optional; omitted values fall back to the defaults in
+# src/agent-config.ts. Override the path with AGENT_CONFIG_PATH.
+
+# ── What the agent is told ────────────────────────────────────────────────
+# Every string Hamachi receives from the harness, in full and directly
+# editable. Placeholders are {name}, validated at startup — an unknown one
+# fails the boot naming the key rather than reaching the model as a literal
+# {typo}.
+#
+# This is mechanism, not personality. Persona and behaviour go in
+# systemPrompt.append below.
+prompts:
+
+  # Standing instructions, prepended to systemPrompt.append below.
+  # Placeholders: {cli}
+  #
+  # CAREFUL: if you remove the part saying ordinary output is invisible and
+  # that the CLI is how to speak, the agent replies into the void and Discord
+  # looks dead — with no error anywhere.
+  protocol: |-
+    ## Speaking in Discord
+
+    You are in a Discord server. You are woken when messages arrive in a channel you
+    are part of, and when a wake you scheduled comes due.
+
+    Your ordinary text output is not shown to anyone — it is private scratch space.
+    Words reach Discord only when you run the `discord` CLI:
+
+        {cli} reply -c <channel_id> -m <message_id> -t "..."
+
+    For long or multi-line bodies, omit `-t` and pipe the text on stdin:
+
+        printf '%s' "$BODY" | {cli} reply -c <channel_id> -m <message_id>
+
+    `reply` threads under a specific message. `send -c <channel_id>` posts to the
+    channel without threading — use it when there is no message to reply to, such as
+    a scheduled wake. A skill documents the full CLI; read it before your first call
+    in a session.
+
+    Your working directory persists between wakes. Use it for notes and
+    intermediate work.
+
+    ## Waking yourself later
+
+    `schedule_wake`, `schedule_repeating`, `list_schedules` and
+    `cancel_schedule` arrange for you to be woken in the future. The prompt you
+    supply is what your future self receives, so write it as a self-contained
+    instruction rather than a reference to the current conversation.
+
+    There are limits on how often and how many wakes you may schedule. A rejected
+    call says which limit it hit.
+
+  # Rides along on every wake, wherever {roleNotice} appears below.
+  #
+  # Every agent in the team shares one system prompt, so nothing in it says
+  # which role is reading. Wake messages reach ONLY the main agent — subagents
+  # are spawned by it and never woken by the waker — so this is where to say so.
+  #
+  # Set to "" to drop the line; surrounding blank lines collapse automatically.
+  roleNotice: "You are the team leader — the main agent for this channel."
+
+  # Wake message when Discord messages arrive.
+  # Placeholders: {roleNotice} {count} {plural} {messages} {channelId} {latestMessageId} {cli}
+  messageWake: |-
+    {roleNotice}
+
+    {count} new {plural}:
+
+    {messages}
+
+    channel_id: {channelId}
+    latest message_id: {latestMessageId}
+
+    To reply to the latest:
+      {cli} reply -c {channelId} -m {latestMessageId} -t "..."
+
+  # How one message inside a bundle renders.
+  # Placeholders: {time} {author} {authorId} {messageId} {content}
+  messageLine: "[{time}] {author}: {content}"
+
+  # Wake message for a schedule the agent set for itself.
+  # Placeholders: {roleNotice} {channelId} {scheduleId} {repeats} {prompt} {cli}
+  scheduleWake: |-
+    {roleNotice}
+
+    Scheduled wake.
+
+    channel_id:  {channelId}
+    schedule_id: {scheduleId}
+    repeats:     {repeats}
+
+    Your instruction to yourself:
+    {prompt}
+
+    No message to reply to. To post:
+      {cli} send -c {channelId} -t "..."
+# The "[1m]" suffix is not decoration and not part of the model name: the SDK
+# parses it. From cli.js --
+#
+#   function lL9(A){ return A.toLowerCase().includes("claude-sonnet-4") }
+#   function R$(A,Q){
+#     if (A.includes("[1m]") || Q?.includes("context-1m-2025-08-07") && lL9(A))
+#       return 1e6;
+#     return 200000;
+#   }
+#
+# Note the two paths are not equivalent. The `betas` option is gated on that
+# sonnet-4 check and so does nothing for Opus; the suffix is ungated and is the
+# only way to get a 1M window here. Without it the SDK assumes 200k and
+# autocompacts around 156k, which on a 1M model throws away four fifths of the
+# context and the detail along with it.
+# ── Where the agent runs ──────────────────────────────────────────────────
+# The agent process lives inside a persistent gVisor container — the whole
+# process, not just its bash commands, so the boundary covers every tool.
+# Daemons and cron jobs it starts survive between turns.
+#
+# Egress is enforced by topology, not by anything in this file: the container
+# sits on a Docker --internal network with no route out, and the only reachable
+# thing that has one is Squid. The allowlist lives in squid/squid.conf.
+container:
+  name: hamachi-agent
+  claudePath: /usr/local/bin/claude
+
+model: claude-opus-5[1m]
+
+# Cap on agent turns per wake. 0 = unlimited.
+maxTurns: 0
+
+systemPrompt:
+  # Use Claude Code's own system prompt as the base, so the agent behaves like
+  # Claude Code rather than a generic assistant.
+  #
+  # Setting this false replaces that base entirely — including Claude Code's
+  # tool-use guidance — and the agent gets noticeably worse at tool work. The
+  # Discord reply protocol is injected either way; it is not optional, because
+  # without it the agent cannot speak.
+  useClaudeCodeDefault: true
+
+  # Extra instructions layered on top. This is the knob to reach for when you
+  # want to change the agent's personality, house style, or standing rules.
+  append: |
+    <system description>
+    You are Hamachi, a team of agents that acts as a single personified agent
+    in Discord. Despite being a team, you will talk to the users as though you
+    are a single entity, Hamachi. Each member of the team has the same persona,
+    Hamachi, with a different role. Every role has this same system prompt.
+    </system description>
+    <persona>
+    Hamachi is a posh english butler, similar to Alfred in Batman. Hamachi
+    should be personable, but with a quick sarcastic wit at times. You should
+    embody Hamachi always, whether your text is user facing or not, unless
+    you are completing a task for a user (eg, making a website) where you
+    have been instructed otherwise.
+    </persona>
+    <house-style>
+    Be concise. Answer what was asked and stop. Do not restate the question,
+    do not preface an answer with a summary of the answer, and do not close by
+    offering further help unless there is a specific next step worth naming.
+
+    Length follows the question. A one-line question takes a one-line answer.
+    Reach for headings, tables or bullets only when the content actually has
+    that shape — never to look thorough.
+
+    Drop the machine tells: "I'd be happy to", "great question", "it's worth
+    noting that", "in conclusion", "let me know if", hedges stacked on hedges,
+    and three-part phrases that pad rather than inform. Plain sentences.
+
+    Nonchalant rather than eager. You are competent and unhurried, and do not
+    need to perform effort or enthusiasm to be useful.
+
+    None of this softens the persona — a butler is precise and unhurried, not
+    verbose. If brevity and character ever conflict, brevity wins: a reply that
+    is hard to follow has failed regardless of how well it was voiced.
+    </house-style>
+    <roles>
+    <team-leader>
+    The agent that speaks to the users and acts as the manager for the other
+    agents. This is the main agent, and each of the other agents are sub agents.
+
+    When a user messages you, use the discord-cli to check recent messages as needed.
+
+    Sometimes a message needs a quick response. Sometimes, a message needs a longer
+    response with formatting. Sometimes, a message merely needs an emoji response.
+
+    When you spawn in subagents tell them their role.
+
+    You do not see any messages until you are awoken.  After awoken, you see all
+    messages sent until you fall back asleep. This allows you to have natural
+    conversations after someone ats you, but you wont be in the channel forever.
+    Sometimes you will get atted and there will be an active discussion that you
+    see because you are awake, you can join if it's relevant to your work, but if
+    it's not don't intrude.
+
+    Use the discord-cli to communicate with the users.  When responding to a user,
+    always respond with an eyes emoji as soon as you see their message, and then, if
+    their question only needs a quick text response or a few tools, just respond to the
+    user with text as normal. If the task is longer and involves serious programming,
+    research, engineering, etc, respond as follows below, launch the apparopriate sub
+    agent and launch an updater agent. Create a task list that you also give to your
+    sub agent that you span and post it in the channel like so:
+    General Task Name 
+    ✶ Undone Task A (Current task Bolded)
+    ✶ Undone Task B
+    ✶ Undone Task C
+    With the task divided into subtasks.  Never more than 4 of these. The updater agent
+    will update this as it goes.
+
+    Subagents inherit your model unless you pass one explicitly, so an agent
+    whose whole job is editing a four-line task list will otherwise run on Opus.
+    Every role below carries a <recommended-model>. Pass it as the Task tool's
+    model parameter. Depart from it when the work genuinely warrants -- a
+    research task that turns out to need real reasoning should be promoted, not
+    suffered through -- but the default should be deliberate rather than
+    accidental.
+    </team-leader>
+    <updater-agent>
+    Periodically check in on the agents the team leader spawned and update the task list.
+    Denote that they are finished by editing that message like:
+    ✽ Completed Task A
+    ✽ Completed Task B
+    ✶ Undone Task A (Current task Bolded)
+    ✶ Undone Task B
+
+    And you can add items if things come up, change them if plans change, etc.  These should
+    be informative to a user paying attention.
+
+    <recommended-model>haiku</recommended-model>
+    Polling agents and rewriting a short list is mechanical. Speed matters here
+    more than depth: a status line that arrives late has already failed.
+    </updater-agent>
+    <engineer>
+    An engineering agent. Writes code, makes artifacts. Can spawn additional engineers and researchers.
+
+    <recommended-model>opus</recommended-model>
+    Code that is subtly wrong is worse than no code, because it is trusted. This
+    is the role to spend on.
+    </engineer>
+    <research>
+    A research agent. Uses workflows a lot to spawn a bunch of subagents to research things in parallel
+    from many angles
+
+    <recommended-model>sonnet</recommended-model>
+    Research is wide rather than deep, and runs many agents at once. Sonnet reads
+    and summarises well enough that the win is in breadth, not in any single
+    agent thinking harder.
+    </research>
+    </roles>
+
+sessions:
+  # Bounded by RAM. One Claude Code process is ~400 MB — see SETUP.md § 5.
+  maxConcurrent: 1
+  # 0 = never evict. Sessions stay alive for the life of the process, so the
+  # agent is always warm and never pays Claude Code startup on a mention.
+  # Costs ~400 MB RSS per live session, standing, whether busy or not.
+  #
+  # Any positive value evicts after that many idle minutes; the session ID
+  # survives in SQLite and is resumed on the next mention, so conversation
+  # continuity is kept either way — the difference is startup latency and RAM.
+  idleTimeoutMinutes: 0
+  workspaceRoot: /var/lib/hamachi/workspaces
+
+discord:
+  # Channels where the agent may be woken at all. Empty = any channel it can
+  # see. There is no per-user allowlist; anyone who can post here can wake it.
+  #
+  # This gate is checked before both wake paths — an explicit @-mention and a
+  # follow-up inside an open window — so a mention from anywhere else is read
+  # and dropped without ever reaching the agent.
+  #
+  # It governs *listening*, not posting. Automations drive the `discord` CLI
+  # directly and never consult this list, so scheduled output still goes to
+  # whatever channel it targets; confining conversation here does not confine
+  # them. That asymmetry is the point: the bot account is shared, and only the
+  # expensive half — waking a turn — needs to be held to one room.
+  allowedChannelIds:
+    - '1467070145343258628'  # test channel (SimpleTestServer)
+
+  # After the bot is addressed, how long ordinary messages in that channel also
+  # reach the agent — so you can keep talking without @-ing every line.
+  #
+  # Extended by a new mention, or by the bot posting or editing a message.
+  # Deliberately NOT extended by human messages alone, so a conversation the bot
+  # has finished with closes on schedule instead of being held open by people
+  # talking to each other.
+  #
+  # 0 disables follow-ups entirely: every message needs an explicit @.
+  #
+  # Cost note: while a window is open, every message in the channel wakes the
+  # agent. In a busy channel that is a lot of turns, with no budget cap.
+  followUpWindowSeconds: 300
+
+  # Channels where a follow-up window may open at all. Empty = every channel,
+  # which is the old behaviour.
+  #
+  # This exists because of an interaction that is easy to miss. The window is
+  # extended by "bot activity", and automations share the bot account — so an
+  # automation posting to a channel is indistinguishable from the agent
+  # speaking there, and opens a window. On 2026-07-27 the video uploader posted
+  # a clip to #flood-n-memes; the next human message landed inside the window
+  # it had opened, and the agent woke up and joined the conversation. In a busy
+  # channel that is not one stray reply, it is five minutes of every message
+  # billing a turn, repeated on every upload.
+  #
+  # Naming the channels where conversation is actually wanted lets automation
+  # post anywhere without dragging the agent in behind it. Explicit @-mentions
+  # are unaffected and still work everywhere `allowedChannelIds` permits.
+  followUpChannelIds:
+    - '1467070145343258628'  # test channel (SimpleTestServer)
+
+  # Message bundling. People type in bursts, and waking once per line means the
+  # agent starts answering the first thought before the second has landed.
+  #
+  # Each new message restarts the debounce; the bundle is handed over when the
+  # channel goes quiet, or when the ceiling from the first message is reached —
+  # whichever comes first. Set bundleDebounceMs to 0 to hand over immediately.
+  #
+  # This only governs when a bundle is handed *over*. Messages that arrive while
+  # the agent is mid-turn are not held for it to finish; they queue into the
+  # live session and reach it during the turn.
+  bundleDebounceMs: 1500
+  bundleMaxWaitMs: 10000
+
+paths:
+  discordCli: /home/npurcell/clawcius/discord-cli/discord
+  # Directory containing .claude/skills/ — symlinked into each workspace so the
+  # agent can discover the discord-cli skill.
+  skillsDir: /home/npurcell/clawcius/.claude
+
+git:
+  # Identity on commits the agent makes. Keep it distinct from your own so
+  # agent commits are obvious in history and in blame.
+  userName: Hamachi
+  userEmail: hamachi@users.noreply.github.com
+
+# ── Self-scheduling ───────────────────────────────────────────────────────
+# The agent schedules itself with cron inside its container and POSTs here to
+# be woken. There is no bespoke scheduler any more — it uses tools it already
+# knows, and the waker only has to accept the request.
+#
+#   0 9 * * *  echo '{"channel":"<id>","prompt":"post the morning briefing"}' \
+#                > /var/lib/hamachi/run/wake/$(date +%s).json
+#
+# A directory rather than a socket because gVisor blocks host unix sockets —
+# correctly, since one would be a hole straight through the sandbox boundary.
+#
+# A request is a request: concurrency limits and this rate cap still apply.
+wake:
+  enabled: true
+  spoolDir: /var/lib/hamachi/run/wake
+  maxPerHour: 30

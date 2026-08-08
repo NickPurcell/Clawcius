@@ -1,0 +1,72 @@
+[Unit]
+Description=Hamachi — second Clawcius-architecture sandbox, SimpleTestServer
+Documentation=file:/home/npurcell/clawcius/SETUP.md
+After=network-online.target docker.service hamachi-container.service
+Wants=network-online.target
+Requires=docker.service hamachi-container.service
+
+# Same reasoning as the main unit: never give up on a crash loop. These belong
+# in [Unit] — systemd ignores them in [Service] with a warning, leaving the
+# default of 5 starts per 10s before stopping the unit permanently.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+
+# Runs as npurcell for the same load-bearing reason as the main instance: the
+# agent authenticates with this user's OAuth login, and those credentials live
+# in this user's home. A dedicated service account would have no login and
+# every turn would fail on auth.
+#
+# Note both instances therefore share one credential. A fresh process reads it
+# correctly, which is what the respawn-on-stale-token path in index.ts relies
+# on; but a re-login on the host is still a single point of failure for both.
+User=npurcell
+Group=npurcell
+
+WorkingDirectory=/home/npurcell/clawcius
+EnvironmentFile=/home/npurcell/clawcius/.env.hamachi
+
+# Selects this instance's behaviour. Without it the process would resolve
+# agent-config.yaml relative to WorkingDirectory and quietly come up as a
+# second copy of the main deployment — same container name, same workspaces,
+# same channel. This one line is what makes the two instances distinct.
+Environment=AGENT_CONFIG_PATH=/home/npurcell/clawcius/agent-config.hamachi.yaml
+
+# The Agent SDK spawns Claude Code invoking bare `node`, and systemd hands
+# services a minimal PATH that excludes ~/.local — without this the bot starts
+# and every agent spawn dies with ENOENT.
+Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+
+Restart=always
+RestartSec=5
+WatchdogSec=90
+
+# Creates and chowns /var/lib/hamachi. Separate from the main instance's
+# state directory: this holds its own SQLite database, its own per-channel
+# workspaces and its own wake spool.
+StateDirectory=hamachi
+StateDirectoryMode=0750
+
+# Sized well below the main instance, which is budgeted for three concurrent
+# sessions. This one runs a single session on a VM with roughly 1.8 GB free and
+# 671 MB of swap already in use, so the ceiling is deliberately low: the point
+# is to stop a runaway here from pushing the main deployment into swap.
+MemoryHigh=600M
+MemoryMax=900M
+TasksMax=256
+
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hamachi
+
+[Install]
+WantedBy=multi-user.target
