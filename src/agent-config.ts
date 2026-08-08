@@ -99,6 +99,24 @@ export type AgentConfig = {
      */
     followUpChannelIds: string[];
     /**
+     * Channels where every message wakes the agent, with no mention required
+     * and no window to expire — a room dedicated to talking to the bot.
+     *
+     * This is deliberately separate from `followUpChannelIds`. A follow-up
+     * window is a grace period anchored to an exchange the bot is part of; this
+     * is a standing invitation. Listing a channel here makes `!` commands work
+     * without an @ too, on the same reasoning: the room is the bot's.
+     *
+     * `allowedChannelIds` still applies. A channel named here but absent from a
+     * non-empty `allowedChannelIds` will never wake anything, so startup warns
+     * rather than leaving you to wonder why the room is silent.
+     *
+     * Cost note: every message in these channels bills a turn, indefinitely.
+     * There is no budget cap. Use it for rooms that exist to talk to the agent,
+     * not for busy general channels.
+     */
+    alwaysOnChannelIds: string[];
+    /**
      * Wait this long after a message before handing the bundle to the agent,
      * restarting on each new message. 0 hands every message over immediately.
      */
@@ -219,6 +237,7 @@ const DEFAULTS: AgentConfig = {
     allowedChannelIds: [],
     followUpWindowSeconds: 300,
     followUpChannelIds: [],
+    alwaysOnChannelIds: [],
     bundleDebounceMs: 1500,
     bundleMaxWaitMs: 10000,
   },
@@ -408,6 +427,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         discord['followUpChannelIds'],
         'discord.followUpChannelIds',
         DEFAULTS.discord.followUpChannelIds,
+      ),
+      alwaysOnChannelIds: strList(
+        discord['alwaysOnChannelIds'],
+        'discord.alwaysOnChannelIds',
+        DEFAULTS.discord.alwaysOnChannelIds,
       ),
       bundleDebounceMs: num(
         discord['bundleDebounceMs'],
