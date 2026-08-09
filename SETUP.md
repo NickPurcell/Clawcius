@@ -315,6 +315,13 @@ can be re-labelled later.
 repositories" silently returns 404 for the others, and the journal will say
 `could not list pull requests`.
 
+**Everything fails with `EAI_AGAIN` or "Could not resolve host: github.com",
+but `curl` works.** The host reaches the internet through a proxy and Node's
+`fetch` does not read `HTTP_PROXY`/`HTTPS_PROXY` unless told to. Set
+`NODE_USE_ENV_PROXY=1` — the systemd unit and `npm start` both do, and OJO
+warns at startup when a proxy is configured and this is not set. OJO forwards
+the proxy variables to git and to the workers itself, so this is the only knob.
+
 **"could not list pull requests — GitHub GET … → 403"** with rate limit budget
 remaining is a permissions problem wearing a rate limit's status code. Check
 the installation's repository access.

@@ -35,6 +35,16 @@ EnvironmentFile=/home/npurcell/oj/.env
 # review would die with ENOENT.
 Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Node's fetch ignores HTTP_PROXY/HTTPS_PROXY unless told otherwise. On a host
+# whose only route out is a proxy, that means every GitHub request fails with
+# EAI_AGAIN — a DNS error, which reads as a network outage rather than as a
+# process not using the proxy it was given. Harmless when there is no proxy.
+#
+# The variable rather than --use-env-proxy: an unrecognised CLI flag stops Node
+# from starting, so an older 22.x would fail to boot over something it does not
+# need. An unrecognised variable is ignored.
+Environment=NODE_USE_ENV_PROXY=1
+
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
 
 # ── Restart policy ────────────────────────────────────────────────────────

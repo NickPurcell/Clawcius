@@ -122,6 +122,26 @@ export type ReviewRequest = {
 type GitResult = { code: number; stdout: string; stderr: string };
 
 /**
+ * Proxy variables, which have to reach both git and the worker.
+ *
+ * On a host whose only route out is a proxy — which is the shape of every
+ * carefully-egressed agent host — dropping these means `git fetch` cannot
+ * resolve github.com and the worker cannot reach the Anthropic API. Both
+ * failures present as "the review never happened" with no useful error, which
+ * is why they are listed rather than left to the ambient environment: this
+ * file builds environments from scratch, and anything not named here does not
+ * exist as far as its children are concerned.
+ */
+const PROXY_VARS = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+] as const;
+
+/**
  * Run git with the credential supplied out-of-band.
  *
  * The token goes in an environment variable read by a tiny askpass script, and
@@ -145,6 +165,10 @@ function git(
       GIT_CONFIG_NOSYSTEM: '1',
       LC_ALL: 'C',
     };
+    for (const name of PROXY_VARS) {
+      const value = process.env[name];
+      if (value !== undefined) env[name] = value;
+    }
     if (options.token && options.askpass) {
       env['GIT_ASKPASS'] = options.askpass;
       env['OJ_GIT_PASSWORD'] = options.token;
@@ -166,11 +190,19 @@ function git(
         'credential.helper=',
         ...args,
       ],
-      { cwd: options.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] },
+      { cwd: options.cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
     );
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const finish = (result: GitResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
     child.stdout.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -178,24 +210,52 @@ function git(
       stderr += chunk.toString();
     });
 
-    const timer = setTimeout(
-      () => child.kill('SIGKILL'),
-      options.timeoutMs ?? 15 * 60 * 1000,
-    );
+    const timer = setTimeout(() => {
+      killTree(child, 'SIGKILL');
+      // Resolve regardless a moment later: if a grandchild still holds the
+      // pipe, `close` will not arrive and the caller would wait forever after
+      // the timeout that was supposed to end this.
+      setTimeout(() => finish({ code: -1, stdout, stderr: `${stderr}\ngit timed out` }), 2_000).unref();
+    }, options.timeoutMs ?? 15 * 60 * 1000);
     timer.unref();
 
     child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ code: 127, stdout, stderr: `${stderr}\n${error.message}` });
+      finish({ code: 127, stdout, stderr: `${stderr}\n${error.message}` });
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout, stderr });
+      finish({ code: code ?? -1, stdout, stderr });
     });
   });
 }
 
 const ASKPASS_SCRIPT = '#!/bin/sh\nexec printf \'%s\\n\' "$OJ_GIT_PASSWORD"\n';
+
+/**
+ * Kill a child and everything it started.
+ *
+ * `child.kill()` signals one process. Both children spawned in this file start
+ * others — git runs helpers, and a Claude Code worker runs a shell per Bash
+ * tool call — and a grandchild that survives keeps the inherited stdout pipe
+ * open, which means `close` never fires and the caller waits forever *past* the
+ * timeout it just enforced. Found exactly that way: a stub worker running
+ * `sleep 300` was SIGTERMed, its shell died, and `sleep` held the pipe.
+ *
+ * The children are spawned `detached` so they lead their own process group, and
+ * a negative pid signals the whole group.
+ */
+function killTree(child: { pid?: number | undefined; kill: (signal: NodeJS.Signals) => boolean }, signal: NodeJS.Signals): void {
+  try {
+    if (child.pid !== undefined) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    // ESRCH: already gone, which is the outcome we wanted anyway.
+    try {
+      child.kill(signal);
+    } catch {
+      /* nothing left to signal */
+    }
+  }
+}
 
 /**
  * Delete the instruction-shaped files from the working tree.
@@ -245,14 +305,22 @@ function stripInstructionFiles(repoDir: string, patterns: string[]): string[] {
  * and so cannot be overridden by a `.gitattributes` in the PR.
  */
 function writeDiffAttributes(repoDir: string, patterns: string[]): void {
-  const lines = ['# Written by OJO. Instruction-shaped paths must not surface through git diff.'];
+  // A gitattributes pattern with no slash already matches at every depth, so
+  // `**/CLAUDE.md` and `CLAUDE.md` collapse to one rule — hence the Set, which
+  // keeps the file readable when someone is checking what was hidden and why.
+  const rules = new Set<string>();
   for (const pattern of patterns) {
-    // A gitattributes pattern with no slash already matches at every depth, so
-    // `**/CLAUDE.md` and `CLAUDE.md` collapse to the same rule.
     const normalised = pattern.startsWith('**/') ? pattern.slice(3) : pattern;
-    lines.push(`${normalised} -diff`);
-    lines.push(`${normalised}/** -diff`);
+    rules.add(`${normalised} -diff`);
+    // The directory form, for `.claude/` and `.cursor/`. Harmless on a file.
+    rules.add(`${normalised}/** -diff`);
   }
+  const lines = [
+    '# Written by OJO. Instruction-shaped paths must not surface through git diff.',
+    '# This file is not part of the repository, so a .gitattributes in the pull',
+    '# request cannot override it.',
+    ...rules,
+  ];
   mkdirSync(join(repoDir, '.git', 'info'), { recursive: true });
   writeFileSync(join(repoDir, '.git', 'info', 'attributes'), `${lines.join('\n')}\n`);
 }
@@ -382,19 +450,29 @@ async function resolveMergeBase(repoDir: string): Promise<string> {
  * a typo in a template — exactly the sort of failure that costs an hour.
  */
 export function render(template: string, values: Record<string, string>): string {
-  const rendered = template.replace(/\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g, (match, name: string) => {
-    const value = values[name];
-    if (value === undefined) return match;
-    return value;
-  });
-  const leftover = [...new Set([...rendered.matchAll(/\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g)].map((m) => m[1]))];
-  if (leftover.length > 0) {
+  const placeholder = /\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g;
+
+  // Validate the TEMPLATE, not the result. Substituted values are data — one
+  // of them is the watched repository's own OJ.md — and that data legitimately
+  // contains double braces: a Vue component, a Handlebars fixture, or in the
+  // case that found this, an OJ.md that documents this very template. Checking
+  // after substitution treats the repository's content as our typo and refuses
+  // to review it.
+  //
+  // A single `replace` pass never re-scans what it inserted, so a `{{headSha}}`
+  // arriving inside repository content is passed through untouched rather than
+  // becoming an injection point.
+  const unknown = [...new Set([...template.matchAll(placeholder)].map((match) => match[1]))].filter(
+    (name) => name !== undefined && values[name] === undefined,
+  );
+  if (unknown.length > 0) {
     throw new Error(
-      `Prompt template uses unknown placeholder(s) ${leftover.map((n) => `{{${n}}}`).join(', ')}. ` +
+      `Prompt template uses unknown placeholder(s) ${unknown.map((n) => `{{${n}}}`).join(', ')}. ` +
         `Available: ${Object.keys(values).map((n) => `{{${n}}}`).join(', ')}`,
     );
   }
-  return rendered;
+
+  return template.replace(placeholder, (match, name: string) => values[name] ?? match);
 }
 
 function buildKickoff(
@@ -513,6 +591,11 @@ function workerEnv(config: OjConfig, gitToken: string): NodeJS.ProcessEnv {
     'XDG_CONFIG_HOME',
     'XDG_CACHE_HOME',
     'XDG_DATA_HOME',
+    // Without these the worker cannot reach the Anthropic API on a proxied
+    // host, and a worker that cannot reach the API produces no report at all.
+    // Note the trade: a proxy URL with credentials embedded in it would be
+    // handed over. That is the operator's own proxy, but it is worth knowing.
+    ...PROXY_VARS,
     ...config.worker.envPassthrough,
   ];
 
@@ -522,13 +605,34 @@ function workerEnv(config: OjConfig, gitToken: string): NodeJS.ProcessEnv {
     if (value !== undefined) env[name] = value;
   }
 
-  // Anthropic and Claude Code's own configuration: the worker is a Claude Code
-  // session and needs whatever the operator uses to authenticate one. On a
-  // subscription install this passes nothing at all, and the session reads the
-  // OAuth credentials under HOME — which is why --bare is not used, see below.
+  // Anthropic configuration: the worker is a Claude Code session and needs
+  // whatever the operator uses to authenticate one. On a subscription install
+  // this passes nothing at all and the session reads the OAuth credentials
+  // under HOME — which is why --bare is not used, see below.
   for (const [name, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (name.startsWith('ANTHROPIC_') || name.startsWith('CLAUDE_')) env[name] = value;
+    if (value !== undefined && name.startsWith('ANTHROPIC_')) env[name] = value;
+  }
+
+  // Claude Code's own variables are named individually rather than taken by
+  // prefix, and the distinction is not pedantry. `CLAUDE_*` also contains
+  // per-invocation runtime markers — CLAUDE_CODE_SESSION_ID, CLAUDE_PID,
+  // CLAUDE_CODE_CHILD_SESSION — and if OJO is ever started from inside a
+  // Claude Code session, which is exactly how someone would first try it, a
+  // prefix match hands the worker its grandparent's session identity. Observed
+  // while testing this file.
+  const CLAUDE_CONFIG_VARS = [
+    'CLAUDE_CONFIG_DIR',
+    'CLAUDE_CODE_USE_BEDROCK',
+    'CLAUDE_CODE_USE_VERTEX',
+    'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
+    'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+    'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+    'CLAUDE_CODE_API_KEY_HELPER_TTL_MS',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  ];
+  for (const name of CLAUDE_CONFIG_VARS) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
   }
 
   // Belt and braces: nothing in the resulting environment may contain the live
@@ -621,6 +725,9 @@ function spawnClaude(
       cwd: workerDir,
       env: workerEnv(config, request.gitToken),
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Its own process group, so a timeout can take out the tool calls it
+      // started as well as the session itself. See killTree.
+      detached: true,
     });
 
     let stderr = '';
@@ -629,15 +736,40 @@ function spawnClaude(
     let turns = 0;
     let resultIsError = false;
     let timedOut = false;
+    let settled = false;
+
+    const finish = (outcome: SpawnOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
 
     const timer = setTimeout(
       () => {
         timedOut = true;
         request.onProgress?.(`timeout after ${config.worker.timeoutMinutes}m — terminating`);
-        child.kill('SIGTERM');
+        killTree(child, 'SIGTERM');
         // Claude Code cleans up on SIGTERM, but a wedged tool call will not
         // notice it. Give it ten seconds of dignity, then stop asking.
-        setTimeout(() => child.kill('SIGKILL'), 10_000).unref();
+        setTimeout(() => killTree(child, 'SIGKILL'), 10_000).unref();
+        // And resolve five seconds after that whatever happens. A grandchild
+        // holding the stdout pipe open stops `close` from ever firing, which
+        // would turn the timeout into an indefinite hang — the exact failure
+        // the timeout exists to prevent.
+        setTimeout(
+          () =>
+            finish({
+              code: null,
+              signal: 'SIGKILL',
+              timedOut: true,
+              stderr: `${stderr}\nworker did not exit after SIGKILL; abandoned`,
+              costUsd,
+              turns,
+              resultIsError: true,
+            }),
+          15_000,
+        ).unref();
       },
       config.worker.timeoutMinutes * 60 * 1000,
     );
@@ -679,8 +811,7 @@ function spawnClaude(
     });
 
     child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({
+      finish({
         code: 127,
         signal: null,
         timedOut,
@@ -692,8 +823,7 @@ function spawnClaude(
     });
 
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal, timedOut, stderr, costUsd, turns, resultIsError });
+      finish({ code, signal, timedOut, stderr, costUsd, turns, resultIsError });
     });
   });
 }

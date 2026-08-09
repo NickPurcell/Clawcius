@@ -39,6 +39,36 @@ mkdirSync(config.paths.workersRoot, { recursive: true, mode: 0o700 });
 /** The account OJO posts as. Resolved at startup; only used to avoid self-review. */
 let identity = '';
 
+/**
+ * Node's `fetch` does not read `HTTP_PROXY`/`HTTPS_PROXY` unless it is told to,
+ * and on a host where the only route out is a proxy that means every GitHub
+ * request fails with `EAI_AGAIN` — a DNS error, which reads as "the network is
+ * down" rather than "this process is not using the proxy you configured".
+ *
+ * `NODE_USE_ENV_PROXY=1` fixes it, and it is set in the systemd unit and the
+ * `start` script. The environment variable rather than `--use-env-proxy`
+ * deliberately: an unrecognised CLI flag stops Node from starting at all, so a
+ * host on an older 22.x would fail to boot the service over something it does
+ * not need, whereas an unrecognised variable is ignored.
+ *
+ * Warned rather than thrown because a host can have both a proxy variable and
+ * working direct egress, and refusing to start there would be wrong.
+ */
+function warnIfProxyIgnored(): void {
+  const proxy = process.env['HTTPS_PROXY'] ?? process.env['https_proxy'] ?? process.env['HTTP_PROXY'] ?? process.env['http_proxy'];
+  if (!proxy) return;
+  const enabled =
+    process.env['NODE_USE_ENV_PROXY'] === '1' ||
+    process.execArgv.includes('--use-env-proxy') ||
+    (process.env['NODE_OPTIONS'] ?? '').includes('--use-env-proxy');
+  if (enabled) return;
+  process.stderr.write(
+    `[oj] a proxy is configured (${proxy}) but this process is not using it — Node's fetch ` +
+      'ignores the proxy variables by default. Every GitHub request will fail with EAI_AGAIN. ' +
+      'Set NODE_USE_ENV_PROXY=1 in the environment (the systemd unit does).\n',
+  );
+}
+
 const log = (message: string): void => {
   process.stdout.write(`[oj] ${message}\n`);
 };
@@ -491,6 +521,8 @@ async function tick(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  warnIfProxyIgnored();
+
   try {
     identity = await client.whoAmI();
   } catch (error) {
