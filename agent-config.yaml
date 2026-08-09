@@ -318,6 +318,23 @@ discord:
   followUpChannelIds:
     - '1105739162230984735'  # clanker-internet-asbestos-gen (dev)
 
+  # Channels where EVERY message wakes the agent, as though it had been @-ed.
+  # No mention needed, and nothing to expire — unlike a follow-up window, which
+  # is a grace period that closes. This is a room that belongs to the bot.
+  #
+  # `!` commands also work without an @ in these channels, on the same
+  # reasoning: if the room is the bot's, a bare `!status` means what it says.
+  #
+  # `allowedChannelIds` still gates this. A channel listed here but missing from
+  # a non-empty `allowedChannelIds` wakes nothing; startup logs a warning rather
+  # than leaving you to work that out from the silence.
+  #
+  # Cost note, and it is the real one: every message here bills a turn, forever,
+  # with no budget cap. A follow-up window at least closes on its own. Put
+  # dedicated bot channels in this list and nothing else.
+  alwaysOnChannelIds:
+    - '1467070145343258628'  # hamachi (dedicated agent channel)
+
   # Message bundling. People type in bursts, and waking once per line means the
   # agent starts answering the first thought before the second has landed.
   #
