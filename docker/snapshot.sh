@@ -13,13 +13,35 @@
 # Restore:  docker rm -f clawcius-agent
 #           docker tag clawcius-agent:snap-<stamp> clawcius-agent:latest
 #           docker/run-container.sh
+#
+# That restore path is now exercised on a timer rather than trusted —
+# clawcius-snapshot-verify.timer starts a throwaway container from the newest
+# snapshot and proves it comes up. It exists because these images had been
+# produced nightly for weeks without one of them ever having been booted, which
+# is not a backup, it is 2 GB of optimism. See ops/README.md.
 set -euo pipefail
 
-NAME=clawcius-agent
-REPO=clawcius-agent
+# Parameterised the same way as run-container.sh, and for the same reason: a
+# second instance is config, not a forked copy of this script. The defaults are
+# instance 1, so clawcius-snapshot.service and anything else calling this with
+# no environment behaves exactly as it did before.
+#
+# The ops executor sets both when it snapshots an instance before recreating
+# it. It passes them as environment on an argv-array exec — there is no shell
+# involved on that path, and the values come from its own config allowlist,
+# never from the request that triggered it.
+NAME=${CLAWCIUS_CONTAINER:-clawcius-agent}
+REPO=${CLAWCIUS_SNAPSHOT_REPO:-$NAME}
 KEEP=${KEEP:-8}
 
-docker inspect -f '{{.State.Running}}' "$NAME" >/dev/null 2>&1 || {
+# `docker container inspect`, never bare `docker inspect`. The bare form
+# resolves ANY object type, and the snapshot repo is named after the container
+# — so on a host that has ever taken a snapshot, bare inspect can match the
+# IMAGE, whose JSON has no .State, and the whole check fails into the "not
+# running" branch. That branch exits 0, so the failure mode was a nightly timer
+# reporting success and silently taking no backups. run-container.sh was fixed
+# for the same reason on 2026-08-08; this copy was missed.
+docker container inspect -f '{{.State.Running}}' "$NAME" >/dev/null 2>&1 || {
   echo "container $NAME is not running; nothing to snapshot" >&2
   exit 0
 }

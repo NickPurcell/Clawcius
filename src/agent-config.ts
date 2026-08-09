@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, isAbsolute } from 'node:path';
 import { parse } from 'yaml';
 
 export type SystemPromptConfig = {
@@ -130,6 +130,36 @@ export type AgentConfig = {
     /** Cap on accepted wake requests per channel per rolling hour. */
     maxPerHour: number;
   };
+  /**
+   * What this instance publishes for the ops executor (`ops/`).
+   *
+   * The waker does not read anything from the executor and holds no privilege
+   * of its own — this is one-way telemetry. The executor recreates containers,
+   * and needs to know whether doing so right now would kill someone's live
+   * turn; the waker is the only process that knows that.
+   */
+  status: {
+    /**
+     * Absolute path for the status file, or empty to publish nothing.
+     *
+     * MUST NOT live under `wake.spoolDir` or anywhere else bind-mounted into
+     * the agent container. The whole point of the file is that a privileged
+     * process trusts it, and the agent inside the container is exactly the
+     * party that must not be able to write "I am idle, go ahead and recreate
+     * me". `wake.spoolDir` is mounted read-write by design; this is one level
+     * up, outside every mount in `docker/run-container.sh`. The ops config
+     * loader re-checks the containment and refuses to start if it is violated.
+     */
+    file: string;
+    /** Republish this often even when the live count has not moved. */
+    intervalSeconds: number;
+    /**
+     * This deployment's instance name — the key under `instances:` in
+     * ops-config.yaml, and the name the executor uses when it decides whose
+     * container it is about to recreate. `clawcius`, `hamachi`.
+     */
+    instance: string;
+  };
 };
 
 const DEFAULT_PROMPTS: PromptTemplates = {
@@ -234,6 +264,12 @@ const DEFAULTS: AgentConfig = {
     enabled: true,
     spoolDir: '/var/lib/clawcius/run/wake',
     maxPerHour: 30,
+  },
+  status: {
+    // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
+    file: '/var/lib/clawcius/waker-status.json',
+    intervalSeconds: 20,
+    instance: 'clawcius',
   },
 };
 
@@ -347,6 +383,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
   const wake = section(root['wake'], 'wake');
+  const status = section(root['status'], 'status');
   const git = section(root['git'], 'git');
   const prompts = section(root['prompts'], 'prompts');
   const container = section(root['container'], 'container');
@@ -435,6 +472,17 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       spoolDir: str(wake['spoolDir'], 'wake.spoolDir', DEFAULTS.wake.spoolDir),
       maxPerHour: num(wake['maxPerHour'], 'wake.maxPerHour', DEFAULTS.wake.maxPerHour, 1),
     },
+    status: {
+      file: str(status['file'], 'status.file', DEFAULTS.status.file),
+      intervalSeconds: num(
+        status['intervalSeconds'],
+        'status.intervalSeconds',
+        DEFAULTS.status.intervalSeconds,
+        1,
+        3600,
+      ),
+      instance: str(status['instance'], 'status.instance', DEFAULTS.status.instance),
+    },
   };
 
   if (
@@ -447,6 +495,36 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     );
   }
 
+  // The status file is read by a root process that will recreate containers on
+  // the strength of it. Inside the spool directory it would be writable by the
+  // agent, which is the party the executor is defending against — a container
+  // that can publish `liveCount: 0` can talk a privileged process into
+  // destroying a session mid-turn, or into overwriting a rollback decision.
+  // Checked here as well as in the ops config loader; neither should be the
+  // only place this is true.
+  if (config.status.file) {
+    if (!isAbsolute(config.status.file)) {
+      throw new ConfigError('status.file', 'must be an absolute path');
+    }
+    const spool = resolve(config.wake.spoolDir);
+    const statusFile = resolve(config.status.file);
+    if (statusFile === spool || statusFile.startsWith(`${spool}/`)) {
+      throw new Error(
+        `agent-config.yaml: status.file (${statusFile}) is inside wake.spoolDir ` +
+          `(${spool}), which is bind-mounted read-write into the agent container. ` +
+          'The ops executor trusts this file when deciding whether recreating the ' +
+          'container would kill a live turn; the agent must not be able to write it.',
+      );
+    }
+  }
+
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(config.status.instance)) {
+    throw new ConfigError(
+      'status.instance',
+      'must be a short lowercase identifier — it is matched against the ' +
+        'allowlist in ops-config.yaml, which only ever compares exact strings',
+    );
+  }
 
   return config;
 }

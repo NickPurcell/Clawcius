@@ -1,0 +1,20 @@
+[Unit]
+Description=Periodic restore test of the newest agent snapshots
+
+[Timer]
+# 05:30, an hour and a half after clawcius-snapshot.timer takes the nightly
+# images at 04:00. Deliberately after, so what gets tested is the snapshot an
+# incident tonight would actually roll back to, rather than yesterday's.
+#
+# Deliberately not immediately after, either: the snapshot commit is itself a
+# heavyweight docker operation on a 12 GB box, and starting a 2 GB container
+# on top of it is how you find the memory ceiling on a schedule.
+OnCalendar=*-*-* 05:30:00
+
+# Catch up after downtime rather than skipping. A host that was off for two
+# days is exactly a host whose snapshots nobody has checked.
+Persistent=true
+RandomizedDelaySec=20m
+
+[Install]
+WantedBy=timers.target

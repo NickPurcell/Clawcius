@@ -387,3 +387,20 @@ wake:
   enabled: true
   spoolDir: /var/lib/hamachi/run/wake
   maxPerHour: 30
+
+# ── Status for the ops executor ───────────────────────────────────────────
+# The waker publishes how many turns are in flight; `ops/` reads it before it
+# does anything that would recreate this container. There is no path back —
+# the executor never writes here and the waker never asks it for anything.
+#
+# NOTE THE PATH. This is a sibling of `run/`, not a child, and that is a
+# security boundary rather than tidiness: `run/` is bind-mounted read-write
+# into the agent container (docker/run-container.sh), so a file inside it is
+# writable by the agent. A prompt-injected agent that can publish "no turns in
+# flight" can talk a root process into destroying a live session — or into
+# believing a rollback is safe. Both loaders refuse to start if this path ends
+# up inside the spool.
+status:
+  file: /var/lib/hamachi/waker-status.json
+  intervalSeconds: 20
+  instance: hamachi

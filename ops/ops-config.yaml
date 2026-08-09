@@ -1,0 +1,195 @@
+# Ops executor configuration.
+#
+# This file is not settings. It is the authorization model.
+#
+# Everything clawcius-ops is capable of doing is named here, by exact string.
+# The requests it reads come from a container that may be prompt-injected, and
+# nothing in a request can add to these lists — a request selects an entry, it
+# never supplies a value. A unit that is not under `units:` cannot be
+# restarted; an instance not under `instances:` cannot be recreated. There is
+# no wildcard and no pattern match anywhere in the loader, on purpose.
+#
+# Every key has a default in src/config.ts and the loader validates types, so a
+# typo fails the boot with the offending key named. Override the path with
+# OPS_CONFIG_PATH.
+
+# ── Dry run ───────────────────────────────────────────────────────────────
+# SHIPS ON, AND SHOULD STAY ON UNTIL YOU HAVE READ THE LOG.
+#
+# In this mode the executor makes every decision it would really make — the
+# allowlist checks, the idle wait, the deadline, the breaker — and logs the
+# exact argv it would have executed, and executes none of it. Read-only probes
+# (docker inspect, git rev-parse, docker images) still run, because a dry run
+# that cannot see the machine is a dry run reporting fiction.
+#
+# Turn it off once `journalctl -u clawcius-ops` for a week contains nothing
+# that surprises you. This is a root process holding docker and systemctl; the
+# first deploy should be observable before it is trusted.
+dryRun: true
+
+# ── Directories ───────────────────────────────────────────────────────────
+# The spool is bind-mounted into the agent containers and is WRITTEN BY THEM.
+# Treat everything in it as hostile input to privileged code.
+spoolDir: /var/lib/clawcius/run/ops
+
+# State is NOT reachable from any container: the journal, the circuit breaker,
+# and any armed rollback deadline live here. A breaker the quarantined party
+# can edit is not a breaker, so the loader refuses to start if this ends up
+# inside the spool or inside any instance's wake spool.
+stateDir: /var/lib/clawcius-ops
+
+# Sweep interval. fs.watch is set up too, but the sweep is the primary
+# mechanism — gVisor's gofer does not reliably deliver inotify for writes made
+# inside the sandbox, which is the same finding that put a 5s sweep next to the
+# waker's own watcher (SETUP.md § 6b).
+pollSeconds: 5
+
+# ── Binaries and scripts ──────────────────────────────────────────────────
+# Absolute paths, resolved at load. Nothing here is looked up on PATH: the
+# process runs as root and a PATH lookup is one writable directory away from
+# being someone else's choice of binary.
+runContainerScript: /home/npurcell/clawcius/docker/run-container.sh
+snapshotScript: /home/npurcell/clawcius/docker/snapshot.sh
+systemctlPath: /usr/bin/systemctl
+dockerPath: /usr/bin/docker
+gitPath: /usr/bin/git
+
+# ── Units that may be restarted ───────────────────────────────────────────
+# Note what is absent: clawcius-ops.service. The executor refuses to restart
+# itself by name even if you add it here — a process cannot restart itself
+# without dying mid-operation, and the operation would vanish with no record
+# that it did not finish. Restart the executor by hand.
+#
+# Also absent: docker.service. Restarting the docker daemon takes every
+# container on the host down at once, including both agents and the proxy, and
+# it is not something an agent should be able to ask for in passing.
+units:
+  - name: clawcius.service
+    description: the Clawcius waker (Discord gateway, agent sessions)
+
+  - name: hamachi.service
+    description: the Hamachi waker
+
+  - name: clawcius-status.service
+    description: the read-only status page on the tailnet
+
+# ── Checkouts that may be pulled ──────────────────────────────────────────
+# `git pull --ff-only`, and only when HEAD is on the configured branch and the
+# tree is clean. A merge commit made unattended by a root daemon in a checkout
+# that is about to be deployed is not a thing anyone wants to find later.
+repos:
+  - name: clawcius
+    path: /home/npurcell/clawcius
+    branch: main
+
+# ── Instances whose containers may be recreated ───────────────────────────
+# Everything needed to rebuild an instance is spelled out rather than derived.
+# Derivation is guessing, and this is the code path that destroys a writable
+# layer.
+#
+# `wakerStatusFile` must match `status.file` in that instance's agent-config,
+# and must live OUTSIDE every bind mount in docker/run-container.sh. The
+# executor believes that file when it decides whether recreating the container
+# would kill someone's live turn; the agent must not be able to write it. Both
+# loaders check the containment and refuse to start.
+instances:
+  - name: clawcius
+    container: clawcius-agent
+    image: clawcius-agent:latest
+    stateDir: /var/lib/clawcius
+    envFile: /home/npurcell/clawcius/.env
+    memory: 2g
+    wakerStatusFile: /var/lib/clawcius/waker-status.json
+    wakeSpoolDir: /var/lib/clawcius/run/wake
+    # Where the "you were rebuilt, verify and check in" wake is delivered.
+    wakeChannelId: "000000000000000000"
+    # HEAD of this checkout identifies the build for the circuit breaker. A
+    # build that has been rolled back once is refused from then on; a new
+    # commit is a different build and goes through, because the fix for a bad
+    # build is a new build.
+    buildRepo: clawcius
+
+  - name: hamachi
+    container: hamachi-agent
+    image: hamachi-agent:latest
+    stateDir: /var/lib/hamachi
+    envFile: /home/npurcell/clawcius/.env.hamachi
+    memory: 3g
+    wakerStatusFile: /var/lib/hamachi/waker-status.json
+    wakeSpoolDir: /var/lib/hamachi/run/wake
+    wakeChannelId: "000000000000000000"
+    buildRepo: clawcius
+
+# ── Limits ────────────────────────────────────────────────────────────────
+# Every one of these is a cap on what a compromised or looping agent can do
+# with a directory it can write.
+limits:
+  # Bytes. Checked with stat before the file is opened, so an enormous request
+  # costs a stat rather than a read.
+  maxRequestBytes: 16384
+  # Requests consumed per sweep. A burst cannot monopolise the daemon.
+  maxPerSweep: 8
+  # Files allowed to be sitting in the spool at all. Past this the spool is
+  # treated as flooded and drained unread — a container writing thousands of
+  # request files is not a scheduling accident.
+  maxSpoolFiles: 64
+  # Accepted operations per rolling hour, across every verb and instance.
+  maxPerHour: 20
+  # Requests allowed to wait behind the lock. Past this they are refused with a
+  # stated reason, because a refusal the agent can read beats a request that
+  # silently evaporates.
+  maxQueued: 8
+  commandTimeoutSeconds: 600
+
+# ── Waiting for an idle turn ──────────────────────────────────────────────
+# redeploy and rollback recreate the container, and every live agent session is
+# a `docker exec` into it. Doing that mid-turn kills someone's conversation.
+idle:
+  # A waker status file older than this is treated as busy. Must be comfortably
+  # more than the waker's status.intervalSeconds (20) and comfortably less than
+  # "long enough that a crashed waker looks idle" — a stale zero is the most
+  # dangerous value in this system, because it is the one that reads as
+  # permission.
+  staleSeconds: 90
+  # Then give up and ABANDON the operation. Not defer, not proceed anyway. The
+  # agent can ask again.
+  maxWaitMinutes: 30
+  pollSeconds: 10
+
+# ── The check-in deadline ─────────────────────────────────────────────────
+# After a destructive operation the executor wakes the instance with context
+# and waits to hear back. Silence means the rebuild broke it, and the whole
+# point is that nobody has to be awake for that.
+deadline:
+  minutes: 15
+  # Off makes the deadline pure alerting. Recommended only while dryRun is on
+  # and you are still reading what it decides.
+  autoRollback: true
+
+# ── Circuit breaker ───────────────────────────────────────────────────────
+breaker:
+  # Consecutive missed check-ins before the executor FREEZES: it stops
+  # accepting destructive verbs entirely and says so, until a human runs
+  # ops/unfreeze.sh. The alternative is a bad build that reinstalls the outage
+  # every fifteen minutes.
+  maxConsecutiveFailedRecoveries: 2
+  # Quarantined builds remembered per host, oldest evicted. Persisted, because
+  # a breaker that clears on restart is no breaker at all — and `restart` is a
+  # verb the agent can ask for.
+  maxQuarantined: 32
+
+# ── Snapshot restore verification ─────────────────────────────────────────
+# The usual cause of a failed rollback is a restore path nobody ever ran.
+# SETUP.md carried "snapshots are untested as a restore path" as a known gap
+# for weeks while the nightly timer produced 2 GB images that had never been
+# booted. Now that a missed check-in triggers an automatic rollback, that gap
+# is in the recovery path.
+snapshotVerify:
+  enabled: true
+  instances: [clawcius, hamachi]
+  startTimeoutSeconds: 60
+  # Run inside the throwaway container once it reports running. argv array, no
+  # shell. `docker run -d` succeeding proves almost nothing — it returns as
+  # soon as the container is created, and an image whose entrypoint dies
+  # immediately satisfies it. This is the check that tells "up" from "usable".
+  probe: [/bin/sh, -c, "test -x /usr/local/bin/claude && test -d /home/agent"]

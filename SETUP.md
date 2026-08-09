@@ -351,6 +351,126 @@ A unix socket was the original design. gVisor blocks connections to host unix
 sockets, correctly, since one would be a hole straight through the sandbox
 boundary; a bind-mounted directory needs no such exception.
 
+---
+
+## 7. The ops executor
+
+The same idea as § 6b, generalised from "wake me" to a short list of privileged
+host operations, so the agents can maintain their own deployments without a
+person having to log in and restart a service.
+
+`ops/README.md` is the full write-up — the verb list, the trust model, and why
+it is a separate daemon. The short version of the last one: `restart
+clawcius.service` is one of the operations, and a process cannot restart itself
+without dying mid-operation. The executor has to outlive the things it
+restarts, so it is its own unit with no Discord connection, no credential and
+no model.
+
+**It ships in dry-run.** `dryRun: true` in `ops/ops-config.yaml` makes it take
+every decision and log the exact argv it would have run, without running any of
+it. Leave it on until a week of `journalctl -u clawcius-ops` holds no
+surprises. This is a root process with docker and systemctl.
+
+### Install
+
+```sh
+cd /home/npurcell/clawcius/ops
+npm install
+npm run build
+npm run selftest              # 53 tests, no docker required
+
+sudo cp ../systemd/clawcius-ops.service \
+        ../systemd/clawcius-snapshot-verify.service \
+        ../systemd/clawcius-snapshot-verify.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now clawcius-ops.service
+sudo systemctl enable --now clawcius-snapshot-verify.timer
+```
+
+Then create the spool directory so the containers can write into it. It lives
+inside each instance's `run/` mount, which `docker/run-container.sh` already
+bind-mounts read-write:
+
+```sh
+sudo install -d -m 0770 -o npurcell -g npurcell /var/lib/clawcius/run/ops
+```
+
+Check it is watching, and that the first thing it says is that it is not really
+doing anything:
+
+```sh
+journalctl -u clawcius-ops -n 30
+# [ops] boot: clawcius-ops — … DRY RUN — every decision is made and logged, nothing is executed.
+# [ops] watching /var/lib/clawcius/run/ops (sweep 5s)
+```
+
+Then file a request from inside a container and watch it land:
+
+```sh
+docker exec clawcius-agent sh -c '
+  OPS=/var/lib/clawcius/run/ops; S=$(date +%s)
+  printf "%s" "{\"verb\":\"restart\",\"unit\":\"clawcius.service\",\"reason\":\"smoke test\"}" \
+    > $OPS/$S.tmp && mv $OPS/$S.tmp $OPS/$S.json'
+journalctl -u clawcius-ops -n 10
+```
+
+### The status file each waker publishes
+
+`redeploy` and `rollback` recreate a container, and every live agent session is
+a `docker exec` into it — doing that mid-turn kills someone's conversation. The
+executor learns whether that would happen from a small JSON file each waker
+writes:
+
+```
+/var/lib/clawcius/waker-status.json     # status.file in agent-config.yaml
+/var/lib/hamachi/waker-status.json      # ditto, agent-config.hamachi.yaml
+```
+
+**Note the path.** It is a *sibling* of `run/`, not a child. `run/` is
+bind-mounted read-write into the container, so a status file inside it would be
+writable by the agent — and an agent that can publish "no turns in flight" can
+talk a root process into destroying a live session, or into believing a
+rollback is safe. Both config loaders check the containment and refuse to start
+if it is violated. Missing, stale, malformed or future-dated all read as
+*busy*, which is the safe direction; a waker that crashed leaves a stale
+`liveCount: 0` behind, and that is the one value that must never be believed.
+
+Restart the wakers after adding the `status:` block so they begin publishing:
+
+```sh
+sudo systemctl restart clawcius hamachi
+cat /var/lib/clawcius/waker-status.json
+```
+
+### Going live
+
+Set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Set the
+two `wakeChannelId` values first — they are placeholder zeros in the shipped
+config, and they are where the "you were rebuilt, verify and check in" wake is
+delivered. Without a real channel the agent never hears that it is on a
+deadline, and fifteen minutes later it gets rolled back for not answering a
+question it was never asked.
+
+```sh
+sudo systemctl restart clawcius-ops
+```
+
+### When it freezes
+
+After two consecutive missed check-ins the executor stops accepting destructive
+verbs and says so, loudly, in the journal. That is deliberate: something is
+wrong that redeploying cannot fix, and continuing would mean reinstalling the
+outage every fifteen minutes.
+
+```sh
+sudo ops/unfreeze.sh                    # prints why, asks, then clears
+sudo systemctl restart clawcius-ops
+```
+
+The quarantine list is not cleared by that, and there is no verb for any of it.
+An agent that can unfreeze the breaker holding back its own broken build is
+back where we started.
+
 ## Known gaps
 
 - **Not exercised end-to-end since the container migration.** Agent turns,
@@ -371,6 +491,19 @@ boundary; a bind-mounted directory needs no such exception.
 - **gVisor overhead is unmeasured.** `systrap` is the default platform; this
   host has nested virt so the `kvm` platform is also available. The agent is
   file-I/O heavy and no benchmark has been run.
-- **Snapshots are untested as a restore path.** `docker/snapshot.sh` produces
-  images (~2 GB each, 8 retained), but restoring from one has never been
-  rehearsed.
+- **Snapshots are untested as a restore path *on this host*.** This gap is
+  what `clawcius-snapshot-verify.timer` exists to close: it restores the newest
+  snapshot into a throwaway container nightly and fails the unit if it does not
+  come up. The timer is written and its logic is covered by the ops self-test
+  against stand-in binaries, but it has not yet run against real images here —
+  so the gap stays open until the first green run at 05:30.
+- **The ops executor has never executed anything.** Everything up to the
+  `execFile` is tested (see `ops/README.md` § *What has and has not been
+  tested*), and everything past it is not: no `systemctl restart` performed, no
+  container recreated, no snapshot committed or restored, no post-rebuild wake
+  picked up by a live waker. It ships with `dryRun: true` for exactly this
+  reason.
+- **The `wakeChannelId` values in `ops/ops-config.yaml` are placeholder
+  zeros.** Until they are real channels the post-rebuild wake goes nowhere, and
+  an instance would be rolled back for failing to answer a question it never
+  received. Set them before turning `dryRun` off.

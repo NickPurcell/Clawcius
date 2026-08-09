@@ -15,6 +15,7 @@ import { config } from './config.js';
 import { SessionStore } from './store.js';
 import { SessionManager } from './agent.js';
 import { WakeSpool } from './wake-spool.js';
+import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { systemd } from './systemd.js';
@@ -31,6 +32,37 @@ const windows = new ConversationWindows(
   config.agent.discord.followUpWindowSeconds,
   config.agent.discord.followUpChannelIds,
 );
+/**
+ * Tell the ops executor whether this instance is mid-turn.
+ *
+ * One-way: the waker publishes, the executor reads, and nothing comes back.
+ * That direction is the design — the executor holds docker and systemctl and
+ * one of the things it restarts is this process, so a channel from it to here
+ * would be a channel from a privileged daemon into the thing it supervises.
+ *
+ * `busyCount`, not `liveCount`, is what makes "idle" mean anything on this
+ * deployment; see the accessor in agent.ts for why.
+ */
+const wakerStatus = new WakerStatusPublisher({
+  path: config.agent.status.file,
+  intervalSeconds: config.agent.status.intervalSeconds,
+  instance: config.agent.status.instance,
+  maxConcurrent: config.agent.sessions.maxConcurrent,
+  liveCount: () => sessions.busyCount,
+});
+// Wrapped: a failed status write must never propagate into session handling.
+// The publisher already swallows its own IO errors, and this is the second
+// layer, because a bot that dies on a full disk while telling another process
+// it is healthy would be a very stupid way to lose Discord.
+sessions.onCountsChanged = () => {
+  try {
+    wakerStatus.noteChange();
+  } catch (error) {
+    process.stderr.write(`[waker-status] noteChange failed: ${String(error)}\n`);
+  }
+};
+wakerStatus.start();
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -88,7 +120,8 @@ async function handleCommand(message: Message, command: string): Promise<boolean
       const idle = config.agent.sessions.idleTimeoutMinutes;
       await message.reply(
         [
-          `Live sessions: ${sessions.liveCount}/${config.agent.sessions.maxConcurrent}`,
+          `Live sessions: ${sessions.liveCount}/${config.agent.sessions.maxConcurrent}` +
+            ` (${sessions.busyCount} mid-turn)`,
           `Model: ${config.agent.model}`,
           `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
           `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
@@ -495,6 +528,10 @@ async function shutdown(signal: string): Promise<void> {
   systemd.stopping();
   try {
     wakeSpool?.stop();
+    wakerStatus.stop();
+    // Absent reads as busy to the executor, which is the correct answer for a
+    // waker that is no longer running: it cannot vouch for anything.
+    wakerStatus.removeOnShutdown();
     clearInterval(windowSweeper);
     bundler.flushAll();
     await sessions.shutdown();

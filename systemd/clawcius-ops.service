@@ -1,0 +1,88 @@
+[Unit]
+Description=Clawcius ops executor — privileged host operations requested by the sandboxed agents
+Documentation=file:/home/npurcell/clawcius/ops/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+# NOT ordered Before= or After= the wakers, and NOT bound to them.
+#
+# Restarting clawcius.service is one of the operations this unit performs. A
+# dependency in either direction would mean the executor is stopped or
+# restarted as a side effect of the thing it is supposed to be restarting —
+# which is the exact failure the separate daemon exists to avoid. It has to
+# outlive the units it acts on.
+
+# Never give up. [Unit] directives, not [Service]: in [Service] systemd ignores
+# them with a warning and leaves the default of 5 starts per 10s, after which
+# the unit stays dead. This one holds rollback deadlines; it staying dead is
+# how a broken rebuild becomes a permanent outage.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+
+# Root, and this is the whole point of the design rather than laziness.
+#
+# The executor runs systemctl and docker. The agents cannot: they are in gVisor
+# containers with no docker socket and no host socket, deliberately, and
+# docker/run-container.sh carries the note about why mounting one would make
+# gVisor decorative. This unit is the narrow, enumerated hole through that
+# wall — narrow because ops-config.yaml lists every unit, repo and instance it
+# may touch by exact name, and because ops/src/request.ts validates every byte
+# of a request before any of it is believed.
+#
+# What it does NOT have: DISCORD_TOKEN, GITHUB_TOKEN, any Anthropic
+# credential, or an EnvironmentFile of any kind. It talks to no network service
+# and authenticates to nothing.
+User=root
+Group=root
+
+WorkingDirectory=/home/npurcell/clawcius/ops
+
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=OPS_CONFIG_PATH=/home/npurcell/clawcius/ops/ops-config.yaml
+
+ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+
+Restart=always
+RestartSec=5
+
+# ── State ─────────────────────────────────────────────────────────────────
+# The journal, the circuit breaker and any armed rollback deadline. 0750 and
+# root-owned: this is the one directory in the system that the agents must not
+# be able to reach, and no part of it is bind-mounted into any container.
+StateDirectory=clawcius-ops
+StateDirectoryMode=0750
+
+# ── Hardening ─────────────────────────────────────────────────────────────
+# Deliberately light, and the reason is worth writing down rather than
+# rediscovering. This unit exists to run systemctl and docker; the usual
+# sandboxing directives are aimed at services that should not be able to do
+# either. ProtectSystem=strict breaks the docker socket connection (writing to
+# a unix socket inode needs write permission on it, which a read-only /run
+# denies) — the same thing that constrains clawcius.service, for the same
+# reason. PrivateDevices and ProtectKernelTunables interfere with docker's own
+# operation.
+#
+# Anything added here must be verified with an actual restart and a real
+# dry-run request, not by reading. A broken executor looks exactly like an
+# agent whose requests are being ignored.
+NoNewPrivileges=false
+RestrictSUIDSGID=true
+RemoveIPC=true
+ProtectHome=read-only
+
+# Bounded so a runaway docker operation cannot take the host with it. Modest
+# on purpose: this process parses small JSON files and waits on child
+# processes.
+MemoryMax=512M
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawcius-ops
+
+[Install]
+WantedBy=multi-user.target

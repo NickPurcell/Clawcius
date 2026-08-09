@@ -273,7 +273,28 @@ export class AgentSession {
   #retryTimer: NodeJS.Timeout | null = null;
 
   lastActiveAt = Date.now();
-  busy = false;
+
+  #busy = false;
+  /**
+   * Fired on every transition of `busy`, so the waker can republish its status
+   * file the moment a turn starts rather than up to an interval later.
+   *
+   * That latency is the whole reason this is an accessor and not a plain field:
+   * the ops executor decides whether recreating this container would interrupt
+   * anybody by reading that file, and the dangerous window is exactly the gap
+   * between a turn starting and the file saying so.
+   */
+  onBusyChanged: () => void = () => {};
+
+  get busy(): boolean {
+    return this.#busy;
+  }
+
+  set busy(value: boolean) {
+    if (this.#busy === value) return;
+    this.#busy = value;
+    this.onBusyChanged();
+  }
 
   constructor(
     channelId: string,
@@ -607,6 +628,36 @@ export class SessionManager {
     return this.#sessions.size;
   }
 
+  /**
+   * Sessions with a turn actually in flight.
+   *
+   * Distinct from `liveCount` and the distinction is load-bearing for the ops
+   * executor. With the shipped `sessions.idleTimeoutMinutes: 0` a session is
+   * never evicted, so `liveCount` is a high-water mark: after the first mention
+   * it never returns to zero for the life of the process. An executor that
+   * waited for `liveCount === 0` before recreating a container would wait
+   * forever, and the obvious fix — waiting a bit and going anyway — is the
+   * thing that kills someone's turn.
+   *
+   * `busyCount === 0` is the real "nobody is mid-conversation" signal. A live
+   * but idle session costs nothing to recreate: it is resumed from SQLite on
+   * the next mention.
+   */
+  get busyCount(): number {
+    let busy = 0;
+    for (const session of this.#sessions.values()) if (session.busy) busy += 1;
+    return busy;
+  }
+
+  /**
+   * Called whenever the live or busy count may have moved.
+   *
+   * Set by the waker to the ops status publisher. A callback rather than an
+   * EventEmitter because there is exactly one subscriber and it must never be
+   * able to throw into session handling — see the wrapper in index.ts.
+   */
+  onCountsChanged: () => void = () => {};
+
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
   }
@@ -640,7 +691,9 @@ export class SessionManager {
       events,
     );
 
+    session.onBusyChanged = () => this.onCountsChanged();
     this.#sessions.set(channelId, session);
+    this.onCountsChanged();
     // Deliberately not persisted here: the id is still the placeholder. It is
     // written once the SDK reports the real one — see persist().
     return session;
@@ -657,6 +710,7 @@ export class SessionManager {
     const session = this.#sessions.get(channelId);
     if (!session) return;
     this.#sessions.delete(channelId);
+    this.onCountsChanged();
     await session.close();
   }
 

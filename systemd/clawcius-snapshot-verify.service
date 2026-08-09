@@ -1,0 +1,47 @@
+[Unit]
+Description=Restore the newest agent snapshot into a throwaway container and prove it starts
+Documentation=file:/home/npurcell/clawcius/ops/README.md
+After=docker.service
+Requires=docker.service
+
+# Deliberately independent of clawcius-ops.service.
+#
+# A restore test takes minutes and starts a multi-gigabyte container. Inside
+# the executor it would either hold the operation lock for the whole time — so
+# a verify at 04:00 would defer a rollback triggered at 04:01 — or run outside
+# it, which means two docker operations overlapping, which is the thing the
+# lock exists to prevent.
+#
+# And this is the unit you most want still working when the executor is frozen.
+# A freeze means a build is failing and the rollback path matters more than
+# usual; that is the wrong moment for the only thing that tests the rollback
+# path to be stopped.
+
+[Service]
+Type=oneshot
+
+# Root for the docker socket, same as the executor. It holds no credential and
+# talks to no network service; the throwaway container it starts has no env
+# file, no bind mounts and no restart policy, so it cannot reach the spools,
+# the workspaces, the agent home, or Discord.
+User=root
+Group=root
+
+WorkingDirectory=/home/npurcell/clawcius/ops
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=OPS_CONFIG_PATH=/home/npurcell/clawcius/ops/ops-config.yaml
+
+ExecStart=/home/npurcell/.local/share/node/bin/node dist/verify-main.js
+
+# Exits non-zero when any instance's restore path is broken, so the unit shows
+# up in `systemctl --failed`. That is the loud part: a verifier whose failures
+# only land in a log file is a verifier nobody reads.
+SuccessExitStatus=0
+
+# Generous. Restoring a 2 GB image and starting it under gVisor is not fast,
+# and a timeout that fires mid-test would report a working snapshot as broken.
+TimeoutStartSec=1800
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawcius-snapshot-verify
