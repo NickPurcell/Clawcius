@@ -1,0 +1,402 @@
+/**
+ * clawcius-status — a read-only window onto the agents running on this host.
+ *
+ * ── The security model, in one place ───────────────────────────────────────
+ *
+ * This service has no authentication, and that is a deliberate design, not an
+ * omission. Authentication is delegated to the network:
+ *
+ *   1. It binds to LOOPBACK ONLY. Never 0.0.0.0, and the bind address is
+ *      validated twice — once in the config loader, once here immediately
+ *      before `listen`. The property this buys is the failure mode:
+ *      `tailscale serve` proxies from localhost, so if tailscaled dies the page
+ *      becomes UNREACHABLE rather than becoming PUBLIC. A page bound to
+ *      0.0.0.0 and merely firewalled has the opposite failure mode, and you
+ *      find out about it from a stranger.
+ *
+ *   2. It is READ-ONLY. Every route is GET or HEAD; anything else is refused
+ *      before routing. Nothing here writes, deletes, or spawns a process, and
+ *      no request parameter reaches a shell — there is no shell.
+ *
+ *   3. Ids from URLs are validated against a strict pattern AND resolved
+ *      inside their configured root, independently. See `transcripts.ts`.
+ *
+ *   4. Every string that reaches the browser is treated as hostile. Transcripts
+ *      contain whatever a user typed into Discord, whatever a web page said,
+ *      and — once Osmosis Jones runs — whatever text was in a pull request
+ *      opened by a stranger on the internet. The API returns JSON, the client
+ *      builds DOM nodes with `textContent`, and there is no `innerHTML` with
+ *      data anywhere in `public/`. Rendering that content unescaped would be
+ *      XSS regardless of the page being private.
+ *
+ *   5. Credential-shaped strings are redacted server-side on the way out. That
+ *      is a mitigation and not a guarantee — see the comment on the pattern
+ *      list in `transcripts.ts`.
+ */
+
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isLoopback, loadStatusConfig } from './config.js';
+import { readOjSnapshot } from './oj.js';
+import { isValidSubagentId, TranscriptStore } from './transcripts.js';
+import { buildAgentOverview, buildSessionDetail, buildSessionList } from './views.js';
+import { RootWatcher, type ChangeEvent } from './watch.js';
+
+const config = loadStatusConfig();
+const store = new TranscriptStore(config);
+
+const PUBLIC_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'public');
+
+/**
+ * Static assets, by exact name.
+ *
+ * An allowlist rather than "serve whatever is under public/". There is no
+ * user-supplied path arithmetic to get wrong, no dotfile to leak, and adding a
+ * file to the UI is a one-line change — which is a fair trade for a category
+ * of bug this service simply does not have.
+ */
+const ASSETS: Record<string, { file: string; type: string }> = {
+  '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
+};
+
+/**
+ * Content-Security-Policy, as tight as a page with no third-party anything can
+ * be. `default-src 'none'` means an injection that got past the DOM-building
+ * discipline in app.js still has nowhere to send what it found.
+ *
+ * No 'unsafe-inline' anywhere: the HTML carries no inline script and no inline
+ * style, specifically so this header can say so.
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  'Content-Security-Policy':
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
+    "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  // The page shows an entire host's agent activity; it has no business in
+  // anyone's search index or in a browser's shared cache.
+  'Cache-Control': 'no-store',
+};
+
+function send(
+  response: ServerResponse,
+  status: number,
+  type: string,
+  body: string | Buffer,
+  extra: Record<string, string> = {},
+): void {
+  response.writeHead(status, {
+    'Content-Type': type,
+    'Content-Length': Buffer.byteLength(body),
+    ...SECURITY_HEADERS,
+    ...extra,
+  });
+  response.end(body);
+}
+
+function sendJson(response: ServerResponse, status: number, payload: unknown): void {
+  send(response, status, 'application/json; charset=utf-8', JSON.stringify(payload));
+}
+
+/**
+ * Error bodies say what went wrong without saying where anything lives.
+ *
+ * Paths are already visible on this page — it is an observability tool for the
+ * person who owns the host — but an error path is reachable with a malformed
+ * URL, and echoing a resolved filesystem path back to whoever sent one is a
+ * habit worth not having.
+ */
+function fail(response: ServerResponse, status: number, message: string): void {
+  sendJson(response, status, { error: message });
+}
+
+// ── Watching ────────────────────────────────────────────────────────────────
+
+const watcher = new RootWatcher(
+  [
+    ...config.agents.map((agent) => ({ scope: agent.id, root: agent.projectsRoot })),
+    { scope: 'oj', root: config.oj.workersRoot },
+  ],
+  config.watch.debounceMs,
+  config.watch.rescanSeconds,
+);
+watcher.start();
+
+/** Open SSE clients. Held so shutdown can close them rather than drop them. */
+const streams = new Set<ServerResponse>();
+
+watcher.subscribe((event: ChangeEvent) => {
+  const frame = `event: change\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const stream of streams) {
+    // No error handling around the write on purpose: a client that has gone
+    // away emits 'close', which removes it from the set. Writing to a dead
+    // socket is a no-op, not a throw.
+    stream.write(frame);
+  }
+});
+
+/**
+ * The heartbeat.
+ *
+ * This is what makes a dead stream visible AS DEAD instead of as a quiet host.
+ * The client tracks the interval between heartbeats and marks the page stale
+ * when two go missing, so a reader can always tell "nothing is happening" from
+ * "this page stopped being told what is happening".
+ *
+ * Sent as an SSE comment (`: …`) rather than an event, so no client-side
+ * handler is needed for it to keep proxies from closing an idle connection —
+ * which matters here because `tailscale serve` is exactly such a proxy.
+ */
+const heartbeat = setInterval(() => {
+  const frame = `: heartbeat ${Date.now()}\n\nevent: heartbeat\ndata: ${JSON.stringify({
+    at: Date.now(),
+    watched: watcher.watchedCount,
+  })}\n\n`;
+  for (const stream of streams) stream.write(frame);
+}, config.watch.heartbeatSeconds * 1000);
+heartbeat.unref();
+
+// ── Routing ─────────────────────────────────────────────────────────────────
+
+function intParam(value: string | null, fallback: number, min: number, max: number): number {
+  if (value === null) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+async function handleApi(url: URL, response: ServerResponse): Promise<void> {
+  const now = Date.now();
+  const path = url.pathname;
+
+  if (path === '/api/overview') {
+    const agents = [];
+    for (const agent of store.agents) {
+      agents.push(await buildAgentOverview(store, agent, config, now));
+    }
+    sendJson(response, 200, {
+      generatedAt: new Date(now).toISOString(),
+      liveness: config.liveness,
+      agents,
+    });
+    return;
+  }
+
+  if (path === '/api/oj') {
+    sendJson(response, 200, await readOjSnapshot(config.oj));
+    return;
+  }
+
+  // /api/agents/<agentId>/sessions[/<sessionId>[/transcript]]
+  const parts = path.split('/').filter((part) => part.length > 0);
+  if (parts[0] === 'api' && parts[1] === 'agents' && typeof parts[2] === 'string') {
+    const agent = store.agent(parts[2]);
+    // Same 404 whether the id is malformed or simply not configured. There is
+    // nothing to enumerate here, but the habit costs nothing.
+    if (!agent) return fail(response, 404, 'no such agent');
+
+    if (parts[3] === 'sessions' && parts.length === 4) {
+      const { sessions, error } = await buildSessionList(store, agent, config, now);
+      sendJson(response, 200, { agent: agent.id, label: agent.label, sessions, error });
+      return;
+    }
+
+    if (parts[3] === 'sessions' && typeof parts[4] === 'string') {
+      const sessionId = parts[4];
+      const session = await store.findSession(agent, sessionId);
+      if (!session) return fail(response, 404, 'no such session');
+
+      if (parts.length === 5) {
+        sendJson(response, 200, await buildSessionDetail(store, session, config, now));
+        return;
+      }
+
+      if (parts[5] === 'transcript' && parts.length === 6) {
+        // `subagent` selects a child transcript instead of the parent's. It is
+        // validated here and then joined under the session directory, which
+        // `resolveWithin` has already confined — two checks, neither relying
+        // on the other.
+        const subagent = url.searchParams.get('subagent');
+        let target = session.transcriptPath;
+
+        if (subagent !== null) {
+          if (!isValidSubagentId(subagent)) return fail(response, 400, 'invalid subagent id');
+          const refs = await store.subagents(session);
+          const ref = refs.find((candidate) => candidate.agentId === subagent);
+          if (!ref) return fail(response, 404, 'no such subagent in this session');
+          target = ref.path;
+        }
+
+        const from = intParam(url.searchParams.get('from'), 0, 0, Number.MAX_SAFE_INTEGER);
+        const limit = intParam(
+          url.searchParams.get('limit'),
+          config.read.pageSize,
+          1,
+          config.read.pageSize,
+        );
+
+        try {
+          const page = await store.page(target, from, limit);
+          sendJson(response, 200, {
+            agent: agent.id,
+            sessionId: session.sessionId,
+            subagent,
+            ...page,
+          });
+        } catch (error) {
+          fail(
+            response,
+            503,
+            `transcript could not be read: ${error instanceof Error ? error.message : 'unknown'}`,
+          );
+        }
+        return;
+      }
+    }
+  }
+
+  fail(response, 404, 'no such endpoint');
+}
+
+function handleEvents(request: IncomingMessage, response: ServerResponse): void {
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    Connection: 'keep-alive',
+    // Both matter behind a proxy: without them an intermediary may buffer the
+    // stream and deliver nothing until it closes, which looks precisely like a
+    // dead stream — the state the heartbeat exists to distinguish.
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+    ...SECURITY_HEADERS,
+  });
+
+  // An immediate frame so the client can start its heartbeat clock without
+  // waiting a full interval to find out whether the stream works at all.
+  response.write(
+    `event: hello\ndata: ${JSON.stringify({
+      at: Date.now(),
+      heartbeatSeconds: config.watch.heartbeatSeconds,
+      agents: config.agents.map((agent) => agent.id),
+    })}\n\n`,
+  );
+
+  streams.add(response);
+  request.on('close', () => {
+    streams.delete(response);
+  });
+}
+
+async function handleAsset(pathname: string, response: ServerResponse): Promise<void> {
+  const asset = ASSETS[pathname];
+  if (!asset) return fail(response, 404, 'not found');
+  try {
+    const body = await readFile(join(PUBLIC_DIR, asset.file));
+    send(response, 200, asset.type, body);
+  } catch {
+    // Only reachable if the deployment is missing files it shipped with —
+    // worth saying plainly rather than as a bare 404 among the URL typos.
+    fail(response, 500, `asset ${asset.file} is missing from the deployment`);
+  }
+}
+
+const server = createServer((request, response) => {
+  // Read-only, enforced before anything looks at the path. There is no route
+  // that mutates, so this is redundant today; it is here so that it stays
+  // true if someone adds one without thinking about it.
+  const method = request.method ?? 'GET';
+  if (method !== 'GET' && method !== 'HEAD') {
+    send(response, 405, 'text/plain; charset=utf-8', 'read-only service', { Allow: 'GET, HEAD' });
+    return;
+  }
+
+  // The base is a placeholder — only the path and query are used, never the
+  // host — but URL parsing needs one and a malformed request line should 400
+  // rather than throw out of the request handler.
+  let url: URL;
+  try {
+    url = new URL(request.url ?? '/', 'http://localhost');
+  } catch {
+    fail(response, 400, 'malformed request');
+    return;
+  }
+
+  if (url.pathname === '/healthz') {
+    sendJson(response, 200, {
+      ok: true,
+      uptimeSeconds: Math.round(process.uptime()),
+      agents: config.agents.length,
+      streams: streams.size,
+      watched: watcher.watchedCount,
+      unwatched: Object.fromEntries(watcher.unwatched),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/events') {
+    handleEvents(request, response);
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/')) {
+    handleApi(url, response).catch((error: unknown) => {
+      // Last line of defence. An unhandled rejection in a request handler
+      // would otherwise take the process down under Node's default policy,
+      // and one bad transcript should not stop the page telling you about the
+      // other nineteen.
+      console.error('[status] request failed:', error);
+      if (!response.headersSent) fail(response, 500, 'internal error');
+      else response.end();
+    });
+    return;
+  }
+
+  handleAsset(url.pathname, response).catch(() => {
+    if (!response.headersSent) fail(response, 500, 'internal error');
+    else response.end();
+  });
+});
+
+// The second loopback check, immediately before the bind that would matter.
+// The config loader already rejects a non-loopback host; this catches the case
+// where a future refactor builds the listen options from somewhere else.
+if (!isLoopback(config.server.host)) {
+  throw new Error(
+    `refusing to bind ${config.server.host}: this service is loopback-only by design`,
+  );
+}
+
+server.listen(config.server.port, config.server.host, () => {
+  console.log(
+    `[status] listening on http://${config.server.host}:${config.server.port} ` +
+      `(loopback only — expose with: tailscale serve --bg ${config.server.port})`,
+  );
+  for (const agent of config.agents) {
+    console.log(`[status]   ${agent.id}: ${agent.projectsRoot}`);
+  }
+  for (const [scope, reason] of watcher.unwatched) {
+    // A warning, not a failure: the rescan timer covers it, and a root that
+    // does not exist yet is the normal state of a new instance.
+    console.warn(`[status]   not watching ${scope}: ${reason} (falling back to rescan)`);
+  }
+});
+
+function shutdown(signal: string): void {
+  console.log(`[status] ${signal} — closing`);
+  clearInterval(heartbeat);
+  watcher.stop();
+  // SSE connections are long-lived by definition, so `server.close()` alone
+  // would wait forever for them. Ending them explicitly is what makes a
+  // `systemctl restart` take a moment rather than a TimeoutStopSec.
+  for (const stream of streams) stream.end();
+  streams.clear();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

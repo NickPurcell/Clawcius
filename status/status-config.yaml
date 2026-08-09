@@ -1,0 +1,100 @@
+# Status page configuration.
+#
+# Every value here has a default in src/config.ts; this file exists to make the
+# deployment's actual shape a diff rather than a thing you have to infer from
+# TypeScript. Anything you delete falls back to that default.
+#
+# There are no secrets in here, by design. The service reads files and serves
+# HTML — it authenticates to nothing and mutates nothing.
+
+server:
+  # LOOPBACK ONLY. This is enforced, not advised: config.ts refuses to start on
+  # anything that is not 127.0.0.0/8 or ::1.
+  #
+  # `tailscale serve` terminates TLS and proxies to this address, so the page
+  # reaches the tailnet and nothing else. The property that makes it worth the
+  # constraint is the failure mode: if tailscaled dies, the page becomes
+  # unreachable rather than becoming public.
+  host: 127.0.0.1
+  port: 8477
+
+# One entry per agent instance.
+#
+# These paths are the host side of the mount in docker/run-container.sh:
+#
+#     AGENT_HOME=$CLAWCIUS_STATE_DIR/agent-home
+#     -v "$AGENT_HOME:/home/agent/.claude-agent:rw"
+#     -e CLAUDE_CONFIG_DIR=/home/agent/.claude-agent
+#
+# so instance `X` writes its transcripts to /var/lib/X/agent-home/projects on
+# the host. If you add a third instance, add it here — the service does not
+# discover instances, because guessing which directories are agent homes is a
+# worse failure than a missing line in a config file.
+#
+# A root that does not exist yet is fine and is shown as such. A brand-new
+# instance legitimately has no projects directory until its first turn.
+agents:
+  - id: clawcius
+    label: Clawcius
+    projectsRoot: /var/lib/clawcius/agent-home/projects
+
+  - id: hamachi
+    label: Hamachi
+    projectsRoot: /var/lib/hamachi/agent-home/projects
+
+  # Osmosis Jones, once it runs as a Claude Code instance of its own. Left
+  # commented rather than pointing at a non-existent path so the overview does
+  # not carry a permanently broken row.
+  # - id: oj
+  #   label: Osmosis Jones
+  #   projectsRoot: /var/lib/oj/agent-home/projects
+
+liveness:
+  # Newest transcript write within this many seconds => running.
+  # Generous on purpose: a long tool call (docker build, npm install, a clone)
+  # writes nothing for minutes, and an agent that flickers to "idle" mid-build
+  # trains you to ignore the indicator.
+  runningSeconds: 180
+
+  # Beyond runningSeconds but within this => idle. Beyond it => stale, which is
+  # the state worth looking at: an agent nobody has spoken to and an agent
+  # wedged mid-turn are identical from outside, and this is the line that
+  # separates "quiet" from "suspicious".
+  idleSeconds: 3600
+
+oj:
+  # Osmosis Jones's per-PR worker directories, <workersRoot>/<owner>__<repo>__<pr>.
+  # OJ is not running yet; missing is the expected state and renders as
+  # "no OJ data yet" rather than an error.
+  workersRoot: /var/lib/oj/workers
+  stateFile: /var/lib/oj/state.json
+
+read:
+  # Transcript lines per page.
+  pageSize: 60
+  # Ceiling on bytes read off disk for one page. A single JSONL line can hold a
+  # whole file's contents, so a line count alone does not bound the response.
+  maxPageBytes: 2000000
+  # Characters kept per content block before truncation. The file on disk is
+  # the archive; this is a reader.
+  maxBlockChars: 20000
+  # Session indexes held in memory (offsets and per-line metadata, never
+  # message bodies). LRU beyond this.
+  maxCachedSessions: 64
+
+watch:
+  # Coalescing window for filesystem events. One agent turn is many writes.
+  debounceMs: 400
+  # SSE heartbeat. The client marks the stream dead after missing two, so this
+  # is also the resolution of "is this page still telling the truth".
+  heartbeatSeconds: 15
+  # Rescan interval. Called a fallback, but on this host it is probably the
+  # PRIMARY mechanism: the agents write their transcripts inside a gVisor
+  # container to a bind mount we watch from the host side, and SETUP.md § 6b
+  # records that "gVisor's gofer does not reliably deliver inotify for writes
+  # made inside the sandbox" — which is why the waker carries a 5s sweep next
+  # to its own fs.watch. Same topology here, so the same assumption applies.
+  #
+  # fs.watch is still set up: when it fires the update is instant and free.
+  # It is just not trusted on its own. 0 disables the rescan.
+  rescanSeconds: 10

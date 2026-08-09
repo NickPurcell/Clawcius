@@ -351,6 +351,48 @@ A unix socket was the original design. gVisor blocks connections to host unix
 sockets, correctly, since one would be a hole straight through the sandbox
 boundary; a bind-mounted directory needs no such exception.
 
+## 7. The status page
+
+`status/` is a separate, read-only service that shows what every agent on this
+host has been doing — liveness, session timelines, and the subagent tree for
+any session drawn over a time axis. It reads transcripts off local disk and
+talks to nothing: not Docker, not Discord, not the agents. It deliberately has
+no dependency on the rest of the stack, because a status page that goes down
+with what it monitors is one you cannot use at the moment you need it.
+
+```sh
+cd status && npm install && npm run build
+
+sudo cp systemd/clawcius-status.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now clawcius-status
+```
+
+It binds `127.0.0.1:8477` and **refuses to start on any non-loopback address**.
+Publishing it to the tailnet is one command:
+
+```sh
+sudo tailscale serve --bg 8477
+```
+
+That terminates HTTPS with a Tailscale-issued certificate, gives the page a
+MagicDNS name (`https://<hostname>.<tailnet>.ts.net/`), and proxies to the
+loopback port. No public port is opened and no firewall rule is needed. Check
+with `tailscale serve status`; remove with
+`sudo tailscale serve --bg --https=443 off`.
+
+The loopback bind is the point rather than an implementation detail: if
+tailscaled dies, the page becomes *unreachable* instead of becoming *public*.
+
+Transcript roots default to the host side of the agent-home mount —
+`/var/lib/clawcius/agent-home/projects` and `/var/lib/hamachi/agent-home/projects`.
+Adding an instance means a new entry under `agents:` in
+`status/status-config.yaml` **and** a matching `ReadOnlyPaths=` line in the
+unit. Full detail, including the security model, is in
+[`status/README.md`](status/README.md).
+
+---
+
 ## Known gaps
 
 - **Not exercised end-to-end since the container migration.** Agent turns,
