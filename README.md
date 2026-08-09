@@ -81,7 +81,7 @@ claude -p --output-format stream-json --verbose
        --session-id <uuid> | --resume <uuid>
        --setting-sources user
        --strict-mcp-config
-       --permission-mode acceptEdits
+       --permission-mode auto --settings <deny-rules>
        --append-system-prompt-file prompts/worker-system-prompt.md
 ```
 

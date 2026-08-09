@@ -669,11 +669,51 @@ type SpawnOutcome = {
   resultIsError: boolean;
 };
 
+/**
+ * Permission settings for a reviewer.
+ *
+ * A code reviewer has no business editing the code it reviews, but it cannot be
+ * made read-only either: it has to write its report, and a mode that forbids
+ * all writes would have it complete the whole review and then be unable to hand
+ * over the result.
+ *
+ * So the rule is narrower than any single permission mode expresses — write
+ * exactly one file, read anything, change nothing. `--permission-mode auto`
+ * keeps the session from stopping to ask a question nobody is there to answer;
+ * these rules are what actually constrain it.
+ *
+ * The deny list names the ways a review turns into a mutation: editing the
+ * tree, committing, pushing, rewriting history, or reaching for the `gh` CLI,
+ * which would be an unexpected second path to GitHub with credentials of its
+ * own. Deny beats allow in Claude Code's permission model, so these hold even
+ * though the mode is permissive.
+ */
+function workerPermissionSettings(reportPath: string): string {
+  return JSON.stringify({
+    permissions: {
+      allow: [`Write(${reportPath})`, `Edit(${reportPath})`],
+      deny: [
+        'Write(*)',
+        'Edit(*)',
+        'NotebookEdit(*)',
+        'Bash(git push:*)',
+        'Bash(git commit:*)',
+        'Bash(git reset:*)',
+        'Bash(git rebase:*)',
+        'Bash(git checkout:*)',
+        'Bash(git clean:*)',
+        'Bash(gh:*)',
+      ],
+    },
+  });
+}
+
 function spawnClaude(
   request: ReviewRequest,
   workerDir: string,
   prompt: string,
   resume: boolean,
+  reportPath: string,
 ): Promise<SpawnOutcome> {
   const { config } = request;
   const sessionId = sessionIdFor(request.repo.slug, request.pull.number);
@@ -701,11 +741,18 @@ function spawnClaude(
     // MCP server is a tool with credentials attached, which is the one thing
     // this worker must not have.
     '--strict-mcp-config',
-    // The worker writes scratch files and its report. It does not need to ask.
-    // Note this also lets it edit the clone — which is why the tree is reset
-    // from git at the start of every round rather than trusted between them.
+    // `auto` so the session never stops to ask a question no human is present
+    // to answer — in headless that is a hang, not a refusal. The actual limits
+    // are the deny rules below, which are narrower than any mode: a reviewer
+    // may read everything and write exactly its report.
+    //
+    // The tree is still reset from git at the start of every round. Defence in
+    // depth: a permission rule is a policy, and a policy is a thing that can be
+    // misconfigured.
     '--permission-mode',
-    'acceptEdits',
+    'auto',
+    '--settings',
+    workerPermissionSettings(reportPath),
     // The standing rules: what the worker is, what it must not trust, what it
     // must produce. Separate from the kickoff so that they survive compaction
     // and are not something the conversation can talk itself out of.
@@ -870,7 +917,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   // should not require re-deriving it from config.
   writeFileSync(join(workerDir, 'oj', `kickoff-round-${request.round}.md`), prompt);
 
-  let outcome = await spawnClaude(request, workerDir, prompt, !firstRound);
+  let outcome = await spawnClaude(request, workerDir, prompt, !firstRound, reportPath);
 
   // A resume against a transcript that no longer exists — the host was
   // reimaged, ~/.claude was cleared, the retention window passed. The PR is
@@ -880,7 +927,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
     request.onProgress?.('resume found no transcript — starting a fresh session');
     const fresh = buildKickoff(request, clone, reportPath);
     writeFileSync(join(workerDir, 'oj', `kickoff-round-${request.round}-restart.md`), fresh);
-    outcome = await spawnClaude(request, workerDir, fresh, false);
+    outcome = await spawnClaude(request, workerDir, fresh, false, reportPath);
   }
 
   const durationMs = Date.now() - startedAt;
