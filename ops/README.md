@@ -1,15 +1,14 @@
 # ops
 
-A host-side executor for a fixed list of privileged operations, requested by
-the sandboxed agents by dropping JSON files in a directory.
+A host-side supervisor for a **host agent**: a headless Claude Code session,
+running on the host with a shell and sudo, that carries out tasks the sandboxed
+agents describe in free text.
 
-The agents run in gVisor containers with no docker socket and no host socket —
-deliberately, and `docker/run-container.sh` carries the note about why mounting
-one would make the sandbox decorative. That leaves them unable to do anything
-about their own deployment: they can write code and push it, and then someone
-has to log in and restart a service. This is the narrow, enumerated hole through
-that wall, so the agents can maintain their own deployments without the sandbox
-becoming decorative after all.
+Until 2026-08-10 this was a closed list of seven verbs and this file said, in
+several places, that there must never be a model in it. That is no longer true.
+The rest of this document is about what changed, why, what was given up, and
+what was put in its place — because the trust model changed and this is the
+place that has to say so honestly.
 
 ```
   agent containers                          host
@@ -17,126 +16,492 @@ becoming decorative after all.
   │ clawcius               │  bind mount   │ clawcius-ops.service (root)          │
   │  /var/lib/clawcius/run │ ────────────► │  one spool watched per instance      │
   │    ops/   wake/        │               │  the SPOOL names the requester       │
-  ├────────────────────────┤               │  closed verb list, config allowlists │
-  │ hamachi                │  bind mount   │  one operation at a time             │
-  │  /var/lib/hamachi/run  │ ────────────► │  waits for an idle turn              │
-  │    ops/   wake/        │ ◄──────────── │  arms a check-in deadline            │
-  └────────────────────────┘   wakes back  │  rolls back if nobody checks in      │
-                                           └──────────────────────────────────────┘
+  ├────────────────────────┤               │  one task at a time                  │
+  │ hamachi                │  bind mount   │  snapshot ▸ idle-wait ▸ SESSION ▸    │
+  │  /var/lib/hamachi/run  │ ────────────► │    health check ▸ roll back if worse │
+  │    ops/   wake/        │ ◄──────────── │  every command audited, in full      │
+  └────────────────────────┘   wakes back  │  deadline armed on what it touched   │
+                                           └───────────────┬──────────────────────┘
+                                                           │ claude -p, as npurcell,
+                                                           │ with Bash and sudo
+                                                           ▼
+                                                    the whole machine
 ```
 
-## The verbs
+## Why the verbs went
 
-Requests are JSON objects. Write to `<name>.tmp` and rename to `<name>.json` —
-the executor only looks at `.json`, and a file written in place can be read
-while it is still empty.
+The operator, on 2026-08-10, in his own words: he is **"sick of this whole verbs
+game"**.
+
+Standing up three services that evening took roughly a dozen ad-hoc shell
+commands that he had to type himself — `chown`, `mkdir`, editing a config file,
+installing units, and above all pasting `journalctl` output back to an agent
+that could not read it. Not one of those is `restart`, `pull`, `redeploy`,
+`snapshot` or `rollback`.
+
+That is not a gap in the verb list. It is a property of verb lists. A closed set
+can only ever contain what somebody imagined in advance, and every gap in it
+turns the operator into the agent's hands: typing what the agent dictates,
+pasting back what the machine says. That is exactly the labour this system
+exists to remove, so a safety mechanism that reinstates it at every unforeseen
+step is not a safety mechanism with a cost — it is one that is eating the
+product.
+
+## The requests
+
+Write to `<name>.tmp` and rename to `<name>.json` — the executor only looks at
+`.json`, and a file written in place can be read while it is still empty.
 
 | Verb | Fields | What it does |
 |---|---|---|
-| `restart` | `unit` | `systemctl restart` an allowlisted unit |
-| `pull` | `repo` | `git pull --ff-only`, **then `npm ci && npm run build`** |
-| `redeploy` | `instance` | build, snapshot, then `docker/run-container.sh --recreate` |
-| `snapshot` | `instance` | `docker/snapshot.sh` — commit the writable layer |
-| `rollback` | `instance`, optional `tag` | restore a snapshot image and recreate |
+| `task` | `task`, optional `instance` | free text, handed to a host agent session |
 | `checkin` | `instance` | "I came back up" — closes an armed deadline |
+| `rollback` | `instance`, optional `tag` | restore a snapshot image and recreate |
 | `wake` | `channel`, `detail` | relay a wake into the waker's own spool |
 
-`reason` is accepted on anything and is worth writing: it ends up in the
-journal, and in the wake the executor sends you after a rebuild.
+`reason` is accepted on anything and is worth writing: it ends up in the journal
+and in the wake you get back.
 
 ```sh
 # Your own spool. Clawcius: /var/lib/clawcius/run/ops.
 #                 Hamachi: /var/lib/hamachi/run/ops.
-OPS=$CLAWCIUS_STATE_DIR/run/ops        # or just the literal path for your instance
-printf '%s' '{"verb":"restart","unit":"clawcius.service","reason":"picked up new dist/"}' \
-  > $OPS/$(date +%s).tmp && mv $OPS/$(date +%s).tmp $OPS/$(date +%s).json
+OPS=$CLAWCIUS_STATE_DIR/run/ops
+STAMP=$(date +%s)
+printf '%s' '{"verb":"task","instance":"clawcius","task":"clawcius.service has been
+restarting every 30s since the last deploy. Find out why and fix it. Do not
+change anything outside the checkout without saying so."}' > $OPS/$STAMP.tmp \
+  && mv $OPS/$STAMP.tmp $OPS/$STAMP.json
 ```
 
-There is no `requester` field and there must never be one. **The spool you
-wrote into is who you are** — see the next section.
+There is no `requester` field and there must never be one. **The spool you wrote
+into is who you are** — see [Provenance](#provenance-is-the-directory-not-a-field).
 
-`wake` is a relay, not a new capability: the waker already accepts wake files
-written by the agent, so this adds nothing it could not do directly. It exists
-so the ops spool is genuinely one queue with a verb list rather than a second
-queue beside the old one. **The existing wake spool is untouched** — same
-directory, same format, same rate limit.
+### Which verbs were kept, and why
 
-## `pull` builds. It has to.
+Deleted: `restart`, `pull`, `redeploy`, `snapshot`. Each of them is now a
+sentence a task can say, and each was an argument allowlist to maintain.
+`snapshot` is not gone as a *behaviour* — every task takes one before it starts,
+which is strictly more than a verb somebody had to remember to call.
 
-Every service in this repository starts as `node dist/index.js`, and **not one
-unit compiles anything.** The build was a thing a human did between the pull
-and the restart, and it was never written down as a step because it was never a
-step — it was a habit.
+The three that were kept are plumbing, and each survived for its own reason:
 
-On 2026-08-09 the habit was skipped. The always-on-channels change was merged,
-`agent-config.yaml` was correct, the checkout was pulled, `systemctl restart
-clawcius` returned 0, and the feature did nothing at all for an hour. `dist/`
-was still yesterday's. Nothing failed, nothing logged, the unit was `active
-(running)` the whole time. The tell, eventually, was that even the *config
-warning* about unreachable always-on channels never appeared — code that had
-been merged was simply not on the machine.
+- **`checkin` could not have been dropped.** It is the answer to a question the
+  executor asked. A destructive task arms a deadline and rolls the instance back
+  on silence, so the check-in has to work when the instance answering it has
+  just been rebuilt and may be barely alive. It runs no command and is answered
+  inline without taking the lock. Routing it through a model would make the
+  recovery path depend on the thing being recovered.
+- **`rollback` is deliberately not delegated.** It is the undo, and the undo is
+  the safety property that replaced the verb list. "Whatever it does can be
+  undone" is worth nothing if undoing is itself a free-text task carried out by
+  the same machinery that just broke something. It is a fixed argv — retag an
+  image, recreate a container — and the automatic deadline path calls the same
+  code, so it exists whether or not it is exposed.
+- **`wake` is not a privilege at all.** It relays a wake into the waker's own
+  spool, which the agent can already write. It runs no command and grants
+  nothing, so deleting it would remove a documented capability in exchange for
+  nothing.
 
-That is one hour, from one human doing pull-then-restart once. The first draft
-of this executor exposed `pull` and `restart` as separate verbs with no build
-between them, which does not merely permit that mistake: it is a machine that
-performs it, on request, in four seconds, as often as it is asked.
+## What a task actually does
 
-So `pull` now means *bring this checkout up to date and make it runnable*:
+1. **Refuse early.** Disabled? Frozen? Out of scope for this requester? Owner of
+   the checkout unknowable? Nothing starts.
+2. **Sample health.** `systemctl is-active` for every unit under `units:`,
+   `docker container inspect` for every instance. This is the baseline, and
+   having one is what makes "this was already broken" distinguishable from "this
+   task broke it".
+3. **Snapshot every instance in scope**, and record the tag to go back to. If
+   the snapshot fails, the task is refused: a session with a shell and no
+   rollback target is not a deployment, it is a coin toss.
+4. **Wait for an idle turn** on every instance in scope. A task may recreate a
+   container and every live agent session is a `docker exec` into one.
+5. **Run the session**, auditing every Bash command as it is issued.
+6. **Sample health again and compare.** Anything that was up and is now not is a
+   regression.
+7. **Roll back** if the agent reported failure, the audit came out incomplete,
+   the report says "failed", or health regressed.
+8. **Arm a check-in deadline** for each instance the task actually touched.
+9. **Report back** into the requester's wake spool.
 
+### Scope: naming an instance is how you buy a cheap task
+
+A task may name an `instance`. If it does, that instance is what gets
+snapshotted, idle-waited, health-checked and rolled back.
+
+**If it names none, every configured instance is in scope.** That default is the
+expensive one on purpose. "Which containers might this sentence disturb" has no
+answer — it is prose, and the session has a shell — and the only safe reading of
+"no answer" is the same one `readIdle` uses for a missing waker status file:
+assume the dangerous case. So an unnamed task costs a `docker commit` per
+instance and a wait for all of them to go idle.
+
+An instance restricted by `mayRequest.instances` may not file an unnamed task at
+all, because for it "unnamed" would be *wider* than what it is allowed rather
+than narrower and slower. It is refused with the fix in the message.
+
+## The audit is the accountability mechanism now
+
+Every Bash invocation the session makes is written into
+`/var/lib/clawcius-ops/journal.jsonl` as its own entry, with the **full command
+string**, byte for byte, in the `command` field — not summarised, not re-quoted,
+not shortened. Evidence that has been tidied up is not evidence.
+
+```sh
+sudo grep '"kind":"audit"' /var/lib/clawcius-ops/journal.jsonl | jq -r '.command'
 ```
-git rev-parse --abbrev-ref HEAD   # on the configured branch?
-git status --porcelain            # clean?
-git pull --ff-only
-npm ci && npm run build           # in each of repo.buildDirs, as the owner
+
+Three properties matter more than the format:
+
+- **It is written before the result is known.** Not collected and flushed at the
+  end. A session killed by a timeout mid-`rm` still has that `rm` on disk; a
+  buffer inside a process that just died is not a record.
+- **An incomplete audit fails the task.** Every command arrives through the
+  agent's stream-json output, so a line that could not be parsed is a command we
+  cannot swear we logged. That fails the task on its own and triggers the
+  rollback. A command that runs and is not logged is the one failure this design
+  cannot tolerate, and the honest response to "we might have missed one" is to
+  put the container back.
+- **The sub-agent tool is denied.** A sub-agent's tool calls do not appear in
+  this session's stream, so a Bash command run inside one would execute
+  unaudited. Denying `Task` is what makes "one conversation" true, and "one
+  conversation" is what makes the audit complete.
+
+It reaches the status page through the existing contract and needed no new
+plumbing: audit entries *are* journal entries, so they are already in the last
+hundred events in `<stateDir>/ops-status.json`, which is the file `status/`
+reads off local disk. `ops-status.json` also gained `hostAgent` (what this
+daemon is now capable of), `auditedCommands` and `lastTask`. Nothing was
+removed, so a reader written against the old shape still works.
+
+## Snapshot before, roll back on failure
+
+`redeploy` used to snapshot before recreating a container. Now every task does,
+for every instance in scope, and the tag is captured at that moment rather than
+looked up afterwards — because afterwards the newest snapshot could easily be
+one taken of the broken state.
+
+On failure the executor retags that exact snapshot and recreates the container,
+without being asked and without waiting for an idle turn. The idle wait already
+happened before the task; a container a failed task has just wedged may never
+report idle again, and waiting for it would turn "roll back on failure" into
+"roll back unless the failure was bad enough to matter".
+
+**This is container-scoped, and that limit is the most important sentence in
+this document.** `docker commit` captures an agent container's writable layer.
+It does not capture `/etc`, the checkout, systemd units, or anything else on the
+host. A task that breaks the host filesystem is undone by the VPS snapshot and
+by git, by a person. The operator accepted that explicitly; it is written here so
+that nobody has to discover it.
+
+Because a snapshot is now taken per task rather than per night, `snapshotKeep`
+raises `docker/snapshot.sh`'s retention from 8 to 24. The ring is shared with the
+nightly timer and whoever runs last prunes to their own ceiling, so at 8 a busy
+evening would evict the previous night's backup by morning. This costs disk.
+
+## Dry run — on by default, and genuinely unable to act
+
+`ops-config.yaml` ships with `dryRun: true`, **and it should stay that way until
+you have read the log.**
+
+The executor still makes every decision it would really make. The difference
+from every other dry-run in this repository is that the session is not asked
+nicely: **the Bash tool is removed from it by Claude Code's permission system**,
+along with everything else that can change the machine. It investigates with
+read-only tools and then writes out the exact list of commands it would have
+run, and that list goes in the journal.
+
+### What was learned by testing this, on 2026-08-10
+
+Claude Code's permission semantics are not what they look like. Every line below
+was established by running `claude -p` against real settings and reading the
+stream, not by reasoning:
+
+- `deny: ["Bash"]` **removes the tool from the session entirely.** The init
+  message's tool list does not contain it and the model reports that it has no
+  way to run anything.
+- **Deny survives `--permission-mode bypassPermissions`.** With
+  `deny: ["Bash(gh:*)"]` and that mode, `echo` ran and `gh --version` came back
+  *"Permission to use Bash with command gh --version has been denied"*, recorded
+  in the result message's `permission_denials`. The mode removes the questions
+  nobody is there to answer; the deny rules are what actually bound the session.
+- `Write(<path>)` **allow rules are inert** — only `Edit(path)` is matched
+  against file paths — `deny: ["Write(*)"]` removes the Write tool rather than
+  scoping it, and `deny: ["Edit(*)"]` does not restrict paths at all. Nothing
+  here relies on any of that. Where a tool should be gone, the bare tool name is
+  used.
+- **Denying Bash alone does not stop execution.** The session still held `Task`,
+  `Monitor`, `CronCreate`, `RemoteTrigger`, `Workflow`, `Skill`, `Write` and
+  `Edit` — and the model, asked to run a command with Bash denied, pointed out
+  unprompted that `Monitor` "does execute a shell command" and offered to use
+  it. That is why `DRY_RUN_TOOL_DENY` in `src/host-agent.ts` is long and blunt.
+  Naming a tool that does not exist in a given install is harmless; missing one
+  is not.
+
+With the shipped dry-run settings the session's tool list comes back as
+`['Glob', 'Grep', 'Read']`, an attempt to `Write` is refused with *"No such tool
+available"*, and the file it was asked to create does not exist afterwards.
+
+## The trust model
+
+> **The spool is written by an agent that may be prompt-injected, and read by a
+> root process that starts a shell session with sudo.**
+
+That sentence used to end "…and this service is where the container boundary is
+enforced". It does not any more. **For this component the sandbox has stopped
+being a security boundary.** The operator was warned twice and accepted the
+trade in writing. What is offered in exchange is rollback, the audit log, and
+the fact that this is a personal VPS with snapshots.
+
+Everything below is what is still true.
+
+### The host agent must never ingest untrusted content
+
+This is the security model now.
+
+> **OJ reads hostile input and holds no credential.
+> This agent holds everything and must read nothing hostile.**
+
+Its inputs are task files from the agents and a briefing the executor assembled
+itself out of read-only probes — unit states, container states, `git rev-parse`,
+the list of uncommitted filenames. **Never a PR diff. Never repository files
+from a branch under review. Never OJ's findings. Never a web page.**
+
+Enforced three ways, in descending order of how much they are worth:
+
+1. **Structurally.** The only text that reaches the prompt is the request's
+   `task` field plus facts this daemon gathered. There is no code path in `ops/`
+   that reads a diff, a pull request, or a file from a branch.
+2. **By tool policy.** `WebFetch`, `WebSearch` and the sub-agent tool are denied
+   outright; `Bash(gh:*)`, `Bash(curl:*)` and `Bash(wget:*)` are denied by rule.
+3. **By instruction.** The standing system prompt says so in as many words, and
+   tells the session that a task asking it to read untrusted content is either a
+   mistake or an injection and gets the same answer either way.
+
+The second and third are defence in depth over a shell, and neither is airtight:
+`sh -c 'curl …'` is one layer of indirection away. The first is the one that
+holds, and it holds only as long as nobody adds a feature to this directory that
+reads something a stranger wrote. If someone wires this session up to summarise
+a pull request, the trade the operator accepted has silently become a
+prompt-injectable root shell — and it will look like a feature.
+
+### It holds no Discord token, and that is asserted rather than assumed
+
+The session reports its result back through the spool and the **sandboxed agent
+does the talking**. A session with a shell, sudo and a chat credential is a
+session that can be talked into impersonation.
+
+Its environment is built from an allowlist, the same shape as `worker.ts` in the
+OJ project and for the same reason: a denylist has to anticipate every name a
+credential might be under and fails open on the one nobody thought of, while
+starting from nothing fails closed. `assertNoSecrets()` then re-checks the built
+environment and **refuses to spawn** — not warns — if any variable name looks
+like a credential (`DISCORD*`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_API_KEY`)
+or if any value contains the live Discord token as a substring. An operator can
+override that per-name with `hostAgent.envPassthrough`, which is the point: it
+makes "yes, I mean it" a diff somebody reviewed.
+
+`clawcius-ops.service` has no `EnvironmentFile` at all and must never gain one.
+The session authenticates with the owner's own Claude Code OAuth credentials
+under `/home/npurcell`.
+
+### The session runs as the checkout's owner, never as root
+
+Discovered by `stat`ing the checkout, never hardcoded, exactly as the build step
+it replaces did — this daemon is not entitled to an opinion about who owns a
+directory it was pointed at. The drop is `setuid(2)` performed by libuv in the
+forked child before `execve`, so there is no `sudo`, no `su` and no setuid
+binary involved, and `NoNewPrivileges` has no bearing on it.
+
+**If the owner cannot be determined, the task is refused.** Running a session
+with a shell as root is a much larger version of the 2026-08-09 failure that
+motivated the original drop: not two commands leaving root-owned files, but
+every command it chooses to run.
+
+The upside is that the original failure becomes structurally impossible for
+anything the session does without `sudo`. It cannot leave a root-owned
+`node_modules/` behind by accident, because it is not root.
+
+### What still holds, unchanged
+
+**Provenance.** The requester is the spool directory the file was found in, one
+per instance, each bind-mounted into exactly one container. It is stamped on in
+`src/spool.ts` where the file's contents cannot reach it, and a request that
+writes `"requester": "clawcius"` into Hamachi's spool is logged as an ignored
+unknown field and attributed to Hamachi.
+
+**Structural rejection, not repair.** Malformed JSON is discarded whole. Nothing
+salvages the parseable prefix of a broken file and nothing coerces types.
+
+**Traversal and control bytes are refused, not stripped**, on every identifier —
+`instance`, `tag`, `channel` — even though they are never used as paths.
+
+**Every identifier is still a lookup, not a value.** `instance` is compared by
+exact equality against config and what reaches a docker argv is the config
+entry. That rule is intact everywhere the *executor* builds a command. It cannot
+apply to a task, which is prose.
+
+**No shell in the executor.** Every command this daemon runs is an argv array
+handed to `execFile` with `shell: false`. The host agent obviously runs a shell —
+that is what it is for — and every string it hands to it is in the audit.
+
+**Caps everywhere.** Per-file size cap enforced by `stat` before the file is
+opened; a cap on files per sweep; a ceiling on files present, past which the
+spool is drained unread; a rolling-hour cap on accepted operations; a bounded
+queue; a wall-clock timeout and a **dollar ceiling** per task.
+
+**The state directory is out of reach of the containers.** The journal, the
+breaker and any armed deadline live in `/var/lib/clawcius-ops`, which is not
+bind-mounted anywhere and is 0750 root-owned. The loader refuses to start if it
+is ever placed inside any spool, or inside the host agent's working directory.
+
+**The host agent's working directory is not the checkout.** Claude Code
+auto-discovers `CLAUDE.md` and project settings from its cwd, and the checkout
+is a tree the agents can get commits merged into — so a session pointed at it
+would take standing instructions from anything they could merge. It is
+`/var/lib/clawcius-host-agent`, and the loader refuses a `workDir` inside any
+repo path, any spool, or `stateDir`.
+
+### What this does *not* protect against
+
+Honest list, and it is longer than it was.
+
+- **The host agent can do anything on this host.** That is the feature. It is
+  bounded by the rate limit, the timeout, the budget, the lock and the rollback
+  — not prevented. There is no allowlist in front of prose and there cannot be.
+- **The rollback is containers only.** `/etc`, the checkout, unit files,
+  packages: not covered. VPS snapshots and git are the recovery path, and a
+  person is the one who invokes them.
+- **The audit is not tamper-proof.** The session runs as `npurcell`, and
+  `npurcell` is in the `docker` group, which SETUP.md itself describes as
+  "effectively root on the host". Anything that can become root can rewrite
+  `journal.jsonl`. The sudoers file is scoped so that the *easy* path is the
+  audited one — no `sudo sh`, no `sudo tee`, no `sudo cp` — but this is a record
+  against carelessness and confusion, not against a determined adversary with a
+  docker socket.
+- **`mayRequest` bounds what an instance may ASK for, not what the agent may
+  DO.** A task scoped to `hamachi` is still carried out by a session with a
+  shell, and nothing but the task text and the standing prompt points it at
+  Hamachi rather than at anything else on the box. It is a statement of intent
+  that the journal records.
+- **`mayRequest.units` and `mayRequest.repos` are now inert.** No request carries
+  a unit or a repo. The loader says so loudly at boot rather than failing to
+  start, and anybody who wrote them believing they restricted something is now
+  wrong.
+- **A dirty tree no longer stops anything.** The check that refused a `pull` is
+  gone; the filenames go into the briefing and the standing prompt forbids
+  `reset --hard`, `checkout -f`, `stash` and `clean`. An instruction can be
+  forgotten in a way a check cannot. This was a deliberate trade: sometimes the
+  right answer during an incident *is* to work in a dirty tree, and a daemon
+  that could not was a daemon the operator worked around by hand.
+- **The build is an instruction again.** Nothing here compiles on start, and the
+  hour that cost on 2026-08-09 is now prevented by a standing rule plus the
+  per-repo `buildDirs` in the briefing rather than by a step that cannot be
+  skipped.
+- **A task that names no instance may still touch one.** Scope-by-omission takes
+  everything, so the snapshot and the rollback do cover it — but nothing stops
+  the session from touching a container the requester was not thinking about.
+  The deadline machinery catches this after the fact by scanning the audit for
+  container names, which is over-broad on purpose.
+- **`task`, `reason` and `detail` are attacker-influenced text.** `task` now
+  reaches a model's prompt, which is not safer than reaching a shell — it is the
+  deal. The rest end up in the journal, in `ops-status.json`, and in wake
+  prompts; anything rendering them owes them the same suspicion.
+- **Root is root.** This service being small and readable is still the
+  mitigation for the supervisor. It is not a mitigation for the session.
+
+## Why a separate daemon
+
+`restart clawcius.service` is one of the things a task will ask for. A process
+cannot restart itself: systemd sends it SIGTERM, it dies, and whatever it was
+doing dies with it — including the record of what it was doing and any deadline
+it had just armed. The argument is stronger for a container recreate: every live
+agent session *is* a `docker exec` into the container being recreated.
+
+So it is a unit of its own, with no Discord connection and no GitHub token. It
+now has a model, and `src/host-agent.ts` is where that decision is written down
+in full.
+
+## One task at a time
+
+A lock, not a negotiation. Two host agent sessions with sudo running
+concurrently on the same box is not a scenario anybody should have to reason
+about, and it is much worse than the two overlapping docker operations this lock
+was originally written to prevent. A second request queues; past
+`limits.maxQueued` it is refused with a reason the agent can read.
+
+Missing, stale, malformed or future-dated waker status all read as *busy*. The
+stale case is the important one: a waker that crashed leaves a file saying
+`liveCount: 0` forever, and a stale zero is the most dangerous value in this
+system because it is the one that reads as permission.
+
+## The deadline, and the revert
+
+After a task that touched an instance, the executor:
+
+1. files a wake to that instance carrying context — *a host task touched you
+   because `<reason>`; here is what to check; check in within N minutes*;
+2. waits `deadline.minutes` for a `checkin` request from it;
+3. on silence, rolls back to the snapshot taken immediately **before** the task,
+   and reports.
+
+"Touched" is answered from the audit: the task named it, or its container name,
+image or one of the deploy scripts appears in a command the session ran. That is
+a substring match over shell text and is deliberately over-broad — a false
+positive costs one wake and one check-in, a false negative is an instance
+recreated with nobody waiting to hear whether it came back.
+
+### Circuit breaker
+
+- A build that has been rolled back once is **quarantined** and identified by the
+  `buildRepo` checkout's HEAD, so a fix — which is a new commit — goes through on
+  its own.
+- After `breaker.maxConsecutiveFailedRecoveries` consecutive failed recoveries
+  the executor **freezes** and refuses `task` and `rollback`. `checkin` and
+  `wake` still work, so an instance that is alive can still say so — otherwise a
+  freeze would guarantee the next deadline was missed too.
+- A failed recovery is a missed check-in **or a task that actually had to be
+  rolled back**. A task that failed harmlessly — a typo, a refusal, an agent that
+  decided the request was unsafe — does not count, or two badly worded sentences
+  in a row would take the whole mechanism offline.
+- All of it is persisted. A breaker that clears when its process restarts is not
+  a breaker, and the host agent can restart this process.
+
+```sh
+sudo ops/unfreeze.sh          # prints the reason, asks, then clears
+sudo systemctl restart clawcius-ops
 ```
 
-**A build failure aborts the operation.** Nothing is restarted, nothing is
-recreated, and the journal says so under its own `build` kind. The state a
-failed `tsc` leaves behind is not "unchanged" — it is *half-written*, four
-files out of thirty, which starts cleanly and behaves wrongly.
+There is deliberately no `unfreeze` task-that-counts: a task *could* run
+`unfreeze.sh`, and that is one more thing the audit is for.
 
-`redeploy` builds too, before the pre-snapshot and long before the recreate,
-because the cheapest thing that can say no should say it first. It does not
-rebuild the container *image* — `run-container.sh --recreate` starts a
-container from an image built separately — but it does build the checkout the
-breaker identifies the deploy by and that `.claude/` and `discord-cli/` are
-mounted from.
+## Sudoers
 
-`ops/` itself is deliberately **not** in `buildDirs`. Rebuilding the executor's
-`dist/` underneath the running executor would swap the code out from under a
-process that already refuses to restart itself, for the same reason. Changes to
-`ops/` are built and restarted by a person.
+`ops/clawcius-sudoers` grants `npurcell` passwordless sudo for:
 
-### The build runs as the checkout's owner, never as root
+| Grant | Why |
+|---|---|
+| `systemctl` restart/start/stop/status/is-active/is-enabled/enable/disable/reset-failed/list-units/show/cat, any unit; `daemon-reload` | The evening that motivated all this was spent standing up **new** units, which by definition are not in any list. Restricting the unit names is exactly what made the old rule useless. |
+| `journalctl` | The specific pain point: the operator was reading unit logs out loud to an agent that could not see them. Read-only. |
+| `mkdir -p`, `chown`, `chmod` under `/var/lib/clawcius*` and `/var/lib/hamachi*` | Making and fixing state directories, which was half the ad-hoc work. Scoped by **path**, because `chown -R npurcell /etc` is the failure worth preventing and it looks perfectly ordinary. |
+| `install -m 0644 -o root -g root … /etc/systemd/system/*`, `rm -f` of units | Installing a unit, with the mode and ownership pinned by the rule rather than chosen by the caller. |
 
-`clawcius-ops.service` is `User=root`. The checkout is
-`/home/npurcell/clawcius`, and `clawcius.service`, `hamachi.service` and
-`clawcius-status.service` all run as `User=npurcell`. A build run as root
-leaves root-owned `node_modules/` and `dist/` behind, and every one of those
-units then fails to start with an EACCES naming a file nobody edited.
+Deliberately **not** granted: `docker` (npurcell already has it via group
+membership, so a rule would only create the false impression it is being
+controlled), `apt`/`npm`/`pip` as root, `systemctl edit` (opens `$EDITOR` as
+root), `visudo`/`usermod`/`passwd`/`su`, and any blanket interpreter — no
+`sudo sh`, `sudo bash`, `sudo python3`, `sudo env`, `sudo tee`, `sudo cp`,
+`sudo dd` or `sudo find`. Those are the one-line escalations, and each is also a
+one-line way to rewrite the audit log.
 
-That happened twice on the night of 2026-08-09 — the second time ten minutes
-after a `chown -R` had fixed the first, because the fix was applied to the
-symptom and the root `npm ci` was simply run again. It is a nasty failure
-precisely because the build *succeeds*: exit code 0, `dist/` complete and
-correct, and the damage entirely in file metadata.
+Two honest caveats, both in the file itself: it **has not been checked with
+`visudo -c`** (the machine it was written on has no sudo — do that before
+installing it, from a second shell that already has root), and sudo's `*`
+matches `/` without canonicalising, so `chown … /var/lib/clawcius/../../etc`
+matches. On a host where npurcell is already in the docker group that changes
+nothing about what is reachable, which is why it is documented rather than
+papered over with a glob that looks airtight and is not.
 
-The owner is discovered by `stat`ing the checkout — never hardcoded, because
-this daemon is not entitled to an opinion about who owns a directory it was
-pointed at — and the build runs as that uid/gid, with `HOME` and the npm cache
-following. **If the owner cannot be determined, or the drop cannot be
-performed, the build is refused.** Running it as root anyway is the failure
-being prevented.
-
-The drop is `setuid(2)` via the spawn options, not `sudo` and not `su`. Those
-are setuid binaries, and a setuid bit is exactly what `NoNewPrivileges=true`
-turns into a no-op — so `sudo -u npurcell npm ci` fails under NNP even when the
-caller is already root, and fails in a way that reads like a permissions bug
-rather than a unit setting. Dropping privilege from root is the opposite
-operation and NNP has no bearing on it, which means the build needs no sudoers
-rule, no helper binary, and no weakening of the unit.
-
-## `pull` refuses a dirty tree. There is no way past it.
+## `pull` refused a dirty tree. Now the briefing names the files instead.
 
 On 2026-08-09, on the host:
 
@@ -148,24 +513,22 @@ error: Your local changes to the following files would be overwritten by merge:
 Git was right, and right in the way that matters: those edits were real fixes
 someone had made in place during an incident and had not yet committed. Every
 tempting way past that message — `reset --hard`, `checkout -f`, `stash`,
-`clean -fd` — destroys or hides them, and the one that "keeps" the work hides
-it somewhere nobody looks until the next incident.
+`clean -fd` — destroys or hides them, and the one that "keeps" the work hides it
+somewhere nobody looks until the next incident.
 
-A human hitting that reads the filename and thinks. A daemon must do exactly
-one thing: stop, name the files, and let the operation be reported as failed.
+The executor no longer refuses on it, because there is no `pull` verb to refuse.
+What it does instead:
 
-- The check runs **before** the pull, not after git refuses it, so the refusal
-  arrives as a short list of filenames rather than a wall of stderr — and so it
-  is identical whether the conflict is in a tracked file git would block on or
-  an untracked one it would happily clobber.
-- A `git status` that cannot be read is treated as **dirty**, not as clean.
-  Unknown and dangerous are the same state.
-- `redeploy` refuses a dirty tree too, because the breaker identifies a build
-  by the checkout's HEAD — and a deploy built from uncommitted edits would have
-  the wrong sha quarantined, which blocks the fix as well as the fault.
-- There is no `force` field, no `allowDirty` key and no second code path. Grep
-  `ops/src` for `reset`, `checkout`, `stash` and `clean`: nothing. That absence
-  is the feature, and the self-test asserts it directly.
+- `readDirty` runs before every task and the **exact filenames** go into the
+  briefing, with the sentence about 2026-08-09 attached;
+- the standing system prompt forbids `reset`, `checkout -f`, `stash` and `clean`
+  by name;
+- a `git status` that cannot be read is reported as dirty, not as clean. Unknown
+  and dangerous are the same state;
+- and **this daemon still has no such command of its own**. Grep `ops/src` for
+  `reset`, `stash` and `clean`: nothing. The self-test asserts that absence
+  against the compiled output, which is the part that a refactor cannot quietly
+  undo.
 
 ## One spool per instance, and why that turned out to matter twice
 
@@ -267,22 +630,31 @@ bug this whole section is about, so it is not left to chance.
   - name: hamachi
     # …
     mayRequest:
-      instances: [hamachi]        # redeploy/snapshot/rollback/checkin targets,
-                                  # and the instance a `wake` channel routes to
-      units: [hamachi.service]    # restart
-      repos: [clawcius]           # pull
-      verbs: [restart, pull, redeploy, snapshot, checkin]
+      instances: [hamachi]        # task/rollback/checkin targets, and the
+                                  # instance a `wake` channel routes to
+      verbs: [task, checkin, wake]
 ```
+
+`units:` and `repos:` used to be here too. **They are now inert** — no request
+carries a unit or a repo — and the loader says so in the boot journal rather
+than failing to start, on the same reasoning as the old `spoolDir` key: this
+unit is `Restart=always` with no start limit, and refusing to boot on a stale
+key turns a cosmetic problem into a restart loop with every deadline
+unhonoured. Anybody who wrote them believing they restricted something is now
+wrong, which is exactly why the notice exists.
 
 - **No `mayRequest` block means unrestricted**, which is what every instance had
   before this existed. Upgrading changes nothing until somebody writes one.
 - A key left out is unrestricted. A key present is an exact-match allowlist. A
   key present and empty (`instances: []`) means none at all, which is a
   legitimate thing to say and is not confused with absent.
-- Every name is checked against the real allowlists at boot. A typo in
-  `mayRequest.units` would otherwise be a silent total denial of something the
-  operator believed they had granted, and a restriction that fails closed by
+- Every name is checked against the real lists at boot. A typo in
+  `mayRequest.instances` would otherwise be a silent total denial of something
+  the operator believed they had granted, and a restriction that fails closed by
   accident is indistinguishable from a broken executor.
+- An **unnamed task** from a restricted instance is refused. Scope-by-omission
+  takes every instance, so for a restricted one "unnamed" is wider than what it
+  is allowed rather than narrower.
 - Refusals are journalled with the requester and the reason, and are checked
   **before** the rate limit, so an agent looping on requests it may not make
   cannot starve the one doing real work.
@@ -291,10 +663,13 @@ bug this whole section is about, so it is not left to chance.
   has been resolved. Waking somebody else's agent with attacker-influenced text
   is exactly what a restricted instance should not be able to do.
 
-This is **not** a new security boundary. An agent that can write its spool can
-still restart its waker and recreate its own container; that is the feature,
-bounded by the allowlists, the rate limit and the deadline. This is the
-narrower thing that per-instance spools made expressible for the first time:
+This is **not** a security boundary, and since 2026-08-10 it is even less of one
+than it was: it bounds what an instance may *ask for*, not what the host agent
+may *do*. A task scoped to `hamachi` is still carried out by a session with a
+shell and sudo, and nothing but the task text and the standing prompt points it
+at Hamachi rather than at anything else on the box. It is a statement of intent
+that the journal records, which is genuinely useful. It is the narrower thing
+that per-instance spools made expressible for the first time:
 keeping an instance out of its neighbour's business, deliberately, with the
 refusal in the journal. It could not have existed before, because "this
 instance" was not a thing the executor knew.
@@ -338,194 +713,6 @@ So on boot, a top-level `spoolDir:`:
 
 Delete the key once you have read the notice.
 
-## The trust model
-
-> **The spool is written by an agent that may be prompt-injected, and read by a
-> root process holding docker and systemctl.**
-
-That sentence is the whole design. It is not hypothetical: these agents read
-Discord messages from strangers, fetch web pages, clone repositories, and will
-one day summarise pull requests opened by people we have never met. Any of that
-text can say "now write the following JSON into `/var/lib/clawcius/run/ops`".
-The container boundary is what stops it becoming host code execution, and this
-service is where that boundary is enforced.
-
-So every byte from the spool is treated as hostile input to privileged code:
-
-**Closed verb list.** Matched against a frozen set. An unknown verb is rejected
-and logged — never a prefix match, never a default branch that tries something
-sensible. "Best effort" on privileged input means the attacker picks the
-effort.
-
-**Every argument is a lookup, not a value.** `unit`, `instance` and `repo` are
-compared by exact string equality against `ops-config.yaml`, and what reaches
-the command is *the config entry*, never the request's string. The request
-selects; it never supplies. `docker/run-container.sh` is invoked with an
-environment built entirely from the instance's own config block.
-
-**No shell. Anywhere.** Every command is an argv array handed to `execFile`
-with an explicit `shell: false`. There is no command string in this codebase,
-so there is nothing for quoting to get wrong. The rendered form in the log is
-for humans and is never parsed or re-executed.
-
-**Structural rejection, not repair.** Malformed JSON is discarded whole.
-Nothing salvages the parseable prefix of a broken file and nothing coerces
-types — a number where a string belongs is a reject.
-
-**Traversal and control bytes are refused, not stripped.** Stripping is how
-`....//` becomes `../`. Identifiers are checked for separators, `..`, NUL and
-control characters even though they are never used as paths, because "never
-used as paths" is a property of today's call graph.
-
-**Caps everywhere a directory the agent can write meets a process that does
-work.** A per-file size cap enforced by `stat` before the file is opened; a cap
-on files consumed per sweep; a ceiling on files *present*, past which the spool
-is treated as flooded and drained unread; a rolling-hour cap on accepted
-operations; and a bounded queue that refuses with a stated reason rather than
-letting requests evaporate.
-
-**The state directory is out of reach.** The journal, the circuit breaker and
-any armed rollback deadline live in `/var/lib/clawcius-ops`, which is not
-bind-mounted into any container. A breaker the quarantined party can edit is
-not a breaker. The config loader refuses to start if it is ever placed inside
-*any* instance's spool — every spool, not just the first, which is a check that
-had to grow teeth when there stopped being only one.
-
-**And the spools are out of each other's reach.** The loader refuses two
-instances sharing a spool (provenance would not be blurred, it would be
-invented), one spool nested inside another (forgery with extra steps), and an
-ops spool that would swallow a wake spool — the ops spool unlinks every file it
-sweeps before parsing it, so that arrangement would silently eat the waker's
-queue.
-
-**The idle signal is out of reach too.** Each waker publishes
-`/var/lib/<instance>/waker-status.json`, a sibling of the bind-mounted `run/`
-directory rather than a child of it. The executor believes that file when it
-decides whether recreating a container would kill a live turn; an agent that
-could write "no turns in flight" could talk root into destroying a session
-mid-conversation. Both config loaders — the waker's and this one's — refuse to
-start if the path ends up inside a mount.
-
-### What this does *not* protect against
-
-Honest list.
-
-- **An agent that can write the spool can restart the waker and recreate its
-  own container.** That is the feature. It is bounded by the allowlists, the
-  rate limit and the deadline, not prevented.
-- **By default an agent can also recreate the *other* agent's container.** The
-  allowlists are per-executor, not per-instance, unless somebody writes a
-  `mayRequest` block. What changed on 2026-08-10 is that this is now *visible*
-  — the journal says which agent asked — and *restrictable*. It is not
-  restricted by default, deliberately: this shipped as a mechanism, and a
-  privileged daemon that silently starts refusing requests on upgrade is an
-  outage with a changelog.
-- **Provenance is as good as the bind mounts, and no better.** It is a strong
-  property — a container can write into exactly one spool no matter what its
-  prompt says — but it rests entirely on `docker/run-container.sh` mounting one
-  per instance. Anyone who adds a second mount, or points two instances at one
-  directory in config (the loader refuses that one), has removed it. Root on
-  the host can of course write into any spool it likes and be recorded as
-  whichever agent it chose.
-- **`pull` fetches from the configured remote, and now builds it.** Anything the
-  agent can get merged into `main` on GitHub is code this host will run — and
-  since 2026-08-10 it is also code this host will *execute at build time*, via
-  `npm ci` running whatever `package.json` lifecycle scripts the lockfile's
-  dependencies declare. That is not a new capability (the built output was
-  always going to run) but it moves the moment of execution earlier and off the
-  agent's uid onto the checkout owner's. The breaker limits the blast radius of
-  a bad build; it does not review it.
-- **The build's privilege drop sets the uid and gid but not the supplementary
-  groups.** `setgroups(2)` is not called, so the build inherits root's group
-  list — in practice just `root`. Files it creates are owned
-  `npurcell:npurcell`, which is the property that matters here, but the process
-  is not as thoroughly unprivileged as a real login. Fixing it properly means
-  `setpriv --clear-groups`, which is another binary to depend on and another
-  thing never run on this host; noted rather than half-done.
-- **`reason` and `detail` are attacker-influenced text** that ends up in the
-  journal, in `ops-status.json`, and in a wake prompt. They never reach a
-  command, but anything rendering them owes them the same suspicion.
-- **Root is root.** This service being small and readable is the mitigation.
-  There is no second sandbox under it.
-
-## Why a separate daemon
-
-`restart clawcius.service` is one of the operations. A process cannot restart
-itself: systemd sends it SIGTERM, it dies, and whatever it was doing dies with
-it — including the record of what it was doing and any deadline it had just
-armed. Folding this into the waker would make the single most useful operation
-the one that cannot be performed reliably.
-
-The argument is stronger for `redeploy`. Every live agent session *is* a
-`docker exec` into the container being recreated, so a waker running its own
-redeploy would be tearing down the processes it is made of.
-
-The executor has to outlive the things it restarts. So it is a unit of its own,
-with no Discord connection, no GitHub token, no Anthropic credential and — this
-one matters most — **no model**.
-
-### No model. Ever.
-
-There is no LLM in this service and there must never be one. It runs as root
-with docker and systemctl, and its entire safety argument is that the set of
-things it can do is finite, enumerated and readable in one sitting. A model
-here would make that set "whatever the model was talked into", and the party
-doing the talking is on the far side of the boundary this exists to defend.
-
-## One operation at a time
-
-A lock, not a negotiation. Not a semaphore, not per-instance, not "these two
-are independent so they can overlap". A second request queues; past
-`limits.maxQueued` it is refused with a reason the agent can read, because a
-refusal beats a request that silently evaporates.
-
-Anything destructive — `redeploy`, `rollback` — first waits for the target
-instance to report no turns in flight. If it does not go idle within
-`idle.maxWaitMinutes`, the operation is **abandoned**, not deferred and not
-forced. The agent can ask again.
-
-Missing, stale, malformed or future-dated status all read as *busy*. The stale
-case is the important one: a waker that crashed leaves a file saying
-`liveCount: 0` and keeps saying it forever, and a stale zero is the most
-dangerous value in this system because it is the one that reads as permission.
-
-## The deadline, and the revert
-
-After a destructive operation the executor:
-
-1. files a wake to the instance carrying context — *you were rebuilt from
-   `<sha>` because `<reason>`; here is what to check; check in within N
-   minutes*;
-2. waits `deadline.minutes` for a `checkin` request from that instance;
-3. on silence, rolls back to the snapshot taken immediately **before** the
-   operation, and reports.
-
-The rollback target is captured before anything is destroyed, on purpose:
-afterwards, the newest snapshot could easily be one taken of the broken build.
-
-### Circuit breaker
-
-- A build that has been rolled back once is **quarantined** and never deployed
-  again. A build is identified by the `buildRepo` checkout's HEAD, so a fix —
-  which is a new commit — goes through on its own. Retrying the same build is
-  refused permanently, not backed off.
-- After `breaker.maxConsecutiveFailedRecoveries` consecutive missed check-ins
-  the executor **freezes**: it refuses every destructive verb and says so.
-  Non-destructive work still runs; a freeze is about not rebuilding, not about
-  refusing to take a backup.
-- All of it is persisted. `restart` is a verb the agent can ask for, and a
-  breaker that clears when its process restarts is not a breaker.
-
-Clearing a freeze is a human decision made after looking at why it froze:
-
-```sh
-sudo ops/unfreeze.sh          # prints the reason, asks, then clears
-sudo systemctl restart clawcius-ops
-```
-
-There is deliberately no `unfreeze` verb. The quarantine list is not cleared by
-it either.
-
 ## Snapshot restore verification
 
 `clawcius-snapshot-verify.timer` restores the newest snapshot for each
@@ -551,33 +738,6 @@ policy, so it holds no credential and cannot reach the spools, the workspaces
 or Discord; and it is removed in a `finally` on every path, because a verifier
 that leaks 2 GB containers turns a broken snapshot into a full disk.
 
-## Dry run — on by default
-
-`ops-config.yaml` ships with `dryRun: true`, **and it should stay that way
-until you have read the log.**
-
-In this mode the executor makes every decision it would really make — allowlist
-checks, the idle wait, the deadline, the breaker — and logs the exact argv it
-would have executed, and executes none of it. Read-only probes (`docker
-inspect`, `docker images`, `git rev-parse`) still run, because a dry run that
-cannot see the machine reports fiction rather than a prediction.
-
-A dry run also arms no deadline and files no wake: nothing was rebuilt, so
-there is nothing to verify and nobody to check in, and arming one would
-schedule a rollback of a container that was never touched.
-
-```
-[ops] started [dry-run]: redeploy hamachi — waited 0.0s in the queue. DRY RUN.
-[ops] DRY-RUN would run: /home/npurcell/clawcius/docker/snapshot.sh (env CLAWCIUS_CONTAINER=hamachi-agent …)
-[ops] idle-wait: redeploy hamachi — waiting for an idle turn: 1 turn(s) in flight as of 3s ago
-[ops] DRY-RUN would run: /home/npurcell/clawcius/docker/run-container.sh --recreate (env …)
-[ops] deadline-armed [dry-run]: checkin hamachi — DRY RUN — would have armed a 15-minute deadline. Nothing armed.
-```
-
-Turn it off when a week of `journalctl -u clawcius-ops` contains nothing that
-surprises you. This is a root process holding docker and systemctl; the first
-deploy should be observable before it is trusted.
-
 ## Running it
 
 ```sh
@@ -585,7 +745,7 @@ cd ops
 npm install
 npm run build
 npm start                      # reads ./ops-config.yaml
-npm run selftest               # 82 tests, no docker required
+npm run selftest               # no docker, no systemd, no real claude required
 ```
 
 Override the config path with `OPS_CONFIG_PATH`.
@@ -594,12 +754,22 @@ Installation and the systemd units are in [SETUP.md](../SETUP.md) § 7.
 
 ## Configuration
 
-`ops-config.yaml` is not settings — it is the authorization model. Every unit,
-repo and instance this daemon may touch is named there by exact string, and
-nothing in a request can add to those lists. Every key has a default in
-`src/config.ts` and the loader validates types and cross-field invariants, so a
-typo fails the boot with the offending key named rather than producing an
-executor that quietly does nothing.
+`ops-config.yaml` is **no longer the authorization model**, and reading it as
+though it were is how somebody ends up believing they are protected by a list.
+It now holds three different kinds of thing:
+
+- a **health manifest** (`units:`, `repos:`) — what gets checked before and
+  after every task and what the session is briefed about. Leaving something out
+  does not make it safe, it makes it unwatched;
+- **real invariants** — the containment assertions, unchanged and still
+  load-bearing;
+- **limits** — how often, how long, how much money. Never *what*.
+
+`instances:` is the one list that still gates something: it decides what may be
+named as a rollback or check-in target, and what gets snapshotted and rolled
+back. Every key has a default in `src/config.ts` and the loader validates types
+and cross-field invariants, so a typo fails the boot with the offending key
+named rather than producing an executor that quietly does nothing.
 
 The cross-field checks worth knowing about, because they are security
 properties rather than tidiness:
@@ -611,7 +781,13 @@ properties rather than tidiness:
   neighbour rather than nowhere;
 - no two instances may share an `opsSpoolDir`, and none may nest inside another;
 - an `opsSpoolDir` may not contain or be contained by any `wakeSpoolDir`;
-- `mayRequest` may only name units, repos, instances and verbs that exist;
+- `mayRequest` may only name instances and verbs that exist; `units` and `repos`
+  are accepted, inert, and produce a deprecation notice in the boot journal
+  rather than a boot failure;
+- `hostAgent.workDir` may not be inside any spool, inside `stateDir`, or inside
+  any checkout under `repos:` — a session that can write a spool can forge a
+  request from whichever instance owns it, and a session whose cwd is a checkout
+  takes standing instructions from anything the agents can get merged;
 - `buildRepo` must name a real entry under `repos:`, or the breaker cannot
   identify a build;
 - `repos[].buildDirs` must be relative and must resolve inside the checkout —
@@ -626,15 +802,20 @@ properties rather than tidiness:
 ops/
   ops-config.yaml        the authorization model
   unfreeze.sh            human-only: clear the breaker's freeze
-  clawcius-sudoers       the pre-existing narrow sudo rule for the waker
+  clawcius-sudoers       what the host agent may do with sudo, and why
   src/
     index.ts             daemon entry, single-instance lock, signals
     config.ts            typed YAML loader, defaults, containment assertions
-    build.ts             npm ci/build as the checkout's owner; the dirty check
+    build.ts             who owns the checkout (the session runs as them), and
+                         what state its tree is in (for the briefing)
     request.ts           parsing and validating hostile spool content
     spool.ts             one directory-as-a-queue per instance; the caps, and
                          the stamp that says whose it was
-    executor.ts          the lock, verb dispatch, deadline, breaker
+    host-agent.ts        the session: env allowlist, tool policy, the standing
+                         prompt, stream-json parsing and the audit. READ THIS
+                         FILE FIRST — it is where the trust model lives.
+    executor.ts          the lock, the task supervisor, snapshot/health/rollback,
+                         deadline, breaker
     runner.ts            argv-array exec, no shell; dry-run
     idle.ts              reading the waker status file; fails safe
     state.ts             persisted breaker, quarantine and deadlines
@@ -677,7 +858,14 @@ writes `node_modules/`, `npm run build` writes `dist/`. All three get EROFS on
 a filesystem that is demonstrably read-write from a shell, so the journal fills
 with permission errors against paths whose `ls -l` says they are fine. **The
 `pull` verb could never have worked as shipped**, and it would have been
-diagnosed as a git problem. There is a near miss next to it: `ExecStart` is
+diagnosed as a git problem.
+
+Re-audited on 2026-08-10 with the host agent in mind, and the case against it is
+now much stronger. The session's `HOME` is `/home/npurcell` and that is where
+Claude Code keeps the OAuth credentials it authenticates with: under
+`ProtectHome=read-only` it cannot write its session state, and under `=yes` or
+`=tmpfs` it cannot find its credentials at all. The symptom would be every task
+failing to authenticate on a host where `claude` works perfectly from a shell. There is a near miss next to it: `ExecStart` is
 `/home/npurcell/.local/share/node/bin/node`, so `ProtectHome=yes` or `=tmpfs`
 would have hidden the interpreter and the unit would not have started at all —
 which would have been the *better* failure, caught on the first restart instead
@@ -691,13 +879,27 @@ into this exact file is what #7 *was*. The honest accounting is that
 anything it wanted to do to a home directory it can still do with
 `docker run -v /home:/host`, one argument away, with no namespace in the path.
 
-`MemoryMax` was raised from 512M to 2G and `TasksMax` from 128 to 512. The old
-numbers were sized for "parses small JSON and waits on children", which stopped
-being true when the build became a step. systemd's `MemoryMax` applies to the
-unit's whole cgroup, children included, so `npm ci` plus `tsc` over three
-packages would have been OOM-killed by the cgroup — a build failure with no
-compiler error in it. The container a redeploy starts does *not* count against
-this; docker puts it in its own slice.
+`MemoryMax` went 512M → 2G → **6G**, and `TasksMax` 128 → 512 → **1024**. The
+first raise was for the build; the second, on 2026-08-10, is for the host agent.
+systemd's `MemoryMax` applies to the unit's whole cgroup, children included, and
+the children are now this daemon *plus* a `claude` session holding a
+conversation *plus* whatever that session runs, concurrently — which is expected
+to include `npm ci` and `tsc` over three packages. Under 2G the failure mode is
+the cgroup OOM-killing a build halfway through (a build failure with no compiler
+error in it) or, worse, killing the session mid-task and leaving the host in
+whatever state it had reached.
+
+6G is not a measurement, it is headroom on a box that can spare it: too high
+costs nothing until something runs away, too low costs a task that fails for a
+reason appearing nowhere in its own logs. Measure with `systemd-cgtop` during a
+real task before lowering it. The containers a task starts do *not* count
+against this; docker puts them in their own slice.
+
+`StateDirectory` gained `clawcius-host-agent`, a **sibling** of the executor's
+state rather than a child. The session runs as `npurcell` and needs to write its
+working directory; putting it inside a 0750 root-owned directory would mean
+either the session cannot traverse to it or the journal and the breaker stop
+being 0750.
 
 Checked and deliberately still absent, each with the reason recorded in the
 unit itself:
@@ -705,12 +907,12 @@ unit itself:
 | Directive | Verdict |
 |---|---|
 | `MemoryDenyWriteExecute` | Never. Any Node process dies at startup. |
-| `NoNewPrivileges` | Stays `false`. Not because of the build — a root process dropping via `setuid(2)` is unaffected by NNP; it is `sudo`/`su` that NNP breaks, and neither is used. It is untested here against `docker run` and `systemctl`, and that is the whole reason. |
-| `SystemCallFilter` | No. `@system-service` would probably cover docker, systemctl, git, npm and node — including `@setuid` for the drop — and "would probably cover" is the phrase that preceded the SIGTRAP loop. A filter one syscall short kills a redeploy *halfway through*, container already destroyed. |
+| `NoNewPrivileges` | Stays `false`, and since 2026-08-10 that is **mandatory** rather than cautious. `sudo` is a setuid binary and NNP makes the setuid bit a no-op, so under it every sudo call the host agent makes fails — with a message about the effective uid that reads like a broken sudoers file rather than a unit setting. Note the asymmetry that used to be the whole entry: *dropping* privilege via `setuid(2)` is unaffected by NNP, so the session's own privilege drop would work fine. It is the sudo inside the session that would not. |
+| `SystemCallFilter` | No. `@system-service` would probably cover docker, systemctl, git, npm and node — including `@setuid` for the drop — and "would probably cover" is the phrase that preceded the SIGTRAP loop. It now also has to cover *whatever a task chooses to run*, which is not a set anybody can enumerate. A filter one syscall short kills a task *halfway through*. |
 | `IPAddressDeny` | No, and not close. `git pull` reaches GitHub and `npm ci` reaches the registry; denial surfaces as timeouts, not refusals. |
 | `PrivateTmp` | No. npm stages tarballs through `TMPDIR`, and a private `/tmp` also hides it from the operator debugging this at 3am. |
 | `ProtectSystem` | `strict` breaks the docker socket (a read-only `/run` denies the write permission a unix socket connect needs). `full` is likely fine and likewise untested. |
-| `RestrictSUIDSGID` | Kept. It restricts *creating* setuid files; it does not touch `setuid(2)`, so the build's drop is unaffected. |
+| `RestrictSUIDSGID` | Kept. It restricts *creating* setuid files; it does not touch `setuid(2)` and does not stop *executing* an existing setuid binary — checked deliberately, because if it did it would break `sudo` and therefore the host agent, exactly as NNP would. |
 
 `clawcius-snapshot-verify.service` carried no hardening block at all, which is
 the only reason it had nothing fatal in it. It now carries the same reasoning
@@ -719,79 +921,101 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` runs 82 tests with no docker, no systemd and no npm. It
-covers request validation against hostile inputs (traversal, separators, NUL
-and control bytes, shell metacharacters, unknown verbs, wrong types, malformed
-JSON, oversized files), the spool's caps and flood handling, the config
-loader's containment assertions, the operation lock and queue, the idle logic
-against synthetic waker status files including the stale-zero case, dry-run
-suppression, breaker persistence across a fresh `StateStore`, deadline expiry
-driving an automatic rollback and quarantine, and deadlines restored after a
-restart. The privileged binaries are replaced with stand-ins that record their
-argv one element per line, which is what proves no shell string is being built.
+`npm run selftest` runs with no docker, no systemd and no npm, and no real
+`claude`. It covers request validation against hostile inputs (traversal,
+separators, NUL and control bytes, shell metacharacters, unknown verbs, wrong
+types, malformed JSON, oversized files), the spool's caps and flood handling,
+the config loader's containment assertions, the lock and queue, the idle logic
+against synthetic waker status files including the stale-zero case, breaker
+persistence across a fresh `StateStore`, deadline expiry driving an automatic
+rollback and quarantine, and deadlines restored after a restart.
 
-The eleven added on 2026-08-10 assert the four corrections as **orderings and
-absences** rather than as log lines, because every one of the failures they
-describe was silent on the host — exit 0, no stderr, unit `active (running)`:
+The privileged binaries are replaced with stand-ins that record their argv one
+element per line, which is what proves no shell string is being built by the
+executor. `claude` is replaced by a stand-in that emits genuine stream-json and
+**honours the deny list it is handed** — a denied Bash is a Bash tool that does
+not exist in that session, exactly as the real CLI was observed to behave — so
+the dry-run assertions test the whole chain rather than a flag.
 
-- `pull` runs `npm ci && npm run build`, *after* the pull and in each
-  `buildDir`, and never `npm install` (which rewrites the lockfile unattended);
-- `redeploy` builds *before* the pre-snapshot and *before* the recreate;
-- a failed build stops everything: no `systemctl`, no `run-container.sh`, no
-  snapshot, no armed deadline;
-- a dirty tree refuses `pull` and `redeploy`, names the files, and — the
-  assertion that matters most — no `git reset`, `checkout`, `stash`, `clean`,
-  `restore`, `--force` or `-f` appears in any recorded argv;
-- an unreadable `git status` reads as dirty, not as clean;
-- every planned build step carries the checkout owner's uid/gid, `HOME` and npm
-  cache, and none carries uid 0; when the executor already is the owner, no uid
-  is set at all;
-- the owner is refused, loudly, when the directory cannot be stat'd or the uid
-  has no passwd entry;
-- `buildDirs` may not be absolute or climb out of the checkout.
+The tests added for the host agent on 2026-08-10:
 
-The eighteen added later on 2026-08-10, for per-instance spools, needed the
-fixture to grow a second instance first — and that is the point rather than an
-aside. The old suite had one instance and one spool, which is exactly the world
-in which a shared spool looks correct, and no test could have caught the
-Hamachi bug without first being able to represent two agents:
+- a task reaches a session with the task text in the prompt, `--setting-sources
+  user`, `--strict-mcp-config`, `--disable-slash-commands`, a fresh
+  `--session-id` and never `--resume`, and a working directory that is **not**
+  the checkout;
+- **every** Bash command in the stream reaches the journal, in order, byte for
+  byte — including one with spaces, quotes and a semicolon in it — and the first
+  audit entry is written before the `finished` entry rather than flushed with it;
+- an unparseable line in the stream fails the task **on its own** and triggers
+  the rollback, and the auditor says so at the time as well as in the summary;
+- a task snapshots before the session starts and, when the agent reports
+  failure, restores that exact tag by name — not "the newest", which after a
+  failed task could easily be one taken of the broken state;
+- a health regression rolls the task back **even though the agent said it
+  succeeded**, and `compareHealth` reports only things that got worse (fixing
+  something is not a regression, and a service that was already dead is not
+  blamed on the task);
+- dry-run: the settings actually sent deny `Bash`, `Task`, `Monitor`, `Write`,
+  `Edit` and `WebFetch`, the tool list is exactly `Read, Glob, Grep`, and — the
+  assertion that matters — a task told to `touch` a file leaves no file;
+- `assertNoSecrets` throws on `DISCORD_TOKEN` **and** on `GITHUB_TOKEN`,
+  `ANTHROPIC_API_KEY`, `DB_PASSWORD`, `MY_SECRET` and `DISCORD_WEBHOOK`, passes
+  ordinary variables, and honours an explicit `envPassthrough` exemption;
+- the built environment inherits nothing by accident, carries the checkout
+  owner's `HOME` rather than root's, and contains no token;
+- a clean exit with `is_error: true` is a failure, not a success — the CLI does
+  exactly that when the model's own turn ends badly, and reading the exit code
+  alone would arm a deadline off a task that failed;
+- an unnamed task snapshots **every** instance, and a restricted instance may
+  not file one;
+- a deadline is armed for an instance the task never named, because a command in
+  the audit mentioned its container;
+- the result is reported back into the requester's wake spool, with the command
+  count, rather than spoken by the host agent;
+- tasks can be switched off (`hostAgent.enabled: false`) while check-ins and
+  rollbacks keep working, and a freeze refuses tasks while still letting an
+  instance check in;
+- the compiled output of `ops/src` contains no `reset`, `stash`, `clean` or
+  `checkout -f` — asserted against `dist/`, which is the part a refactor cannot
+  quietly undo.
 
-- each instance's spool defaults inside its own state directory, and no
-  instance's spool lives under another's;
-- two spools are drained concurrently and each request is attributed to the
-  directory it arrived in — asserted with the *same verb on the same target*
-  filed into both, which is the pair that was indistinguishable before;
-- a request claiming `"requester": "clawcius"` inside Hamachi's spool is still
-  attributed to Hamachi, and the claim is reported as an ignored unknown field;
-- "hamachi asked to snapshot hamachi" and "hamachi asked to snapshot clawcius"
-  produce different journal lines;
-- an automatic rollback is attributed to `(executor)`, not to the instance it
-  is performed on;
-- a `mayRequest` restriction refuses an out-of-scope target, names why, leaves
-  the unrestricted instance alone, does not consume the hourly budget, and
-  blocks a `wake` at the point the channel routes to a forbidden instance;
-- a `mayRequest` naming a unit, instance or verb that does not exist fails the
-  boot rather than denying everything quietly;
-- the containment assertions hold across several spools: shared, nested,
-  swallowing a wake spool, and a state directory inside the *second* instance's
-  spool (which a check written against one spool passes and is wrong about);
-- the deprecated `spoolDir` is attributed to its owning instance, leaves that
-  instance watching the same directory as before, gives the other one its own,
-  and fails the boot when it belongs to nobody or disagrees with an explicit
-  `opsSpoolDir`;
-- the post-rebuild wake tells the instance to check in via *its own* spool.
+The per-instance-spool tests from earlier the same day are unchanged in intent
+and were rewritten onto `task`: two spools drained concurrently with each
+request attributed to its own directory, a request claiming
+`"requester": "clawcius"` inside Hamachi's spool still attributed to Hamachi,
+"hamachi acting on hamachi" and "hamachi acting on clawcius" producing different
+journal lines, an automatic rollback attributed to `(executor)`, the
+`mayRequest` refusals, the containment assertions across several spools, the
+deprecated `spoolDir` migration, and the check-in instructions naming the
+instance's *own* spool.
 
-**Not tested, and it needs a real host:** everything on the far side of the
-exec, and one thing on this side of it — `ensureSpoolDir`'s `chown` has never
-run as root here, because the self-test does not run as root and cannot. What
-is tested is that the spool is created and watched; that it ends up owned by
-the container's uid is asserted only by construction, via
-`run-container.sh` creating it as `npurcell`. Check it with `ls -ld
-/var/lib/*/run/ops` after the first start. No `systemctl restart` has been run, no container has been recreated, no
-snapshot has been committed or restored, no real `npm ci` has been dropped to
-another uid, and the wake the executor files after a rebuild has never been
-picked up by a live waker. Nor has any unit in `systemd/` been loaded since the
-audit above — which is exactly the condition that produced the bug the audit
-was looking for, and is why the `ProtectHome` fix removes a directive rather
-than adding a cleverer one. Run it with `dryRun: true` first and read the log:
-the build's argv, cwd and uid are all in there.
+### Verified by hand, against the real CLI
+
+Everything in [Dry run](#dry-run--on-by-default-and-genuinely-unable-to-act)
+was established by running `claude -p` on 2026-08-10 and reading the stream.
+None of it is inferable from a stand-in and none of it matches what the
+documentation would lead you to expect, which is exactly why it was tested. The
+most useful finding was the one nobody was looking for: with only `Bash` denied,
+the model itself pointed out that `Monitor` runs a shell command and offered to
+use it.
+
+### Not tested, and it needs a real host
+
+- **No task has ever been run for real.** No `claude` session has been started
+  by this daemon on the host, no snapshot has been committed or restored, no
+  container has been recreated, no unit has been restarted.
+- **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
+  a shell that already has root.
+- **No unit in `systemd/` has been loaded since the audit below** — which is
+  exactly the condition that produced the two units that shipped unable to run
+  at all.
+- `ensureOwnedDir`'s `chown` has never run as root here, because the self-test
+  does not run as root and cannot. Check with `ls -ld /var/lib/*/run/ops
+  /var/lib/clawcius-host-agent` after the first start.
+- The wake the executor files after a task has never been picked up by a live
+  waker.
+
+Run it with `dryRun: true` first and read the log. In that mode the session
+cannot execute anything, and what lands in the journal is the list of commands
+it would have run — which is the single most useful week of reading available
+before turning this on.

@@ -1,16 +1,132 @@
-# Allow npurcell to manage the clawcius service without a password.
+# Passwordless sudo for npurcell, for the host agent.
 #
-# Scope is deliberately narrow: named unit, fixed verbs, absolute path. It
-# grants no new privilege — clawcius.service runs as npurcell, so anyone who
-# can restart it could already achieve the same by editing dist/ and waiting.
+# ── What this is for, and what changed on 2026-08-10 ──────────────────────
 #
-# daemon-reload is included because the unit file changes often during setup;
-# it only re-reads unit files and starts nothing.
+# This file used to grant four things: start, stop and restart of one named
+# unit, plus daemon-reload. That was enough for the waker and it was nowhere
+# near enough for the host agent, which is a Claude Code session that runs on
+# this box as npurcell and is expected to do the work the operator was doing by
+# hand — install a unit, make a state directory, fix an ownership mistake, and
+# above all read a journal so that nobody has to paste one into a chat window.
+#
+# ── Be clear about what this does and does not buy ────────────────────────
+#
+# It does NOT contain the host agent. It cannot. npurcell is in the `docker`
+# group on this host — SETUP.md says so in the line that adds it, "docker group
+# is effectively root on the host" — and `docker run -v /:/host` is root with
+# no sudo involved at all. Anybody reading this file hoping it is a boundary
+# should stop here and read ops/README.md § The trust model instead.
+#
+# What the scoping does buy is real, and it is worth the effort:
+#
+#   1. **The easy path is the audited path.** Every command the session runs is
+#      written into /var/lib/clawcius-ops/journal.jsonl in full before its
+#      result is known. Granting `ALL` here would make "get a root shell" a
+#      single command; granting these makes the obvious way to do each job the
+#      way that reads clearly in the log.
+#   2. **No blanket interpreter.** There is deliberately no `sudo sh`, `sudo
+#      bash`, `sudo python3`, `sudo env`, `sudo tee`, `sudo cp`, `sudo dd`,
+#      `sudo vi` or `sudo find` here. Those are the classic one-line escalations
+#      and each one would also be a one-line way to rewrite the audit log that
+#      is standing where the verb allowlist used to.
+#   3. **It is a diff.** Widening it is a change somebody reviews, which is the
+#      whole point of it being in the repository rather than typed into
+#      visudo at 3am.
+#
+# ── Why each grant is here ────────────────────────────────────────────────
+#
+# systemctl (restart/start/stop/status/is-active/is-enabled/enable/disable/
+#   daemon-reload/reset-failed), unrestricted as to unit name.
+#   Restricting the unit names is what the old file did and it is exactly what
+#   made this useless: the operator's evening was spent standing up NEW units,
+#   which by definition are not in any list. Note the widening this represents:
+#   `docker.service` used to be deliberately excluded, because restarting it
+#   takes every container on the host down at once. It is reachable now. That is
+#   part of the trade and it is not hidden.
+#   `edit` and `set-property` are NOT granted: `systemctl edit` opens $EDITOR as
+#   root, which is a root shell with extra steps.
+#
+# journalctl — the thing that started all this. The operator was reading unit
+#   logs out loud to an agent that could not see them. Read-only.
+#
+# mkdir/chown/chmod/install, scoped BY PATH to the directories this system
+#   actually owns: /var/lib/clawcius*, /var/lib/hamachi*, /etc/systemd/system.
+#   The paths are the scope here rather than the verbs, because `chown -R
+#   npurcell /etc` is the failure worth preventing and it is a perfectly
+#   ordinary-looking command.
+#   Note the deliberate absence of /home/npurcell: the session already owns that
+#   tree and needs no privilege for it, and a `sudo chown` inside it is how the
+#   2026-08-09 root-owned-node_modules incident got "fixed" twice.
+#
+# ── What is NOT here, and why ─────────────────────────────────────────────
+#
+# * docker — not granted, and not an oversight. npurcell reaches docker through
+#   group membership, so a sudoers rule would add nothing except the false
+#   impression that docker access is being controlled here.
+# * apt / npm / pip as root — no. Installing packages system-wide is a decision
+#   with a blast radius beyond this host's lifetime, and it is one of the very
+#   few things worth waiting for a human on. If a task genuinely needs a system
+#   package, it should say so in its report and stop.
+# * /var/lib/clawcius-ops — no path rule reaches it. It holds journal.jsonl, the
+#   circuit breaker and the armed deadlines, and nothing here should make it
+#   convenient to write. (The docker group defeats this. It is still not made
+#   easy.)
+# * visudo, usermod, useradd, passwd, su — no. Granting the ability to grant is
+#   the end of the exercise.
 #
 # Install:  sudo install -m 0440 -o root -g root \
 #             /home/npurcell/clawcius/ops/clawcius-sudoers \
 #             /etc/sudoers.d/clawcius
-npurcell ALL=(root) NOPASSWD: /usr/bin/systemctl restart clawcius.service, \
-                              /usr/bin/systemctl start clawcius.service, \
-                              /usr/bin/systemctl stop clawcius.service, \
-                              /usr/bin/systemctl daemon-reload
+#
+# Check it parses BEFORE you rely on it — a syntax error in one file in
+# /etc/sudoers.d breaks sudo for everybody:
+#           sudo visudo -c -f /etc/sudoers.d/clawcius
+#
+# NOT YET VERIFIED WITH visudo -c. It was written on a machine without sudo
+# installed and has never been parsed by the real binary. Run the check above
+# before installing it, and do it from a second shell that already has root, in
+# case it is wrong.
+#
+# One more honest limitation, since it is the sort of thing this repository
+# writes down rather than discovers: sudo's `*` matches `/` and sudo does not
+# canonicalise paths, so `chown npurcell:npurcell /var/lib/clawcius/../../etc`
+# matches the /var/lib/clawcius* rule. On a host where npurcell is already in
+# the docker group that changes nothing about what is reachable, which is why
+# it is documented rather than papered over with a cleverer glob — a glob that
+# looks airtight and is not would be worse than one that is honestly leaky.
+
+Cmnd_Alias CLAWCIUS_SYSTEMCTL = /usr/bin/systemctl restart *, \
+                                /usr/bin/systemctl start *, \
+                                /usr/bin/systemctl stop *, \
+                                /usr/bin/systemctl status *, \
+                                /usr/bin/systemctl is-active *, \
+                                /usr/bin/systemctl is-enabled *, \
+                                /usr/bin/systemctl is-failed *, \
+                                /usr/bin/systemctl enable *, \
+                                /usr/bin/systemctl disable *, \
+                                /usr/bin/systemctl reset-failed *, \
+                                /usr/bin/systemctl daemon-reload, \
+                                /usr/bin/systemctl list-units *, \
+                                /usr/bin/systemctl show *, \
+                                /usr/bin/systemctl cat *
+
+Cmnd_Alias CLAWCIUS_LOGS = /usr/bin/journalctl *
+
+Cmnd_Alias CLAWCIUS_STATE = /usr/bin/mkdir -p /var/lib/clawcius*, \
+                            /usr/bin/mkdir -p /var/lib/hamachi*, \
+                            /usr/bin/chown [a-z]*\:[a-z]* /var/lib/clawcius*, \
+                            /usr/bin/chown [a-z]*\:[a-z]* /var/lib/hamachi*, \
+                            /usr/bin/chmod [0-7][0-7][0-7][0-7] /var/lib/clawcius*, \
+                            /usr/bin/chmod [0-7][0-7][0-7][0-7] /var/lib/hamachi*, \
+                            /usr/bin/chmod [0-7][0-7][0-7] /var/lib/clawcius*, \
+                            /usr/bin/chmod [0-7][0-7][0-7] /var/lib/hamachi*
+
+# Installing and removing unit files. `install` rather than `cp` because it
+# takes the mode and ownership as arguments, so the rule can pin them: a unit
+# file arrives 0644 root:root or it does not arrive.
+Cmnd_Alias CLAWCIUS_UNITS = /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/*, \
+                            /usr/bin/rm -f /etc/systemd/system/*.service, \
+                            /usr/bin/rm -f /etc/systemd/system/*.timer
+
+npurcell ALL=(root) NOPASSWD: CLAWCIUS_SYSTEMCTL, CLAWCIUS_LOGS, \
+                              CLAWCIUS_STATE, CLAWCIUS_UNITS

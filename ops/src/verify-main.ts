@@ -69,6 +69,18 @@ const journal = new Journal(config.stateDir, () => ({
   quarantined: [],
   consecutiveFailedRecoveries: 0,
   lastVerify: null,
+  // Reported as configured, so the page does not show a blank where the most
+  // consequential setting on this host should be. Nothing else here concerns
+  // the host agent: this is a oneshot with no session and there never will be
+  // one — it exists to boot a snapshot and prove it comes up.
+  hostAgent: {
+    enabled: config.hostAgent.enabled,
+    claudePath: config.hostAgent.claudePath,
+    timeoutMinutes: config.hostAgent.timeoutMinutes,
+    maxCostUsd: config.hostAgent.maxCostUsd,
+  },
+  auditedCommands: 0,
+  lastTask: null,
 }));
 
 const outcomes = await verifyAll(config, runner);

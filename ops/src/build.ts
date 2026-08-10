@@ -1,7 +1,30 @@
 /**
- * Building a checkout before anything is restarted onto it.
+ * Who owns the checkout, and what state its tree is in.
  *
- * ── Why this file exists at all ──────────────────────────────────────────
+ * ── What this file was, and what is left of it ───────────────────────────
+ *
+ * Until 2026-08-10 this ran the build: `npm ci && npm run build` as a step
+ * inside the `pull` and `redeploy` verbs. Those verbs are gone, and with them
+ * the planner and the runner — the host agent runs npm itself, in a Bash
+ * command that gets audited like every other.
+ *
+ * Two things stayed, and both are load-bearing for what replaced them:
+ *
+ *   - `resolveOwner`, which is how the executor decides who the host agent
+ *     session runs as. The session is dropped to the checkout's owner for
+ *     exactly the reason the build was, and the drop now covers everything the
+ *     session does rather than two commands;
+ *   - `readDirty`, which feeds the briefing. The prohibition on forcing past a
+ *     dirty tree moved from a gate in this file to a standing rule in the host
+ *     agent's system prompt, and a rule that arrives with the actual filenames
+ *     attached is one the session can act on.
+ *
+ * The rest of this header is the record of why either of them exists. It is
+ * kept in full, because the failures it describes have not stopped being
+ * possible — they have stopped being prevented by a check and started being
+ * prevented by an instruction, which is a weaker thing and worth knowing.
+ *
+ * ── Why the build mattered ───────────────────────────────────────────────
  *
  * Every service in this repository is started as `node dist/index.js`. Not one
  * unit compiles anything: `clawcius.service`, `hamachi.service` and
@@ -26,14 +49,16 @@
  * An agent wiring "pull, then restart" into a redeploy loop would reproduce the
  * silent no-op perfectly and far faster than anyone could notice.
  *
- * So the build is no longer a habit. It is a step in the `pull` and `redeploy`
- * verbs, it runs `npm ci && npm run build` exactly as `package.json` defines
- * them, and if it fails the operation stops there. Nothing gets restarted onto
- * a stale `dist/`, and — the case that is actually worse — nothing gets
- * restarted onto a *half-built* one, where `tsc` emitted four files out of
- * thirty before it hit the error.
+ * From 2026-08-10 the build is a habit again — the host agent's habit, stated
+ * as a standing rule in its system prompt along with the date and the hour it
+ * cost, and named per repository in the briefing with the exact directories.
+ * That is a real reduction in strength and it is written down here rather than
+ * glossed: an instruction can be forgotten in a way a step in a state machine
+ * cannot. What is bought for it is that the same agent can also install a unit,
+ * chown a directory and read a journal, which is what the operator actually
+ * needed.
  *
- * ── Why it drops privileges ──────────────────────────────────────────────
+ * ── Why the session drops privileges ─────────────────────────────────────
  *
  * `clawcius-ops.service` is `User=root`. The checkout is `/home/npurcell/clawcius`
  * and `clawcius.service`, `hamachi.service` and `clawcius-status.service` all
@@ -50,9 +75,16 @@
  *
  * So the owner is discovered by `stat`ing the checkout — never hardcoded,
  * because the executor is not entitled to an opinion about who owns a directory
- * it was pointed at — and the build runs as that uid/gid. If the owner cannot
- * be determined, or the drop cannot be performed, the build is refused. Running
- * it as root anyway is the failure this is here to prevent.
+ * it was pointed at — and the host agent session runs as that uid/gid. If the
+ * owner cannot be determined, or the drop cannot be performed, THE TASK IS
+ * REFUSED. Running a session with a shell as root is a much larger version of
+ * the failure this was written for: not two commands producing root-owned
+ * files, but every command it chooses to run.
+ *
+ * The upside of dropping the whole session rather than two commands is that the
+ * original failure becomes structurally impossible for anything the agent does
+ * without `sudo`. It cannot leave a root-owned `node_modules/` behind by
+ * accident, because it is not root.
  *
  * ── Why the drop is setuid(2) and not sudo or su ─────────────────────────
  *
@@ -82,9 +114,8 @@
  */
 
 import { readFileSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
 import type { OpsConfig, RepoEntry } from './config.js';
-import type { Runner, CommandResult } from './runner.js';
+import type { Runner } from './runner.js';
 import { summarise } from './runner.js';
 
 /** Where the owning user's name and home directory are looked up. */
@@ -193,184 +224,6 @@ function lookupPasswd(uid: number, passwdPath: string): { user: string; home: st
   return null;
 }
 
-export type BuildStep = {
-  /** For the journal: `npm ci in ops`. Never re-parsed. */
-  label: string;
-  argv: string[];
-  cwd: string;
-  env: Record<string, string>;
-  /** Present only when the executor is dropping privilege for this step. */
-  uid?: number;
-  gid?: number;
-  timeoutSeconds: number;
-};
-
-/**
- * The commands, in order, with nothing left implicit.
- *
- * Pure — it decides and returns, it does not execute — so the self-test can
- * assert on the ordering, the working directories and the uid/gid without a
- * root process and without npm installed. That matters more than usual here:
- * the interesting properties of this function are "the build comes before the
- * restart" and "the build does not run as root", and both are statements about
- * a plan rather than about an outcome.
- *
- * `npm ci`, not `npm install`. `ci` deletes `node_modules/` and installs
- * exactly what `package-lock.json` says, which is the only form of the command
- * whose result does not depend on what happened to be installed before it. An
- * unattended root daemon silently rewriting a lockfile — which is what `npm
- * install` does when it feels the lockfile is out of date — is a change nobody
- * reviewed arriving in a checkout that is about to be deployed.
- */
-export function planBuild(
-  config: OpsConfig,
-  repo: RepoEntry,
-  owner: BuildOwner,
-  drop: boolean,
-): BuildStep[] {
-  // npm re-execs node and runs `tsc` out of node_modules/.bin through sh, so
-  // the directory npm itself lives in has to be on PATH. It is not on the
-  // system PATH on this host — node is installed under the owner's home — and
-  // without this the build fails at `npm run build` with "tsc: not found",
-  // several minutes after `npm ci` succeeded.
-  const nodeBin = dirname(config.npmPath);
-  const env: Record<string, string> = {
-    PATH: `${nodeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
-    HOME: owner.home,
-    // Set explicitly rather than left to npm's HOME-relative default. The
-    // default is correct given the HOME above, and stating it anyway means a
-    // future change to how HOME is derived cannot quietly send a root-run
-    // build's cache into /root/.npm — the same class of mistake as the
-    // root-owned node_modules this whole file exists for.
-    npm_config_cache: join(owner.home, '.npm'),
-    // Nothing here has a terminal and nothing here should be phoning home for
-    // a version banner mid-deploy.
-    NO_UPDATE_NOTIFIER: '1',
-    npm_config_fund: 'false',
-    npm_config_audit: 'false',
-    CI: '1',
-  };
-
-  const steps: BuildStep[] = [];
-  for (const relative of repo.buildDirs) {
-    const cwd = resolve(repo.path, relative);
-    const where = relative === '.' ? repo.name : `${repo.name}/${relative}`;
-    for (const [label, argv] of [
-      [`npm ci in ${where}`, [config.npmPath, 'ci']],
-      [`npm run build in ${where}`, [config.npmPath, 'run', 'build']],
-    ] as Array<[string, string[]]>) {
-      steps.push({
-        label,
-        argv,
-        cwd,
-        env,
-        ...(drop ? { uid: owner.uid, gid: owner.gid } : {}),
-        // Generous. `npm ci` on a cold cache pulls a few hundred packages over
-        // a proxied link, and a timeout that fires mid-install leaves a
-        // node_modules/ that is neither the old one nor the new one — which is
-        // precisely the half-built state the caller is being protected from.
-        timeoutSeconds: config.limits.buildTimeoutSeconds,
-      });
-    }
-  }
-  return steps;
-}
-
-export type BuildOutcome = {
-  ok: boolean;
-  /** Prose for the journal. Always says which step failed and what it means. */
-  detail: string;
-  /** Labels of the steps actually attempted, in order. */
-  ran: string[];
-  owner: BuildOwner | null;
-};
-
-/**
- * Run the plan, stopping at the first failure.
- *
- * `run`, not `probe`, so `dryRun` suppresses it like every other mutating
- * command — a dry run that quietly reinstalled node_modules and rewrote dist/
- * would be the single most surprising thing this daemon could do, given the
- * whole promise of the mode is that it changes nothing.
- *
- * Suppressed steps still walk the plan and still log the exact argv, the cwd
- * and the uid they would have used, which is the point: it is how you read a
- * week of the journal and know that the build would have run as npurcell
- * before deciding to turn dry-run off.
- */
-export async function runBuild(
-  runner: Runner,
-  config: OpsConfig,
-  repo: RepoEntry,
-): Promise<BuildOutcome> {
-  const resolved = resolveOwner(repo.path);
-  if (!resolved.ok) {
-    return { ok: false, detail: resolved.reason, ran: [], owner: null };
-  }
-
-  const { owner, drop } = resolved;
-  const steps = planBuild(config, repo, owner, drop);
-  if (steps.length === 0) {
-    return {
-      ok: true,
-      detail: `${repo.name} has no buildDirs configured, so there is nothing to build.`,
-      ran: [],
-      owner,
-    };
-  }
-
-  const asWho = drop
-    ? `dropping to ${owner.user} (uid ${owner.uid}, gid ${owner.gid})`
-    : `already running as ${owner.user} (uid ${owner.uid}), nothing to drop`;
-
-  // The checkout being root-owned is not an error — the owner is whoever the
-  // owner is, and the executor does not get to have an opinion. It is said
-  // loudly all the same, because on this host it means the services that run
-  // as a person are already broken or about to be.
-  const rootWarning =
-    owner.uid === 0
-      ? ' WARNING: the checkout is owned by root, so the build runs as root and everything ' +
-        'it writes will be root-owned. Every unit that runs this code does so as an ' +
-        'ordinary user; check that they can still start.'
-      : '';
-
-  const ran: string[] = [];
-  for (const step of steps) {
-    ran.push(step.label);
-    const result: CommandResult = await runner.run(step.argv, {
-      cwd: step.cwd,
-      env: step.env,
-      timeoutSeconds: step.timeoutSeconds,
-      ...(step.uid === undefined ? {} : { uid: step.uid, gid: step.gid }),
-    });
-    if (!result.ok) {
-      return {
-        ok: false,
-        owner,
-        ran,
-        detail:
-          `${step.label} FAILED (${summarise(result)}), ${asWho}.\n` +
-          'STOPPING HERE. Nothing will be restarted or recreated. A failed build leaves ' +
-          'dist/ either stale or half-written, and restarting onto either is how a merged ' +
-          'change silently does nothing — which is exactly the hour this step was added to ' +
-          'stop happening again.' +
-          (result.stderr.trim() ? `\nstderr: ${result.stderr.trim().slice(0, 2000)}` : '') +
-          (result.stdout.trim() ? `\nstdout: ${result.stdout.trim().slice(0, 2000)}` : ''),
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    owner,
-    ran,
-    detail:
-      `built ${repo.name} (${repo.path}): ${ran.join(', ')} — ${asWho}.` +
-      (runner.dryRun ? ' DRY RUN — the plan was logged, nothing was built.' : '') +
-      rootWarning,
-  };
-}
-
 export type DirtyResult =
   | { ok: true; files: string[] }
   | { ok: false; reason: string };
@@ -432,22 +285,4 @@ export async function readDirty(
     .map((line) => line.slice(2).trim());
 
   return { ok: true, files };
-}
-
-/** The refusal text, kept in one place so pull and redeploy say the same thing. */
-export function dirtyRefusal(repo: RepoEntry, files: string[]): string {
-  return (
-    `${repo.path} has ${files.length} uncommitted change(s). REFUSING, and not touching ` +
-    'them:\n' +
-    files
-      .slice(0, 50)
-      .map((file) => `  ${file}`)
-      .join('\n') +
-    (files.length > 50 ? `\n  …and ${files.length - 50} more` : '') +
-    '\n\nThis executor will never reset --hard, checkout -f, stash or clean its way past ' +
-    'this. On 2026-08-09 the local edits that blocked a pull on this host turned out to be ' +
-    'real fixes made by hand during an incident, and every way of "getting the pull to go ' +
-    'through" would have destroyed or hidden them. Commit them, or revert them, on the ' +
-    'host, by a person who can look at what they are.'
-  );
 }

@@ -1,22 +1,28 @@
 /**
  * clawcius-ops — the host-side executor.
  *
- * Watches a bind-mounted spool directory that the sandboxed agents write into,
- * and performs a fixed list of privileged operations on their behalf. It has no
- * Discord connection, no Anthropic credential and no model; see executor.ts for
- * why each of those absences is deliberate.
+ * Watches one bind-mounted spool per instance, and carries out the tasks the
+ * sandboxed agents file there by handing each one to a headless Claude Code
+ * session on the host: snapshot first, audit every command, health-check after,
+ * roll back if it went wrong.
  *
- * It ships with `dryRun: true`. First deploy of a daemon holding docker and
- * systemctl should be watched before it is trusted, and in dry-run every
- * decision is made and logged exactly as it would be, with the argv it would
- * have executed, and nothing runs. Read a week of that log, then turn it off.
+ * It has no Discord connection and files no messages. Since 2026-08-10 it DOES
+ * have a model — the sentence that used to be here said it never would, and
+ * ops/src/host-agent.ts is the whole account of why that changed, what was
+ * given up, and what was put in its place. Read that before this.
+ *
+ * It ships with `dryRun: true`, and in this mode the session is not asked
+ * nicely: Bash and every other tool that can change the machine is removed from
+ * it by the permission system, so it can look and plan and cannot act. Read a
+ * week of that log, then turn it off.
  */
 
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadOpsConfig } from './config.js';
 import { Executor } from './executor.js';
-import { OpsSpool } from './spool.js';
+import { OpsSpool, ensureOwnedDir } from './spool.js';
+import { resolveOwner } from './build.js';
 
 const config = loadOpsConfig();
 
@@ -102,6 +108,39 @@ const releaseLock = takeLock(config.stateDir);
 
 const executor = new Executor(config);
 
+/**
+ * The host agent's working directory, created and handed to the checkout owner.
+ *
+ * Created here rather than lazily at the first task, because a task that fails
+ * because a directory does not exist fails several seconds into a `claude`
+ * spawn with a message about a bad cwd, at the moment somebody was waiting on
+ * it. Doing it at boot means the failure — if there is one — is in the boot
+ * banner where it belongs.
+ *
+ * Root-owned would be useless: the session runs as the checkout's owner, so it
+ * is chowned to match, exactly as the spools are, with the ownership discovered
+ * by stat rather than configured.
+ */
+const ownerOfCheckout = config.repos[0]?.path ?? '';
+if (config.hostAgent.enabled) {
+  if (!ownerOfCheckout) {
+    process.stderr.write(
+      '[ops] hostAgent.enabled is true but no repos: are configured, so there is no ' +
+        'checkout to take an owner from. Every task will be refused rather than run a ' +
+        'session with a shell as root.\n',
+    );
+  } else {
+    ensureOwnedDir(
+      config.hostAgent.workDir,
+      ownerOfCheckout,
+      (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
+      0o750,
+    );
+  }
+}
+
+const owner = ownerOfCheckout ? resolveOwner(ownerOfCheckout) : null;
+
 executor.journal.write({
   kind: 'boot',
   what: 'clawcius-ops',
@@ -109,15 +148,24 @@ executor.journal.write({
   detail:
     `pid ${process.pid}; state ${config.stateDir}; spools ` +
     `${config.instances.map((i) => `${i.name}=${i.opsSpoolDir}`).join(', ') || '(NONE)'}; ` +
-    `${config.units.length} unit(s), ${config.repos.length} repo(s), ` +
-    `${config.instances.length} instance(s) allowlisted; ` +
+    `${config.units.length} unit(s) and ${config.instances.length} container(s) health-` +
+    `checked around every task; ${config.repos.length} repo(s) in the briefing; ` +
     `deadline ${config.deadline.minutes}m (auto-rollback ` +
     `${config.deadline.autoRollback ? 'on' : 'off'}); ` +
     `breaker freezes after ${config.breaker.maxConsecutiveFailedRecoveries} consecutive ` +
-    `failed recoveries. ` +
+    `failed recoveries; snapshots kept: ${config.snapshotKeep}. ` +
+    `HOST AGENT: ${
+      config.hostAgent.enabled
+        ? `${config.hostAgent.claudePath}, up to ${config.hostAgent.timeoutMinutes}m and ` +
+          `$${config.hostAgent.maxCostUsd} per task, cwd ${config.hostAgent.workDir}, as ` +
+          `${owner?.ok ? `${owner.owner.user} (uid ${owner.owner.uid})` : 'NOBODY — tasks will be refused'}`
+        : 'DISABLED — tasks refused, deadlines and rollbacks still honoured'
+    }. ` +
     (config.dryRun
-      ? 'DRY RUN — every decision is made and logged, nothing is executed.'
-      : 'LIVE — this process will run systemctl and docker for real.'),
+      ? 'DRY RUN — the session has no Bash tool and cannot execute anything; it plans and ' +
+        'the plan is logged.'
+      : 'LIVE — a Claude Code session with a shell and sudo will run on this host, and ' +
+        'every command it issues is written into journal.jsonl before its result is known.'),
 });
 
 // Deprecation notices go in the journal, not just to stdout, because the whole

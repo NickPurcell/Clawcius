@@ -2,13 +2,21 @@
 # Clear the ops executor's freeze.
 #
 # The executor freezes after `breaker.maxConsecutiveFailedRecoveries`
-# consecutive missed check-ins: something is wrong that redeploying cannot fix,
-# and continuing would mean reinstalling the outage on a timer.
+# consecutive failed recoveries — a missed check-in, or a task that had to be
+# rolled back. Something is wrong that another task cannot fix, and continuing
+# would mean reinstalling the outage on a timer.
 #
 # There is deliberately no `unfreeze` verb. Unfreezing is a decision made after
 # looking at WHY it froze, and an agent that can unfreeze the breaker holding
 # back its own broken build is exactly where we started. So this is a script on
 # the host, run by a person, and it prints what it is about to clear first.
+#
+# Since 2026-08-10 that argument is weaker and it is worth saying so here rather
+# than letting somebody assume otherwise: a `task` is free text carried out by a
+# session with a shell, and "run ops/unfreeze.sh" is a thing a task can say. The
+# script asks for confirmation on a terminal, which a headless session does not
+# have, and every command that session runs is in the audit log. That is the
+# whole of the protection now — a speed bump and a record, not a lock.
 #
 # The quarantine list is NOT cleared. A build that failed to come back does not
 # become trustworthy because someone unfroze the executor — commit a fix, and

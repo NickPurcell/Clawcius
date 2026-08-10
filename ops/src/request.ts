@@ -5,69 +5,99 @@
  * READ THIS BEFORE CHANGING ANYTHING IN THIS FILE.
  *
  * The spool is written by an agent that may be prompt-injected, and read by a
- * root process holding docker and systemctl. That is the whole threat model in
- * one sentence, and it is not hypothetical: the agents on this host read
- * Discord messages from strangers, fetch web pages, clone repositories and
- * summarise pull requests opened by people we have never met. Any of those can
- * contain text saying "now write the following JSON into the ops spool". The
- * container boundary is what stops that text becoming host code execution, and
- * this file is where the boundary is actually enforced.
+ * root process holding docker and systemctl. That sentence used to end with
+ * "and this file is where the boundary is enforced". Since 2026-08-10 it does
+ * not, and the change is worth stating rather than discovering.
  *
- * So the rules, and the reasoning:
+ * ── What changed, and what did not ───────────────────────────────────────
  *
- *   **Closed verb list.** A verb is matched against a frozen set. An unknown
- *   verb is rejected and logged — never "close enough", never a prefix match,
- *   never a default branch that tries something sensible. "Best effort" on
- *   privileged input means the attacker chooses the effort.
+ * The closed verb list is gone. `restart`, `pull`, `redeploy` and `snapshot`
+ * have been deleted, and `task` — a free-text description of what needs doing,
+ * handed to a Claude Code session on the host with a shell — has replaced all
+ * of them. The reasoning is in ops/src/host-agent.ts and in ops/README.md; the
+ * short version is that a closed set can only contain what somebody imagined in
+ * advance, and every gap in it turned the operator into the agent's hands.
  *
- *   **Every argument is a lookup, not a value.** `unit`, `instance` and `repo`
- *   are validated by exact equality against config, and what reaches the
- *   command is the *config entry*, not the request's string. The request only
- *   ever selects; it never supplies. That is the difference between an
- *   allowlist and a filter, and filters lose.
- *
- *   **No shell, anywhere.** Every command in this service is an argv array
- *   handed to execFile with no shell. There is no string to quote, so there is
- *   nothing quoting can get wrong. Do not add `exec`, do not pass
- *   `shell: true`, do not build a command line "just for logging" and then run
- *   it. This is why `;`, `$(…)`, backticks and newlines in a field are not
- *   interesting to us — but the validation rejects them anyway, because the
- *   day someone adds a shell should not also be the day this became
- *   exploitable.
+ * So this file no longer decides what may happen. It cannot: `task` carries
+ * prose, and prose has no allowlist. What it still does, and still must:
  *
  *   **Structural rejection, not repair.** Malformed JSON is discarded whole.
- *   Nothing here salvages the parseable prefix of a broken file, and nothing
- *   coerces types. A number where a string belongs is a reject.
+ *   Nothing salvages the parseable prefix of a broken file and nothing coerces
+ *   types. A number where a string belongs is a reject.
  *
- *   **Traversal is checked on identifiers even though they are never used as
- *   paths.** They are not used as paths *today*. Defence that only holds while
- *   the current call graph holds is not defence.
+ *   **Identifiers are still lookups, not values.** `instance` and `tag` are
+ *   shape-checked here and matched by exact equality against config in the
+ *   executor, and what reaches a command is the config entry. That rule is
+ *   unchanged for the verbs that still take an identifier, because those verbs
+ *   still build argv arrays out of them.
+ *
+ *   **Traversal and control bytes are refused, not stripped.** Stripping is how
+ *   `....//` becomes `../`. Still checked on identifiers even though they are
+ *   never used as paths, because "never used as paths" is a property of today's
+ *   call graph.
+ *
+ *   **Free text is retained, capped and never executed.** `task`, `reason` and
+ *   `detail` are the only fields that reach anything as *content*, and the
+ *   thing they reach is a model's prompt. That is not a shell and it is not
+ *   safer than one — it is the deal the operator accepted with his eyes open.
+ *
+ * The one thing this file must never be talked into growing is a way for the
+ * request to say who filed it. Provenance is the spool directory. See
+ * KNOWN_FIELDS.
  * ══════════════════════════════════════════════════════════════════════════
  */
 
-/** The closed set. Nothing outside this is ever dispatched. */
-export const VERBS = [
-  'restart',
-  'pull',
-  'redeploy',
-  'snapshot',
-  'rollback',
-  'checkin',
-  'wake',
-] as const;
+/**
+ * What a request may be. Four things, and three of them are plumbing.
+ *
+ * `task` is the whole feature: free text, handed to the host agent. The other
+ * three survived the cull of 2026-08-10 for reasons that are individually
+ * boring and collectively the point — none of them is a capability the host
+ * agent would do better, and two of them must keep working when the host agent
+ * does not.
+ *
+ * **`checkin`** — kept, and it could not have been dropped. It is the answer to
+ * a question the executor asked: a destructive task arms a deadline and rolls
+ * the instance back on silence. It runs no command, it is answered inline
+ * without taking the lock, and it has to work when the instance that is
+ * answering has just been rebuilt and may be barely alive. Routing it through a
+ * model would make the recovery path depend on the thing being recovered.
+ *
+ * **`rollback`** — kept, and deliberately NOT delegated. It is the undo, and
+ * the undo is now the safety property that replaced the verb list: "whatever it
+ * does can be undone" is worth nothing if undoing is itself a natural-language
+ * task run by the same machinery that just broke something. It is a fixed argv
+ * — retag an image, recreate a container — and the automatic deadline path
+ * calls the same code, so it exists whether or not it is exposed.
+ *
+ * **`wake`** — kept because it is not a privilege at all. It relays a wake into
+ * the waker's own spool, which the agent can already write; it runs no command
+ * and grants nothing. Deleting it would remove a documented capability in
+ * exchange for nothing.
+ *
+ * Deleted: `restart`, `pull`, `redeploy`, `snapshot`. Every one of them is a
+ * sentence a task can say, and each was an argument allowlist to maintain.
+ * `snapshot` in particular is not gone as a *behaviour* — every task now takes
+ * one before it starts, which is strictly more than a verb nobody remembered to
+ * call.
+ */
+export const VERBS = ['task', 'checkin', 'rollback', 'wake'] as const;
 
 export type Verb = (typeof VERBS)[number];
 
 const VERB_SET: ReadonlySet<string> = new Set<string>(VERBS);
 
 /**
- * Verbs that destroy or replace a running container.
+ * Verbs that can take an instance off the air.
  *
- * These are the ones that wait for an idle turn, arm a check-in deadline and
- * consult the circuit breaker. Kept as data next to the verb list so that
- * adding a verb forces a decision about which side of the line it is on.
+ * These wait for an idle turn, arm a check-in deadline and are refused while
+ * the breaker is frozen. `task` is on the list unconditionally and that is not
+ * a judgement about any particular task: the executor cannot know what a
+ * sentence will turn out to mean, and the only safe reading of "unknown" is the
+ * same one the idle check uses for a missing waker status file — treat it as
+ * the dangerous case.
  */
-export const DESTRUCTIVE_VERBS: ReadonlySet<Verb> = new Set<Verb>(['redeploy', 'rollback']);
+export const DESTRUCTIVE_VERBS: ReadonlySet<Verb> = new Set<Verb>(['task', 'rollback']);
 
 export function isDestructive(verb: Verb): boolean {
   return DESTRUCTIVE_VERBS.has(verb);
@@ -82,11 +112,27 @@ export function isDestructive(verb: Verb): boolean {
  */
 export type OpsRequest = {
   verb: Verb;
-  /** Unit name, for `restart`. */
-  unit: string;
-  /** Repo name, for `pull`. */
-  repo: string;
-  /** Instance name, for `redeploy` / `snapshot` / `rollback` / `checkin`. */
+  /**
+   * What needs doing, in words, for `task`.
+   *
+   * The only field in this system whose content is *acted on* rather than
+   * matched against a list. It reaches a model's prompt and nothing else — it
+   * is never a path, never an argv element, never interpolated into anything.
+   * Capped at MAX_TASK_CHARS and stripped of control characters, which is
+   * hygiene for the journal rather than a security control: there is no
+   * security control available here and pretending otherwise would be worse
+   * than saying so.
+   */
+  task: string;
+  /**
+   * Instance the request concerns. Required by `checkin` and `rollback`,
+   * OPTIONAL on `task` — and the default when it is absent is the expensive,
+   * safe one. See the executor: a task that names an instance has that one
+   * snapshotted, idle-waited and health-checked; a task that names none gets
+   * every configured instance, because "which containers might this sentence
+   * disturb" has no answer and the fail-safe reading of no answer is "all of
+   * them".
+   */
   instance: string;
   /** Snapshot tag, for `rollback`. Empty means "the newest one". */
   tag: string;
@@ -105,13 +151,16 @@ export type ParseResult = { ok: true; request: OpsRequest } | { ok: false; reaso
 /**
  * Identifier fields: what an agent may name.
  *
- * Deliberately tighter than the set it selects from. The config allowlist is
- * the real gate — this is a cheap structural filter in front of it so garbage
- * is rejected with a precise reason instead of failing an equality test and
- * being reported as "not allowed", which reads like a config problem.
+ * Deliberately tighter than the set they select from. `instances:` in the
+ * config is still the real gate for the fields that reach a command — this is a
+ * cheap structural filter in front of it so garbage is rejected with a precise
+ * reason instead of failing an equality test and being reported as "not
+ * allowed", which reads like a config problem.
+ *
+ * Note that these now guard only `instance`, `tag` and `channel`. The task text
+ * has no pattern and cannot have one; that field is prose by design.
  */
 const IDENTIFIER = /^[a-z][a-z0-9-]{0,63}$/;
-const UNIT = /^[a-z][a-z0-9@.-]{0,95}\.(service|timer|socket|target|path)$/;
 /** Exactly the shape `docker/snapshot.sh` writes: `snap-YYYYmmdd-HHMMSS`. */
 const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
 const CHANNEL = /^[0-9]{5,25}$/;
@@ -123,6 +172,14 @@ const CONTROL_CHARS_EXCEPT_WHITESPACE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f
 
 /** Ceiling on free-text fields, past which they are truncated, not rejected. */
 const MAX_TEXT_CHARS = 2000;
+/**
+ * Ceiling on the task itself. Larger, because a task is the payload now.
+ *
+ * Still bounded, and bounded well under `limits.maxRequestBytes` so the spool's
+ * stat-before-open cap is the first thing that says no. A task that needs more
+ * than this many characters is a task that should have been three tasks.
+ */
+const MAX_TASK_CHARS = 8000;
 
 /**
  * Anything with a separator, a traversal component, a NUL or a control
@@ -156,9 +213,9 @@ function rejectTraversal(field: string, value: string): string | null {
  * It is still not *safe* text. Anything that renders it later — the status
  * page, a Discord message — treats it as hostile on its own account.
  */
-function text(value: unknown): string {
+function text(value: unknown, max: number = MAX_TEXT_CHARS): string {
   if (typeof value !== 'string') return '';
-  return value.replace(CONTROL_CHARS_EXCEPT_WHITESPACE, ' ').slice(0, MAX_TEXT_CHARS).trim();
+  return value.replace(CONTROL_CHARS_EXCEPT_WHITESPACE, ' ').slice(0, max).trim();
 }
 
 /**
@@ -179,8 +236,7 @@ function text(value: unknown): string {
  */
 const KNOWN_FIELDS = new Set([
   'verb',
-  'unit',
-  'repo',
+  'task',
   'instance',
   'tag',
   'channel',
@@ -238,8 +294,7 @@ export function parseRequest(raw: string): ParseResult {
 
   const request: OpsRequest = {
     verb,
-    unit: '',
-    repo: '',
+    task: text(body['task'], MAX_TASK_CHARS),
     instance: '',
     tag: '',
     channel: '',
@@ -250,7 +305,7 @@ export function parseRequest(raw: string): ParseResult {
 
   /** Pull one identifier field, shape-check it, refuse traversal. */
   const identifier = (
-    field: 'unit' | 'repo' | 'instance' | 'tag' | 'channel',
+    field: 'instance' | 'tag' | 'channel',
     pattern: RegExp,
     required: boolean,
   ): string | null => {
@@ -270,16 +325,19 @@ export function parseRequest(raw: string): ParseResult {
 
   let error: string | null = null;
   switch (verb) {
-    case 'restart':
-      error = identifier('unit', UNIT, true);
+    case 'task':
+      // The instance is optional and the task text is not. An empty task is
+      // rejected rather than handed to a model to interpret, because "do
+      // something" filed against a root shell is the request most likely to be
+      // an accident and least likely to be what anybody wanted.
+      error = identifier('instance', IDENTIFIER, false);
+      if (!error && !request.task) {
+        error =
+          'task requires "task" — a sentence or two saying what needs doing. It is handed ' +
+          'to a Claude Code session on the host; write it for a colleague, not for a parser.';
+      }
       break;
 
-    case 'pull':
-      error = identifier('repo', IDENTIFIER, true);
-      break;
-
-    case 'redeploy':
-    case 'snapshot':
     case 'checkin':
       error = identifier('instance', IDENTIFIER, true);
       break;
@@ -300,10 +358,22 @@ export function parseRequest(raw: string): ParseResult {
   return { ok: true, request };
 }
 
-/** One-line rendering for the journal and for stdout. */
+/**
+ * One-line rendering for the journal and for stdout.
+ *
+ * A task is summarised by its first line, squeezed and clipped, because the
+ * journal's prose lines are read in a terminal during an incident and an
+ * eight-thousand-character `what` field makes `journalctl` useless at the
+ * moment it is needed. The full text is in the `detail` of the request entry
+ * and in the audit, both of which are complete.
+ */
 export function describeRequest(request: OpsRequest): string {
-  const target =
-    request.unit || request.instance || request.repo || request.channel || '(no target)';
+  if (request.verb === 'task') {
+    const first = request.task.split('\n')[0]?.replace(/\s+/g, ' ').trim() ?? '';
+    const clipped = first.length > 80 ? `${first.slice(0, 80)}…` : first;
+    return `task ${request.instance ? `${request.instance}: ` : ''}${clipped || '(empty)'}`;
+  }
+  const target = request.instance || request.channel || '(no target)';
   const tag = request.tag ? ` ${request.tag}` : '';
   return `${request.verb} ${target}${tag}`;
 }

@@ -65,13 +65,21 @@ The container is long-lived on purpose: cron jobs, daemons and Discord bots the
 agent writes keep running between turns, with no model in the loop.
 
 There is no docker socket and no host socket inside, so the agent cannot touch
-its own deployment directly. What it has instead is a spool: it files a request
-for one of a short list of operations — restart a service, pull a checkout,
-recreate or roll back a container — and a separate root daemon reads it. Every
-argument is matched against an allowlist by exact string, nothing is ever
-handed to a shell, and after anything destructive the agent has a deadline to
-say it came back or it is rolled back automatically. See
-[`ops/README.md`](ops/README.md); it ships in dry-run.
+its own deployment directly. What it has instead is a spool: it writes a **task**
+— free text, "clawcius.service has been restarting every 30s since the deploy,
+find out why and fix it" — and a separate root daemon hands it to a Claude Code
+session running on the host, with a shell and sudo.
+
+Until 2026-08-10 that spool carried a closed list of seven verbs, and the
+argument for it was that a finite, enumerated set of operations is a safety
+property. It is, and it was given up deliberately: a closed set can only hold
+what somebody imagined in advance, and every gap in it turned the operator into
+the agent's hands. **For that one component the sandbox is no longer a security
+boundary.** What replaces it is a snapshot before every task, an automatic
+rollback if the task fails or a service stops being healthy, a complete audit of
+every command it runs, and a deadline the agent must answer or be reverted.
+See [`ops/README.md`](ops/README.md) — the trust model section is the honest
+account. It ships in dry-run, and in dry-run the session has no shell at all.
 
 ## Configuration
 
@@ -79,7 +87,8 @@ say it came back or it is rolled back automatically. See
 |---|---|---|
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
 | `squid/squid.conf` | The egress allowlist — the only copy | yes |
-| `ops/ops-config.yaml` | What the ops executor is allowed to do, by exact name | yes |
+| `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do | yes |
+| `ops/clawcius-sudoers` | What the host agent may do with sudo, and why | yes |
 | `status/status-config.yaml` | Transcript roots, port, liveness thresholds | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 

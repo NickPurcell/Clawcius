@@ -138,11 +138,37 @@ export function ensureSpoolDir(
   ownerOf: string,
   log: (line: string) => void,
 ): void {
+  ensureOwnedDir(dir, ownerOf, log, 0o770);
+}
+
+/**
+ * Create a directory and give it the same ownership as a reference path.
+ *
+ * Factored out of `ensureSpoolDir` on 2026-08-10 for the host agent's working
+ * directory, which has the same problem for the same reason: the executor is
+ * root, `mkdir` from root produces a root-owned directory, and the process that
+ * has to write there is not root. For a spool the symptom is an agent whose
+ * requests are never seen; for the host agent's workDir it is a session that
+ * cannot start, which at least fails loudly.
+ *
+ * The ownership is discovered by `stat`ing `ownerOf` rather than configured.
+ * Same rule as build.ts: this daemon is not entitled to an opinion about who
+ * owns a directory it was pointed at.
+ *
+ * Failures are logged, never fatal — with the exact `chown` to run, because the
+ * alternative symptom is a capability that silently does not work.
+ */
+export function ensureOwnedDir(
+  dir: string,
+  ownerOf: string,
+  log: (line: string) => void,
+  mode: number,
+): void {
   let created = false;
   try {
     // 0770 rather than 0750: the container writes here. Group ownership is
     // what makes that work without the directory being world-writable.
-    created = mkdirSync(dir, { recursive: true, mode: 0o770 }) !== undefined;
+    created = mkdirSync(dir, { recursive: true, mode }) !== undefined;
   } catch (error) {
     log(`cannot create ${dir}: ${String(error)} — requests filed there will never arrive`);
     return;

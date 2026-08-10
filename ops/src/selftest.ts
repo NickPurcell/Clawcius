@@ -22,7 +22,12 @@
  *   - the idle logic against synthetic waker status files, including the
  *     stale-zero case that is the dangerous one;
  *   - dry-run, verifying that mutating commands are logged and not run while
- *     read-only probes still execute;
+ *     read-only probes still execute, AND that the host agent session is sent
+ *     settings which remove its ability to execute rather than asking it not to;
+ *   - the host agent itself, against a `claude` stand-in that speaks real
+ *     stream-json: task dispatch, the completeness of the audit, the
+ *     snapshot-before/rollback-after ordering, the health comparison, and the
+ *     refusal to spawn a session whose environment holds a credential;
  *   - the breaker across a process boundary: quarantine and freeze are written
  *     to disk and re-read by a fresh StateStore;
  *   - deadline expiry driving an automatic rollback, the quarantine that
@@ -31,7 +36,26 @@
  * The stand-in `docker`, `git`, `systemctl` and the two scripts are shell
  * scripts written into a temp directory. They are enough to prove the argv the
  * executor builds is the argv that arrives — which, given that "never build a
- * shell string" is the central claim, is the thing most worth proving.
+ * shell string" is still the claim everywhere the executor itself runs
+ * commands, is worth proving.
+ *
+ * ── What the claude stand-in can and cannot prove ────────────────────────
+ *
+ * The `claude` stand-in emits genuine stream-json and honours the deny list it
+ * is handed, which lets this suite assert the things the executor is
+ * responsible for: that every Bash call in the stream reaches the journal, that
+ * an unparseable line fails the task, that a failure rolls back, that dry-run
+ * sends settings which remove the Bash tool.
+ *
+ * What it cannot prove is that the REAL CLI honours those settings. That was
+ * established by experiment on 2026-08-10, by running `claude -p` against the
+ * exact settings this code ships, and the results are recorded in the header of
+ * ops/src/host-agent.ts: `deny: ["Bash"]` removes the tool from the session
+ * entirely, deny survives `--permission-mode bypassPermissions`, and denying
+ * Bash alone leaves `Monitor` and friends able to run a shell command. None of
+ * that is inferable from a stand-in, and none of it is what the documentation
+ * would lead you to expect, which is why it was tested rather than reasoned
+ * about.
  */
 
 import { test } from 'node:test';
@@ -47,7 +71,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { loadOpsConfig, type OpsConfig } from './config.js';
 import { parseRequest, describeRequest, isDestructive, VERBS } from './request.js';
@@ -55,9 +80,17 @@ import { OpsSpool } from './spool.js';
 import { readIdle } from './idle.js';
 import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
-import { Executor } from './executor.js';
+import { Executor, compareHealth } from './executor.js';
 import { verifyInstance } from './verify.js';
-import { planBuild, resolveOwner, runBuild } from './build.js';
+import { resolveOwner } from './build.js';
+import {
+  assertNoSecrets,
+  hostAgentEnv,
+  hostAgentSettings,
+  hostAgentTools,
+  judge,
+  DRY_RUN_TOOL_DENY,
+} from './host-agent.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -91,6 +124,10 @@ function makeHost(options: {
   buildDirs?: string[];
   /** Defaults to a single instance named `clawcius`. */
   instances?: InstanceSpec[];
+  /** Set false to test the "tasks refused, everything else still works" mode. */
+  hostAgent?: boolean;
+  snapshotKeep?: number;
+  envPassthrough?: string[];
 }): {
   root: string;
   config: OpsConfig;
@@ -101,8 +138,16 @@ function makeHost(options: {
   spoolDir: (instance: string) => string;
   /** Make `git status --porcelain` report these lines. Empty means clean. */
   setDirty: (porcelain: string[]) => void;
-  /** Make the npm stand-in exit non-zero for one subcommand (`ci` or `build`). */
-  failBuild: (which: string) => void;
+  /** The commands the fake session will issue, in order. */
+  setPlan: (commands: string[]) => void;
+  /** Make the fake session report `is_error: true`. */
+  failTask: () => void;
+  /** Make the fake session emit a line that is not JSON. */
+  corruptStream: () => void;
+  /** The fake session's final report text. */
+  setReport: (text: string) => void;
+  /** The claude stand-in's recorded argv, decoded. */
+  claudeCall: () => { argv: string[]; cwd: string; home: string; envNames: string[] } | null;
 } {
   const root = mkdtempSync(join(tmpdir(), `ops-selftest-${options.suffix}-`));
   const bin = join(root, 'bin');
@@ -180,18 +225,31 @@ function makeHost(options: {
     ].join('\n'),
   );
 
-  const systemctl = recorder('systemctl', '');
+  // `is-active` answers from a control file so a test can make a task break a
+  // service and watch the health comparison catch it. Silent (and exit 0)
+  // otherwise, which the executor reads as "active".
+  const systemctl = recorder(
+    'systemctl',
+    [
+      'if [ "$1" = "is-active" ]; then',
+      `  if [ -s "${control}/is-active" ]; then cat "${control}/is-active"; fi`,
+      'fi',
+    ].join('\n'),
+  );
   const runContainer = recorder('run-container.sh', '');
   const snapshot = recorder('snapshot.sh', '');
 
   /**
    * The npm stand-in, which records more than the others.
    *
-   * `cwd=` and `uid=` go into the call file because the two properties this
-   * suite has to prove about the build are *where* it ran and *as whom*, and
-   * neither is visible in the argv. The uid is the real one — the tests do not
-   * run as root, so nothing is actually dropped here; what is asserted about
-   * dropping is asserted against planBuild(), which is pure.
+   * The executor no longer runs npm itself — a task does, through Bash, and
+   * that command lands in the audit like any other. This is kept because
+   * `npmPath` is still config (its directory goes on the host agent's PATH) and
+   * because a task in a test may legitimately invoke it.
+   *
+   * `cwd=` and `uid=` go into the call file because *where* something ran and
+   * *as whom* are the two properties that are not visible in an argv, and both
+   * still matter: the host agent session is dropped to the checkout's owner.
    */
   const npm = join(bin, 'npm');
   writeFileSync(
@@ -218,6 +276,111 @@ function makeHost(options: {
   );
   chmodSync(npm, 0o755);
 
+  /**
+   * The `claude` stand-in.
+   *
+   * A real Node program rather than a shell script, because it has to emit
+   * well-formed stream-json — the executor's audit is built by parsing that
+   * stream, and a stand-in that only approximated the format would be testing
+   * the test.
+   *
+   * It records its own argv the same way every other stand-in does, so the
+   * suite can assert on the flags the executor passes (the deny list, the tool
+   * list, the working directory, the model). Then it reads the control files
+   * and behaves accordingly:
+   *
+   *   plan       — one command per line, each emitted as a Bash tool_use;
+   *   claude-fail    — emit `is_error: true` in the result;
+   *   claude-garbage — emit a line that is not JSON, which must make the
+   *                    executor treat the whole audit as incomplete;
+   *   claude-result  — the text of the final report.
+   *
+   * Crucially it HONOURS THE DENY LIST it is handed: if `--settings` denies
+   * Bash it emits no tool_use at all and reports the commands as prose, which
+   * is exactly what the real CLI was observed doing on 2026-08-10. That is what
+   * makes the dry-run assertions below mean something rather than merely
+   * checking a flag was passed.
+   */
+  const claudeJs = join(root, 'fake-claude.mjs');
+  writeFileSync(
+    claudeJs,
+    `
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+const argv = process.argv.slice(2);
+const out = ${JSON.stringify(callsDir)} + '/' + Date.now() + process.hrtime.bigint() + '-claude';
+// One JSON object rather than one argument per line, unlike every other
+// stand-in here. The others record line-per-argument precisely to prove no
+// shell string was built; this one is handed a multi-line prompt on purpose,
+// so line-per-argument would be unreadable and would lose the newlines that
+// matter.
+writeFileSync(out, JSON.stringify({
+  argv,
+  cwd: process.cwd(),
+  uid: process.getuid(),
+  home: process.env.HOME ?? '',
+  envNames: Object.keys(process.env).sort(),
+}) + '\\n');
+
+const control = ${JSON.stringify(control)};
+const read = (name) => existsSync(control + '/' + name) ? readFileSync(control + '/' + name, 'utf8') : '';
+const plan = read('plan').split('\\n').filter((line) => line.length > 0);
+const failing = read('claude-fail').trim() === '1';
+const garbage = read('claude-garbage').trim() === '1';
+const report = read('claude-result') || 'done';
+
+// Honour the deny list exactly as the real CLI was observed to: a denied Bash
+// is a Bash tool that does not exist in this session.
+const settingsIndex = argv.indexOf('--settings');
+const settings = settingsIndex >= 0 ? JSON.parse(argv[settingsIndex + 1]) : { permissions: { deny: [] } };
+const bashDenied = (settings.permissions?.deny ?? []).includes('Bash');
+
+const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+emit({ type: 'system', subtype: 'init', session_id: 'fake', tools: bashDenied ? ['Read'] : ['Bash', 'Read'] });
+
+if (garbage) process.stdout.write('this line is not json at all\\n');
+
+if (!bashDenied) {
+  let n = 0;
+  for (const command of plan) {
+    n += 1;
+    emit({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_use', id: 'tool_' + n, name: 'Bash', input: { command, description: 'step ' + n } }] },
+    });
+    // Actually run it, so a test can assert on a side effect if it wants to.
+    // A stand-in that only claimed to run commands would let a bug that never
+    // executes anything pass every assertion in this file.
+    try {
+      const { execSync } = await import('node:child_process');
+      execSync(command, { stdio: 'ignore' });
+    } catch {
+      emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool_' + n, is_error: true, content: 'command failed' }] } });
+    }
+  }
+}
+
+emit({
+  type: 'result',
+  subtype: failing ? 'error_during_execution' : 'success',
+  is_error: failing,
+  num_turns: plan.length + 1,
+  total_cost_usd: 0.25,
+  permission_denials: [],
+  result: bashDenied
+    ? 'I have no Bash tool in this session. The commands I would have run:\\n' + plan.join('\\n')
+    : report,
+});
+`,
+  );
+  const claude = join(bin, 'claude');
+  writeFileSync(
+    claude,
+    ['#!/bin/sh', `exec ${process.execPath} ${claudeJs} "$@"`, ''].join('\n'),
+    { mode: 0o755 },
+  );
+  chmodSync(claude, 0o755);
+
   const statusFile = (instance: string) => join(root, `${instance}-waker-status.json`);
 
   const configPath = join(root, 'ops-config.yaml');
@@ -233,6 +396,15 @@ function makeHost(options: {
       `dockerPath: ${docker}`,
       `gitPath: ${git}`,
       `npmPath: ${npm}`,
+      `snapshotKeep: ${options.snapshotKeep ?? 24}`,
+      'hostAgent:',
+      `  enabled: ${options.hostAgent === false ? 'false' : 'true'}`,
+      `  claudePath: ${claude}`,
+      `  workDir: ${join(root, 'host-agent')}`,
+      '  timeoutMinutes: 1',
+      '  maxCostUsd: 1',
+      '  model: ""',
+      `  envPassthrough: [${(options.envPassthrough ?? []).join(', ')}]`,
       'units:',
       '  - name: clawcius.service',
       '    description: the waker',
@@ -298,10 +470,18 @@ function makeHost(options: {
       if (!existsSync(callsDir)) return [];
       return readdirSync(callsDir)
         .sort()
+        // The claude stand-in records JSON rather than one argument per line
+        // (its prompt is multi-line on purpose), so it is read through
+        // claudeCall() instead. It still shows up here as a single-element
+        // 'claude' entry, because several assertions are about ORDERING —
+        // snapshot before the session, restore after it — and those need it in
+        // the same sequence as everything else.
         .map((name) =>
-          readFileSync(join(callsDir, name), 'utf8')
-            .split('\n')
-            .filter((line) => line.length > 0),
+          name.endsWith('-claude')
+            ? ['claude']
+            : readFileSync(join(callsDir, name), 'utf8')
+                .split('\n')
+                .filter((line) => line.length > 0),
         );
     },
     spoolDir: spoolDirOf,
@@ -311,8 +491,24 @@ function makeHost(options: {
     setDirty: (porcelain) => {
       writeFileSync(join(control, 'dirty'), porcelain.length ? `${porcelain.join('\n')}\n` : '');
     },
-    failBuild: (which) => {
-      writeFileSync(join(control, 'npm-fail'), `${which}\n`);
+    setPlan: (commands) => {
+      writeFileSync(join(control, 'plan'), commands.length ? `${commands.join('\n')}\n` : '');
+    },
+    failTask: () => writeFileSync(join(control, 'claude-fail'), '1\n'),
+    corruptStream: () => writeFileSync(join(control, 'claude-garbage'), '1\n'),
+    setReport: (text) => writeFileSync(join(control, 'claude-result'), text),
+    claudeCall: () => {
+      if (!existsSync(callsDir)) return null;
+      const file = readdirSync(callsDir)
+        .sort()
+        .find((name) => name.endsWith('-claude'));
+      if (!file) return null;
+      return JSON.parse(readFileSync(join(callsDir, file), 'utf8')) as {
+        argv: string[];
+        cwd: string;
+        home: string;
+        envNames: string[];
+      };
     },
   };
 }
@@ -358,19 +554,45 @@ async function settle(executor: Executor, timeoutMs = 20_000): Promise<void> {
 // Request validation — the hostile inputs
 // ══════════════════════════════════════════════════════════════════════════
 
-test('every verb in the closed list parses when well formed', () => {
-  const bodies: Record<string, unknown> = {
-    restart: { verb: 'restart', unit: 'clawcius.service' },
-    pull: { verb: 'pull', repo: 'clawcius' },
-    redeploy: { verb: 'redeploy', instance: 'hamachi', reason: 'new build' },
-    snapshot: { verb: 'snapshot', instance: 'hamachi' },
-    rollback: { verb: 'rollback', instance: 'hamachi', tag: 'snap-20260808-040000' },
-    checkin: { verb: 'checkin', instance: 'hamachi', detail: 'all good' },
-    wake: { verb: 'wake', channel: '123456789012345678', detail: 'do the thing' },
-  };
-  for (const verb of VERBS) {
-    const result = parseRequest(JSON.stringify(bodies[verb]));
-    assert.equal(result.ok, true, `${verb} should parse: ${JSON.stringify(result)}`);
+test('every verb parses when well formed', () => {
+  const cases = [
+    '{"verb":"task","task":"restart the waker, it is wedged"}',
+    '{"verb":"task","instance":"clawcius","task":"free some disk"}',
+    '{"verb":"rollback","instance":"clawcius","tag":"snap-20260810-120000"}',
+    '{"verb":"checkin","instance":"clawcius","detail":"back up"}',
+    '{"verb":"wake","channel":"123456789012345678","detail":"hello"}',
+  ];
+  for (const body of cases) {
+    const parsed = parseRequest(body);
+    assert.equal(parsed.ok, true, `${body} should parse: ${parsed.ok ? '' : parsed.reason}`);
+  }
+});
+
+test('a task needs an actual task, and the instance is optional', () => {
+  // Optional, because most of what the operator needed on 2026-08-10 — chown,
+  // mkdir, installing a unit, reading a journal — concerns no instance at all.
+  const unnamed = parseRequest('{"verb":"task","task":"install the new timer unit"}');
+  assert.equal(unnamed.ok, true);
+  assert.equal(unnamed.ok && unnamed.request.instance, '');
+
+  // Required, because "do something" filed against a root shell is the request
+  // most likely to be an accident and least likely to be what anyone wanted.
+  const empty = parseRequest('{"verb":"task","instance":"clawcius"}');
+  assert.equal(empty.ok, false);
+  assert.match(empty.ok ? '' : empty.reason, /requires "task"/);
+
+  const blank = parseRequest('{"verb":"task","task":"   "}');
+  assert.equal(blank.ok, false);
+});
+
+test('the deleted verbs are gone and are rejected by name', () => {
+  // Not "unknown-ish". An agent that has been filing `redeploy` for two days
+  // gets a rejection naming the verbs that exist, so its next attempt is a
+  // task and not a retry.
+  for (const verb of ['restart', 'pull', 'redeploy', 'snapshot']) {
+    const parsed = parseRequest(`{"verb":"${verb}","instance":"clawcius","unit":"clawcius.service","repo":"clawcius"}`);
+    assert.equal(parsed.ok, false, `${verb} must no longer be a verb`);
+    assert.match(parsed.ok ? '' : parsed.reason, /known verbs: task, checkin, rollback, wake/);
   }
 });
 
@@ -421,7 +643,7 @@ test('path traversal in an identifier is rejected', () => {
     'a/b',
   ];
   for (const instance of cases) {
-    const result = parseRequest(JSON.stringify({ verb: 'redeploy', instance }));
+    const result = parseRequest(JSON.stringify({ verb: 'checkin', instance }));
     assert.equal(result.ok, false, `"${instance}" must be rejected`);
     if (!result.ok) {
       assert.match(result.reason, /traversal|path separator|does not match/);
@@ -430,19 +652,19 @@ test('path traversal in an identifier is rejected', () => {
 });
 
 test('NUL and control bytes in an identifier are rejected', () => {
-  const withNul = `{"verb":"redeploy","instance":"clawcius\\u0000extra"}`;
+  const withNul = `{"verb":"checkin","instance":"clawcius\\u0000extra"}`;
   const nul = parseRequest(withNul);
   assert.equal(nul.ok, false);
   if (!nul.ok) assert.match(nul.reason, /NUL byte/);
 
   // No separator in this one, so it exercises the control-character branch
   // rather than being caught earlier by the path check.
-  const withControl = `{"verb":"redeploy","instance":"clawcius\\u0007bell"}`;
+  const withControl = `{"verb":"checkin","instance":"clawcius\\u0007bell"}`;
   const control = parseRequest(withControl);
   assert.equal(control.ok, false);
   if (!control.ok) assert.match(control.reason, /control character/);
 
-  const withNewline = `{"verb":"redeploy","instance":"clawcius\\nrm -rf /"}`;
+  const withNewline = `{"verb":"checkin","instance":"clawcius\\nrm -rf /"}`;
   const newline = parseRequest(withNewline);
   assert.equal(newline.ok, false);
   if (!newline.ok) assert.match(newline.reason, /path separator/);
@@ -461,7 +683,7 @@ test('shell metacharacters never make it through an identifier', () => {
     '-v/:/host',
   ];
   for (const instance of attempts) {
-    const result = parseRequest(JSON.stringify({ verb: 'redeploy', instance }));
+    const result = parseRequest(JSON.stringify({ verb: 'checkin', instance }));
     assert.equal(result.ok, false, `"${instance}" must be rejected`);
   }
   // The same applied to a unit name, which has a looser pattern.
@@ -491,24 +713,29 @@ test('a snapshot tag must look exactly like one snapshot.sh writes', () => {
 
 test('types are not coerced', () => {
   for (const instance of [1, true, null, {}, [], 1.5]) {
-    const body = JSON.stringify({ verb: 'redeploy', instance });
+    const body = JSON.stringify({ verb: 'checkin', instance });
     const result = parseRequest(body);
     assert.equal(result.ok, false, `${body} must be rejected`);
   }
 });
 
 test('a missing required field is a rejection, not a default', () => {
-  assert.equal(parseRequest('{"verb":"restart"}').ok, false);
-  assert.equal(parseRequest('{"verb":"pull"}').ok, false);
-  assert.equal(parseRequest('{"verb":"redeploy"}').ok, false);
+  assert.equal(parseRequest('{"verb":"checkin"}').ok, false);
+  assert.equal(parseRequest('{"verb":"rollback"}').ok, false);
+  assert.equal(parseRequest('{"verb":"task"}').ok, false);
   assert.equal(parseRequest('{"verb":"wake","channel":"123456789012345678"}').ok, false);
 });
 
 test('unknown fields are reported and never acted on', () => {
   const result = parseRequest(
     JSON.stringify({
-      verb: 'restart',
-      unit: 'clawcius.service',
+      verb: 'task',
+      task: 'restart clawcius.service',
+      // `unit` and `repo` were fields until 2026-08-10. They are unknown now,
+      // which is the correct treatment of a request written against the old
+      // schema: reported, ignored, never quietly honoured.
+      unit: 'sshd.service',
+      repo: 'somewhere-else',
       args: ['--force'],
       env: { LD_PRELOAD: '/tmp/x.so' },
       command: 'rm -rf /',
@@ -516,7 +743,13 @@ test('unknown fields are reported and never acted on', () => {
   );
   assert.equal(result.ok, true);
   if (result.ok) {
-    assert.deepEqual(result.request.unknownFields.sort(), ['args', 'command', 'env']);
+    assert.deepEqual(result.request.unknownFields.sort(), [
+      'args',
+      'command',
+      'env',
+      'repo',
+      'unit',
+    ]);
     // And none of them appear anywhere in the parsed request.
     assert.equal(JSON.stringify(result.request).includes('LD_PRELOAD'), false);
   }
@@ -525,7 +758,8 @@ test('unknown fields are reported and never acted on', () => {
 test('free text is kept but stripped of control characters and capped', () => {
   const result = parseRequest(
     JSON.stringify({
-      verb: 'redeploy',
+      verb: 'task',
+      task: 'do the thing',
       instance: 'clawcius',
       reason: `line one\u0000\u0007 line two\nkept`,
       detail: 'x'.repeat(5000),
@@ -540,20 +774,34 @@ test('free text is kept but stripped of control characters and capped', () => {
   }
 });
 
-test('destructive verbs are exactly redeploy and rollback', () => {
-  assert.equal(isDestructive('redeploy'), true);
+test('every task counts as destructive, because a sentence cannot be read', () => {
+  assert.equal(isDestructive('task'), true);
   assert.equal(isDestructive('rollback'), true);
-  assert.equal(isDestructive('restart'), false);
-  assert.equal(isDestructive('pull'), false);
-  assert.equal(isDestructive('snapshot'), false);
   assert.equal(isDestructive('checkin'), false);
   assert.equal(isDestructive('wake'), false);
+
+  // The point of the assertion: there is no attempt to classify a task by its
+  // text. A `task` that says "just read the logs" is destructive as far as this
+  // executor is concerned, and it waits for an idle turn and takes a snapshot
+  // like any other, because the alternative is guessing about prose.
+  assert.equal(isDestructive(parseRequest('{"verb":"task","task":"just read the logs"}').ok ? 'task' : 'task'), true);
 });
 
-test('describeRequest never returns an empty target', () => {
-  const result = parseRequest(JSON.stringify({ verb: 'snapshot', instance: 'clawcius' }));
-  assert.equal(result.ok, true);
-  if (result.ok) assert.equal(describeRequest(result.request), 'snapshot clawcius');
+test('describeRequest never returns an empty target, and clips a task', () => {
+  const rollback = parseRequest(JSON.stringify({ verb: 'rollback', instance: 'clawcius' }));
+  assert.equal(rollback.ok, true);
+  if (rollback.ok) assert.equal(describeRequest(rollback.request), 'rollback clawcius');
+
+  // The journal's prose lines are read in a terminal during an incident, and an
+  // eight-thousand-character `what` makes journalctl useless at the one moment
+  // it is needed. The full text is in the request entry's detail.
+  const long = parseRequest(JSON.stringify({ verb: 'task', task: `${'x'.repeat(400)}\nsecond line` }));
+  assert.equal(long.ok, true);
+  if (long.ok) {
+    const described = describeRequest(long.request);
+    assert.ok(described.length < 100, described.length.toString());
+    assert.match(described, /^task x+…$/);
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -985,37 +1233,53 @@ test('armed deadlines persist and can be disarmed', () => {
 // The executor: allowlists, the lock, the deadline, the breaker
 // ══════════════════════════════════════════════════════════════════════════
 
-test('a unit outside the allowlist is refused with the allowlist named', async () => {
-  const host = makeHost({ dryRun: true, suffix: 'unit' });
-  const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"restart","unit":"sshd.service"}' });
-  await settle(executor);
-
-  const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
-  assert.equal(rejected.length, 1);
-  assert.match(String(rejected[0]?.['detail']), /not in the units allowlist/);
-  assert.match(String(rejected[0]?.['detail']), /clawcius\.service/);
-  assert.equal(host.calls().some((call) => call[0] === 'systemctl'), false);
-  executor.stop();
-});
-
-test('the executor refuses to restart itself', async () => {
-  const host = makeHost({ dryRun: true, suffix: 'self' });
-  const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"restart","unit":"clawcius-ops.service"}' });
-  await settle(executor);
-  const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
-  assert.match(String(rejected[0]?.['detail']), /this process/);
-  executor.stop();
-});
-
-test('an instance outside the allowlist is refused', async () => {
+test('a task naming an instance that does not exist is refused', async () => {
   const host = makeHost({ dryRun: true, suffix: 'inst' });
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"hamachi"}' });
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"hamachi","task":"restart it"}',
+  });
   await settle(executor);
   const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
   assert.match(String(rejected[0]?.['detail']), /not in the instances allowlist/);
+  // And nothing was started. The instance name still selects a config entry
+  // rather than supplying a value, which is the one part of the old rule that
+  // survives — it decides what gets snapshotted and rolled back.
+  assert.equal(host.claudeCall(), null);
+  executor.stop();
+});
+
+test('tasks can be switched off without dropping the deadlines', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'disabled', hostAgent: false });
+  const executor = new Executor(host.config);
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","task":"anything"}' });
+  await settle(executor);
+
+  const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
+  assert.match(String(rejected[0]?.['detail']), /hostAgent\.enabled is false/);
+  assert.equal(host.claudeCall(), null);
+
+  // The point of the setting: a check-in still closes a deadline. Turning tasks
+  // off must not be the same as stopping the unit, which would drop every armed
+  // rollback deadline on a host somebody is already worried about.
+  executor.state.arm({
+    instance: 'clawcius',
+    deadlineAt: Date.now() + 600_000,
+    reason: 'a task',
+    build: 'abc',
+    rollbackTag: 'snap-20260808-040000',
+    fromRollback: false,
+    armedAt: Date.now(),
+  });
+  executor.intake({
+    requester: 'clawcius',
+    name: 'b.json',
+    body: '{"verb":"checkin","instance":"clawcius"}',
+  });
+  await settle(executor);
+  assert.equal(executor.state.pendingFor('clawcius'), null, 'the check-in must still land');
   executor.stop();
 });
 
@@ -1025,7 +1289,7 @@ test('a destructive verb abandons rather than interrupting a live turn', async (
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
 
   const entries = journalEntries(host.config);
@@ -1046,7 +1310,7 @@ test('a destructive verb abandons rather than interrupting a live turn', async (
 test('a missing waker status file also blocks a destructive verb', async () => {
   const host = makeHost({ dryRun: true, suffix: 'nostatus' });
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
   const entries = journalEntries(host.config);
   assert.equal(
@@ -1069,7 +1333,7 @@ test('the rolling-hour cap refuses work with a stated reason', async () => {
 
   // limits.maxPerHour is 6 in the fixture.
   for (let i = 0; i < 9; i += 1) {
-    executor.intake({ requester: 'clawcius', name: `r${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
+    executor.intake({ requester: 'clawcius', name: `r${i}.json`, body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}' });
   }
   await settle(executor);
 
@@ -1091,13 +1355,13 @@ test('one operation at a time: the second request queues behind the first', asyn
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
 
   // Give the first one a moment to take the lock and start waiting.
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(executor.snapshot().current, 'redeploy clawcius');
+  assert.equal(executor.snapshot().current, 'task clawcius: recreate the container');
 
-  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}' });
   assert.equal(executor.snapshot().queued, 1, 'the second must queue, not run');
 
   // Now go idle; the first finishes and the second follows.
@@ -1106,7 +1370,10 @@ test('one operation at a time: the second request queues behind the first', asyn
 
   const entries = journalEntries(host.config);
   const started = entries.filter((entry) => entry['kind'] === 'started').map((e) => e['what']);
-  assert.deepEqual(started, ['redeploy clawcius', 'snapshot clawcius']);
+  assert.deepEqual(started, [
+    'task clawcius: recreate the container',
+    'task clawcius: take a snapshot',
+  ]);
   assert.equal(
     entries.some((entry) => entry['kind'] === 'queued'),
     true,
@@ -1123,12 +1390,12 @@ test('the queue has a ceiling and says so', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   // limits.maxQueued is 2.
   for (let i = 0; i < 4; i += 1) {
-    executor.intake({ requester: 'clawcius', name: `q${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
+    executor.intake({ requester: 'clawcius', name: `q${i}.json`, body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}' });
   }
 
   const refused = journalEntries(host.config).filter(
@@ -1141,45 +1408,30 @@ test('the queue has a ceiling and says so', async () => {
   executor.stop();
 });
 
-test('a live redeploy takes a snapshot, recreates, arms a deadline and files a wake', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'redeploy' });
+test('a live task snapshots first, runs the session, and reports back', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'live' });
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
 
   const executor = new Executor(host.config);
   executor.intake({
     requester: 'clawcius',
     name: 'a.json',
-    body: '{"verb":"redeploy","instance":"clawcius","reason":"new build"}',
+    body: '{"verb":"task","instance":"clawcius","task":"recreate the container","reason":"new build"}',
   });
-  await settle(executor);
+  await settle(executor, 40_000);
 
-  const calls = host.calls();
-  const order = calls.map((call) => call[0]);
-  assert.equal(order.includes('snapshot.sh'), true, 'snapshot before anything destructive');
-  assert.equal(order.includes('run-container.sh'), true);
+  const order = host.calls().map((call) => call[0]);
   assert.ok(
-    order.indexOf('snapshot.sh') < order.indexOf('run-container.sh'),
-    'the rollback target must be captured before the container is destroyed',
+    order.indexOf('snapshot.sh') >= 0 && order.indexOf('snapshot.sh') < order.indexOf('claude'),
+    'the rollback target must be captured before the session is allowed to start',
   );
 
-  const recreate = calls.find((call) => call[0] === 'run-container.sh');
-  assert.deepEqual(recreate, ['run-container.sh', '--recreate']);
+  const snapshot = host.calls().find((call) => call[0] === 'snapshot.sh');
+  assert.deepEqual(snapshot, ['snapshot.sh'], 'no arguments; everything goes through the env');
 
-  const pending = executor.state.pendingFor('clawcius');
-  assert.ok(pending, 'a check-in deadline must be armed');
-  assert.equal(pending?.rollbackTag, 'snap-20260808-040000', 'newest snapshot is the target');
-  assert.equal(pending?.build, 'deadbeefcafe0000000000000000000000000000');
-
-  // And the instance was told, in its own wake spool.
-  const wakeDir = join(host.root, 'state', 'clawcius', 'run', 'wake');
-  const files = readdirSync(wakeDir).filter((n) => n.endsWith('.json'));
-  assert.equal(files.length, 1);
-  const wakeFile = files[0] ?? '';
-  const wake = JSON.parse(readFileSync(join(wakeDir, wakeFile), 'utf8')) as Record<string, string>;
-  assert.equal(wake['channel'], '123456789012345678');
-  assert.match(wake['prompt'] ?? '', /You were rebuilt/);
-  assert.match(wake['prompt'] ?? '', /new build/);
-  assert.match(wake['prompt'] ?? '', /checkin/);
+  const finished = journalEntries(host.config).filter((entry) => entry['kind'] === 'finished');
+  assert.ok(finished.some((entry) => /host agent session/.test(String(entry['detail']))));
 
   executor.stop();
 });
@@ -1189,7 +1441,7 @@ test('a dry run arms nothing and files nothing', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
 
   assert.equal(executor.state.pendingFor('clawcius'), null, 'a dry run must not arm a rollback');
@@ -1207,7 +1459,7 @@ test('a check-in meets the deadline and resets the failure count', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
   assert.ok(executor.state.pendingFor('clawcius'));
 
@@ -1237,7 +1489,7 @@ test('a missed deadline rolls back, quarantines the build, and refuses it again'
   };
 
   const executor = new Executor(config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
   const pending = executor.state.pendingFor('clawcius');
   assert.ok(pending);
@@ -1273,7 +1525,7 @@ test('a missed deadline rolls back, quarantines the build, and refuses it again'
   // And the build is quarantined — permanently, not backed off.
   assert.ok(executor.state.isQuarantined('clawcius', build));
 
-  executor.intake({ requester: 'clawcius', name: 'c.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'c.json', body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}' });
   await settle(executor);
   const breaker = journalEntries(config).filter(
     (entry) => entry['kind'] === 'breaker' && /will not be deployed again/.test(String(entry['detail'])),
@@ -1298,8 +1550,11 @@ test('consecutive failed recoveries freeze the executor, and a freeze refuses de
   const executor = new Executor(host.config);
   assert.equal(executor.state.state.frozen, true, 'the freeze is read back from disk at boot');
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
-  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}',
+  });
   await settle(executor);
 
   const entries = journalEntries(host.config);
@@ -1307,12 +1562,30 @@ test('consecutive failed recoveries freeze the executor, and a freeze refuses de
     entries.some((entry) => entry['kind'] === 'rejected' && /FROZEN/.test(String(entry['detail']))),
     true,
   );
-  // Non-destructive work still runs: a freeze is about not rebuilding, not
-  // about refusing to take a backup.
-  assert.equal(
-    entries.some((entry) => entry['kind'] === 'started' && entry['what'] === 'snapshot clawcius'),
-    true,
-  );
+  assert.equal(host.claudeCall(), null, 'a frozen executor starts no session at all');
+
+  // What a freeze still lets through has changed with the verbs, and the new
+  // list is the interesting part: `checkin` and `wake`. Everything that could
+  // touch the host is refused — there is no such thing as a "non-destructive
+  // task", because a task is a sentence — but an instance that is alive must
+  // still be able to say so, or a freeze would guarantee the next deadline is
+  // missed as well.
+  executor.state.arm({
+    instance: 'clawcius',
+    deadlineAt: Date.now() + 600_000,
+    reason: 'a task',
+    build: 'abc',
+    rollbackTag: 'snap-20260808-040000',
+    fromRollback: false,
+    armedAt: Date.now(),
+  });
+  executor.intake({
+    requester: 'clawcius',
+    name: 'b.json',
+    body: '{"verb":"checkin","instance":"clawcius"}',
+  });
+  await settle(executor);
+  assert.equal(executor.state.pendingFor('clawcius'), null, 'a check-in must survive a freeze');
   executor.stop();
 });
 
@@ -1348,397 +1621,532 @@ test('deadlines that expired while the executor was down are honoured, not forgi
   executor.stop();
 });
 
-test('a pull is refused on the wrong branch and outside the allowlist', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'pull' });
+// ══════════════════════════════════════════════════════════════════════════
+// The host agent
+//
+// Everything from here to the containment section is about the mechanism that
+// replaced the verb list on 2026-08-10. The properties under test are the ones
+// the operator was promised in exchange for the sandbox stopping being a
+// boundary for this component: a snapshot before, a rollback after, an audit
+// that is complete, and a dry-run that genuinely cannot act.
+// ══════════════════════════════════════════════════════════════════════════
+
+/** Every Bash command the journal recorded for this run, in order. */
+function auditedCommands(config: OpsConfig): string[] {
+  return journalEntries(config)
+    .filter((entry) => entry['kind'] === 'audit' && entry['what'] === 'bash')
+    .map((entry) => String(entry['command']));
+}
+
+test('a task reaches a host agent session, with the task text and nothing else', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'task' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
   const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: JSON.stringify({
+      verb: 'task',
+      instance: 'clawcius',
+      task: 'the waker is wedged, work out why and fix it',
+    }),
+  });
+  await settle(executor, 40_000);
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
-  await settle(executor);
-  // The stand-in git reports branch `main` and a clean tree, so this succeeds.
-  assert.equal(
-    journalEntries(host.config).some(
-      (entry) => entry['kind'] === 'finished' && /pull clawcius/.test(String(entry['what'])),
-    ),
-    true,
-  );
-  const pull = host.calls().find((call) => call[0] === 'git' && call.includes('pull'));
-  assert.deepEqual(pull, ['git', '-C', join(host.root, 'repo'), 'pull', '--ff-only']);
+  const call = host.claudeCall();
+  assert.ok(call, 'the host agent must actually have been started');
 
-  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"pull","repo":"not-allowed"}' });
-  await settle(executor);
-  assert.equal(
-    journalEntries(host.config).some((entry) =>
-      /not in the repos allowlist/.test(String(entry['detail'])),
-    ),
-    true,
+  const prompt = call.argv[call.argv.indexOf('-p') + 1] ?? '';
+  assert.match(prompt, /the waker is wedged, work out why and fix it/);
+  assert.match(prompt, /filed by the sandboxed agent "clawcius"/);
+
+  // The working directory is NOT the checkout. Claude Code reads CLAUDE.md and
+  // project settings from its cwd, and the checkout is a tree the agents get
+  // commits merged into — so a session pointed at it would take standing
+  // instructions from anything they could merge.
+  assert.equal(call.cwd, join(host.root, 'host-agent'));
+  assert.notEqual(call.cwd, join(host.root, 'repo'));
+
+  // Only the operator's settings, no MCP, no skills.
+  assert.deepEqual(
+    ['--setting-sources', 'user'],
+    call.argv.slice(call.argv.indexOf('--setting-sources'), call.argv.indexOf('--setting-sources') + 2),
   );
+  assert.ok(call.argv.includes('--strict-mcp-config'));
+  assert.ok(call.argv.includes('--disable-slash-commands'));
+  // A fresh session every time. Never --resume and never --continue: a task
+  // must not inherit anything an earlier task was talked into leaving behind.
+  assert.ok(call.argv.includes('--session-id'));
+  assert.equal(call.argv.includes('--resume'), false);
+  assert.equal(call.argv.includes('--continue'), false);
+  // And a dollar ceiling, which the timeout does not cover.
+  assert.ok(call.argv.includes('--max-budget-usd'));
+
   executor.stop();
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// The build step, and the dirty tree
-//
-// Four properties, all of them added on 2026-08-10 after a night of deploying
-// this stack by hand:
-//
-//   1. `pull` builds. A pull that only fetches source, next to a `restart`
-//      verb, is a machine for restarting onto a stale dist/ — which is what
-//      cost an hour when always-on-channels was merged, pulled, restarted and
-//      did nothing at all.
-//   2. A failed build aborts. Nothing is restarted or recreated afterwards,
-//      because the two states a failed build leaves are "stale" and
-//      "half-written" and both of them start cleanly and behave wrongly.
-//   3. A dirty tree is refused, by name, and never forced past.
-//   4. The build does not run as root.
-//
-// Each is asserted as an ORDERING or an ABSENCE rather than as a log line,
-// because every one of these failures was silent on the host: exit code 0, no
-// stderr, unit active (running).
-// ══════════════════════════════════════════════════════════════════════════
+test('every Bash command the session issues is written into the journal, in full', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'audit' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
-test('pull builds before anything can be restarted onto it', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'pullbuild', buildDirs: ['.', 'status'] });
+  // Includes a command with spaces, quotes and a semicolon, because the audit
+  // must record what was ISSUED rather than something tidied up. Evidence that
+  // has been normalised is not evidence.
+  const plan = [
+    'true',
+    'echo "hello world"; echo again',
+    "sh -c 'exit 0'",
+  ];
+  host.setPlan(plan);
+
   const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do three things"}',
+  });
+  await settle(executor, 40_000);
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
-  await settle(executor);
+  assert.deepEqual(auditedCommands(host.config), plan, 'every command, in order, byte for byte');
 
-  const calls = host.calls();
-  const order = calls.map((call) => call[0]);
-  assert.ok(order.includes('git'), 'the pull itself should have run');
-  assert.ok(order.includes('npm'), 'a pull that does not build is the bug this fixes');
+  // Written BEFORE the result is known, which is what makes the record survive
+  // a process that dies mid-task. Asserted as an ordering in the journal: the
+  // first audit entry precedes the `finished` entry rather than being flushed
+  // with it.
+  const kinds = journalEntries(host.config).map((entry) => entry['kind']);
+  assert.ok(kinds.indexOf('audit') < kinds.lastIndexOf('finished'));
 
-  // The pull comes first, and every npm invocation comes after it: building
-  // before fetching would compile the previous commit and report success.
-  const pullAt = calls.findIndex((call) => call[0] === 'git' && call.includes('pull'));
-  const firstNpm = order.indexOf('npm');
-  assert.ok(pullAt >= 0 && firstNpm > pullAt, 'the build must run after the pull, not before');
+  executor.stop();
+});
 
-  // `npm ci`, not `npm install`. `install` rewrites package-lock.json when it
-  // disagrees with it, which is an unreviewed change arriving in a checkout
-  // that is about to be deployed, made by a root daemon, unattended.
-  const npm = npmCalls(calls);
-  assert.deepEqual(
-    npm.map((call) => call.argv.join(' ')),
-    ['npm ci', 'npm run build', 'npm ci', 'npm run build'],
-    'ci then build, once per configured buildDir',
-  );
-  assert.equal(
-    npm.some((call) => call.argv.includes('install')),
-    false,
-    'npm install would rewrite the lockfile unattended',
-  );
+test('an audit with a hole in it fails the task and rolls it back', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'garbage' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+  host.corruptStream();
 
-  // And in the right directories, in the configured order.
-  assert.deepEqual(
-    npm.map((call) => call.cwd),
-    [
-      join(host.root, 'repo'),
-      join(host.root, 'repo'),
-      join(host.root, 'repo', 'status'),
-      join(host.root, 'repo', 'status'),
-    ],
-  );
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+  });
+  await settle(executor, 40_000);
 
   const entries = journalEntries(host.config);
+  const failed = entries.filter((entry) => entry['kind'] === 'failed');
   assert.ok(
-    entries.some((entry) => entry['kind'] === 'build' && entry['ok'] === true),
-    'the build should be its own journal kind, greppable by one word',
+    failed.some((entry) => /AUDIT INCOMPLETE/.test(String(entry['detail']))),
+    'an unparseable line must fail the task on its own',
   );
+  // And the auditor said so at the time, not only in the summary.
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry['kind'] === 'audit' && /could not be parsed as JSON/.test(String(entry['detail'])),
+    ),
+  );
+
+  // The whole point: the session may have run a command nobody recorded, so the
+  // container goes back to where it was.
+  const order = host.calls().map((call) => call[0]);
+  assert.ok(order.includes('run-container.sh'), 'a broken audit must trigger the rollback');
+
   executor.stop();
 });
 
-test('a failed build aborts the operation and restarts nothing', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'buildfail' });
-  host.failBuild('build');
-  const executor = new Executor(host.config);
-
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
-  await settle(executor);
-
-  const npm = npmCalls(host.calls());
-  // `npm ci` ran, `npm run build` ran and failed, and nothing after it did.
-  assert.deepEqual(npm.map((call) => call.argv.join(' ')), ['npm ci', 'npm run build']);
-
-  const entries = journalEntries(host.config);
-  const failure = entries.find(
-    (entry) => entry['kind'] === 'failed' && /^build /.test(String(entry['what'])),
-  );
-  assert.ok(failure, 'a failed build must be journalled as a failure, loudly');
-  assert.match(String(failure?.['detail']), /STOPPING HERE/);
-  assert.match(String(failure?.['detail']), /stale|half-built|half-written/);
-
-  assert.equal(
-    host.calls().some((call) => call[0] === 'systemctl'),
-    false,
-    'nothing may be restarted after a build failure',
-  );
-  executor.stop();
-});
-
-test('a failed build stops a redeploy before the container is touched', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'redeploybuildfail' });
+test('a task snapshots before it starts and rolls back when the agent reports failure', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'rollback' });
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
-  host.failBuild('ci');
-  const executor = new Executor(host.config);
+  host.setPlan(['true']);
+  host.failTask();
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
-  await settle(executor);
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"break something"}',
+  });
+  await settle(executor, 40_000);
 
   const order = host.calls().map((call) => call[0]);
-  assert.equal(order.includes('npm'), true, 'the build should have been attempted');
-  assert.equal(
-    order.includes('run-container.sh'),
-    false,
-    'a redeploy must not recreate the container after a failed build',
+  assert.ok(
+    order.indexOf('snapshot.sh') >= 0 && order.indexOf('snapshot.sh') < order.indexOf('claude'),
+    'the rollback target is captured BEFORE the session runs, not after',
   );
-  assert.equal(
-    order.includes('snapshot.sh'),
-    false,
-    'and it should fail before spending two gigabytes on a snapshot',
+  assert.ok(
+    order.indexOf('claude') < order.lastIndexOf('run-container.sh'),
+    'the restore happens after the session, not instead of it',
   );
-  assert.equal(executor.state.pendingFor('clawcius'), null, 'and arm no deadline');
-  executor.stop();
-});
 
-test('redeploy builds before it snapshots or recreates', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'redeploybuild' });
-  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
-  const executor = new Executor(host.config);
+  // Restored to the pre-task snapshot by name, not to "the newest", which after
+  // a failed task could easily be one taken of the broken state.
+  const tag = host.calls().find((call) => call[0] === 'docker' && call[1] === 'tag');
+  assert.deepEqual(tag, ['docker', 'tag', 'clawcius-agent:snap-20260808-040000', 'clawcius-agent:latest']);
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
-  await settle(executor);
-
-  const order = host.calls().map((call) => call[0]);
-  const npmAt = order.indexOf('npm');
-  const snapAt = order.indexOf('snapshot.sh');
-  const recreateAt = order.indexOf('run-container.sh');
-  assert.ok(npmAt >= 0, 'a redeploy must build the checkout it deploys');
-  assert.ok(snapAt >= 0 && recreateAt >= 0);
-  assert.ok(npmAt < snapAt, 'build first: the cheapest thing that can say no goes first');
-  assert.ok(npmAt < recreateAt, 'and certainly before anything is destroyed');
-  executor.stop();
-});
-
-test('a dirty tree refuses the pull, names the files, and forces nothing', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'dirty' });
-  // Exactly what the host reported on 2026-08-09.
-  host.setDirty([' M docker/run-container.sh', '?? notes.txt']);
-  const executor = new Executor(host.config);
-
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
-  await settle(executor);
-
-  const entries = journalEntries(host.config);
-  const failure = entries.find(
-    (entry) => entry['kind'] === 'failed' && /pull clawcius/.test(String(entry['what'])),
-  );
-  assert.ok(failure, 'a dirty tree must fail the operation, not warn about it');
-  const detail = String(failure?.['detail']);
-  // The files, by name. A refusal that says "the tree is dirty" and stops
-  // sends the operator to `git status`; this one is the answer.
-  assert.match(detail, /docker\/run-container\.sh/);
-  assert.match(detail, /notes\.txt/);
-  assert.match(detail, /REFUSING/);
-
-  const calls = host.calls();
-  // Nothing was pulled…
-  assert.equal(
-    calls.some((call) => call[0] === 'git' && call.includes('pull')),
-    false,
-    'the pull must not be attempted over a dirty tree',
-  );
-  // …nothing was built on top of it…
-  assert.equal(calls.some((call) => call[0] === 'npm'), false);
-  // …and, the assertion that matters most: not one of the four ways past a
-  // dirty tree was used. There is no code path in this daemon that runs any of
-  // them, and this is what keeps it that way.
-  for (const forbidden of ['reset', 'checkout', 'stash', 'clean', 'restore', '--force', '-f']) {
-    assert.equal(
-      calls.some((call) => call[0] === 'git' && call.includes(forbidden)),
-      false,
-      `git ${forbidden} must never be used to get past a dirty tree`,
-    );
-  }
-  executor.stop();
-});
-
-test('a dirty tree refuses a redeploy too, because the breaker names builds by HEAD', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'dirtyredeploy' });
-  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
-  host.setDirty([' M src/index.ts']);
-  const executor = new Executor(host.config);
-
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
-  await settle(executor);
-
-  const order = host.calls().map((call) => call[0]);
-  assert.equal(order.includes('run-container.sh'), false);
-  assert.equal(order.includes('npm'), false);
+  // A failed task arms nothing. There is nothing to check in about.
   assert.equal(executor.state.pendingFor('clawcius'), null);
-  assert.match(
-    String(journalEntries(host.config).find((e) => e['kind'] === 'failed')?.['detail']),
-    /src\/index\.ts/,
-  );
+  // And it counted towards the breaker, because a rollback actually happened.
+  assert.equal(executor.state.state.consecutiveFailedRecoveries, 1);
+
   executor.stop();
 });
 
-test('a git status that cannot be read is treated as dirty, not as clean', async () => {
-  const host = makeHost({ dryRun: false, suffix: 'statusbroken' });
-  const executor = new Executor({ ...host.config, gitPath: '/nonexistent/git' });
+test('a task that fails without a rollback does not push the breaker', async () => {
+  // A typo, a refusal, an agent that decided the request was unsafe. Two of
+  // those in a row must not freeze the whole mechanism — that would make a
+  // pair of badly worded sentences an outage.
+  const host = makeHost({ dryRun: false, suffix: 'harmless' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
-  await settle(executor);
-
-  // The branch probe fails first here, which is itself the right answer; the
-  // property under test is that no path through #doPull reaches `git pull`
-  // when the checkout's state could not be established.
-  assert.equal(host.calls().some((call) => call.includes('pull')), false);
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    // No instance named and no instances in scope beyond the one configured,
+    // but the request is refused before anything runs.
+    name: 'a.json',
+    body: '{"verb":"task","instance":"nope","task":"x"}',
+  });
+  await settle(executor, 40_000);
+  assert.equal(executor.state.state.consecutiveFailedRecoveries, 0);
   executor.stop();
 });
 
-// ── The privilege drop ────────────────────────────────────────────────────
-//
-// planBuild() and resolveOwner() are pure and are tested directly, because the
-// property — "the build does not run as root" — cannot be observed by running
-// the build in a suite that is not root to begin with. Testing the plan is not
-// a compromise here: the plan IS the decision, and the decision is what was
-// wrong on 2026-08-09.
+test('a health regression rolls back even when the agent says it succeeded', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'health' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  // The systemctl stand-in prints nothing, so `is-active` reads as "active"
+  // both times — until the plan tells it to start failing. The control file the
+  // stand-in checks is the same one the npm stand-in uses; here the task itself
+  // breaks the unit, which is precisely the case the check exists for.
+  host.setPlan([`echo inactive > ${join(host.root, 'control', 'is-active')}`]);
+  host.setReport('All done, everything is fine.');
 
-test('the build plan drops to the checkout owner and never runs as root', () => {
-  const host = makeHost({ dryRun: false, suffix: 'plan', buildDirs: ['.', 'ops'] });
-  const repo = host.config.repos[0];
-  assert.ok(repo);
-  const owner = { uid: 1000, gid: 1000, user: 'npurcell', home: '/home/npurcell' };
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"restart the waker"}',
+  });
+  await settle(executor, 40_000);
 
-  const steps = planBuild(host.config, repo, owner, true);
-  assert.equal(steps.length, 4, 'ci and build, per buildDir');
-  for (const step of steps) {
-    assert.equal(step.uid, 1000, 'every build step must drop to the owner');
-    assert.equal(step.gid, 1000);
-    assert.notEqual(step.uid, 0, 'a root build leaves root-owned node_modules/ and dist/');
-    // HOME and the npm cache follow the owner, or npm writes into /root/.npm
-    // as a user that cannot read it.
-    assert.equal(step.env['HOME'], '/home/npurcell');
-    assert.equal(step.env['npm_config_cache'], '/home/npurcell/.npm');
-    // npm re-execs node and runs tsc through sh, so npm's own directory has to
-    // be on PATH — node is not on the system PATH on this host.
-    assert.ok(step.env['PATH']?.startsWith(join(host.root, 'bin')));
-    assert.equal(step.timeoutSeconds, 60);
-  }
-  assert.deepEqual(
-    steps.map((step) => step.argv.slice(1).join(' ')),
-    ['ci', 'run build', 'ci', 'run build'],
+  const failed = journalEntries(host.config).filter((entry) => entry['kind'] === 'failed');
+  assert.ok(
+    failed.some((entry) => /HEALTH REGRESSED/.test(String(entry['detail']))),
+    'the agent claiming success does not settle the question',
   );
+  assert.ok(host.calls().some((call) => call[0] === 'docker' && call[1] === 'tag'));
+  executor.stop();
+});
+
+test('compareHealth only reports things that got worse', () => {
+  // Asymmetric on purpose. A strict "anything different is a regression" fires
+  // on every deliberate restart — systemctl reports `activating` for a second —
+  // and the first thing anybody does about a rollback triggered by a service
+  // coming back up correctly is switch the whole mechanism off.
+  const before = {
+    units: { 'a.service': 'active', 'b.service': 'failed' },
+    containers: { 'x-agent': 'running', 'y-agent': 'exited' },
+  };
+
+  assert.deepEqual(compareHealth(before, before), []);
+
   assert.deepEqual(
-    steps.map((step) => step.cwd),
-    [
-      join(host.root, 'repo'),
-      join(host.root, 'repo'),
-      join(host.root, 'repo', 'ops'),
-      join(host.root, 'repo', 'ops'),
-    ],
+    compareHealth(before, {
+      units: { 'a.service': 'active', 'b.service': 'active' },
+      containers: { 'x-agent': 'running', 'y-agent': 'running' },
+    }),
+    [],
+    'fixing something is not a regression',
   );
 
-  // And when the executor already IS the owner there is nothing to drop, so
-  // no uid is set at all — `uid: undefined` and "no uid" are not the same
-  // thing to libuv, and "run as whoever we already are" must stay the default
-  // that costs nothing to reason about.
-  const undropped = planBuild(host.config, repo, owner, false);
-  assert.equal(undropped[0]?.uid, undefined);
-  assert.equal('uid' in (undropped[0] ?? {}), false);
+  const worse = compareHealth(before, {
+    units: { 'a.service': 'failed', 'b.service': 'failed' },
+    containers: { 'x-agent': 'exited', 'y-agent': 'exited' },
+  });
+  assert.equal(worse.length, 2);
+  assert.match(worse[0] ?? '', /a\.service was active and is now "failed"/);
+  assert.match(worse[1] ?? '', /x-agent was running and is now "exited"/);
+
+  // A unit that vanished from the sample entirely reads as a regression, not as
+  // "no news". Unknown and dangerous are the same state, which is the rule the
+  // idle check follows too.
+  assert.equal(compareHealth(before, { units: {}, containers: {} }).length, 2);
 });
 
-test('the owner is discovered by stat, never hardcoded, and refused when unknowable', () => {
-  const root = mkdtempSync(join(tmpdir(), 'ops-owner-'));
-  const passwd = join(root, 'passwd');
-  const me = process.getuid?.() ?? 0;
+test('dry-run removes the ability to act rather than asking it not to', async () => {
+  const host = makeHost({ dryRun: true, suffix: 'dryagent' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  const marker = join(host.root, 'DRY-RUN-BREACH');
+  host.setPlan([`touch ${marker}`]);
 
-  // A passwd file that does not describe the owner of the directory is the
-  // "cannot determine" case, and it must refuse rather than fall back to root.
-  writeFileSync(passwd, 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n');
-  const unknown = resolveOwner(root, passwd);
-  assert.equal(unknown.ok, false);
-  if (!unknown.ok) {
-    assert.match(unknown.reason, /no entry in/);
-    assert.match(unknown.reason, /Refusing to build/);
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"create a file"}',
+  });
+  await settle(executor, 40_000);
+
+  const call = host.claudeCall();
+  assert.ok(call);
+
+  // The settings actually sent. `deny: ["Bash"]` was verified against the real
+  // CLI on 2026-08-10 to REMOVE the tool from the session — the init message's
+  // tool list does not contain it — and to survive
+  // `--permission-mode bypassPermissions`.
+  const settings = JSON.parse(call.argv[call.argv.indexOf('--settings') + 1] ?? '{}');
+  assert.ok(settings.permissions.deny.includes('Bash'));
+
+  // And not only Bash. The same experiment found the session still holding
+  // `Task`, `Monitor`, `CronCreate`, `Write` and `Edit`, and the model pointed
+  // out unprompted that `Monitor` runs a shell command. A dry run with one of
+  // those left enabled is a dry run with a hole in it.
+  for (const tool of ['Task', 'Monitor', 'Write', 'Edit', 'WebFetch']) {
+    assert.ok(settings.permissions.deny.includes(tool), `${tool} must be denied in dry-run`);
   }
 
-  // A directory that does not exist is the other "cannot determine" case.
-  const missing = resolveOwner(join(root, 'nope'), passwd);
-  assert.equal(missing.ok, false);
-  if (!missing.ok) assert.match(missing.reason, /cannot stat/);
+  // The independent second limit: the built-in tool list itself.
+  const tools = call.argv.slice(call.argv.indexOf('--tools') + 1, call.argv.indexOf('--append-system-prompt'));
+  assert.deepEqual(tools, ['Read', 'Glob', 'Grep']);
 
-  // And the happy path: the uid comes off the directory, and the home comes
-  // out of passwd. Nothing here is a constant in the source.
-  writeFileSync(passwd, `someone:x:${me}:${me}:someone:/home/someone:/bin/sh\n`);
-  const found = resolveOwner(root, passwd);
-  assert.equal(found.ok, true);
-  if (found.ok) {
-    assert.equal(found.owner.uid, me);
-    assert.equal(found.owner.user, 'someone');
-    assert.equal(found.owner.home, '/home/someone');
-    // The suite runs as the owner of a directory it just created, so there is
-    // nothing to drop — which is the honest answer, not a skipped check.
-    assert.equal(found.drop, false);
+  // And nothing happened. The stand-in honours the deny list the way the real
+  // one was observed to, so this asserts the whole chain rather than a flag.
+  assert.equal(existsSync(marker), false, 'dry-run must not be able to touch the filesystem');
+  assert.deepEqual(auditedCommands(host.config), []);
+  assert.equal(host.calls().some((call) => call[0] === 'run-container.sh'), false);
+  assert.equal(executor.state.pendingFor('clawcius'), null, 'a dry run arms nothing');
+
+  executor.stop();
+});
+
+test('the dry-run deny list is a superset of everything that can execute', () => {
+  const dry = JSON.parse(hostAgentSettings(true)).permissions.deny as string[];
+  assert.deepEqual(dry, [...DRY_RUN_TOOL_DENY]);
+  assert.deepEqual(hostAgentTools(true), ['Read', 'Glob', 'Grep']);
+
+  const live = JSON.parse(hostAgentSettings(false)).permissions.deny as string[];
+  assert.ok(hostAgentTools(false).includes('Bash'), 'a live session must be able to work');
+
+  // The live denials are about untrusted content reaching a session that holds
+  // everything, which is the security model now that the sandbox is not.
+  for (const rule of ['WebFetch', 'WebSearch', 'Bash(gh:*)', 'Bash(curl:*)']) {
+    assert.ok(live.includes(rule), `${rule} must be denied even when live`);
   }
+  // Task is denied for a second reason: a sub-agent's tool calls do not appear
+  // in this session's stream, so a Bash command inside one would run unaudited.
+  assert.ok(live.includes('Task'));
 });
 
-test('a dry run logs the build it would have run, including the uid', async () => {
-  const host = makeHost({ dryRun: true, suffix: 'drybuild' });
-  const logged: string[] = [];
-  const runner = new Runner(true, 20, (line) => logged.push(line));
-  const repo = host.config.repos[0];
-  assert.ok(repo);
-
-  const outcome = await runBuild(runner, host.config, repo);
-  assert.equal(outcome.ok, true);
-  assert.match(outcome.detail, /DRY RUN/);
-  // Nothing ran…
-  assert.equal(host.calls().some((call) => call[0] === 'npm'), false);
-  // …but the plan is legible, which is the entire point of the mode: "would
-  // the build have run as root?" is the question a week of this log is read to
-  // answer.
-  assert.match(logged.join('\n'), /DRY-RUN would run: .*npm ci/);
-  assert.match(logged.join('\n'), /DRY-RUN would run: .*npm run build/);
-  assert.match(logged.join('\n'), /HOME=/);
+test('the host agent is refused a Discord token, and refuses to start if it has one', () => {
+  // The assertion the operator asked for by name. This session has a shell and
+  // sudo; it must not also be able to speak as the bot. It reports back through
+  // the spool and the sandboxed agent does the talking.
+  assert.throws(
+    () => assertNoSecrets({ PATH: '/usr/bin', DISCORD_TOKEN: 'abc' }),
+    /DISCORD_TOKEN.*looks like a credential/s,
+  );
+  // And not only that one name. A check that knows one name fails on the second.
+  for (const name of ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'DB_PASSWORD', 'MY_SECRET', 'DISCORD_WEBHOOK']) {
+    assert.throws(() => assertNoSecrets({ [name]: 'x' }), /looks like a credential/, name);
+  }
+  // Ordinary things pass.
+  assert.doesNotThrow(() => assertNoSecrets({ PATH: '/usr/bin', HOME: '/home/n', HTTPS_PROXY: 'http://p:3128' }));
+  // And an operator can say "yes, I mean it" — in a file that gets reviewed.
+  assert.doesNotThrow(() => assertNoSecrets({ MY_TOKEN: 'x' }, ['MY_TOKEN']));
 });
 
-test('buildDirs may not escape the checkout', () => {
-  const root = mkdtempSync(join(tmpdir(), 'ops-builddirs-'));
-  const write = (dirs: string) =>
-    writeFileSync(
-      join(root, 'ops-config.yaml'),
-      [
-        `stateDir: ${join(root, 'state')}`,
-        'repos:',
-        '  - name: clawcius',
-        `    path: ${join(root, 'repo')}`,
-        '    branch: main',
-        `    buildDirs: ${dirs}`,
-        '',
-      ].join('\n'),
-    );
+test('the host agent environment is built from nothing and carries no token', () => {
+  const host = makeHost({ dryRun: true, suffix: 'env' });
+  const owner = resolveOwner(join(host.root, 'repo'));
+  assert.equal(owner.ok, true);
+  if (!owner.ok) return;
 
-  for (const dirs of ['["../elsewhere"]', '["/etc"]', '["ops/../../.."]']) {
-    write(dirs);
+  const previous = process.env['DISCORD_TOKEN'];
+  const noise = process.env['SOMETHING_UNRELATED'];
+  process.env['SOMETHING_UNRELATED'] = 'should not be inherited';
+  try {
+    const env = hostAgentEnv(host.config, owner.owner);
+    assert.equal(env['SOMETHING_UNRELATED'], undefined, 'an allowlist, not a filter');
+    assert.equal(env['DISCORD_TOKEN'], undefined);
+    // HOME is the checkout owner's, not root's: it is where Claude Code finds
+    // the OAuth credentials it authenticates with, and it is why the unit must
+    // never carry ProtectHome in any form.
+    assert.equal(env['HOME'], owner.owner.home);
+    assert.equal(env['USER'], owner.owner.user);
+    assert.ok((env['PATH'] ?? '').includes('/usr/bin'));
+
+    // And a token in the executor's own environment does not reach it — it
+    // stops the session starting at all.
+    process.env['DISCORD_TOKEN'] = 'a-very-real-looking-token-value';
+    assert.doesNotThrow(() => hostAgentEnv(host.config, owner.owner));
     assert.throws(
-      () => loadOpsConfig(join(root, 'ops-config.yaml')),
-      /buildDirs/,
-      `${dirs} must be refused: buildDirs names a subdirectory of an already-authorised checkout, not a second way to nominate one`,
+      () => assertNoSecrets({ ...hostAgentEnv(host.config, owner.owner), DISCORD_TOKEN: 'x' }),
+      /looks like a credential/,
     );
+  } finally {
+    if (previous === undefined) delete process.env['DISCORD_TOKEN'];
+    else process.env['DISCORD_TOKEN'] = previous;
+    if (noise === undefined) delete process.env['SOMETHING_UNRELATED'];
+    else process.env['SOMETHING_UNRELATED'] = noise;
   }
+});
 
-  write('[".", "ops", "status"]');
-  const config = loadOpsConfig(join(root, 'ops-config.yaml'));
-  assert.deepEqual(config.repos[0]?.buildDirs, ['.', 'ops', 'status']);
+test('a clean exit with is_error is a failure, not a success', () => {
+  // The CLI exits 0 and reports `is_error: true` when the model's own turn ends
+  // badly. Reading the exit code alone would record a failed task as a clean
+  // run, which would then arm a deadline and skip the rollback.
+  const base = { code: 0, signal: null, sawResult: true, resultIsError: false, resultSubtype: 'success', resultText: 'ok', stderr: '' };
+  assert.equal(judge(base).ok, true);
+  assert.equal(judge({ ...base, resultIsError: true }).ok, false);
+  assert.equal(judge({ ...base, sawResult: false }).reason, 'no-result');
+  assert.equal(judge({ ...base, code: 1 }).reason, 'exit');
+  assert.equal(judge({ ...base, resultSubtype: 'error_max_budget' }).reason, 'budget');
+});
+
+test('an unnamed task scopes to every instance, and a restricted one may not file it', async () => {
+  const host = makeHost({
+    dryRun: false,
+    suffix: 'scope',
+    instances: [
+      { name: 'clawcius' },
+      { name: 'hamachi', extra: ['    mayRequest:', '      instances: [hamachi]'] },
+    ],
+  });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
+  const executor = new Executor(host.config);
+
+  // Unrestricted: an unnamed task takes BOTH instances into scope, so both are
+  // snapshotted. That default is the expensive one on purpose — "which
+  // containers might this sentence disturb" has no answer, and the safe reading
+  // of no answer is "all of them".
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","task":"free some disk space in /var/log"}',
+  });
+  await settle(executor, 40_000);
+
+  const snapshots = host
+    .calls()
+    .filter((call) => call[0] === 'snapshot.sh').length;
+  assert.equal(snapshots, 2, 'an unnamed task snapshots every instance');
+
+  // Restricted: the same request would widen its reach rather than narrow it,
+  // so it is refused with the fix in the message.
+  executor.intake({
+    requester: 'hamachi',
+    name: 'b.json',
+    body: '{"verb":"task","task":"free some disk space in /var/log"}',
+  });
+  await settle(executor, 40_000);
+  const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
+  assert.ok(
+    rejected.some((entry) => /naming no instance/.test(String(entry['detail']))),
+    'an unnamed task from a restricted instance must be refused',
+  );
+
+  executor.stop();
+});
+
+test('a deadline is armed for whatever the audit shows the task touched', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'touched' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  // The task names no instance, and the command names the container. The audit
+  // is what connects the two — which is the point of having one.
+  host.setPlan(['echo clawcius-agent']);
+
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","task":"look at the container"}',
+  });
+  await settle(executor, 40_000);
+
+  const pending = executor.state.pendingFor('clawcius');
+  assert.ok(pending, 'a command naming a container means that instance owes a check-in');
+  assert.equal(pending?.rollbackTag, 'snap-20260808-040000');
+  executor.stop();
+});
+
+test('the result is reported back through the spool, not spoken by the host agent', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'report' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+  host.setReport('I restarted the waker and it came back. journalctl was clean.');
+
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"restart the waker"}',
+  });
+  await settle(executor, 40_000);
+
+  const wakeDir = join(host.root, 'state', 'clawcius', 'run', 'wake');
+  const wakes = readdirSync(wakeDir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(readFileSync(join(wakeDir, name), 'utf8')) as Record<string, string>);
+  const report = wakes.find((wake) => /SUCCEEDED|FAILED/.test(wake['prompt'] ?? ''));
+  assert.ok(report, 'the requester must be told what happened');
+  assert.match(report?.['prompt'] ?? '', /I restarted the waker and it came back/);
+  assert.match(report?.['prompt'] ?? '', /1 command\(s\)/);
+  executor.stop();
+});
+
+test('no code path in ops/src forces past a dirty tree', () => {
+  // This assertion survives the verbs and matters more than it did. The check
+  // that refused a pull on a dirty tree is gone — the host agent runs git
+  // itself and is told, in its standing prompt and with the filenames in its
+  // briefing, never to force past one. What must remain true is that this
+  // daemon has no such command of its own, so grep is the test.
+  //
+  // On 2026-08-09 the local edits blocking a pull on this host turned out to be
+  // real fixes made by hand during an incident, and every way of "getting the
+  // pull to go through" would have destroyed or hidden them.
+  // Resolved from this module's own URL, not from cwd. `npm run selftest` runs
+  // from `ops/`, so a `readdirSync('.')` here would scan a directory with no
+  // compiled output in it and the assertion would pass by finding nothing —
+  // which is the shape of a test that has quietly stopped testing anything.
+  const dist = dirname(fileURLToPath(import.meta.url));
+  const names = readdirSync(dist).filter(
+    (name) => name.endsWith('.js') && !name.startsWith('selftest'),
+  );
+  assert.ok(names.length > 5, `expected the compiled sources in ${dist}, found ${names.length}`);
+  const sources = names.map((name) => readFileSync(join(dist, name), 'utf8'));
+
+  // Quoted argv ELEMENTS, not prose. The words themselves legitimately appear
+  // in host-agent.ts, in the standing prompt that tells the session never to do
+  // any of this — a scan for the bare word would fail on the instruction
+  // forbidding the thing, which is the wrong way round. What must not exist is
+  // one of these as an argument this daemon hands to git.
+  //
+  // `-f` is deliberately not on the list: `docker container inspect -f` uses it.
+  const banned = ['reset', 'stash', 'clean', 'restore', 'checkout', '--hard', '-fd'];
+  for (const [index, source] of sources.entries()) {
+    for (const word of banned) {
+      for (const quoted of [`'${word}'`, `"${word}"`]) {
+        assert.equal(
+          source.includes(quoted),
+          false,
+          `${quoted} must not appear as an argv element in ops/src (${names[index]})`,
+        );
+      }
+    }
+  }
 });
 
 test('the ops-status.json the page reads is valid and describes the current state', async () => {
   const host = makeHost({ dryRun: true, suffix: 'status' });
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
   const executor = new Executor(host.config);
-  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}' });
   await settle(executor);
 
   const payload = JSON.parse(
@@ -1815,12 +2223,12 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
     onRequest: (raw) => executor.intake(raw),
   });
 
-  fileRequest(host.spoolDir('clawcius'), '1-good', '{"verb":"restart","unit":"clawcius.service"}');
+  fileRequest(host.spoolDir('clawcius'), '1-good', '{"verb":"task","task":"restart clawcius.service"}');
   fileRequest(host.spoolDir('clawcius'), '2-bad', '{"verb":"nuke","unit":"clawcius.service"}');
   fileRequest(
     host.spoolDir('clawcius'),
     '3-evil',
-    '{"verb":"restart","unit":"../../../sshd.service"}',
+    '{"verb":"rollback","instance":"../../../etc"}',
   );
 
   spool.start();
@@ -1829,7 +2237,9 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
 
   const entries = journalEntries(host.config);
   assert.equal(
-    entries.some((entry) => entry['kind'] === 'started' && entry['what'] === 'restart clawcius.service'),
+    entries.some(
+      (entry) => entry['kind'] === 'started' && entry['what'] === 'task restart clawcius.service',
+    ),
     true,
   );
   assert.equal(
@@ -1840,8 +2250,9 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
     entries.some((entry) => /path separator/.test(String(entry['detail']))),
     true,
   );
-  // Dry run: the allowed restart was logged, not executed.
-  assert.equal(host.calls().some((call) => call[0] === 'systemctl'), false);
+  // Dry run: the session was started with no ability to execute, and the
+  // executor itself ran nothing that changes the machine.
+  assert.equal(host.calls().some((call) => call[0] === 'run-container.sh'), false);
   executor.stop();
 });
 
@@ -1905,8 +2316,8 @@ test('two spools are watched concurrently and each request is attributed to its 
 
   // The same verb, the same target, filed into two different directories. On
   // the old shared spool these two files were indistinguishable once written.
-  fileRequest(host.spoolDir('clawcius'), '1', '{"verb":"snapshot","instance":"hamachi"}');
-  fileRequest(host.spoolDir('hamachi'), '2', '{"verb":"snapshot","instance":"hamachi"}');
+  fileRequest(host.spoolDir('clawcius'), '1', '{"verb":"task","instance":"hamachi","task":"take a snapshot"}');
+  fileRequest(host.spoolDir('hamachi'), '2', '{"verb":"task","instance":"hamachi","task":"take a snapshot"}');
 
   for (const spool of spools) spool.start();
   await settle(executor);
@@ -1944,7 +2355,7 @@ test('a request in instance A\'s spool is attributed to A, whatever the file cla
   fileRequest(
     host.spoolDir('hamachi'),
     '1',
-    '{"verb":"snapshot","instance":"hamachi","requester":"clawcius","from":"clawcius"}',
+    '{"verb":"task","instance":"hamachi","task":"look at the disk","requester":"clawcius","from":"clawcius"}',
   );
 
   spool.start();
@@ -1966,24 +2377,29 @@ test('a request in instance A\'s spool is attributed to A, whatever the file cla
   executor.stop();
 });
 
-test('provenance distinguishes an instance rebuilding itself from one rebuilding its neighbour', async () => {
+test('provenance distinguishes an instance acting on itself from one acting on its neighbour', async () => {
   const host = twoInstances('neighbour');
+  // Both idle: a task always waits for an idle turn on everything in scope,
+  // which was not true of the old `snapshot` verb this test used to use.
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
   const executor = new Executor(host.config);
 
   executor.intake({
     requester: 'hamachi',
     name: 'a.json',
-    body: '{"verb":"snapshot","instance":"hamachi"}',
+    body: '{"verb":"task","instance":"hamachi","task":"take a snapshot"}',
   });
   await settle(executor);
   executor.intake({
     requester: 'hamachi',
     name: 'b.json',
-    body: '{"verb":"snapshot","instance":"clawcius"}',
+    body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}',
   });
   await settle(executor);
 
-  const finished = journalEntries(host.config).filter((entry) => entry['kind'] === 'finished');
+  const finished = journalEntries(host.config)
+    .filter((entry) => entry['kind'] === 'finished' && /^task /.test(String(entry['what'])));
   assert.deepEqual(
     finished.map((entry) => `${String(entry['requester'])} -> ${String(entry['instance'])}`),
     ['hamachi -> hamachi', 'hamachi -> clawcius'],
@@ -2000,7 +2416,7 @@ test('the executor attributes its own automatic rollback to itself, not to the i
   executor.intake({
     requester: 'clawcius',
     name: 'a.json',
-    body: '{"verb":"redeploy","instance":"clawcius"}',
+    body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}',
   });
   await settle(executor);
 
@@ -2038,7 +2454,7 @@ test('a per-instance restriction refuses an out-of-scope request and names why',
   executor.intake({
     requester: 'hamachi',
     name: 'a.json',
-    body: '{"verb":"snapshot","instance":"hamachi"}',
+    body: '{"verb":"task","instance":"hamachi","task":"take a snapshot"}',
   });
   await settle(executor);
 
@@ -2046,7 +2462,7 @@ test('a per-instance restriction refuses an out-of-scope request and names why',
   executor.intake({
     requester: 'hamachi',
     name: 'b.json',
-    body: '{"verb":"snapshot","instance":"clawcius"}',
+    body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}',
   });
   await settle(executor);
 
@@ -2055,7 +2471,7 @@ test('a per-instance restriction refuses an out-of-scope request and names why',
   executor.intake({
     requester: 'clawcius',
     name: 'c.json',
-    body: '{"verb":"snapshot","instance":"clawcius"}',
+    body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}',
   });
   await settle(executor);
 
@@ -2086,7 +2502,7 @@ test('an out-of-scope request does not consume the hourly budget', async () => {
     executor.intake({
       requester: 'hamachi',
       name: `r${i}.json`,
-      body: '{"verb":"snapshot","instance":"hamachi"}',
+      body: '{"verb":"task","instance":"hamachi","task":"take a snapshot"}',
     });
   }
   await settle(executor);
@@ -2094,7 +2510,7 @@ test('an out-of-scope request does not consume the hourly budget', async () => {
   executor.intake({
     requester: 'clawcius',
     name: 'ok.json',
-    body: '{"verb":"snapshot","instance":"clawcius"}',
+    body: '{"verb":"task","instance":"clawcius","task":"take a snapshot"}',
   });
   await settle(executor);
 
@@ -2340,22 +2756,25 @@ test('the check-in instructions point the instance at its OWN spool', async () =
     instances: [{ name: 'clawcius' }, { name: 'hamachi' }],
   });
   liveHost.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
+  liveHost.setPlan(['true']);
 
   const executor = new Executor(liveHost.config);
   executor.intake({
     requester: 'hamachi',
     name: 'a.json',
-    body: '{"verb":"redeploy","instance":"hamachi"}',
+    body: '{"verb":"task","instance":"hamachi","task":"recreate the container"}',
   });
-  await settle(executor);
+  await settle(executor, 40_000);
 
+  // Two wakes now, and both go to hamachi's own spool: the report of what the
+  // task did, and the "you owe a check-in" that arms the deadline. It is the
+  // second one whose instructions have to be right.
   const wakeDir = join(liveHost.root, 'state', 'hamachi', 'run', 'wake');
   const files = readdirSync(wakeDir).filter((n) => n.endsWith('.json'));
-  assert.equal(files.length, 1);
-  const wake = JSON.parse(readFileSync(join(wakeDir, files[0] ?? ''), 'utf8')) as Record<
-    string,
-    string
-  >;
+  const wakes = files.map(
+    (name) => JSON.parse(readFileSync(join(wakeDir, name), 'utf8')) as Record<string, string>,
+  );
+  const wake = wakes.find((entry) => /check in/i.test(entry['prompt'] ?? '')) ?? {};
   // The one instruction sent to an agent that has just been rebuilt, at the
   // moment it most needs to answer. Pointing it at the other instance's spool
   // is how a working rebuild becomes a rolled-back one.

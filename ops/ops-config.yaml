@@ -1,13 +1,29 @@
 # Ops executor configuration.
 #
-# This file is not settings. It is the authorization model.
+# ── THIS FILE IS NO LONGER THE AUTHORIZATION MODEL ─────────────────────────
 #
-# Everything clawcius-ops is capable of doing is named here, by exact string.
-# The requests it reads come from a container that may be prompt-injected, and
-# nothing in a request can add to these lists — a request selects an entry, it
-# never supplies a value. A unit that is not under `units:` cannot be
-# restarted; an instance not under `instances:` cannot be recreated. There is
-# no wildcard and no pattern match anywhere in the loader, on purpose.
+# It said so, at the top, in bold, until 2026-08-10. It is not true any more
+# and reading it as though it were is how somebody ends up believing they are
+# protected by a list.
+#
+# The closed verb list is gone. A request is now free text — a `task` — handed
+# to a headless Claude Code session running ON THE HOST as the checkout's owner,
+# with Bash and with sudo. There is no allowlist in front of prose. What
+# replaced the list is: a snapshot before every task, a rollback after a failed
+# one, and a complete audit of every command in journal.jsonl.
+#
+# Read ops/README.md § The trust model before changing anything here. What this
+# file still holds:
+#
+#   * `units:` and `repos:` — a HEALTH MANIFEST and a briefing, not a gate.
+#     They decide what gets `systemctl is-active`'d before and after every task
+#     and what the session is told about the machine. Leaving something out of
+#     them does not make it safe; it makes it unwatched.
+#   * `instances:` — still a real allowlist for the things that still take one
+#     (rollback targets, check-in targets, wake routing) and the definition of
+#     what gets snapshotted and rolled back.
+#   * the containment assertions, unchanged and still load-bearing.
+#   * limits: how often, how long, how much money. Never what.
 #
 # Every key has a default in src/config.ts and the loader validates types, so a
 # typo fails the boot with the offending key named. Override the path with
@@ -17,14 +33,22 @@
 # SHIPS ON, AND SHOULD STAY ON UNTIL YOU HAVE READ THE LOG.
 #
 # In this mode the executor makes every decision it would really make — the
-# allowlist checks, the idle wait, the deadline, the breaker — and logs the
-# exact argv it would have executed, and executes none of it. Read-only probes
-# (docker inspect, git rev-parse, docker images) still run, because a dry run
-# that cannot see the machine is a dry run reporting fiction.
+# idle wait, the snapshot, the deadline, the breaker — and logs the exact argv
+# it would have executed, and executes none of it. Read-only probes (docker
+# inspect, git rev-parse, docker images, systemctl is-active) still run, because
+# a dry run that cannot see the machine is a dry run reporting fiction.
+#
+# AND THE HOST AGENT IS UNABLE TO ACT, not merely asked not to. Bash — along
+# with every other tool that can change this machine — is REMOVED from the
+# session by Claude Code's permission system, verified against the real CLI on
+# 2026-08-10: the session's tool list comes back as Glob, Grep and Read, and it
+# reports that it has no way to run anything. It investigates and then writes
+# out the exact list of commands it would have run, which is what lands in the
+# journal for you to read.
 #
 # Turn it off once `journalctl -u clawcius-ops` for a week contains nothing
-# that surprises you. This is a root process holding docker and systemctl; the
-# first deploy should be observable before it is trusted.
+# that surprises you. This is a root daemon that starts a shell session with
+# sudo; the first task should be observable before it is trusted.
 dryRun: true
 
 # ── Directories ───────────────────────────────────────────────────────────
@@ -71,15 +95,21 @@ gitPath: /usr/bin/git
 # found" several minutes after npm ci succeeded.
 npmPath: /home/npurcell/.local/share/node/bin/npm
 
-# ── Units that may be restarted ───────────────────────────────────────────
-# Note what is absent: clawcius-ops.service. The executor refuses to restart
-# itself by name even if you add it here — a process cannot restart itself
-# without dying mid-operation, and the operation would vanish with no record
-# that it did not finish. Restart the executor by hand.
+# ── Units whose health is checked around every task ───────────────────────
+# NOT an allowlist any more. The host agent runs systemctl itself and this list
+# does not constrain it. What it does is decide what gets `systemctl is-active`
+# before and after every task, so a task that takes a service down is caught by
+# the executor — which then rolls the in-scope instances back — instead of by a
+# person the next morning.
 #
-# Also absent: docker.service. Restarting the docker daemon takes every
-# container on the host down at once, including both agents and the proxy, and
-# it is not something an agent should be able to ask for in passing.
+# So the advice is the opposite of what it used to be: put anything here you
+# would want to know had stopped. Leaving a unit out does not protect it.
+#
+# clawcius-ops.service is deliberately absent and is skipped even if added: a
+# process that is running does not need to ask whether it is running. It is
+# named in the host agent's standing prompt as the one unit it must not touch,
+# because restarting it kills the task mid-flight and the audit stops
+# mid-sentence with nothing saying why.
 units:
   - name: clawcius.service
     description: the Clawcius waker (Discord gateway, agent sessions)
@@ -90,18 +120,26 @@ units:
   - name: clawcius-status.service
     description: the read-only status page on the tailnet
 
-# ── Checkouts that may be pulled and built ────────────────────────────────
-# `git pull --ff-only`, and only when HEAD is on the configured branch and the
-# tree is clean. A merge commit made unattended by a root daemon in a checkout
-# that is about to be deployed is not a thing anyone wants to find later.
+# ── Checkouts the host agent is briefed about ─────────────────────────────
+# Also not an allowlist. There is no `pull` verb; the session runs git itself.
+# What these entries do is appear in the briefing the executor assembles before
+# every task: path, expected branch, actual branch, HEAD, and the exact list of
+# uncommitted filenames.
 #
-# A DIRTY TREE IS A HARD REFUSAL. On 2026-08-09 a plain `git pull` on this host
-# stopped with "Your local changes to the following files would be overwritten
-# by merge: docker/run-container.sh", and those local edits turned out to be
-# real fixes someone had made by hand during an incident. There is no force
-# flag here, no allowDirty key, and no code path in ops/src that runs `reset
-# --hard`, `checkout -f`, `stash` or `clean`. The executor names the files and
-# stops; a person decides what they are.
+# The FIRST entry is special in one way that is not obvious: its `path` is what
+# the executor stats to decide who the session runs as. It never runs as root.
+#
+# A DIRTY TREE IS NOW A WARNING, NOT A GATE, and that is a real reduction in
+# strength which is written down rather than glossed. On 2026-08-09 a plain
+# `git pull` on this host stopped with "Your local changes to the following
+# files would be overwritten by merge: docker/run-container.sh", and those local
+# edits turned out to be real fixes someone had made by hand during an incident.
+# The executor no longer refuses on that; instead the filenames go into the
+# briefing and the standing prompt forbids `reset --hard`, `checkout -f`,
+# `stash` and `clean` in as many words. An instruction can be forgotten in a way
+# a check cannot. The trade is deliberate: sometimes the right answer during an
+# incident IS to work in a dirty tree, and a daemon that could not was a daemon
+# the operator worked around by hand.
 repos:
   - name: clawcius
     path: /home/npurcell/clawcius
@@ -126,12 +164,19 @@ repos:
     # build failure aborts the whole operation rather than restarting onto a
     # stale or half-written dist/.
     #
-    # `ops` is deliberately ABSENT from this list. Rebuilding the executor's
-    # own dist/ underneath the running executor would swap the code out from
-    # under a process that cannot restart itself — the same reason
-    # clawcius-ops.service is not in `units:` above. Changes to ops/ are built
-    # and restarted by a person, on purpose.
-    buildDirs: ['.', 'status']
+    # `ops` IS in this list now, and the reason it was absent no longer holds
+    # the same way. It used to be excluded because the executor built these
+    # directories itself, and rebuilding its own dist/ underneath a running
+    # process that could not restart itself was a way to swap the code out
+    # mid-operation. Now nothing here is built automatically at all — this is a
+    # list of directories the session is TOLD to build when it pulls — and a
+    # session asked to deploy a change to ops/ that could not build ops/ would
+    # simply do it anyway, by hand, unbriefed. The warning it needs is in the
+    # standing prompt instead: do not restart clawcius-ops.service, ask.
+    # Named in the briefing, not built by the executor. "Run npm ci && npm run
+    # build in these after any pull" is now a sentence the session is told,
+    # along with the date it cost an hour, rather than a step it cannot skip.
+    buildDirs: ['.', 'status', 'ops']
     #
     # ── Who the build runs as ───────────────────────────────────────────
     # Not configured here, and deliberately not configurable. clawcius-ops
@@ -240,17 +285,29 @@ instances:
     # To let Hamachi look after itself and nothing else:
     #
     #   mayRequest:
-    #     instances: [hamachi]        # redeploy/snapshot/rollback/checkin, and
-    #                                 # the instance a `wake` channel routes to
-    #     units: [hamachi.service]    # restart
-    #     repos: [clawcius]           # pull
-    #     verbs: [restart, pull, redeploy, snapshot, checkin]
+    #     instances: [hamachi]        # task/rollback/checkin targets, and the
+    #                                 # instance a `wake` channel routes to
+    #     verbs: [task, checkin, wake]
     #
-    # Note what this is NOT: a new security boundary. An agent that can write
-    # its spool can already restart its waker and recreate its own container —
-    # that is the feature, bounded by the allowlists, the rate limit and the
-    # deadline. This is the narrower, useful thing: keeping an instance out of
-    # its neighbour's business, deliberately, with the refusal in the journal.
+    # `units:` and `repos:` used to be here too. They are now INERT — no request
+    # carries a unit or a repo since the verbs that named them were deleted —
+    # and the loader says so in the boot journal rather than failing to start,
+    # because this unit is Restart=always and refusing to boot on a stale key
+    # turns a cosmetic problem into a restart loop with every deadline
+    # unhonoured.
+    #
+    # One consequence worth knowing about `instances:`: a task that names NO
+    # instance takes every instance into scope, so for a restricted instance
+    # that would be wider than what it is allowed rather than narrower. The
+    # executor refuses an unnamed task from a restricted instance and says so.
+    #
+    # AND THE BIG CAVEAT, which is different from what this block used to mean.
+    # mayRequest bounds what an instance may ASK FOR. It does not bound what the
+    # host agent may DO. A task scoped to `hamachi` is still carried out by a
+    # session with a shell and sudo, and nothing but the task text and the
+    # standing prompt points that session at Hamachi rather than at anything
+    # else on this box. It is a statement of intent that the journal records —
+    # which is genuinely useful, and is not a boundary.
 
 # ── Limits ────────────────────────────────────────────────────────────────
 # Every one of these is a cap on what a compromised or looping agent can do
@@ -280,9 +337,81 @@ limits:
   # check exists to keep anything from starting on.
   buildTimeoutSeconds: 1800
 
+# ── Snapshots kept per instance ───────────────────────────────────────────
+# Passed to docker/snapshot.sh as KEEP, which defaults to 8 on its own.
+#
+# 8 was sized for one snapshot a night, before a redeploy. Since 2026-08-10 one
+# is taken before EVERY task, and the retention ring is shared with the nightly
+# timer — whoever runs last prunes to their own ceiling — so at 8 a dozen small
+# tasks in an evening would evict the previous night's backup by morning.
+#
+# This is disk. Snapshot images share their base layers, so the marginal cost is
+# the writable diff rather than a whole image, but SETUP.md's measured figure
+# was ~2 GB each and a wrong answer here fills the disk. Narrow the blast radius
+# instead by naming an instance in the task: a task that names one snapshots one.
+snapshotKeep: 24
+
+# ── The host agent ────────────────────────────────────────────────────────
+# The headless Claude Code session that carries out a task. Read
+# ops/src/host-agent.ts before changing any of this; the security decisions —
+# which tools are denied, what the standing prompt says, that the session runs
+# as the checkout's owner and never as root, that its environment is built from
+# an allowlist and asserted free of DISCORD_TOKEN before it spawns — are all in
+# code on purpose. A YAML key that can widen a session with sudo is a YAML key
+# somebody widens at 3am.
+hostAgent:
+  # false refuses every task with a stated reason while leaving deadlines,
+  # check-ins and rollbacks working. That is the setting to put the host in
+  # while somebody works out what the last task did — strictly better than
+  # stopping the unit, which would drop every armed deadline.
+  enabled: true
+
+  # Absolute. Never looked up on PATH: this daemon is root and a PATH lookup is
+  # one writable directory away from being somebody else's choice of binary.
+  claudePath: /usr/local/bin/claude
+
+  # The session's working directory, and NOT the checkout. Claude Code
+  # auto-discovers CLAUDE.md and project settings from its cwd, and the checkout
+  # is a tree the agents get commits merged into — pointing the session there
+  # would let any agent hand standing instructions to a process with sudo,
+  # through a route nobody would think to audit. The loader refuses a workDir
+  # inside any spool, inside stateDir, or inside a checkout. The executor
+  # creates it at boot and chowns it to the checkout's owner.
+  workDir: /var/lib/clawcius-host-agent
+
+  # Wall-clock ceiling. On expiry the whole process group is killed — the
+  # session and anything it started — because killing only the CLI leaves an
+  # `npm ci` running as an orphan holding the lock the next task waits on.
+  timeoutMinutes: 30
+
+  # Dollar ceiling, enforced by the CLI's own --max-budget-usd. The timeout
+  # catches wall-clock runaway; this catches the expensive kind that stays
+  # inside it.
+  maxCostUsd: 10
+
+  # Empty means the CLI's default model.
+  model: ""
+
+  # Extra environment variables passed through BY NAME. Everything else is built
+  # from an allowlist in host-agent.ts and nothing is inherited by accident.
+  #
+  # Anything named here is EXEMPT from the credential-name check that otherwise
+  # refuses to spawn a session whose environment contains something looking like
+  # a token. That exemption is the point: it makes "yes, I mean it" a diff
+  # somebody reviewed. DISCORD_TOKEN here would still be a mistake — this
+  # session reports back through the spool and the sandboxed agent does the
+  # talking, precisely so that a session with a shell cannot speak as anybody.
+  envPassthrough: []
+
 # ── Waiting for an idle turn ──────────────────────────────────────────────
-# redeploy and rollback recreate the container, and every live agent session is
-# a `docker exec` into it. Doing that mid-turn kills someone's conversation.
+# A task may recreate a container, and every live agent session is a `docker
+# exec` into one. Doing that mid-turn kills someone's conversation.
+#
+# Every instance IN SCOPE is waited for. A task that names an instance scopes to
+# that one; a task that names none scopes to ALL of them, because "which
+# containers might this sentence disturb" has no answer and the safe reading of
+# no answer is "all of them". Naming an instance is how an agent buys a cheap,
+# fast task.
 idle:
   # A waker status file older than this is treated as busy. Must be comfortably
   # more than the waker's status.intervalSeconds (20) and comfortably less than
@@ -296,6 +425,14 @@ idle:
   pollSeconds: 10
 
 # ── The check-in deadline ─────────────────────────────────────────────────
+# Armed for each instance the task actually TOUCHED — which is answered from the
+# audit, since it holds every command the session ran. An instance is touched if
+# the task named it, or if its container name, image or one of the deploy
+# scripts appears in any command. That is a substring match over shell text and
+# is therefore over-broad, which is the right direction: a false positive costs
+# one wake and one check-in, a false negative is an instance recreated with
+# nobody waiting to hear whether it came back.
+#
 # After a destructive operation the executor wakes the instance with context
 # and waits to hear back. Silence means the rebuild broke it, and the whole
 # point is that nobody has to be awake for that.

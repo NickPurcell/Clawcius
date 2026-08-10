@@ -35,10 +35,22 @@ export type JournalKind =
   | 'queued'
   | 'started'
   | 'command'
-  // A build step ran, or deliberately did not. Its own kind rather than
-  // another 'command', because "was this actually built before it was
-  // restarted?" is the first question anyone asks about a deploy that merged
-  // and then did nothing, and it should be greppable by one word.
+  // One thing the host agent did — a Bash invocation, in full, in the
+  // `command` field, or another tool call, or a refusal by the permission
+  // system, or the auditor reporting on itself.
+  //
+  // Its own kind because it is the single most important thing in this file
+  // since 2026-08-10. The verb allowlist is gone; this is what replaced it.
+  // `grep '"kind":"audit"' journal.jsonl` is the answer to "what has this
+  // machine actually been told to do", and it must stay one word.
+  | 'audit'
+  // A before/after health comparison across the configured units and
+  // containers. Written when something regressed, which is the case worth
+  // finding by grep.
+  | 'health'
+  // A build step ran, or deliberately did not. Kept although the executor no
+  // longer builds anything itself: journal.jsonl is append-only and years of
+  // it exist, so the kind has to stay readable by whatever reads it.
   | 'build'
   | 'finished'
   | 'failed'
@@ -77,7 +89,20 @@ export type JournalEntry = {
    * this pipeline.
    */
   requester?: string;
-  /** Present when the entry concerns a command; the argv, rendered. */
+  /**
+   * Present when the entry concerns a command.
+   *
+   * Two different things live in this field, and the `kind` says which:
+   *
+   *   - for most kinds, an argv array rendered by `render()` for humans, which
+   *     is never parsed and never re-executed;
+   *   - for `audit`, the FULL command string the host agent handed to its Bash
+   *     tool, byte for byte, untouched.
+   *
+   * The second is deliberately not normalised, quoted or shortened. It is the
+   * primary evidence of what a session with sudo did on this host, and evidence
+   * that has been tidied up is not evidence.
+   */
   command?: string;
   ok?: boolean;
   dryRun?: boolean;
@@ -85,6 +110,28 @@ export type JournalEntry = {
 
 /** Events kept in ops-status.json. The jsonl is the archive. */
 const STATUS_EVENTS = 100;
+
+/**
+ * The last task, for the status page's benefit.
+ *
+ * A summary, not the task text: the full text is in the `request` journal entry
+ * and every command is in the `audit` entries, both of which are in `events`.
+ * This exists so a page can render "a task from hamachi ran 14 commands and
+ * cost $0.31" without walking the event list.
+ */
+export type TaskSummary = {
+  at: number;
+  requester: string;
+  /** The named instance, or `(all)` when the task named none. */
+  instance: string;
+  what: string;
+  commands: number;
+  turns: number;
+  costUsd: number;
+  ok: boolean;
+  dryRun: boolean;
+  sessionId: string;
+};
 
 export type OpsStatusSnapshot = {
   /** What the executor is doing right now, or 'idle'. */
@@ -106,6 +153,21 @@ export type OpsStatusSnapshot = {
   quarantined: Array<{ instance: string; build: string; at: number }>;
   consecutiveFailedRecoveries: number;
   lastVerify: { at: number; ok: boolean; detail: string } | null;
+  /**
+   * The host agent's configuration, as loaded. Published so the status page can
+   * say out loud what this daemon is now capable of — the honest version of the
+   * old "closed verb list" line, which the page could have rendered as
+   * reassurance long after it stopped being true.
+   */
+  hostAgent: {
+    enabled: boolean;
+    claudePath: string;
+    timeoutMinutes: number;
+    maxCostUsd: number;
+  };
+  /** Bash invocations audited since this process started. */
+  auditedCommands: number;
+  lastTask: TaskSummary | null;
 };
 
 export class Journal {
