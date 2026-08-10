@@ -332,8 +332,13 @@ discord:
   # Cost note, and it is the real one: every message here bills a turn, forever,
   # with no budget cap. A follow-up window at least closes on its own. Put
   # dedicated bot channels in this list and nothing else.
-  alwaysOnChannelIds:
-    - '1467070145343258628'  # hamachi (dedicated agent channel)
+  # Empty on purpose. An earlier version of this file listed Hamachi's channel
+  # here, which was simply the wrong file: Hamachi runs from
+  # agent-config.hamachi.yaml, in a different guild, so the entry matched
+  # nothing and the setting appeared not to work at all. If you want a
+  # dedicated always-on room for Clawcius, name a channel from *this* guild —
+  # it must also appear in allowedChannelIds above.
+  alwaysOnChannelIds: []
 
   # Message bundling. People type in bursts, and waking once per line means the
   # agent starts answering the first thought before the second has landed.
