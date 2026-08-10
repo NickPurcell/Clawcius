@@ -23,6 +23,13 @@ Two halves:
   step). Read, send, search, react, edit, delete. Structured exit codes so the
   agent branches on status rather than parsing prose.
 
+And one thing that only watches:
+
+- **`status/`** — a read-only observability page for every agent instance on
+  the host. Reads transcripts off local disk; shows liveness, session timelines
+  and the subagent tree over a time axis. Binds loopback only and is published
+  to the tailnet with `tailscale serve`. See [`status/README.md`](status/README.md).
+
 ## How it behaves
 
 **Wakes** on an @mention, on any message during a follow-up window after it has
@@ -73,6 +80,7 @@ say it came back or it is rolled back automatically. See
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
 | `squid/squid.conf` | The egress allowlist — the only copy | yes |
 | `ops/ops-config.yaml` | What the ops executor is allowed to do, by exact name | yes |
+| `status/status-config.yaml` | Transcript roots, port, liveness thresholds | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 
 Behaviour and persona live in `systemPrompt.append`. The code contributes only
