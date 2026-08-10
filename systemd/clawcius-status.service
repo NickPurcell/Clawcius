@@ -90,7 +90,18 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+
+# NOT MemoryDenyWriteExecute. It belongs in a list like this one and it was in
+# it, until the unit was loaded for the first time on 2026-08-10 and the
+# service core-dumped on SIGTRAP in a restart loop — while a stale manual `node
+# dist/index.js` from the day before still held :8477, so `curl /healthz`
+# answered cheerfully and the crash looked like it was not happening.
+#
+# V8 compiles JavaScript at runtime and needs pages that are writable and then
+# executable. MemoryDenyWriteExecute forbids exactly that transition, so Node
+# cannot start under it at all — this is not tunable, it is what a JIT is.
+# The same applies to any JIT runtime, so do not add it to the waker units
+# either; they have never carried it, which is why they run.
 RemoveIPC=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
