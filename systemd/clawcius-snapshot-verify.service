@@ -42,6 +42,49 @@ SuccessExitStatus=0
 # and a timeout that fires mid-test would report a working snapshot as broken.
 TimeoutStartSec=1800
 
+# ── Hardening: audited 2026-08-10, and the answer is still "almost none" ──
+#
+# Audited alongside clawcius-ops.service after MemoryDenyWriteExecute turned
+# out to be fatal in clawcius-status.service (#7) and ProtectHome turned out to
+# be fatal here in everything but name. This unit carried no hardening block at
+# all, which is the one thing that saved it — but "we never got round to it" is
+# not a reason, so here is the reason.
+#
+# NOT MemoryDenyWriteExecute. Same as everywhere else in this repository: this
+# is a Node process, V8 needs write-then-execute pages, and the option makes it
+# impossible for the interpreter to start. Never add it to anything that runs
+# node.
+#
+# NOT ProtectHome. WorkingDirectory, OPS_CONFIG_PATH and the node interpreter
+# itself all live under /home/npurcell. ProtectHome=yes or =tmpfs hides the
+# interpreter and the unit cannot start; =read-only would work today because
+# this oneshot only reads, which makes it a trap for whoever later gives the
+# verifier somewhere to write.
+#
+# NOT ProtectSystem=strict and NOT SystemCallFilter, for the same reason as the
+# executor: this process exists to drive the docker client, a read-only /run
+# breaks the socket, and a filter one syscall short of what docker needs fails
+# by leaking a 2 GB container rather than by refusing to start.
+#
+# NOT IPAddressDeny. It looks safe — the verifier talks to a local socket — but
+# `docker run` on an image that is somehow absent locally will try the registry,
+# and the failure mode of a denied address is a timeout inside the 1800s window
+# rather than a clean error.
+#
+# What it does have is the bound below and the throwaway container's own
+# inertness (no env file, no bind mounts, no restart policy), which is the part
+# that actually matters: the thing being started here is a restored agent image,
+# and the security property worth having is that it cannot reach the spools,
+# the workspaces or Discord.
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Bounds the verifier process, not the container it starts — docker puts that
+# in its own cgroup slice. So this is sized for a node process driving a docker
+# client, and is deliberately smaller than the executor's, which also builds.
+MemoryMax=256M
+TasksMax=64
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=clawcius-snapshot-verify

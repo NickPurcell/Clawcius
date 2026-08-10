@@ -46,6 +46,7 @@ import { StateStore, type PendingCheckin } from './state.js';
 import { readIdle } from './idle.js';
 import { Runner, render, summarise, type CommandResult } from './runner.js';
 import { describeRequest, isDestructive, parseRequest, type OpsRequest } from './request.js';
+import { dirtyRefusal, readDirty, runBuild } from './build.js';
 import type { RawRequest } from './spool.js';
 
 /**
@@ -412,6 +413,13 @@ export class Executor {
   }
 
   // ── pull ────────────────────────────────────────────────────────────────
+  //
+  // `pull` is "bring this checkout up to date and make it runnable", not
+  // "run git pull". The two came apart on 2026-08-09 and cost an hour; see
+  // #buildCheckout below and the header of ops/src/build.ts for the whole
+  // account. A verb that fetches source and stops, next to a `restart` verb, is
+  // an invitation to restart onto a stale dist/ — and unlike a human, an
+  // executor accepts that invitation every single time it is offered.
 
   async #doPull(request: OpsRequest): Promise<void> {
     const repo = this.#resolveRepo(request.repo);
@@ -446,22 +454,18 @@ export class Executor {
       return;
     }
 
-    const dirty = await this.#runner.probe(
-      [this.#config.gitPath, '-C', repo.path, 'status', '--porcelain'],
-      { timeoutSeconds: 60 },
-    );
-    if (!dirty.ok) {
-      this.#fail(request, `cannot read status in ${repo.path}: ${dirty.stderr || summarise(dirty)}`);
-      return;
-    }
-    if (dirty.stdout.trim().length > 0) {
-      this.#fail(
-        request,
-        `${repo.path} has uncommitted changes. Refusing to pull over them — someone is ` +
-          `mid-edit on the host:\n${dirty.stdout.trim().slice(0, 500)}`,
-      );
-      return;
-    }
+    // The dirty check comes BEFORE the pull, not after git has refused it.
+    //
+    // Git would stop on its own — it did, on this host, on 2026-08-09, with
+    // "Your local changes to the following files would be overwritten by
+    // merge: docker/run-container.sh" — and it was right to. But relying on
+    // that means the refusal arrives as a non-zero exit and a wall of stderr,
+    // in the one situation where what the operator needs is a short list of
+    // filenames and an explicit statement that nothing was touched. Checking
+    // first also means the failure is identical whether the conflict is in a
+    // tracked file git would block on or an untracked one it would happily
+    // clobber.
+    if (!(await this.#requireCleanTree(request, repo))) return;
 
     // `--ff-only`. A merge commit created unattended by a root daemon, in a
     // checkout that is about to be deployed, is not something anyone wants to
@@ -471,6 +475,74 @@ export class Executor {
       { timeoutSeconds: 300 },
     );
     this.#finish(request, result, `pull ${repo.name} (${repo.path}, ${repo.branch})`);
+    if (!result.ok) return;
+
+    // And then build it, because the source arriving on disk is not the thing
+    // any unit runs.
+    await this.#buildCheckout(request, repo);
+  }
+
+  // ── The dirty tree, and the build ───────────────────────────────────────
+
+  /**
+   * Refuse the operation if anything in the checkout is uncommitted.
+   *
+   * Returns false having already journalled the failure, so callers read as
+   * `if (!(await this.#requireCleanTree(...))) return;`.
+   *
+   * There is no counterpart to this that forces past it. No `force` field on a
+   * request, no `allowDirty` key in the config, no second code path. The
+   * closest this daemon comes to touching an uncommitted file is reading its
+   * name out of `git status --porcelain` and printing it.
+   */
+  async #requireCleanTree(request: OpsRequest, repo: RepoEntry): Promise<boolean> {
+    const dirty = await readDirty(this.#runner, this.#config, repo);
+    if (!dirty.ok) {
+      // Cannot tell. Treated as a refusal rather than as "probably clean",
+      // for the same reason a missing waker status file reads as busy: the
+      // unknown state and the dangerous state are the same state, and the only
+      // value worth being wrong about in the safe direction is this one.
+      this.#fail(request, `${dirty.reason}. Refusing to act on a checkout whose state is unknown.`);
+      return false;
+    }
+    if (dirty.files.length === 0) return true;
+
+    this.#fail(request, dirtyRefusal(repo, dirty.files));
+    return false;
+  }
+
+  /**
+   * `npm ci && npm run build`, as the user who owns the checkout.
+   *
+   * Returns false having already journalled the failure. Every caller must
+   * treat that as fatal to the operation — nothing gets restarted or recreated
+   * after a failed build, because the two states a failed build leaves behind
+   * are "stale" and "half-written" and starting on either is the failure this
+   * step was added to prevent.
+   *
+   * The dirty-tree check runs here too, not only in `pull`. A redeploy of a
+   * checkout with uncommitted edits builds something that HEAD does not
+   * describe, and HEAD is precisely what the circuit breaker records as "the
+   * build" — so a rollback would quarantine a commit that was never what ran.
+   * A breaker that blocks the wrong sha is worse than none, because it also
+   * blocks the fix.
+   */
+  async #buildCheckout(request: OpsRequest, repo: RepoEntry): Promise<boolean> {
+    if (!(await this.#requireCleanTree(request, repo))) return false;
+
+    const outcome = await runBuild(this.#runner, this.#config, repo);
+    this.#journal.write({
+      kind: outcome.ok ? 'build' : 'failed',
+      what: `build ${repo.name}`,
+      instance: request.instance || undefined,
+      ok: outcome.ok,
+      dryRun: this.#config.dryRun,
+      detail: outcome.detail,
+    });
+    if (!outcome.ok) {
+      process.stderr.write(`[ops] BUILD FAILED for ${repo.name}. Nothing restarted.\n`);
+    }
+    return outcome.ok;
   }
 
   // ── snapshot ────────────────────────────────────────────────────────────
@@ -528,6 +600,42 @@ export class Executor {
           'through. Retrying this one is refused permanently, not backed off.',
       });
       return;
+    }
+
+    // ── Build, before anything is destroyed ──────────────────────────────
+    //
+    // First because it is the cheapest thing that can say no. A failed `tsc`
+    // costs a minute; discovering the same failure after the pre-snapshot has
+    // committed two gigabytes and the container has been torn down costs the
+    // instance. The ordering is asserted in the self-test rather than left to
+    // whoever next edits this function.
+    //
+    // It is worth being precise about what this build does and does not do.
+    // `run-container.sh --recreate` starts a container from an image that was
+    // built separately; this step does not rebuild that image. What it does
+    // rebuild is the host checkout the breaker identifies this deploy by, and
+    // that `.claude/` and `discord-cli/` are bind-mounted from — so a redeploy
+    // whose checkout has not been built is a deploy of a commit whose compiled
+    // form does not exist on the machine. That was the shape of the
+    // 2026-08-09 hour, and the fix is not to be clever about which half of it
+    // matters.
+    const buildRepo = instance.buildRepo ? this.#resolveRepo(instance.buildRepo) : null;
+    if (buildRepo) {
+      if (!(await this.#buildCheckout(request, buildRepo))) return;
+    } else {
+      // Not fatal — an instance with no buildRepo has already told the breaker
+      // it cannot be identified by a commit, and #buildId says so loudly. But
+      // it is said again here, because "nothing was built" is the exact
+      // condition this verb was changed to stop happening silently.
+      this.#journal.write({
+        kind: 'build',
+        what: describeRequest(request),
+        instance: instance.name,
+        detail:
+          `${instance.name} has no buildRepo, so NOTHING WAS BUILT before this redeploy. ` +
+          'Whatever compiled output is on disk is what will run. Set buildRepo in ' +
+          'ops-config.yaml if this instance runs code from a checkout on this host.',
+      });
     }
 
     // ── Capture what we would roll back TO, before changing anything ─────

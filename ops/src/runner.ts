@@ -52,6 +52,25 @@ export type RunOptions = {
   env?: Record<string, string>;
   /** Override the default timeout for a long operation like an image pull. */
   timeoutSeconds?: number;
+  /**
+   * Run the child as this user instead of root. Both or neither.
+   *
+   * Added 2026-08-10 for the build step, and it is the only reason this
+   * process ever runs a child as anybody but itself. `npm ci` and `npm run
+   * build` executed as root leave root-owned `node_modules/` and `dist/` in a
+   * checkout owned by `npurcell`, after which every unit that runs as npurcell
+   * fails to start with an EACCES naming a file nobody edited. It happened
+   * twice on the night of 2026-08-09; see ops/src/build.ts for the whole story.
+   *
+   * The uid comes from `stat`ing the checkout, never from config and never from
+   * a request. It reaches `execFile` as a number in the options object, so
+   * libuv performs `setgid(2)` then `setuid(2)` in the forked child before
+   * `execve` — no `sudo`, no `su`, no setuid binary, and therefore nothing that
+   * `NoNewPrivileges=true` would neuter. Dropping privilege was never the thing
+   * NNP forbids; gaining it is.
+   */
+  uid?: number;
+  gid?: number;
 };
 
 /** Output kept per stream. Enough to diagnose, bounded enough to journal. */
@@ -128,7 +147,11 @@ export class Runner {
             .map(([key, value]) => `${key}=${value}`)
             .join(' ')})`
         : '';
-      this.#log(`DRY-RUN would run: ${render(argv)}${where}${env}`);
+      // The uid is in the dry-run line on purpose. "Would the build have run
+      // as root?" is the question the dry run is being read to answer, and an
+      // answer that is only visible by inspecting the code is not an answer.
+      const as = options.uid === undefined ? '' : ` (as uid ${options.uid} gid ${options.gid})`;
+      this.#log(`DRY-RUN would run: ${render(argv)}${where}${as}${env}`);
       return {
         ok: true,
         code: 0,
@@ -141,7 +164,8 @@ export class Runner {
         spawnError: '',
       };
     }
-    this.#log(`exec: ${render(argv)}${options.cwd ? ` (cwd ${options.cwd})` : ''}`);
+    const as = options.uid === undefined ? '' : ` (as uid ${options.uid} gid ${options.gid})`;
+    this.#log(`exec: ${render(argv)}${options.cwd ? ` (cwd ${options.cwd})` : ''}${as}`);
     return this.#exec(argv, options);
   }
 
@@ -179,6 +203,11 @@ export class Runner {
         {
           cwd: options.cwd,
           env: { ...baseEnv(), ...(options.env ?? {}) },
+          // Spread rather than set unconditionally: `uid: undefined` is not
+          // the same as absent to libuv on every Node line, and "run as
+          // whoever we already are" must stay the default that costs nothing
+          // to reason about.
+          ...(options.uid === undefined ? {} : { uid: options.uid, gid: options.gid }),
           timeout: (options.timeoutSeconds ?? this.#defaultTimeoutSeconds) * 1000,
           maxBuffer: 4 * 1024 * 1024,
           encoding: 'utf8',

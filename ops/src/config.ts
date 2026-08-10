@@ -59,6 +59,24 @@ export type RepoEntry = {
    * is how you deploy something nobody meant to deploy.
    */
   branch: string;
+  /**
+   * Directories under `path`, each holding a `package.json`, that get
+   * `npm ci && npm run build` after a pull and before a redeploy.
+   *
+   * Added 2026-08-10. Every unit in this repository starts `node dist/index.js`
+   * and not one of them compiles anything, so a pull followed by a restart
+   * cheerfully runs the previous build. That is not a hypothetical: the
+   * always-on-channels change was merged, pulled and restarted on 2026-08-09
+   * and did nothing at all for an hour because `dist/` was stale, with no
+   * error anywhere because nothing had failed. An executor exposing `pull` and
+   * `restart` as separate verbs with no build between them is a machine for
+   * reproducing that in four seconds, on request.
+   *
+   * Empty means "this checkout is not built", which is a legitimate answer for
+   * a repo of scripts and a dangerous one for a repo of TypeScript. The loader
+   * does not guess: it defaults to `['.']` and leaves the rest to config.
+   */
+  buildDirs: string[];
 };
 
 /**
@@ -129,6 +147,17 @@ export type LimitsConfig = {
   maxQueued: number;
   /** Seconds any single privileged command may run before it is killed. */
   commandTimeoutSeconds: number;
+  /**
+   * Seconds a single build step (`npm ci`, `npm run build`) may run.
+   *
+   * Separate from `commandTimeoutSeconds` and much larger, because `npm ci` on
+   * a cold cache fetches a few hundred packages through the host's proxy and
+   * routinely takes longer than a container recreate. A timeout that fires
+   * mid-install is the worst possible outcome of this step: it leaves a
+   * `node_modules/` that is neither the old tree nor the new one, which is the
+   * half-built state the build check exists to keep anything from starting on.
+   */
+  buildTimeoutSeconds: number;
 };
 
 export type IdleConfig = {
@@ -222,6 +251,16 @@ export type OpsConfig = {
   dockerPath: string;
   /** Absolute path to the `git` binary. */
   gitPath: string;
+  /**
+   * Absolute path to the `npm` binary.
+   *
+   * Its directory is prepended to PATH for build steps, because npm re-execs
+   * node and runs `tsc` out of `node_modules/.bin` through `sh`. On this host
+   * node is installed under the owner's home and is not on the system PATH at
+   * all, so without that the build fails at `npm run build` with "tsc: not
+   * found" several minutes after `npm ci` succeeded.
+   */
+  npmPath: string;
   units: UnitEntry[];
   repos: RepoEntry[];
   instances: InstanceEntry[];
@@ -242,6 +281,7 @@ const DEFAULTS: OpsConfig = {
   systemctlPath: '/usr/bin/systemctl',
   dockerPath: '/usr/bin/docker',
   gitPath: '/usr/bin/git',
+  npmPath: '/home/npurcell/.local/share/node/bin/npm',
   units: [],
   repos: [],
   instances: [],
@@ -252,6 +292,7 @@ const DEFAULTS: OpsConfig = {
     maxPerHour: 20,
     maxQueued: 8,
     commandTimeoutSeconds: 600,
+    buildTimeoutSeconds: 1800,
   },
   idle: {
     staleSeconds: 90,
@@ -443,10 +484,33 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
 
   const repos: RepoEntry[] = list(root['repos'], 'repos').map((raw, index) => {
     const entry = section(raw, `repos[${index}]`);
+    const at = `repos[${index}]`;
+    const path = requiredAbsPath(entry['path'], `${at}.path`);
+    // Relative, and checked to stay inside the checkout. `buildDirs` names a
+    // subdirectory of a checkout the operator has already authorised — it is
+    // not a second way to nominate a directory for a root process to run npm
+    // in. An absolute entry, or one that climbs out with `..`, is a config
+    // typo at best and a widening of the allowlist at worst, so it fails the
+    // boot with the offending value named rather than being normalised.
+    const buildDirs = strList(entry['buildDirs'], `${at}.buildDirs`, ['.']).map((dir, at2) => {
+      const where = `${at}.buildDirs[${at2}]`;
+      if (isAbsolute(dir)) {
+        throw new OpsConfigError(where, `("${dir}") must be relative to the checkout`);
+      }
+      const resolved = resolve(path, dir);
+      if (!isInside(resolved, path)) {
+        throw new OpsConfigError(
+          where,
+          `("${dir}") resolves to ${resolved}, which is outside the checkout at ${path}`,
+        );
+      }
+      return dir;
+    });
     return {
-      name: checkName(requiredStr(entry['name'], `repos[${index}].name`), `repos[${index}].name`),
-      path: requiredAbsPath(entry['path'], `repos[${index}].path`),
-      branch: requiredStr(entry['branch'], `repos[${index}].branch`),
+      name: checkName(requiredStr(entry['name'], `${at}.name`), `${at}.name`),
+      path,
+      branch: requiredStr(entry['branch'], `${at}.branch`),
+      buildDirs,
     };
   });
 
@@ -502,6 +566,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     systemctlPath: absPath(root['systemctlPath'], 'systemctlPath', DEFAULTS.systemctlPath),
     dockerPath: absPath(root['dockerPath'], 'dockerPath', DEFAULTS.dockerPath),
     gitPath: absPath(root['gitPath'], 'gitPath', DEFAULTS.gitPath),
+    npmPath: absPath(root['npmPath'], 'npmPath', DEFAULTS.npmPath),
     units,
     repos,
     instances,
@@ -529,6 +594,13 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         DEFAULTS.limits.commandTimeoutSeconds,
         5,
         7200,
+      ),
+      buildTimeoutSeconds: num(
+        limits['buildTimeoutSeconds'],
+        'limits.buildTimeoutSeconds',
+        DEFAULTS.limits.buildTimeoutSeconds,
+        30,
+        14400,
       ),
     },
     idle: {

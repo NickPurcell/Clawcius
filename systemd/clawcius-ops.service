@@ -68,17 +68,124 @@ StateDirectoryMode=0750
 #
 # Anything added here must be verified with an actual restart and a real
 # dry-run request, not by reading. A broken executor looks exactly like an
-# agent whose requests are being ignored.
-NoNewPrivileges=false
-RestrictSUIDSGID=true
-RemoveIPC=true
-ProtectHome=read-only
+# agent whose requests are being ignored. That sentence was already in this
+# file on 2026-08-09 and it was still not enough; see the ProtectHome block
+# below for what shipped anyway.
 
-# Bounded so a runaway docker operation cannot take the host with it. Modest
-# on purpose: this process parses small JSON files and waits on child
-# processes.
-MemoryMax=512M
-TasksMax=128
+# NOT MemoryDenyWriteExecute — audited 2026-08-10, after it turned out to be
+# fatal in clawcius-status.service (#7). It was never in this unit, and it must
+# never be added: V8 compiles JavaScript at runtime and needs pages mapped
+# writable and then executable, which is precisely the transition the option
+# forbids, so Node cannot start under it at all. This is not tunable and not
+# specific to any one service — it is what a JIT is. The same audit is the
+# reason for the rest of this block.
+
+# NoNewPrivileges — false, and the interaction is worth being exact about,
+# because it reads like it ought to be the thing blocking the build's privilege
+# drop and it is not.
+#
+# NNP forbids *gaining* privilege at execve. It makes the setuid bit a no-op,
+# which is why `sudo -u npurcell npm ci` and `su npurcell -c …` both fail under
+# it even when the caller is already root. Dropping privilege is the opposite
+# operation: a root process calling setgid(2)/setuid(2) before execve is
+# unaffected by NNP, and that is how ops/src/build.ts drops to the checkout's
+# owner — libuv performs the two calls in the forked child from the uid/gid
+# spawn options. No sudo, no su, no setuid binary, so the build would work with
+# NNP=true.
+#
+# It stays false for the other reason it was false: docker/run-container.sh
+# runs `docker run` with --cap-drop sets and a gVisor runtime, and this unit's
+# children include systemctl talking to the system bus. Neither has been tested
+# under NNP on this host, and the lesson of #7 is that hardening nobody has
+# loaded is hardening that has never been tested. Flipping it is a one-line
+# change to make deliberately, with a restart and a real dry-run request after
+# it — not a tidy-up.
+NoNewPrivileges=false
+
+# Restricts *creating* files with the setuid/setgid bit, via seccomp on chmod
+# and friends. It does not touch setuid(2) itself, so the build's privilege
+# drop is unaffected. npm extracts tarballs and none of this project's
+# dependencies ship a setuid file; if one ever did, extraction would fail
+# loudly, which is the correct outcome for a root daemon unpacking one.
+RestrictSUIDSGID=true
+
+# A no-op on this unit, kept because it costs nothing and stops being a no-op
+# the day someone changes User=. systemd documents RemoveIPC as having no
+# effect on objects owned by root.
+RemoveIPC=true
+
+# ── NOT ProtectHome. This one was fatal, and it shipped. ──────────────────
+#
+# This unit carried ProtectHome=read-only. It reads like obvious hygiene: a
+# root daemon has no business writing to anybody's home directory. On this host
+# it makes two of the seven verbs impossible, and it does so silently enough
+# that the cause is not obvious from the failure.
+#
+# The checkout is /home/npurcell/clawcius. `git pull` writes .git/; `npm ci`
+# writes node_modules/; `npm run build` writes dist/. Under ProtectHome all
+# three get EROFS on a filesystem that is demonstrably read-write when you look
+# at it from a shell, so the journal fills with permission errors against paths
+# whose `ls -l` says they are fine. The `pull` verb could never have worked as
+# shipped, and it would have been diagnosed as a git problem.
+#
+# Note also the near miss: ExecStart is /home/npurcell/.local/share/node/bin/node.
+# ProtectHome=yes or =tmpfs would have hidden the interpreter and the unit would
+# not have started at all — which, perversely, would have been the better
+# failure, because it would have been noticed on the first restart instead of
+# on the first pull.
+#
+# The honest accounting is that ProtectHome bought approximately nothing here.
+# This unit holds the docker socket. Anything it wanted to do to a home
+# directory it can still do with `docker run -v /home:/host`, one command away,
+# with no namespace in the path. Paying for a boundary that a process can step
+# around in a single argument, with the two verbs that actually maintain the
+# deployment, is not a trade worth making.
+#
+# ReadWritePaths=/home/npurcell/clawcius on top of ProtectHome=read-only is the
+# tidier-looking fix and it is a real one. It is not what is here, because it
+# has never been loaded on this host, and shipping reasoned-but-unloaded
+# hardening into this exact file is what #7 was. If someone wants it, it goes
+# in with a restart, a real `pull` in dry-run, and a real one out of it.
+
+# ── Considered and deliberately absent ────────────────────────────────────
+#
+# SystemCallFilter — no. The children of this unit are docker, systemctl, git,
+# npm and node, plus bash for run-container.sh and snapshot.sh. @system-service
+# would cover the interesting ones (the build's setgid/setuid live in @setuid,
+# which @system-service includes), but "would cover" is exactly the phrase that
+# preceded the SIGTRAP restart loop in #7. A filter that is one syscall short
+# on this unit does not degrade: it kills a redeploy halfway through, with the
+# container already destroyed.
+#
+# IPAddressDeny — no, and this is not close. `git pull` reaches github.com and
+# `npm ci` reaches the npm registry; IPAddressDeny=any would break both and
+# would break them as timeouts rather than as refusals. clawcius-status.service
+# can carry it because it genuinely talks to nothing; this unit is the one that
+# fetches the code.
+#
+# PrivateTmp — no. npm stages package tarballs through TMPDIR, and while a
+# private /tmp would technically serve, it also hides the unit's /tmp from
+# every other process on the host, including the operator running `ls` during
+# an incident. This unit is debugged by hand at 3am by definition.
+#
+# ProtectSystem — see the paragraph at the top: strict breaks the docker socket.
+# =full is very likely fine and is likewise untested here.
+
+# Bounded so a runaway operation cannot take the host with it.
+#
+# Raised from 512M/128 on 2026-08-10. The old numbers were sized for "this
+# process parses small JSON files and waits on child processes", which stopped
+# being true when the build became a step: `npm ci` on this repository plus
+# `tsc` over three packages runs well past 512M, and systemd's MemoryMax
+# applies to the unit's whole cgroup, children included. The build would have
+# been OOM-killed by the cgroup rather than failing on its own terms — a build
+# failure with no compiler error in it, which is a bad half-hour.
+#
+# The container a redeploy starts does NOT count against these: docker places
+# it in its own cgroup slice with its own --memory, so what is bounded here is
+# node, npm, git and the docker/systemctl clients.
+MemoryMax=2G
+TasksMax=512
 
 StandardOutput=journal
 StandardError=journal

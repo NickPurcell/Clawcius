@@ -57,6 +57,7 @@ import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
 import { Executor } from './executor.js';
 import { verifyInstance } from './verify.js';
+import { planBuild, resolveOwner, runBuild } from './build.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -69,23 +70,35 @@ import { verifyInstance } from './verify.js';
  * command string, an argument containing a space or a semicolon would arrive
  * split, and the assertions below would see it.
  */
-function makeHost(options: { dryRun: boolean; suffix: string }): {
+function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string[] }): {
   root: string;
   config: OpsConfig;
   callsDir: string;
   calls: () => string[][];
   setStatus: (instance: string, body: unknown) => void;
+  /** Make `git status --porcelain` report these lines. Empty means clean. */
+  setDirty: (porcelain: string[]) => void;
+  /** Make the npm stand-in exit non-zero for one subcommand (`ci` or `build`). */
+  failBuild: (which: string) => void;
 } {
   const root = mkdtempSync(join(tmpdir(), `ops-selftest-${options.suffix}-`));
   const bin = join(root, 'bin');
   const callsDir = join(root, 'calls');
+  const control = join(root, 'control');
   const spoolDir = join(root, 'state', 'run', 'ops');
   const stateDir = join(root, 'ops-state');
   mkdirSync(bin, { recursive: true });
   mkdirSync(callsDir, { recursive: true });
+  mkdirSync(control, { recursive: true });
   mkdirSync(spoolDir, { recursive: true });
   mkdirSync(join(root, 'state', 'run', 'wake'), { recursive: true });
   mkdirSync(join(root, 'repo'), { recursive: true });
+  // The build steps run with cwd set to these, and execFile fails to spawn at
+  // all if the cwd does not exist — which would look like a missing binary
+  // rather than a missing directory.
+  for (const dir of options.buildDirs ?? ['.']) {
+    mkdirSync(join(root, 'repo', dir), { recursive: true });
+  }
 
   const recorder = (name: string, body: string) => {
     const path = join(bin, name);
@@ -127,6 +140,11 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
       "  printf 'main\\n'",
       'elif [ "$1" = "rev-parse" ]; then',
       "  printf 'deadbeefcafe0000000000000000000000000000\\n'",
+      'elif [ "$1" = "status" ]; then',
+      // Clean unless the test says otherwise. Reading it from a file rather
+      // than baking it in means one fixture can serve both the clean and the
+      // dirty case within a single executor's lifetime.
+      `  if [ -s "${control}/dirty" ]; then cat "${control}/dirty"; fi`,
       'fi',
     ].join('\n'),
   );
@@ -134,6 +152,40 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
   const systemctl = recorder('systemctl', '');
   const runContainer = recorder('run-container.sh', '');
   const snapshot = recorder('snapshot.sh', '');
+
+  /**
+   * The npm stand-in, which records more than the others.
+   *
+   * `cwd=` and `uid=` go into the call file because the two properties this
+   * suite has to prove about the build are *where* it ran and *as whom*, and
+   * neither is visible in the argv. The uid is the real one — the tests do not
+   * run as root, so nothing is actually dropped here; what is asserted about
+   * dropping is asserted against planBuild(), which is pure.
+   */
+  const npm = join(bin, 'npm');
+  writeFileSync(
+    npm,
+    [
+      '#!/bin/sh',
+      `out="${callsDir}/$(date +%s%N)-npm"`,
+      "printf '%s\\n' npm > \"$out\"",
+      'for arg in "$@"; do printf \'%s\\n\' "$arg" >> "$out"; done',
+      'printf \'cwd=%s\\n\' "$(pwd)" >> "$out"',
+      'printf \'uid=%s\\n\' "$(id -u)" >> "$out"',
+      'printf \'home=%s\\n\' "$HOME" >> "$out"',
+      `if [ -s "${control}/npm-fail" ] && grep -qx "$1" "${control}/npm-fail"; then`,
+      '  echo "npm stand-in: told to fail on $1" >&2',
+      '  exit 1',
+      'fi',
+      `if [ -s "${control}/npm-fail" ] && [ "$1" = run ] && grep -qx "$2" "${control}/npm-fail"; then`,
+      '  echo "npm stand-in: told to fail on $2" >&2',
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  chmodSync(npm, 0o755);
 
   const statusFile = (instance: string) => join(root, `${instance}-waker-status.json`);
 
@@ -150,6 +202,7 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
       `systemctlPath: ${systemctl}`,
       `dockerPath: ${docker}`,
       `gitPath: ${git}`,
+      `npmPath: ${npm}`,
       'units:',
       '  - name: clawcius.service',
       '    description: the waker',
@@ -157,6 +210,7 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
       '  - name: clawcius',
       `    path: ${join(root, 'repo')}`,
       '    branch: main',
+      `    buildDirs: [${(options.buildDirs ?? ['.']).map((d) => JSON.stringify(d)).join(', ')}]`,
       'instances:',
       '  - name: clawcius',
       '    container: clawcius-agent',
@@ -175,6 +229,7 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
       '  maxPerHour: 6',
       '  maxQueued: 2',
       '  commandTimeoutSeconds: 20',
+      '  buildTimeoutSeconds: 60',
       'idle:',
       '  staleSeconds: 60',
       '  maxWaitMinutes: 0',
@@ -215,7 +270,24 @@ function makeHost(options: { dryRun: boolean; suffix: string }): {
     setStatus: (instance, body) => {
       writeFileSync(statusFile(instance), JSON.stringify(body));
     },
+    setDirty: (porcelain) => {
+      writeFileSync(join(control, 'dirty'), porcelain.length ? `${porcelain.join('\n')}\n` : '');
+    },
+    failBuild: (which) => {
+      writeFileSync(join(control, 'npm-fail'), `${which}\n`);
+    },
   };
+}
+
+/** The npm invocations recorded by the stand-in, in order, decoded. */
+function npmCalls(calls: string[][]): Array<{ argv: string[]; cwd: string; home: string }> {
+  return calls
+    .filter((call) => call[0] === 'npm')
+    .map((call) => ({
+      argv: call.filter((line) => !/^(cwd|uid|home)=/.test(line)),
+      cwd: call.find((line) => line.startsWith('cwd='))?.slice(4) ?? '',
+      home: call.find((line) => line.startsWith('home='))?.slice(5) ?? '',
+    }));
 }
 
 /** Drop a request into the spool the way an agent is told to: temp then rename. */
@@ -1229,7 +1301,7 @@ test('deadlines that expired while the executor was down are honoured, not forgi
   executor.stop();
 });
 
-test('a pull is refused on the wrong branch and over a dirty tree', async () => {
+test('a pull is refused on the wrong branch and outside the allowlist', async () => {
   const host = makeHost({ dryRun: false, suffix: 'pull' });
   const executor = new Executor(host.config);
 
@@ -1254,6 +1326,366 @@ test('a pull is refused on the wrong branch and over a dirty tree', async () => 
     true,
   );
   executor.stop();
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// The build step, and the dirty tree
+//
+// Four properties, all of them added on 2026-08-10 after a night of deploying
+// this stack by hand:
+//
+//   1. `pull` builds. A pull that only fetches source, next to a `restart`
+//      verb, is a machine for restarting onto a stale dist/ — which is what
+//      cost an hour when always-on-channels was merged, pulled, restarted and
+//      did nothing at all.
+//   2. A failed build aborts. Nothing is restarted or recreated afterwards,
+//      because the two states a failed build leaves are "stale" and
+//      "half-written" and both of them start cleanly and behave wrongly.
+//   3. A dirty tree is refused, by name, and never forced past.
+//   4. The build does not run as root.
+//
+// Each is asserted as an ORDERING or an ABSENCE rather than as a log line,
+// because every one of these failures was silent on the host: exit code 0, no
+// stderr, unit active (running).
+// ══════════════════════════════════════════════════════════════════════════
+
+test('pull builds before anything can be restarted onto it', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'pullbuild', buildDirs: ['.', 'status'] });
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  await settle(executor);
+
+  const calls = host.calls();
+  const order = calls.map((call) => call[0]);
+  assert.ok(order.includes('git'), 'the pull itself should have run');
+  assert.ok(order.includes('npm'), 'a pull that does not build is the bug this fixes');
+
+  // The pull comes first, and every npm invocation comes after it: building
+  // before fetching would compile the previous commit and report success.
+  const pullAt = calls.findIndex((call) => call[0] === 'git' && call.includes('pull'));
+  const firstNpm = order.indexOf('npm');
+  assert.ok(pullAt >= 0 && firstNpm > pullAt, 'the build must run after the pull, not before');
+
+  // `npm ci`, not `npm install`. `install` rewrites package-lock.json when it
+  // disagrees with it, which is an unreviewed change arriving in a checkout
+  // that is about to be deployed, made by a root daemon, unattended.
+  const npm = npmCalls(calls);
+  assert.deepEqual(
+    npm.map((call) => call.argv.join(' ')),
+    ['npm ci', 'npm run build', 'npm ci', 'npm run build'],
+    'ci then build, once per configured buildDir',
+  );
+  assert.equal(
+    npm.some((call) => call.argv.includes('install')),
+    false,
+    'npm install would rewrite the lockfile unattended',
+  );
+
+  // And in the right directories, in the configured order.
+  assert.deepEqual(
+    npm.map((call) => call.cwd),
+    [
+      join(host.root, 'repo'),
+      join(host.root, 'repo'),
+      join(host.root, 'repo', 'status'),
+      join(host.root, 'repo', 'status'),
+    ],
+  );
+
+  const entries = journalEntries(host.config);
+  assert.ok(
+    entries.some((entry) => entry['kind'] === 'build' && entry['ok'] === true),
+    'the build should be its own journal kind, greppable by one word',
+  );
+  executor.stop();
+});
+
+test('a failed build aborts the operation and restarts nothing', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'buildfail' });
+  host.failBuild('build');
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  await settle(executor);
+
+  const npm = npmCalls(host.calls());
+  // `npm ci` ran, `npm run build` ran and failed, and nothing after it did.
+  assert.deepEqual(npm.map((call) => call.argv.join(' ')), ['npm ci', 'npm run build']);
+
+  const entries = journalEntries(host.config);
+  const failure = entries.find(
+    (entry) => entry['kind'] === 'failed' && /^build /.test(String(entry['what'])),
+  );
+  assert.ok(failure, 'a failed build must be journalled as a failure, loudly');
+  assert.match(String(failure?.['detail']), /STOPPING HERE/);
+  assert.match(String(failure?.['detail']), /stale|half-built|half-written/);
+
+  assert.equal(
+    host.calls().some((call) => call[0] === 'systemctl'),
+    false,
+    'nothing may be restarted after a build failure',
+  );
+  executor.stop();
+});
+
+test('a failed build stops a redeploy before the container is touched', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'redeploybuildfail' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.failBuild('ci');
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  await settle(executor);
+
+  const order = host.calls().map((call) => call[0]);
+  assert.equal(order.includes('npm'), true, 'the build should have been attempted');
+  assert.equal(
+    order.includes('run-container.sh'),
+    false,
+    'a redeploy must not recreate the container after a failed build',
+  );
+  assert.equal(
+    order.includes('snapshot.sh'),
+    false,
+    'and it should fail before spending two gigabytes on a snapshot',
+  );
+  assert.equal(executor.state.pendingFor('clawcius'), null, 'and arm no deadline');
+  executor.stop();
+});
+
+test('redeploy builds before it snapshots or recreates', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'redeploybuild' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  await settle(executor);
+
+  const order = host.calls().map((call) => call[0]);
+  const npmAt = order.indexOf('npm');
+  const snapAt = order.indexOf('snapshot.sh');
+  const recreateAt = order.indexOf('run-container.sh');
+  assert.ok(npmAt >= 0, 'a redeploy must build the checkout it deploys');
+  assert.ok(snapAt >= 0 && recreateAt >= 0);
+  assert.ok(npmAt < snapAt, 'build first: the cheapest thing that can say no goes first');
+  assert.ok(npmAt < recreateAt, 'and certainly before anything is destroyed');
+  executor.stop();
+});
+
+test('a dirty tree refuses the pull, names the files, and forces nothing', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'dirty' });
+  // Exactly what the host reported on 2026-08-09.
+  host.setDirty([' M docker/run-container.sh', '?? notes.txt']);
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  await settle(executor);
+
+  const entries = journalEntries(host.config);
+  const failure = entries.find(
+    (entry) => entry['kind'] === 'failed' && /pull clawcius/.test(String(entry['what'])),
+  );
+  assert.ok(failure, 'a dirty tree must fail the operation, not warn about it');
+  const detail = String(failure?.['detail']);
+  // The files, by name. A refusal that says "the tree is dirty" and stops
+  // sends the operator to `git status`; this one is the answer.
+  assert.match(detail, /docker\/run-container\.sh/);
+  assert.match(detail, /notes\.txt/);
+  assert.match(detail, /REFUSING/);
+
+  const calls = host.calls();
+  // Nothing was pulled…
+  assert.equal(
+    calls.some((call) => call[0] === 'git' && call.includes('pull')),
+    false,
+    'the pull must not be attempted over a dirty tree',
+  );
+  // …nothing was built on top of it…
+  assert.equal(calls.some((call) => call[0] === 'npm'), false);
+  // …and, the assertion that matters most: not one of the four ways past a
+  // dirty tree was used. There is no code path in this daemon that runs any of
+  // them, and this is what keeps it that way.
+  for (const forbidden of ['reset', 'checkout', 'stash', 'clean', 'restore', '--force', '-f']) {
+    assert.equal(
+      calls.some((call) => call[0] === 'git' && call.includes(forbidden)),
+      false,
+      `git ${forbidden} must never be used to get past a dirty tree`,
+    );
+  }
+  executor.stop();
+});
+
+test('a dirty tree refuses a redeploy too, because the breaker names builds by HEAD', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'dirtyredeploy' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setDirty([' M src/index.ts']);
+  const executor = new Executor(host.config);
+
+  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  await settle(executor);
+
+  const order = host.calls().map((call) => call[0]);
+  assert.equal(order.includes('run-container.sh'), false);
+  assert.equal(order.includes('npm'), false);
+  assert.equal(executor.state.pendingFor('clawcius'), null);
+  assert.match(
+    String(journalEntries(host.config).find((e) => e['kind'] === 'failed')?.['detail']),
+    /src\/index\.ts/,
+  );
+  executor.stop();
+});
+
+test('a git status that cannot be read is treated as dirty, not as clean', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'statusbroken' });
+  const executor = new Executor({ ...host.config, gitPath: '/nonexistent/git' });
+
+  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  await settle(executor);
+
+  // The branch probe fails first here, which is itself the right answer; the
+  // property under test is that no path through #doPull reaches `git pull`
+  // when the checkout's state could not be established.
+  assert.equal(host.calls().some((call) => call.includes('pull')), false);
+  executor.stop();
+});
+
+// ── The privilege drop ────────────────────────────────────────────────────
+//
+// planBuild() and resolveOwner() are pure and are tested directly, because the
+// property — "the build does not run as root" — cannot be observed by running
+// the build in a suite that is not root to begin with. Testing the plan is not
+// a compromise here: the plan IS the decision, and the decision is what was
+// wrong on 2026-08-09.
+
+test('the build plan drops to the checkout owner and never runs as root', () => {
+  const host = makeHost({ dryRun: false, suffix: 'plan', buildDirs: ['.', 'ops'] });
+  const repo = host.config.repos[0];
+  assert.ok(repo);
+  const owner = { uid: 1000, gid: 1000, user: 'npurcell', home: '/home/npurcell' };
+
+  const steps = planBuild(host.config, repo, owner, true);
+  assert.equal(steps.length, 4, 'ci and build, per buildDir');
+  for (const step of steps) {
+    assert.equal(step.uid, 1000, 'every build step must drop to the owner');
+    assert.equal(step.gid, 1000);
+    assert.notEqual(step.uid, 0, 'a root build leaves root-owned node_modules/ and dist/');
+    // HOME and the npm cache follow the owner, or npm writes into /root/.npm
+    // as a user that cannot read it.
+    assert.equal(step.env['HOME'], '/home/npurcell');
+    assert.equal(step.env['npm_config_cache'], '/home/npurcell/.npm');
+    // npm re-execs node and runs tsc through sh, so npm's own directory has to
+    // be on PATH — node is not on the system PATH on this host.
+    assert.ok(step.env['PATH']?.startsWith(join(host.root, 'bin')));
+    assert.equal(step.timeoutSeconds, 60);
+  }
+  assert.deepEqual(
+    steps.map((step) => step.argv.slice(1).join(' ')),
+    ['ci', 'run build', 'ci', 'run build'],
+  );
+  assert.deepEqual(
+    steps.map((step) => step.cwd),
+    [
+      join(host.root, 'repo'),
+      join(host.root, 'repo'),
+      join(host.root, 'repo', 'ops'),
+      join(host.root, 'repo', 'ops'),
+    ],
+  );
+
+  // And when the executor already IS the owner there is nothing to drop, so
+  // no uid is set at all — `uid: undefined` and "no uid" are not the same
+  // thing to libuv, and "run as whoever we already are" must stay the default
+  // that costs nothing to reason about.
+  const undropped = planBuild(host.config, repo, owner, false);
+  assert.equal(undropped[0]?.uid, undefined);
+  assert.equal('uid' in (undropped[0] ?? {}), false);
+});
+
+test('the owner is discovered by stat, never hardcoded, and refused when unknowable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-owner-'));
+  const passwd = join(root, 'passwd');
+  const me = process.getuid?.() ?? 0;
+
+  // A passwd file that does not describe the owner of the directory is the
+  // "cannot determine" case, and it must refuse rather than fall back to root.
+  writeFileSync(passwd, 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n');
+  const unknown = resolveOwner(root, passwd);
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) {
+    assert.match(unknown.reason, /no entry in/);
+    assert.match(unknown.reason, /Refusing to build/);
+  }
+
+  // A directory that does not exist is the other "cannot determine" case.
+  const missing = resolveOwner(join(root, 'nope'), passwd);
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.match(missing.reason, /cannot stat/);
+
+  // And the happy path: the uid comes off the directory, and the home comes
+  // out of passwd. Nothing here is a constant in the source.
+  writeFileSync(passwd, `someone:x:${me}:${me}:someone:/home/someone:/bin/sh\n`);
+  const found = resolveOwner(root, passwd);
+  assert.equal(found.ok, true);
+  if (found.ok) {
+    assert.equal(found.owner.uid, me);
+    assert.equal(found.owner.user, 'someone');
+    assert.equal(found.owner.home, '/home/someone');
+    // The suite runs as the owner of a directory it just created, so there is
+    // nothing to drop — which is the honest answer, not a skipped check.
+    assert.equal(found.drop, false);
+  }
+});
+
+test('a dry run logs the build it would have run, including the uid', async () => {
+  const host = makeHost({ dryRun: true, suffix: 'drybuild' });
+  const logged: string[] = [];
+  const runner = new Runner(true, 20, (line) => logged.push(line));
+  const repo = host.config.repos[0];
+  assert.ok(repo);
+
+  const outcome = await runBuild(runner, host.config, repo);
+  assert.equal(outcome.ok, true);
+  assert.match(outcome.detail, /DRY RUN/);
+  // Nothing ran…
+  assert.equal(host.calls().some((call) => call[0] === 'npm'), false);
+  // …but the plan is legible, which is the entire point of the mode: "would
+  // the build have run as root?" is the question a week of this log is read to
+  // answer.
+  assert.match(logged.join('\n'), /DRY-RUN would run: .*npm ci/);
+  assert.match(logged.join('\n'), /DRY-RUN would run: .*npm run build/);
+  assert.match(logged.join('\n'), /HOME=/);
+});
+
+test('buildDirs may not escape the checkout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-builddirs-'));
+  const write = (dirs: string) =>
+    writeFileSync(
+      join(root, 'ops-config.yaml'),
+      [
+        `spoolDir: ${join(root, 'spool')}`,
+        `stateDir: ${join(root, 'state')}`,
+        'repos:',
+        '  - name: clawcius',
+        `    path: ${join(root, 'repo')}`,
+        '    branch: main',
+        `    buildDirs: ${dirs}`,
+        '',
+      ].join('\n'),
+    );
+
+  for (const dirs of ['["../elsewhere"]', '["/etc"]', '["ops/../../.."]']) {
+    write(dirs);
+    assert.throws(
+      () => loadOpsConfig(join(root, 'ops-config.yaml')),
+      /buildDirs/,
+      `${dirs} must be refused: buildDirs names a subdirectory of an already-authorised checkout, not a second way to nominate one`,
+    );
+  }
+
+  write('[".", "ops", "status"]');
+  const config = loadOpsConfig(join(root, 'ops-config.yaml'));
+  assert.deepEqual(config.repos[0]?.buildDirs, ['.', 'ops', 'status']);
 });
 
 test('the ops-status.json the page reads is valid and describes the current state', async () => {

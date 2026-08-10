@@ -54,6 +54,14 @@ systemctlPath: /usr/bin/systemctl
 dockerPath: /usr/bin/docker
 gitPath: /usr/bin/git
 
+# npm, for the build step (see buildDirs below). Node is installed under the
+# owner's home on this host and is not on the system PATH at all, so this is
+# not the /usr/bin path the others are. The directory it lives in is prepended
+# to PATH for build steps only, because npm re-execs node and runs tsc out of
+# node_modules/.bin through sh — without it the build fails with "tsc: not
+# found" several minutes after npm ci succeeded.
+npmPath: /home/npurcell/.local/share/node/bin/npm
+
 # ── Units that may be restarted ───────────────────────────────────────────
 # Note what is absent: clawcius-ops.service. The executor refuses to restart
 # itself by name even if you add it here — a process cannot restart itself
@@ -73,14 +81,62 @@ units:
   - name: clawcius-status.service
     description: the read-only status page on the tailnet
 
-# ── Checkouts that may be pulled ──────────────────────────────────────────
+# ── Checkouts that may be pulled and built ────────────────────────────────
 # `git pull --ff-only`, and only when HEAD is on the configured branch and the
 # tree is clean. A merge commit made unattended by a root daemon in a checkout
 # that is about to be deployed is not a thing anyone wants to find later.
+#
+# A DIRTY TREE IS A HARD REFUSAL. On 2026-08-09 a plain `git pull` on this host
+# stopped with "Your local changes to the following files would be overwritten
+# by merge: docker/run-container.sh", and those local edits turned out to be
+# real fixes someone had made by hand during an incident. There is no force
+# flag here, no allowDirty key, and no code path in ops/src that runs `reset
+# --hard`, `checkout -f`, `stash` or `clean`. The executor names the files and
+# stops; a person decides what they are.
 repos:
   - name: clawcius
     path: /home/npurcell/clawcius
     branch: main
+    # ── The build, which used to be a habit ─────────────────────────────
+    # Directories under `path` that get `npm ci && npm run build` after a pull
+    # and before a redeploy.
+    #
+    # Every unit in this repository starts `node dist/index.js` and NOT ONE OF
+    # THEM COMPILES ANYTHING. The build was a thing a human did between the
+    # pull and the restart, and it was never written down as a step because it
+    # was never a step — it was a habit. On 2026-08-09 the habit was skipped:
+    # always-on-channels was merged, the config was right, the checkout was
+    # pulled, `systemctl restart clawcius` returned 0, and the feature did
+    # nothing at all for an hour because dist/ was yesterday's. Nothing failed
+    # and nothing logged.
+    #
+    # An executor with `pull` and `restart` as separate verbs and no build
+    # between them does not merely permit that mistake — it performs it, on
+    # request, in four seconds, as often as asked. So the build is a step now,
+    # it runs as the user who owns the checkout (never root; see below), and a
+    # build failure aborts the whole operation rather than restarting onto a
+    # stale or half-written dist/.
+    #
+    # `ops` is deliberately ABSENT from this list. Rebuilding the executor's
+    # own dist/ underneath the running executor would swap the code out from
+    # under a process that cannot restart itself — the same reason
+    # clawcius-ops.service is not in `units:` above. Changes to ops/ are built
+    # and restarted by a person, on purpose.
+    buildDirs: ['.', 'status']
+    #
+    # ── Who the build runs as ───────────────────────────────────────────
+    # Not configured here, and deliberately not configurable. clawcius-ops
+    # runs as root; this checkout is owned by npurcell; clawcius.service,
+    # hamachi.service and clawcius-status.service all run as npurcell. A build
+    # run as root leaves root-owned node_modules/ and dist/ behind and every
+    # one of those units then fails to start with an EACCES naming a file
+    # nobody edited — which happened twice on the night of 2026-08-09, the
+    # second time ten minutes after a `chown -R` had fixed the first.
+    #
+    # So the owner is discovered by stat()ing this path and the build drops to
+    # that uid/gid. There is no username key to get wrong, and if the owner
+    # cannot be determined or the drop cannot be performed the build is
+    # REFUSED rather than run as root.
 
 # ── Instances whose containers may be recreated ───────────────────────────
 # Everything needed to rebuild an instance is spelled out rather than derived.
@@ -140,6 +196,13 @@ limits:
   # silently evaporates.
   maxQueued: 8
   commandTimeoutSeconds: 600
+  # Build steps get their own, much larger ceiling. `npm ci` on a cold cache
+  # fetches a few hundred packages through the host's proxy and routinely takes
+  # longer than a container recreate. A timeout that fires mid-install is the
+  # worst outcome this step has: it leaves a node_modules/ that is neither the
+  # old tree nor the new one, which is exactly the half-built state the build
+  # check exists to keep anything from starting on.
+  buildTimeoutSeconds: 1800
 
 # ── Waiting for an idle turn ──────────────────────────────────────────────
 # redeploy and rollback recreate the container, and every live agent session is

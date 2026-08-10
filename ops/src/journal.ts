@@ -35,6 +35,11 @@ export type JournalKind =
   | 'queued'
   | 'started'
   | 'command'
+  // A build step ran, or deliberately did not. Its own kind rather than
+  // another 'command', because "was this actually built before it was
+  // restarted?" is the first question anyone asks about a deploy that merged
+  // and then did nothing, and it should be greppable by one word.
+  | 'build'
   | 'finished'
   | 'failed'
   | 'idle-wait'

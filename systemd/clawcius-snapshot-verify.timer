@@ -16,5 +16,12 @@ OnCalendar=*-*-* 05:30:00
 Persistent=true
 RandomizedDelaySec=20m
 
+# Audited 2026-08-10 with the two service units. Nothing here has the character
+# of MemoryDenyWriteExecute — a timer has no process to sandbox — but one thing
+# is worth stating: the 20 minutes of jitter plus Persistent=true means a
+# catch-up run after downtime can land at the same time as a boot-time
+# redeploy. That is fine and is why the verifier is a separate unit from the
+# executor rather than sharing its lock: see the note in the .service.
+
 [Install]
 WantedBy=timers.target

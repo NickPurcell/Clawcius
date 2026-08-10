@@ -371,13 +371,42 @@ every decision and log the exact argv it would have run, without running any of
 it. Leave it on until a week of `journalctl -u clawcius-ops` holds no
 surprises. This is a root process with docker and systemctl.
 
+### `pull` builds, and the build is not run as root
+
+Nothing in `systemd/` compiles anything — every unit here starts `node
+dist/index.js` — so the build used to be a habit a human had between the pull
+and the restart. On 2026-08-09 the habit was skipped and a merged feature did
+nothing for an hour with no error anywhere, because `dist/` was stale. `pull`
+therefore runs `npm ci && npm run build` in each of `repos[].buildDirs` and
+**aborts the whole operation if the build fails**; `redeploy` does the same
+before it snapshots or recreates.
+
+Two things that follow, both of which cost real time on the host that night:
+
+- The build runs as **the user who owns the checkout**, discovered by
+  `stat`ing it. Built as root it leaves root-owned `node_modules/` and `dist/`
+  and every unit that runs as `npurcell` then fails to start with an EACCES
+  naming a file nobody edited. If the owner cannot be determined or the drop
+  cannot be performed, the build is refused.
+- A **dirty tree is a hard refusal**, in `pull` and in `redeploy`. The
+  executor names the modified files and stops. It will never `reset --hard`,
+  `checkout -f`, `stash` or `clean` its way past one; the local edits blocking
+  a pull here turned out to be real fixes made by hand mid-incident.
+
+If either fires, fix it on the host and ask again:
+
+```sh
+git -C /home/npurcell/clawcius status --porcelain    # what is uncommitted
+sudo chown -R npurcell:npurcell /home/npurcell/clawcius   # if a root build got in first
+```
+
 ### Install
 
 ```sh
 cd /home/npurcell/clawcius/ops
 npm install
 npm run build
-npm run selftest              # 53 tests, no docker required
+npm run selftest              # 64 tests, no docker required
 
 sudo cp ../systemd/clawcius-ops.service \
         ../systemd/clawcius-snapshot-verify.service \
@@ -470,6 +499,21 @@ sudo systemctl restart clawcius-ops
 The quarantine list is not cleared by that, and there is no verb for any of it.
 An agent that can unfreeze the breaker holding back its own broken build is
 back where we started.
+
+### The units, after the audit
+
+Every unit in `systemd/` was read line by line on 2026-08-10 after
+`MemoryDenyWriteExecute=true` in `clawcius-status.service` turned out to make
+it impossible for Node to start at all (#7). `clawcius-ops.service` had a
+directive of exactly the same character: `ProtectHome=read-only`, on a unit
+whose entire job includes writing to a checkout in `/home/npurcell`. It is
+gone; `MemoryMax` and `TasksMax` were raised to fit the build, since systemd's
+cgroup limits apply to children too. `ops/README.md` § "The systemd units,
+audited" has the table of what was checked, kept, and deliberately left out.
+
+The rule that came out of both incidents: **do not add a hardening directive to
+these units without loading the unit and running the affected verb.** A broken
+executor looks exactly like an agent whose requests are being ignored.
 
 ---
 
