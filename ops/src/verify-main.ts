@@ -61,6 +61,10 @@ const journal = new Journal(config.stateDir, () => ({
   frozen: false,
   frozenReason: '',
   dryRun: config.dryRun,
+  // Empty rather than the real list: this process watches no spools, and a
+  // status file claiming otherwise would be the verifier lying about the
+  // daemon's state on the one page an operator reads to check it.
+  spools: [],
   pendingCheckins: [],
   quarantined: [],
   consecutiveFailedRecoveries: 0,

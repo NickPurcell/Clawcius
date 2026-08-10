@@ -12,15 +12,17 @@ that wall, so the agents can maintain their own deployments without the sandbox
 becoming decorative after all.
 
 ```
-  agent container                 host
-  ┌───────────────┐               ┌──────────────────────────────────────┐
-  │ writes JSON   │  bind mount   │ clawcius-ops.service (root)          │
-  │ to run/ops/   │ ────────────► │  closed verb list, config allowlists │
-  │               │               │  one operation at a time             │
-  │ reads wakes   │ ◄──────────── │  waits for an idle turn              │
-  │ from run/wake │  bind mount   │  arms a check-in deadline            │
-  └───────────────┘               │  rolls back if nobody checks in      │
-                                  └──────────────────────────────────────┘
+  agent containers                          host
+  ┌────────────────────────┐               ┌──────────────────────────────────────┐
+  │ clawcius               │  bind mount   │ clawcius-ops.service (root)          │
+  │  /var/lib/clawcius/run │ ────────────► │  one spool watched per instance      │
+  │    ops/   wake/        │               │  the SPOOL names the requester       │
+  ├────────────────────────┤               │  closed verb list, config allowlists │
+  │ hamachi                │  bind mount   │  one operation at a time             │
+  │  /var/lib/hamachi/run  │ ────────────► │  waits for an idle turn              │
+  │    ops/   wake/        │ ◄──────────── │  arms a check-in deadline            │
+  └────────────────────────┘   wakes back  │  rolls back if nobody checks in      │
+                                           └──────────────────────────────────────┘
 ```
 
 ## The verbs
@@ -43,10 +45,15 @@ while it is still empty.
 journal, and in the wake the executor sends you after a rebuild.
 
 ```sh
-OPS=/var/lib/clawcius/run/ops
+# Your own spool. Clawcius: /var/lib/clawcius/run/ops.
+#                 Hamachi: /var/lib/hamachi/run/ops.
+OPS=$CLAWCIUS_STATE_DIR/run/ops        # or just the literal path for your instance
 printf '%s' '{"verb":"restart","unit":"clawcius.service","reason":"picked up new dist/"}' \
   > $OPS/$(date +%s).tmp && mv $OPS/$(date +%s).tmp $OPS/$(date +%s).json
 ```
+
+There is no `requester` field and there must never be one. **The spool you
+wrote into is who you are** — see the next section.
 
 `wake` is a relay, not a new capability: the waker already accepts wake files
 written by the agent, so this adds nothing it could not do directly. It exists
@@ -160,6 +167,177 @@ one thing: stop, name the files, and let the operation be reported as failed.
   `ops/src` for `reset`, `checkout`, `stash` and `clean`: nothing. That absence
   is the feature, and the self-test asserts it directly.
 
+## One spool per instance, and why that turned out to matter twice
+
+Until 2026-08-10 there was a single `spoolDir: /var/lib/clawcius/run/ops` for
+the whole executor. That one line was two bugs, and only one of them was
+visible.
+
+**The visible one: Hamachi could not file a request at all.**
+`docker/run-container.sh` gives each instance its own state directory and
+bind-mounts only that:
+
+```sh
+CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
+WAKE_DIR=$CLAWCIUS_STATE/run
+-v "$WAKE_DIR:$WAKE_DIR:rw"
+```
+
+`systemd/hamachi-container.service` sets `CLAWCIUS_STATE_DIR=/var/lib/hamachi`,
+so Hamachi's container has `/var/lib/hamachi/run` and nothing else. The shared
+spool at `/var/lib/clawcius/run/ops` **does not exist inside it** — verified
+from inside the container. The agent the operator talks to most was the one
+agent locked out of the mechanism built for both of them, and it was silent
+from every angle: the agent's `mv` failed into a shell nobody reads, and the
+executor saw an empty directory, which is exactly what a quiet night looks
+like. The mount asymmetry had been there since the second instance shipped on
+2026-08-08; the spool was written against the first instance's paths and read
+as correct because for the first instance it was.
+
+**The invisible one, which matters more: nothing recorded who asked.** A shared
+directory carries no evidence of its writer. `redeploy hamachi` filed by
+Hamachi and `redeploy hamachi` filed by Clawcius are the same forty bytes, and
+the journal said the same thing about both — because it could not tell. One of
+those is an agent maintaining itself. The other is an agent reaching across the
+boundary at its neighbour, and those should never have been indistinguishable
+after the fact on a root process holding docker.
+
+### Provenance is the directory, not a field
+
+Every request now carries a `requester`, and it comes from the spool it was
+found in. It is stamped on in `src/spool.ts`, where the file's contents cannot
+reach it, and it is never read out of the JSON.
+
+That is the whole security property, and it is inherited from the mount rather
+than invented here: a container can write into exactly one of these
+directories, no matter what its prompt says, because that is the only one bind
+-mounted into it. A request that writes `"requester": "clawcius"` into
+Hamachi's spool is logged as an ignored unknown field and attributed to
+Hamachi. The self-test asserts precisely that, because "the attacker supplies
+their own identity" is the obvious way to get this wrong and it would look
+correct in every log until the day it mattered.
+
+It shows up in three places:
+
+- every journal entry gains a `requester`, alongside the existing `instance`
+  (which is the *target* — the two are different questions);
+- every prose log line: `[ops] started: redeploy hamachi (from clawcius) — …`,
+  so `journalctl -u clawcius-ops | grep 'from hamachi'` is now a question with
+  an answer;
+- `ops-status.json` lists the spools being watched, so the status page can show
+  at a glance that every agent has a reachable queue — the failure this
+  replaced was one agent silently having none.
+
+The executor's own actions are attributed to `(executor)`, not to the instance
+they happen to. An automatic rollback after a missed check-in is not a request
+and must not read like one.
+
+### Where the spools live, and who creates them
+
+`instances[].opsSpoolDir`, defaulting to `<stateDir>/run/ops`. Leave it unset.
+The default is the only value that is right by construction — it is inside the
+mount `run-container.sh` already gives that container — and it means a new
+instance can talk to this daemon without anyone remembering a second setting.
+
+**`docker/run-container.sh` creates them**, with `mkdir -p "$OPS_DIR"` directly
+beside the existing `mkdir -p "$WAKE_DIR"`, and for the same reason: that
+script runs as `npurcell` (the container units are `User=npurcell`) and the
+Dockerfile builds the agent user with `AGENT_UID=1000` to match, so the
+directory lands owned by the uid the container runs as without a `chown`
+anywhere.
+
+**The executor also repairs them at startup**, because it must not depend on a
+container having ever been started. `ensureSpoolDir()` creates the directory if
+missing and then `stat`s the instance's state directory and chowns the spool to
+match — the same rule as `build.ts`, where the owner is discovered rather than
+configured, because this daemon is not entitled to an opinion about who owns a
+directory it was pointed at. A failure there is logged loudly with the exact
+`chown` to run, and is never fatal.
+
+The alternative — letting root `mkdir` it and leaving it at that — produces a
+root-owned 0770 directory that the container cannot write, and the symptom is
+an agent whose requests are never seen. That is the same silent shape as the
+bug this whole section is about, so it is not left to chance.
+
+### Optional: restricting an instance. Off by default.
+
+`instances[].mayRequest` narrows what one instance may ask for:
+
+```yaml
+  - name: hamachi
+    # …
+    mayRequest:
+      instances: [hamachi]        # redeploy/snapshot/rollback/checkin targets,
+                                  # and the instance a `wake` channel routes to
+      units: [hamachi.service]    # restart
+      repos: [clawcius]           # pull
+      verbs: [restart, pull, redeploy, snapshot, checkin]
+```
+
+- **No `mayRequest` block means unrestricted**, which is what every instance had
+  before this existed. Upgrading changes nothing until somebody writes one.
+- A key left out is unrestricted. A key present is an exact-match allowlist. A
+  key present and empty (`instances: []`) means none at all, which is a
+  legitimate thing to say and is not confused with absent.
+- Every name is checked against the real allowlists at boot. A typo in
+  `mayRequest.units` would otherwise be a silent total denial of something the
+  operator believed they had granted, and a restriction that fails closed by
+  accident is indistinguishable from a broken executor.
+- Refusals are journalled with the requester and the reason, and are checked
+  **before** the rate limit, so an agent looping on requests it may not make
+  cannot starve the one doing real work.
+- `wake` is checked twice: at intake for the verb, and again after routing,
+  because a wake names a channel and the target instance is not known until it
+  has been resolved. Waking somebody else's agent with attacker-influenced text
+  is exactly what a restricted instance should not be able to do.
+
+This is **not** a new security boundary. An agent that can write its spool can
+still restart its waker and recreate its own container; that is the feature,
+bounded by the allowlists, the rate limit and the deadline. This is the
+narrower thing that per-instance spools made expressible for the first time:
+keeping an instance out of its neighbour's business, deliberately, with the
+refusal in the journal. It could not have existed before, because "this
+instance" was not a thing the executor knew.
+
+### Migration: the old `spoolDir` is a deprecated alias, not an error
+
+**Decision: accept it, attribute it, say so loudly. Refuse only if it cannot be
+attributed.**
+
+The executor is running right now, as root, in dry-run, with the old key on
+disk. `pull` updates the checkout — including `ops-config.yaml` — without
+restarting this daemon, so the new file lands under a process that will not
+read it until a person restarts it.
+
+The alternative was to fail the boot with a message saying exactly what to
+write. That is tempting and it is wrong here, because of what failure means for
+*this* unit: `clawcius-ops.service` is `Restart=always` with
+`StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up — since it
+holds the rollback deadlines and a dead executor is how a broken rebuild
+becomes a permanent outage. A rejected config does not produce one loud
+failure; it produces a root daemon in a five-second restart loop with every
+armed deadline unhonoured. That is the shape of #7, and this repository has
+already agreed not to ship it again.
+
+So on boot, a top-level `spoolDir:`:
+
+- is **attributed** to the one instance whose `stateDir` contains it. That
+  instance carries on watching exactly the directory it watched before the
+  upgrade — no behaviour change for it — and every other instance gets its own
+  spool at the default. On this host that means Clawcius keeps
+  `/var/lib/clawcius/run/ops` and Hamachi finally has
+  `/var/lib/hamachi/run/ops`;
+- writes a **deprecation entry into `journal.jsonl`**, not just to stdout,
+  naming the instance it was attributed to and the lines to replace it with.
+  The whole argument for tolerating the key is that the operator gets a durable
+  record saying it was tolerated;
+- **fails the boot** if no instance owns it, if two do, or if it disagrees with
+  an explicit `opsSpoolDir` — with the exact YAML to write. An unattributable
+  spool is the precise thing this change abolishes; guessing at provenance
+  would be worse than the shared spool was.
+
+Delete the key once you have read the notice.
+
 ## The trust model
 
 > **The spool is written by an agent that may be prompt-injected, and read by a
@@ -210,7 +388,15 @@ letting requests evaporate.
 any armed rollback deadline live in `/var/lib/clawcius-ops`, which is not
 bind-mounted into any container. A breaker the quarantined party can edit is
 not a breaker. The config loader refuses to start if it is ever placed inside
-the spool.
+*any* instance's spool — every spool, not just the first, which is a check that
+had to grow teeth when there stopped being only one.
+
+**And the spools are out of each other's reach.** The loader refuses two
+instances sharing a spool (provenance would not be blurred, it would be
+invented), one spool nested inside another (forgery with extra steps), and an
+ops spool that would swallow a wake spool — the ops spool unlinks every file it
+sweeps before parsing it, so that arrangement would silently eat the waker's
+queue.
 
 **The idle signal is out of reach too.** Each waker publishes
 `/var/lib/<instance>/waker-status.json`, a sibling of the bind-mounted `run/`
@@ -227,6 +413,20 @@ Honest list.
 - **An agent that can write the spool can restart the waker and recreate its
   own container.** That is the feature. It is bounded by the allowlists, the
   rate limit and the deadline, not prevented.
+- **By default an agent can also recreate the *other* agent's container.** The
+  allowlists are per-executor, not per-instance, unless somebody writes a
+  `mayRequest` block. What changed on 2026-08-10 is that this is now *visible*
+  — the journal says which agent asked — and *restrictable*. It is not
+  restricted by default, deliberately: this shipped as a mechanism, and a
+  privileged daemon that silently starts refusing requests on upgrade is an
+  outage with a changelog.
+- **Provenance is as good as the bind mounts, and no better.** It is a strong
+  property — a container can write into exactly one spool no matter what its
+  prompt says — but it rests entirely on `docker/run-container.sh` mounting one
+  per instance. Anyone who adds a second mount, or points two instances at one
+  directory in config (the loader refuses that one), has removed it. Root on
+  the host can of course write into any spool it likes and be recorded as
+  whichever agent it chose.
 - **`pull` fetches from the configured remote, and now builds it.** Anything the
   agent can get merged into `main` on GitHub is code this host will run — and
   since 2026-08-10 it is also code this host will *execute at build time*, via
@@ -385,7 +585,7 @@ cd ops
 npm install
 npm run build
 npm start                      # reads ./ops-config.yaml
-npm run selftest               # 64 tests, no docker required
+npm run selftest               # 82 tests, no docker required
 ```
 
 Override the config path with `OPS_CONFIG_PATH`.
@@ -404,8 +604,14 @@ executor that quietly does nothing.
 The cross-field checks worth knowing about, because they are security
 properties rather than tidiness:
 
-- `stateDir` may not be inside `spoolDir` or any instance's `wakeSpoolDir`;
-- an instance's `wakerStatusFile` may not be inside either spool;
+- `stateDir` may not be inside any instance's `opsSpoolDir` or `wakeSpoolDir`;
+- an instance's `wakerStatusFile` may not be inside its own wake spool or *any*
+  instance's ops spool — the neighbour's counts, and on this host the two state
+  directories are siblings under `/var/lib`, so a fat-fingered path lands in the
+  neighbour rather than nowhere;
+- no two instances may share an `opsSpoolDir`, and none may nest inside another;
+- an `opsSpoolDir` may not contain or be contained by any `wakeSpoolDir`;
+- `mayRequest` may only name units, repos, instances and verbs that exist;
 - `buildRepo` must name a real entry under `repos:`, or the breaker cannot
   identify a build;
 - `repos[].buildDirs` must be relative and must resolve inside the checkout —
@@ -426,7 +632,8 @@ ops/
     config.ts            typed YAML loader, defaults, containment assertions
     build.ts             npm ci/build as the checkout's owner; the dirty check
     request.ts           parsing and validating hostile spool content
-    spool.ts             the directory-as-a-queue, with its structural caps
+    spool.ts             one directory-as-a-queue per instance; the caps, and
+                         the stamp that says whose it was
     executor.ts          the lock, verb dispatch, deadline, breaker
     runner.ts            argv-array exec, no shell; dry-run
     idle.ts              reading the waker status file; fails safe
@@ -442,8 +649,10 @@ ops/
 The executor writes `<stateDir>/ops-status.json`, rewritten atomically on every
 event and again whenever the lock is released. That is the whole integration
 with `status/` — no socket, no API, no shared library. It holds the current
-operation, the queue depth, the freeze, pending check-ins, the quarantine list
-and the last hundred journal entries, and `status/` can grow a panel for it
+operation, the queue depth, the freeze, pending check-ins, the quarantine list,
+the spools being watched (one per instance, and whether each is restricted) and
+the last hundred journal entries — each of which now names its requester as
+well as its target. `status/` can grow a panel for it
 whenever someone wants one. Until then it is the file you `cat` when the
 journal is too long.
 
@@ -510,7 +719,7 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` runs 64 tests with no docker, no systemd and no npm. It
+`npm run selftest` runs 82 tests with no docker, no systemd and no npm. It
 covers request validation against hostile inputs (traversal, separators, NUL
 and control bytes, shell metacharacters, unknown verbs, wrong types, malformed
 JSON, oversized files), the spool's caps and flood handling, the config
@@ -541,8 +750,44 @@ describe was silent on the host — exit 0, no stderr, unit `active (running)`:
   has no passwd entry;
 - `buildDirs` may not be absolute or climb out of the checkout.
 
+The eighteen added later on 2026-08-10, for per-instance spools, needed the
+fixture to grow a second instance first — and that is the point rather than an
+aside. The old suite had one instance and one spool, which is exactly the world
+in which a shared spool looks correct, and no test could have caught the
+Hamachi bug without first being able to represent two agents:
+
+- each instance's spool defaults inside its own state directory, and no
+  instance's spool lives under another's;
+- two spools are drained concurrently and each request is attributed to the
+  directory it arrived in — asserted with the *same verb on the same target*
+  filed into both, which is the pair that was indistinguishable before;
+- a request claiming `"requester": "clawcius"` inside Hamachi's spool is still
+  attributed to Hamachi, and the claim is reported as an ignored unknown field;
+- "hamachi asked to snapshot hamachi" and "hamachi asked to snapshot clawcius"
+  produce different journal lines;
+- an automatic rollback is attributed to `(executor)`, not to the instance it
+  is performed on;
+- a `mayRequest` restriction refuses an out-of-scope target, names why, leaves
+  the unrestricted instance alone, does not consume the hourly budget, and
+  blocks a `wake` at the point the channel routes to a forbidden instance;
+- a `mayRequest` naming a unit, instance or verb that does not exist fails the
+  boot rather than denying everything quietly;
+- the containment assertions hold across several spools: shared, nested,
+  swallowing a wake spool, and a state directory inside the *second* instance's
+  spool (which a check written against one spool passes and is wrong about);
+- the deprecated `spoolDir` is attributed to its owning instance, leaves that
+  instance watching the same directory as before, gives the other one its own,
+  and fails the boot when it belongs to nobody or disagrees with an explicit
+  `opsSpoolDir`;
+- the post-rebuild wake tells the instance to check in via *its own* spool.
+
 **Not tested, and it needs a real host:** everything on the far side of the
-exec. No `systemctl restart` has been run, no container has been recreated, no
+exec, and one thing on this side of it — `ensureSpoolDir`'s `chown` has never
+run as root here, because the self-test does not run as root and cannot. What
+is tested is that the spool is created and watched; that it ends up owned by
+the container's uid is asserted only by construction, via
+`run-container.sh` creating it as `npurcell`. Check it with `ls -ld
+/var/lib/*/run/ops` after the first start. No `systemctl restart` has been run, no container has been recreated, no
 snapshot has been committed or restored, no real `npm ci` has been dropped to
 another uid, and the wake the executor files after a rebuild has never been
 picked up by a live waker. Nor has any unit in `systemd/` been loaded since the

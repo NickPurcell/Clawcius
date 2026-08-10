@@ -107,7 +107,8 @@ executor.journal.write({
   what: 'clawcius-ops',
   dryRun: config.dryRun,
   detail:
-    `pid ${process.pid}; spool ${config.spoolDir}; state ${config.stateDir}; ` +
+    `pid ${process.pid}; state ${config.stateDir}; spools ` +
+    `${config.instances.map((i) => `${i.name}=${i.opsSpoolDir}`).join(', ') || '(NONE)'}; ` +
     `${config.units.length} unit(s), ${config.repos.length} repo(s), ` +
     `${config.instances.length} instance(s) allowlisted; ` +
     `deadline ${config.deadline.minutes}m (auto-rollback ` +
@@ -119,6 +120,16 @@ executor.journal.write({
       : 'LIVE — this process will run systemctl and docker for real.'),
 });
 
+// Deprecation notices go in the journal, not just to stdout, because the whole
+// argument for tolerating the old `spoolDir` key rather than refusing to boot
+// on it is that the operator gets a durable record saying it was tolerated and
+// what it was taken to mean. A warning that only reaches the systemd journal
+// rotates away; this one is in journal.jsonl next to the operations it
+// governed. See migrateLegacySpoolDir() in config.ts.
+for (const notice of config.deprecations) {
+  executor.journal.write({ kind: 'boot', what: 'config deprecation', detail: notice });
+}
+
 if (executor.state.state.frozen) {
   process.stderr.write(
     `[ops] ══ FROZEN ══ ${executor.state.state.frozenReason}\n` +
@@ -129,26 +140,66 @@ if (executor.state.state.frozen) {
 
 executor.restoreDeadlines();
 
-const spool = new OpsSpool({
-  dir: config.spoolDir,
-  maxBytes: config.limits.maxRequestBytes,
-  maxPerSweep: config.limits.maxPerSweep,
-  maxFiles: config.limits.maxSpoolFiles,
-  pollSeconds: config.pollSeconds,
-  log: (line) => process.stdout.write(`[ops spool] ${line}\n`),
-  onRequest: (raw) => executor.intake(raw),
-});
-spool.start();
+/**
+ * One spool per instance, watched concurrently.
+ *
+ * They are separate `OpsSpool` objects rather than one watcher over a parent
+ * directory, and that is the design rather than an implementation detail: the
+ * directory a request arrives in is the ONLY evidence of who filed it, so each
+ * watcher has to know whose it is and stamp that onto everything it emits. A
+ * single watcher over a glob of `/var/lib/<instance>/run/ops` would have to
+ * derive the instance from the path, which is string parsing on a
+ * security-relevant fact.
+ *
+ * They are also physically separate mounts. `docker/run-container.sh` gives
+ * each container `$CLAWCIUS_STATE/run` and nothing else, so a container can
+ * write into exactly one of these directories no matter what it does. That is
+ * what makes the provenance unforgeable, and it is the same property that made
+ * the old single spool unreachable from Hamachi — the mount asymmetry was
+ * always there; this is the first version that uses it instead of tripping
+ * over it.
+ */
+const spools = config.instances.map(
+  (instance) =>
+    new OpsSpool({
+      dir: instance.opsSpoolDir,
+      instance: instance.name,
+      // The spool should end up owned by whoever owns the instance's state
+      // directory — that is the uid the container runs as. See ensureSpoolDir.
+      ownerOf: instance.stateDir,
+      maxBytes: config.limits.maxRequestBytes,
+      maxPerSweep: config.limits.maxPerSweep,
+      maxFiles: config.limits.maxSpoolFiles,
+      pollSeconds: config.pollSeconds,
+      log: (line) => process.stdout.write(`[ops spool ${instance.name}] ${line}\n`),
+      onRequest: (raw) => executor.intake(raw),
+    }),
+);
+
+for (const spool of spools) spool.start();
+
+if (spools.length === 0) {
+  // Not fatal — the deadlines and the breaker still need this process — but
+  // said as loudly as anything in here, because an executor with no spools is
+  // a daemon nobody can talk to, and it looks exactly like a quiet night.
+  process.stderr.write(
+    '[ops] NO INSTANCES CONFIGURED — there are no spools to watch and no agent can file ' +
+      'a request. Deadlines and the breaker still run. Add entries under instances: in ' +
+      'ops-config.yaml.\n',
+  );
+}
 
 process.stdout.write(
-  `[ops] watching ${config.spoolDir} (sweep ${config.pollSeconds}s)\n` +
+  `${spools
+    .map((spool) => `[ops] watching ${spool.dir} for ${spool.instance} (sweep ${config.pollSeconds}s)\n`)
+    .join('')}` +
     `[ops] journal ${executor.journal.path}\n` +
     `[ops] status   ${executor.journal.statusPath}\n`,
 );
 
 function shutdown(signal: string): void {
   process.stdout.write(`[ops] ${signal} received, shutting down\n`);
-  spool.stop();
+  for (const spool of spools) spool.stop();
   executor.stop();
   releaseLock();
   process.exit(0);

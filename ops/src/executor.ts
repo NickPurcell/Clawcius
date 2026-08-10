@@ -61,12 +61,37 @@ import type { RawRequest } from './spool.js';
  */
 const SELF_UNIT = 'clawcius-ops.service';
 
+/**
+ * The requester recorded for operations the executor starts by itself.
+ *
+ * An automatic rollback after a missed check-in is not an agent's request and
+ * must not be attributed to one — least of all to the instance it is being
+ * performed *on*, which is the reading a naive "requester = instance" would
+ * produce. Parenthesised so it cannot collide with a real instance name: the
+ * config's NAME_PATTERN forbids brackets.
+ */
+const SELF_REQUESTER = '(executor)';
+
 /** Snapshot tags, exactly as `docker/snapshot.sh` writes them. */
 const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
 
+/**
+ * One unit of work: a validated request, and who filed it.
+ *
+ * `requester` is carried explicitly through every handler rather than kept in
+ * a field on the executor. That is deliberate and it is not style: `intake()`
+ * is synchronous and can run while a `#dispatch` is parked on an `await`
+ * (fs.watch fires whenever a container writes, and the idle wait can park for
+ * half an hour). A "current requester" field would be clobbered by the next
+ * arrival and the journal would attribute a redeploy to whoever happened to
+ * file something while it was waiting. Passing it down the call chain makes
+ * that class of bug unrepresentable.
+ */
 type Job = {
   raw: RawRequest;
   request: OpsRequest;
+  /** The instance whose spool this arrived in, or SELF_REQUESTER. */
+  requester: string;
   receivedAt: number;
 };
 
@@ -113,6 +138,11 @@ export class Executor {
       frozen: state.frozen,
       frozenReason: state.frozenReason,
       dryRun: this.#config.dryRun,
+      spools: this.#config.instances.map((instance) => ({
+        instance: instance.name,
+        dir: instance.opsSpoolDir,
+        restricted: instance.mayRequest !== null,
+      })),
       pendingCheckins: state.pending.map((entry) => ({
         instance: entry.instance,
         deadlineAt: entry.deadlineAt,
@@ -153,6 +183,7 @@ export class Executor {
           kind: 'deadline-missed',
           what: `checkin ${pending.instance}`,
           instance: pending.instance,
+          requester: SELF_REQUESTER,
           detail:
             `deadline expired at ${new Date(pending.deadlineAt).toISOString()} while the ` +
             'executor was not running. Treating it as missed rather than forgiven — the ' +
@@ -166,6 +197,7 @@ export class Executor {
         kind: 'deadline-armed',
         what: `checkin ${pending.instance}`,
         instance: pending.instance,
+        requester: SELF_REQUESTER,
         detail:
           `restored across a restart; ${(remaining / 60000).toFixed(1)} minutes left of the ` +
           `original deadline (${pending.reason})`,
@@ -184,12 +216,20 @@ export class Executor {
    * garbage does not consume the hourly budget that a real request needs.
    */
   intake(raw: RawRequest): void {
+    // Every journal entry below carries `requester`, which is the directory
+    // this file was found in and not anything the file said about itself. It
+    // is recorded even on the rejection paths — especially there. "Something
+    // wrote malformed JSON into the ops spool" was, until 2026-08-10, the
+    // entire content of that log line; which agent's container is producing
+    // garbage aimed at a root process is not a detail.
+    const requester = raw.requester;
     const parsed = parseRequest(raw.body);
 
     if (!parsed.ok) {
       this.#journal.write({
         kind: 'rejected',
         what: raw.name,
+        requester,
         detail: `${parsed.reason}. Discarded.`,
       });
       return;
@@ -205,6 +245,7 @@ export class Executor {
       this.#journal.write({
         kind: 'request',
         what: describeRequest(request),
+        requester,
         detail: `ignoring unknown field(s): ${request.unknownFields.join(', ')}`,
       });
     }
@@ -213,15 +254,31 @@ export class Executor {
       kind: 'request',
       what: describeRequest(request),
       instance: request.instance || undefined,
+      requester,
       detail:
-        `from ${raw.name}` + (request.reason ? ` — reason given: ${request.reason}` : ' (no reason given)'),
+        `filed by ${requester} as ${raw.name}` +
+        (request.reason ? ` — reason given: ${request.reason}` : ' (no reason given)'),
     });
+
+    const job: Job = { raw, request, requester, receivedAt: Date.now() };
+
+    // ── The per-instance restriction, before the rate limit ──────────────
+    //
+    // Before, so an out-of-scope request does not spend an hour's budget. The
+    // budget exists to stop a looping agent starving a working one, and an
+    // agent looping on requests it is not allowed to make is exactly the case
+    // where the working one must still get through.
+    const outOfScope = this.#outOfScope(job);
+    if (outOfScope) {
+      this.#reject(job, outOfScope);
+      return;
+    }
 
     const now = Date.now();
     this.#accepted = this.#accepted.filter((at) => now - at < 3_600_000);
     if (this.#accepted.length >= this.#config.limits.maxPerHour) {
       this.#reject(
-        request,
+        job,
         `rate limit: ${this.#config.limits.maxPerHour} operations per rolling hour, ` +
           'and this hour is full',
       );
@@ -234,13 +291,13 @@ export class Executor {
     // actually met.
     if (request.verb === 'checkin') {
       this.#accepted.push(now);
-      this.#handleCheckin(request);
+      this.#handleCheckin(job);
       return;
     }
 
     if (this.#state.state.frozen && isDestructive(request.verb)) {
       this.#reject(
-        request,
+        job,
         `the executor is FROZEN: ${this.#state.state.frozenReason}. Destructive verbs are ` +
           'refused until a human clears it with ops/unfreeze.sh. Nothing will be retried.',
       );
@@ -249,7 +306,7 @@ export class Executor {
 
     if (this.#queue.length >= this.#config.limits.maxQueued) {
       this.#reject(
-        request,
+        job,
         `${this.#queue.length} operation(s) already queued behind "${this.#busy ?? 'nothing'}" ` +
           `and the queue holds ${this.#config.limits.maxQueued}. Try again once it drains.`,
       );
@@ -257,13 +314,14 @@ export class Executor {
     }
 
     this.#accepted.push(now);
-    this.#queue.push({ raw, request, receivedAt: now });
+    this.#queue.push(job);
 
     if (this.#busy) {
       this.#journal.write({
         kind: 'queued',
         what: describeRequest(request),
         instance: request.instance || undefined,
+        requester,
         detail: `waiting behind "${this.#busy}"; ${this.#queue.length} in the queue`,
       });
     }
@@ -271,11 +329,69 @@ export class Executor {
     void this.#pump();
   }
 
-  #reject(request: OpsRequest, detail: string): void {
+  // ── The per-instance restriction ────────────────────────────────────────
+
+  /**
+   * Is this request outside what its requester is allowed to ask for?
+   *
+   * Returns the refusal text, or null to allow. Absent config means allow —
+   * `mayRequest` is null for every instance unless somebody writes one, which
+   * is the behaviour every instance had before this existed. An upgrade of a
+   * running privileged daemon does not change what it accepts.
+   *
+   * It is worth being clear about what this is and is not. It is NOT a new
+   * security boundary: an agent that can write its spool can already restart
+   * the waker and recreate its own container, and the allowlists, the rate
+   * limit and the deadline are what bound that. This is the narrower,
+   * genuinely useful thing that per-instance spools made possible for the
+   * first time — saying "this instance may maintain itself and nothing else".
+   * With one shared spool it could not have been expressed, because there was
+   * no `this instance` to attach it to.
+   *
+   * The four lists are checked independently and only where the verb actually
+   * carries that field, so `mayRequest: { instances: [self] }` restricts
+   * redeploy/snapshot/rollback/checkin and leaves `pull` alone. `wake` is
+   * checked again in #doWake against the instance the channel resolves to,
+   * because the target of a wake is not known until then.
+   */
+  #outOfScope(job: Job): string | null {
+    const instance = this.#config.instances.find((entry) => entry.name === job.requester);
+    const scope = instance?.mayRequest;
+    if (!scope) return null;
+
+    const { request } = job;
+
+    if (scope.verbs && !scope.verbs.includes(request.verb)) {
+      return this.#scopeRefusal(job, 'verb', request.verb, scope.verbs);
+    }
+    if (request.instance && scope.instances && !scope.instances.includes(request.instance)) {
+      return this.#scopeRefusal(job, 'instance', request.instance, scope.instances);
+    }
+    if (request.unit && scope.units && !scope.units.includes(request.unit)) {
+      return this.#scopeRefusal(job, 'unit', request.unit, scope.units);
+    }
+    if (request.repo && scope.repos && !scope.repos.includes(request.repo)) {
+      return this.#scopeRefusal(job, 'repo', request.repo, scope.repos);
+    }
+    return null;
+  }
+
+  #scopeRefusal(job: Job, kind: string, value: string, allowed: string[]): string {
+    return (
+      `out of scope: "${job.requester}" may not name ${kind} "${value}". Its ` +
+      `mayRequest.${kind}s in ops-config.yaml allows: ` +
+      `${allowed.join(', ') || '(none — this instance is denied every ' + kind + ')'}. ` +
+      'This is a per-instance restriction the operator configured, not an allowlist ' +
+      'gap: the target may well be allowed for a different instance. Nothing was run.'
+    );
+  }
+
+  #reject(job: Job, detail: string): void {
     this.#journal.write({
       kind: 'rejected',
-      what: describeRequest(request),
-      instance: request.instance || undefined,
+      what: describeRequest(job.request),
+      instance: job.request.instance || undefined,
+      requester: job.requester,
       detail,
     });
   }
@@ -292,6 +408,7 @@ export class Executor {
       kind: 'started',
       what: this.#busy,
       instance: job.request.instance || undefined,
+      requester: job.requester,
       dryRun: this.#config.dryRun,
       detail:
         `waited ${((Date.now() - job.receivedAt) / 1000).toFixed(1)}s in the queue` +
@@ -299,7 +416,7 @@ export class Executor {
     });
 
     try {
-      await this.#dispatch(job.request);
+      await this.#dispatch(job);
     } catch (error) {
       // The dispatcher is supposed to convert every failure into a journal
       // entry and return. Reaching here means a bug, and a bug in a daemon
@@ -309,6 +426,7 @@ export class Executor {
         kind: 'failed',
         what: this.#busy,
         instance: job.request.instance || undefined,
+        requester: job.requester,
         ok: false,
         detail: `unhandled error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`,
       });
@@ -335,25 +453,25 @@ export class Executor {
    * `VERBS` without handling it here is a compile error, not a runtime
    * surprise.
    */
-  async #dispatch(request: OpsRequest): Promise<void> {
-    switch (request.verb) {
+  async #dispatch(job: Job): Promise<void> {
+    switch (job.request.verb) {
       case 'restart':
-        await this.#doRestart(request);
+        await this.#doRestart(job);
         return;
       case 'pull':
-        await this.#doPull(request);
+        await this.#doPull(job);
         return;
       case 'snapshot':
-        await this.#doSnapshot(request);
+        await this.#doSnapshot(job);
         return;
       case 'redeploy':
-        await this.#doRedeploy(request);
+        await this.#doRedeploy(job);
         return;
       case 'rollback':
-        await this.#doRollback(request, 'requested');
+        await this.#doRollback(job, 'requested');
         return;
       case 'wake':
-        this.#doWake(request);
+        this.#doWake(job);
         return;
       case 'checkin':
         // Handled in intake, before the queue. Unreachable, and left as a
@@ -384,10 +502,11 @@ export class Executor {
 
   // ── restart ─────────────────────────────────────────────────────────────
 
-  async #doRestart(request: OpsRequest): Promise<void> {
+  async #doRestart(job: Job): Promise<void> {
+    const { request } = job;
     if (request.unit === SELF_UNIT) {
       this.#reject(
-        request,
+        job,
         `${SELF_UNIT} is this process. Restarting it from inside itself would kill the ` +
           'operation mid-flight and lose the record of it. Do it by hand on the host.',
       );
@@ -397,7 +516,7 @@ export class Executor {
     const unit = this.#resolveUnit(request.unit);
     if (!unit) {
       this.#reject(
-        request,
+        job,
         `"${request.unit}" is not in the units allowlist. Allowed: ` +
           `${this.#config.units.map((entry) => entry.name).join(', ') || '(none configured)'}`,
       );
@@ -409,7 +528,7 @@ export class Executor {
       'restart',
       unit.name,
     ]);
-    this.#finish(request, result, `restart ${unit.name} (${unit.description})`);
+    this.#finish(job, result, `restart ${unit.name} (${unit.description})`);
   }
 
   // ── pull ────────────────────────────────────────────────────────────────
@@ -421,11 +540,12 @@ export class Executor {
   // an invitation to restart onto a stale dist/ — and unlike a human, an
   // executor accepts that invitation every single time it is offered.
 
-  async #doPull(request: OpsRequest): Promise<void> {
+  async #doPull(job: Job): Promise<void> {
+    const { request } = job;
     const repo = this.#resolveRepo(request.repo);
     if (!repo) {
       this.#reject(
-        request,
+        job,
         `"${request.repo}" is not in the repos allowlist. Allowed: ` +
           `${this.#config.repos.map((entry) => entry.name).join(', ') || '(none configured)'}`,
       );
@@ -440,13 +560,13 @@ export class Executor {
       { timeoutSeconds: 30 },
     );
     if (!branch.ok) {
-      this.#fail(request, `cannot read HEAD in ${repo.path}: ${branch.stderr || summarise(branch)}`);
+      this.#fail(job, `cannot read HEAD in ${repo.path}: ${branch.stderr || summarise(branch)}`);
       return;
     }
     const current = branch.stdout.trim();
     if (current !== repo.branch) {
       this.#fail(
-        request,
+        job,
         `${repo.path} is on "${current}", not the configured "${repo.branch}". Refusing to ` +
           'pull: fast-forwarding a branch nobody expected to be checked out is how you ' +
           'deploy something no one meant to deploy.',
@@ -465,7 +585,7 @@ export class Executor {
     // first also means the failure is identical whether the conflict is in a
     // tracked file git would block on or an untracked one it would happily
     // clobber.
-    if (!(await this.#requireCleanTree(request, repo))) return;
+    if (!(await this.#requireCleanTree(job, repo))) return;
 
     // `--ff-only`. A merge commit created unattended by a root daemon, in a
     // checkout that is about to be deployed, is not something anyone wants to
@@ -474,12 +594,12 @@ export class Executor {
       [this.#config.gitPath, '-C', repo.path, 'pull', '--ff-only'],
       { timeoutSeconds: 300 },
     );
-    this.#finish(request, result, `pull ${repo.name} (${repo.path}, ${repo.branch})`);
+    this.#finish(job, result, `pull ${repo.name} (${repo.path}, ${repo.branch})`);
     if (!result.ok) return;
 
     // And then build it, because the source arriving on disk is not the thing
     // any unit runs.
-    await this.#buildCheckout(request, repo);
+    await this.#buildCheckout(job, repo);
   }
 
   // ── The dirty tree, and the build ───────────────────────────────────────
@@ -495,19 +615,19 @@ export class Executor {
    * closest this daemon comes to touching an uncommitted file is reading its
    * name out of `git status --porcelain` and printing it.
    */
-  async #requireCleanTree(request: OpsRequest, repo: RepoEntry): Promise<boolean> {
+  async #requireCleanTree(job: Job, repo: RepoEntry): Promise<boolean> {
     const dirty = await readDirty(this.#runner, this.#config, repo);
     if (!dirty.ok) {
       // Cannot tell. Treated as a refusal rather than as "probably clean",
       // for the same reason a missing waker status file reads as busy: the
       // unknown state and the dangerous state are the same state, and the only
       // value worth being wrong about in the safe direction is this one.
-      this.#fail(request, `${dirty.reason}. Refusing to act on a checkout whose state is unknown.`);
+      this.#fail(job, `${dirty.reason}. Refusing to act on a checkout whose state is unknown.`);
       return false;
     }
     if (dirty.files.length === 0) return true;
 
-    this.#fail(request, dirtyRefusal(repo, dirty.files));
+    this.#fail(job, dirtyRefusal(repo, dirty.files));
     return false;
   }
 
@@ -527,14 +647,15 @@ export class Executor {
    * A breaker that blocks the wrong sha is worse than none, because it also
    * blocks the fix.
    */
-  async #buildCheckout(request: OpsRequest, repo: RepoEntry): Promise<boolean> {
-    if (!(await this.#requireCleanTree(request, repo))) return false;
+  async #buildCheckout(job: Job, repo: RepoEntry): Promise<boolean> {
+    if (!(await this.#requireCleanTree(job, repo))) return false;
 
     const outcome = await runBuild(this.#runner, this.#config, repo);
     this.#journal.write({
       kind: outcome.ok ? 'build' : 'failed',
       what: `build ${repo.name}`,
-      instance: request.instance || undefined,
+      instance: job.request.instance || undefined,
+      requester: job.requester,
       ok: outcome.ok,
       dryRun: this.#config.dryRun,
       detail: outcome.detail,
@@ -547,15 +668,15 @@ export class Executor {
 
   // ── snapshot ────────────────────────────────────────────────────────────
 
-  async #doSnapshot(request: OpsRequest): Promise<void> {
-    const instance = this.#resolveInstance(request.instance);
+  async #doSnapshot(job: Job): Promise<void> {
+    const instance = this.#resolveInstance(job.request.instance);
     if (!instance) {
-      this.#rejectUnknownInstance(request);
+      this.#rejectUnknownInstance(job);
       return;
     }
 
     const result = await this.#snapshotInstance(instance);
-    this.#finish(request, result, `snapshot ${instance.name}`);
+    this.#finish(job, result, `snapshot ${instance.name}`);
   }
 
   /**
@@ -577,10 +698,11 @@ export class Executor {
 
   // ── redeploy ────────────────────────────────────────────────────────────
 
-  async #doRedeploy(request: OpsRequest): Promise<void> {
+  async #doRedeploy(job: Job): Promise<void> {
+    const { request } = job;
     const instance = this.#resolveInstance(request.instance);
     if (!instance) {
-      this.#rejectUnknownInstance(request);
+      this.#rejectUnknownInstance(job);
       return;
     }
 
@@ -592,6 +714,7 @@ export class Executor {
         kind: 'breaker',
         what: describeRequest(request),
         instance: instance.name,
+        requester: job.requester,
         ok: false,
         detail:
           `build ${build.slice(0, 12)} was rolled back on ` +
@@ -621,7 +744,7 @@ export class Executor {
     // matters.
     const buildRepo = instance.buildRepo ? this.#resolveRepo(instance.buildRepo) : null;
     if (buildRepo) {
-      if (!(await this.#buildCheckout(request, buildRepo))) return;
+      if (!(await this.#buildCheckout(job, buildRepo))) return;
     } else {
       // Not fatal — an instance with no buildRepo has already told the breaker
       // it cannot be identified by a commit, and #buildId says so loudly. But
@@ -631,6 +754,7 @@ export class Executor {
         kind: 'build',
         what: describeRequest(request),
         instance: instance.name,
+        requester: job.requester,
         detail:
           `${instance.name} has no buildRepo, so NOTHING WAS BUILT before this redeploy. ` +
           'Whatever compiled output is on disk is what will run. Set buildRepo in ' +
@@ -646,7 +770,7 @@ export class Executor {
     const preSnapshot = await this.#snapshotInstance(instance);
     if (!preSnapshot.ok) {
       this.#fail(
-        request,
+        job,
         `could not snapshot ${instance.name} before recreating it: ` +
           `${preSnapshot.stderr || summarise(preSnapshot)}. Refusing to continue — a ` +
           'destructive operation with no rollback target is not a deployment, it is a ' +
@@ -657,7 +781,7 @@ export class Executor {
     const rollbackTag = await this.#newestSnapshotTag(instance);
     if (!rollbackTag && !this.#config.dryRun) {
       this.#fail(
-        request,
+        job,
         `no snapshot images found for ${this.#imageRepo(instance)} even after taking one. ` +
           'Refusing to recreate the container with nothing to go back to.',
       );
@@ -665,7 +789,7 @@ export class Executor {
     }
 
     // ── Wait for an idle turn ────────────────────────────────────────────
-    const idle = await this.#waitForIdle(instance, describeRequest(request));
+    const idle = await this.#waitForIdle(job, instance, describeRequest(request));
     if (!idle) return;
 
     const result = await this.#runner.run([this.#config.runContainerScript, '--recreate'], {
@@ -673,15 +797,21 @@ export class Executor {
       timeoutSeconds: 900,
     });
 
-    this.#finish(request, result, `redeploy ${instance.name}`);
+    this.#finish(job, result, `redeploy ${instance.name}`);
     if (!result.ok) return;
 
     this.#armDeadline(instance, {
       build,
       rollbackTag,
+      // The requester goes into the reason, and from there into the deadline,
+      // the wake and the rollback record. An instance that is rebuilt and then
+      // rolled back should be able to read, months later, whether it asked for
+      // that or whether its neighbour did.
       reason:
         request.reason ||
-        `redeploy requested via the ops spool${build ? ` at build ${build.slice(0, 12)}` : ''}`,
+        `redeploy requested by ${job.requester} via the ops spool` +
+          `${build ? ` at build ${build.slice(0, 12)}` : ''}`,
+      requester: job.requester,
       skipped: result.skipped,
     });
   }
@@ -699,13 +829,14 @@ export class Executor {
    * it, and this daemon exists partly to make sure that loop cannot start.
    */
   async #doRollback(
-    request: OpsRequest,
+    job: Job,
     origin: 'requested' | 'deadline',
     pending?: PendingCheckin,
   ): Promise<void> {
+    const { request } = job;
     const instance = this.#resolveInstance(request.instance);
     if (!instance) {
-      this.#rejectUnknownInstance(request);
+      this.#rejectUnknownInstance(job);
       return;
     }
 
@@ -719,13 +850,13 @@ export class Executor {
       // well-formed tag for an image nobody ever built taking the container
       // down and leaving it down.
       if (!SNAPSHOT_TAG.test(tag)) {
-        this.#fail(request, `"${tag}" is not a snapshot tag`);
+        this.#fail(job, `"${tag}" is not a snapshot tag`);
         return;
       }
       const known = await this.#snapshotTags(instance);
       if (!known.includes(tag)) {
         this.#fail(
-          request,
+          job,
           `${repo}:${tag} does not exist on this host. Known snapshots: ` +
             `${known.slice(0, 8).join(', ') || '(none)'}`,
         );
@@ -735,7 +866,7 @@ export class Executor {
       tag = (await this.#newestSnapshotTag(instance)) ?? '';
       if (!tag) {
         this.#fail(
-          request,
+          job,
           `no snapshot images exist for ${repo}. There is nothing to roll back to — this ` +
             'is exactly the state clawcius-snapshot-verify.timer exists to stop you ' +
             'discovering during an incident.',
@@ -744,7 +875,7 @@ export class Executor {
       }
     }
 
-    const idle = await this.#waitForIdle(instance, describeRequest(request));
+    const idle = await this.#waitForIdle(job, instance, describeRequest(request));
     if (!idle) return;
 
     const retag = await this.#runner.run([
@@ -754,7 +885,7 @@ export class Executor {
       instance.image,
     ]);
     if (!retag.ok) {
-      this.#fail(request, `could not tag ${repo}:${tag} as ${instance.image}: ${retag.stderr}`);
+      this.#fail(job, `could not tag ${repo}:${tag} as ${instance.image}: ${retag.stderr}`);
       return;
     }
 
@@ -762,7 +893,7 @@ export class Executor {
       env: this.#instanceEnv(instance),
       timeoutSeconds: 900,
     });
-    this.#finish(request, result, `rollback ${instance.name} to ${tag}`);
+    this.#finish(job, result, `rollback ${instance.name} to ${tag}`);
 
     if (origin !== 'deadline') return;
 
@@ -777,6 +908,7 @@ export class Executor {
         kind: 'breaker',
         what: `quarantine ${instance.name}`,
         instance: instance.name,
+        requester: SELF_REQUESTER,
         detail:
           `build ${pending.build.slice(0, 12)} will not be deployed again. It was rolled ` +
           'back once; a build that has already failed to come back does not get a second ' +
@@ -796,6 +928,7 @@ export class Executor {
         kind: 'frozen',
         what: 'executor frozen',
         instance: instance.name,
+        requester: SELF_REQUESTER,
         ok: false,
         detail: why,
       });
@@ -826,10 +959,11 @@ export class Executor {
 
   // ── checkin ─────────────────────────────────────────────────────────────
 
-  #handleCheckin(request: OpsRequest): void {
+  #handleCheckin(job: Job): void {
+    const { request } = job;
     const instance = this.#resolveInstance(request.instance);
     if (!instance) {
-      this.#rejectUnknownInstance(request);
+      this.#rejectUnknownInstance(job);
       return;
     }
 
@@ -842,6 +976,7 @@ export class Executor {
         kind: 'request',
         what: `checkin ${instance.name}`,
         instance: instance.name,
+        requester: job.requester,
         detail: `no deadline was armed for ${instance.name}; noted and ignored`,
       });
       return;
@@ -856,12 +991,25 @@ export class Executor {
       kind: 'deadline-met',
       what: `checkin ${instance.name}`,
       instance: instance.name,
+      requester: job.requester,
       ok: true,
       detail:
         `checked in with ${((pending.deadlineAt - Date.now()) / 60000).toFixed(1)} minutes to ` +
         `spare after: ${pending.reason}` +
         (request.detail ? `. It says: ${request.detail}` : '') +
-        '. Consecutive failed recoveries reset to 0.',
+        '. Consecutive failed recoveries reset to 0.' +
+        // Worth saying out loud rather than leaving to whoever compares two
+        // fields. A check-in is an instance answering for ITSELF: "I came back
+        // up." One instance vouching for another's recovery is not obviously
+        // wrong — an operator may want exactly that — but it is not what the
+        // deadline asked for, and before per-instance spools it was
+        // unobservable. It is not refused here; `mayRequest.instances` is the
+        // place to refuse it, deliberately, per instance.
+        (job.requester !== instance.name && job.requester !== SELF_REQUESTER
+          ? ` NOTE: this check-in was filed by ${job.requester}, not by ${instance.name} ` +
+            'itself. The deadline is closed, but the instance that was rebuilt has not ' +
+            'actually said anything.'
+          : ''),
     });
   }
 
@@ -877,7 +1025,8 @@ export class Executor {
    * relaying one adds nothing the agent could not do itself. The rate limit
    * and concurrency cap on the waker side still apply, unchanged.
    */
-  #doWake(request: OpsRequest): void {
+  #doWake(job: Job): void {
+    const { request } = job;
     // A wake is addressed to a channel, and the channel belongs to whichever
     // instance owns that spool. Without a named instance there is nowhere to
     // put the file, so the verb takes the channel and we route by the only
@@ -888,10 +1037,32 @@ export class Executor {
 
     if (!instance) {
       this.#reject(
-        request,
+        job,
         `channel ${request.channel} does not match any instance's wakeChannelId, and there ` +
           'is more than one instance configured, so there is no unambiguous spool to file ' +
           'it in.',
+      );
+      return;
+    }
+
+    // The second scope check, and the only verb that needs one.
+    //
+    // `wake` names a channel, not an instance, so the target does not exist as
+    // a field at intake time — it is discovered here, by routing. Checking only
+    // at intake would leave `mayRequest.instances` with a hole exactly the
+    // shape of "wake the other agent", which is the one thing a restricted
+    // instance most obviously should not be able to do: a wake starts a turn
+    // in somebody else's agent with attacker-influenced text in the prompt.
+    const scope = this.#config.instances.find((entry) => entry.name === job.requester)
+      ?.mayRequest;
+    if (scope?.instances && !scope.instances.includes(instance.name)) {
+      this.#reject(
+        job,
+        `out of scope: "${job.requester}" may not wake ${instance.name} (channel ` +
+          `${request.channel} routes to it). Its mayRequest.instances allows: ` +
+          `${scope.instances.join(', ') || '(none)'}. Checked here rather than at intake ` +
+          'because a wake names a channel and the target instance is only known after ' +
+          'routing.',
       );
       return;
     }
@@ -901,9 +1072,11 @@ export class Executor {
       kind: ok ? 'finished' : 'failed',
       what: describeRequest(request),
       instance: instance.name,
+      requester: job.requester,
       ok,
       detail: ok
-        ? `filed a wake for ${instance.name} in ${instance.wakeSpoolDir}`
+        ? `filed a wake for ${instance.name} in ${instance.wakeSpoolDir}, on behalf of ` +
+          `${job.requester}`
         : `could not write into ${instance.wakeSpoolDir}`,
     });
   }
@@ -918,7 +1091,7 @@ export class Executor {
    * ways of turning "we decided not to interrupt anyone" into "we interrupted
    * someone, eventually". The agent can ask again.
    */
-  async #waitForIdle(instance: InstanceEntry, what: string): Promise<boolean> {
+  async #waitForIdle(job: Job, instance: InstanceEntry, what: string): Promise<boolean> {
     const deadline = Date.now() + this.#config.idle.maxWaitMinutes * 60_000;
     let waited = 0;
     let lastReason = '';
@@ -931,6 +1104,7 @@ export class Executor {
             kind: 'idle-wait',
             what,
             instance: instance.name,
+            requester: job.requester,
             detail: `idle after waiting ${(waited / 60).toFixed(1)} minutes — ${verdict.reason}`,
           });
         }
@@ -943,6 +1117,7 @@ export class Executor {
           kind: 'idle-wait',
           what,
           instance: instance.name,
+          requester: job.requester,
           detail: `waiting for an idle turn: ${verdict.reason}`,
         });
       }
@@ -952,6 +1127,7 @@ export class Executor {
           kind: 'failed',
           what,
           instance: instance.name,
+          requester: job.requester,
           ok: false,
           detail:
             `gave up after ${this.#config.idle.maxWaitMinutes} minutes waiting for ` +
@@ -971,7 +1147,14 @@ export class Executor {
 
   #armDeadline(
     instance: InstanceEntry,
-    options: { build: string; rollbackTag: string; reason: string; skipped: boolean },
+    options: {
+      build: string;
+      rollbackTag: string;
+      reason: string;
+      /** Who asked for the operation this deadline is attached to. */
+      requester: string;
+      skipped: boolean;
+    },
   ): void {
     if (options.skipped) {
       // Dry run. Nothing was rebuilt, so there is nothing to verify and
@@ -982,6 +1165,7 @@ export class Executor {
         kind: 'deadline-armed',
         what: `checkin ${instance.name}`,
         instance: instance.name,
+        requester: options.requester,
         dryRun: true,
         detail:
           `DRY RUN — would have armed a ${this.#config.deadline.minutes}-minute check-in ` +
@@ -1006,6 +1190,7 @@ export class Executor {
       kind: 'deadline-armed',
       what: `checkin ${instance.name}`,
       instance: instance.name,
+      requester: options.requester,
       detail:
         `${this.#config.deadline.minutes} minutes to check in, or roll back to ` +
         `${options.rollbackTag || '(no target!)'}. ` +
@@ -1032,10 +1217,17 @@ export class Executor {
         '',
         `Then check in, within ${this.#config.deadline.minutes} minutes of the rebuild:`,
         '',
+        // The instance's OWN spool, which since 2026-08-10 is a different
+        // directory for each of them. This text used to name the single
+        // shared `spoolDir` — which meant that the one instruction sent to an
+        // agent that had just been rebuilt, at the exact moment it most needed
+        // to answer, pointed Hamachi at a path that does not exist inside
+        // Hamachi's container. It would have failed the deadline for a reason
+        // it could not have diagnosed and been rolled back for it.
         `    printf '%s' '{"verb":"checkin","instance":"${instance.name}","detail":"..."}' \\`,
-        `      > ${join(this.#config.spoolDir, '$(date +%s)-checkin.tmp')} \\`,
-        `      && mv ${join(this.#config.spoolDir, '$(date +%s)-checkin.tmp')} \\`,
-        `           ${join(this.#config.spoolDir, '$(date +%s)-checkin.json')}`,
+        `      > ${join(instance.opsSpoolDir, '$(date +%s)-checkin.tmp')} \\`,
+        `      && mv ${join(instance.opsSpoolDir, '$(date +%s)-checkin.tmp')} \\`,
+        `           ${join(instance.opsSpoolDir, '$(date +%s)-checkin.json')}`,
         '',
         'If you do not check in, you will be rolled back to the previous snapshot',
         `(${options.rollbackTag || 'none available'}) automatically, and this build will be`,
@@ -1076,6 +1268,7 @@ export class Executor {
       kind: 'deadline-missed',
       what: `checkin ${pending.instance}`,
       instance: pending.instance,
+      requester: SELF_REQUESTER,
       ok: false,
       detail:
         `no check-in within ${this.#config.deadline.minutes} minutes of: ${pending.reason}. ` +
@@ -1102,16 +1295,31 @@ export class Executor {
       unknownFields: [],
     };
 
+    // Attributed to the executor, not to the instance it is being performed
+    // on. That distinction only became expressible with per-instance spools,
+    // and it is the one that matters most in this path: a rollback nobody
+    // asked for is a different event from a rollback an agent requested, and
+    // the journal is now able to say which it was reading.
+    const job: Job = {
+      raw: { name: '(deadline)', body: '', requester: SELF_REQUESTER },
+      request,
+      requester: SELF_REQUESTER,
+      receivedAt: Date.now(),
+    };
+
     // Straight onto the queue, ahead of nothing and behind whatever is
     // running. The rate limit does not apply — this is the executor's own
     // recovery action, not an agent's request, and letting an agent exhaust
     // the hourly budget to stop a rollback would be a lovely little exploit.
-    this.#queue.push({ raw: { name: '(deadline)', body: '' }, request, receivedAt: Date.now() });
+    // The scope check does not apply either, for the same reason: an instance
+    // restricted to itself must still be recoverable by the daemon.
+    this.#queue.push(job);
     if (this.#busy) {
       this.#journal.write({
         kind: 'queued',
         what: describeRequest(request),
         instance: pending.instance,
+        requester: SELF_REQUESTER,
         detail: `automatic rollback waiting behind "${this.#busy}"`,
       });
       return;
@@ -1125,16 +1333,18 @@ export class Executor {
       kind: 'started',
       what: this.#busy,
       instance: pending.instance,
+      requester: SELF_REQUESTER,
       dryRun: this.#config.dryRun,
       detail: 'automatic rollback after a missed check-in',
     });
     try {
-      await this.#doRollback(request, 'deadline', pending);
+      await this.#doRollback(job, 'deadline', pending);
     } catch (error) {
       this.#journal.write({
         kind: 'failed',
         what: this.#busy,
         instance: pending.instance,
+        requester: SELF_REQUESTER,
         ok: false,
         detail: `automatic rollback threw: ${String(error)}`,
       });
@@ -1278,11 +1488,12 @@ export class Executor {
 
   // ── Outcome logging ─────────────────────────────────────────────────────
 
-  #finish(request: OpsRequest, result: CommandResult, what: string): void {
+  #finish(job: Job, result: CommandResult, what: string): void {
     this.#journal.write({
       kind: result.ok ? 'finished' : 'failed',
       what,
-      instance: request.instance || undefined,
+      instance: job.request.instance || undefined,
+      requester: job.requester,
       ok: result.ok,
       dryRun: result.skipped,
       command: render(result.argv),
@@ -1293,20 +1504,21 @@ export class Executor {
     });
   }
 
-  #fail(request: OpsRequest, detail: string): void {
+  #fail(job: Job, detail: string): void {
     this.#journal.write({
       kind: 'failed',
-      what: describeRequest(request),
-      instance: request.instance || undefined,
+      what: describeRequest(job.request),
+      instance: job.request.instance || undefined,
+      requester: job.requester,
       ok: false,
       detail,
     });
   }
 
-  #rejectUnknownInstance(request: OpsRequest): void {
+  #rejectUnknownInstance(job: Job): void {
     this.#reject(
-      request,
-      `"${request.instance}" is not in the instances allowlist. Allowed: ` +
+      job,
+      `"${job.request.instance}" is not in the instances allowlist. Allowed: ` +
         `${this.#config.instances.map((entry) => entry.name).join(', ') || '(none configured)'}`,
     );
   }

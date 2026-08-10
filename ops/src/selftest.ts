@@ -70,12 +70,35 @@ import { planBuild, resolveOwner, runBuild } from './build.js';
  * command string, an argument containing a space or a semicolon would arrive
  * split, and the assertions below would see it.
  */
-function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string[] }): {
+/**
+ * One instance in a fake host.
+ *
+ * `extra` is raw YAML appended inside the instance block, indented to match.
+ * It exists for `mayRequest:`, which is a nested mapping with optional keys
+ * whose absence is meaningful — expressing that through a typed options object
+ * would mean reimplementing the distinction the loader is being tested on.
+ *
+ * Every instance gets its own state directory, and therefore its own spool at
+ * `<stateDir>/run/ops`, exactly as the real host does. That mirroring is the
+ * point: the fixture used to have one instance and one spool, which is the
+ * shape of the world in which the Hamachi bug was invisible.
+ */
+type InstanceSpec = { name: string; extra?: string[] };
+
+function makeHost(options: {
+  dryRun: boolean;
+  suffix: string;
+  buildDirs?: string[];
+  /** Defaults to a single instance named `clawcius`. */
+  instances?: InstanceSpec[];
+}): {
   root: string;
   config: OpsConfig;
   callsDir: string;
   calls: () => string[][];
   setStatus: (instance: string, body: unknown) => void;
+  /** That instance's ops spool, which is where its container would write. */
+  spoolDir: (instance: string) => string;
   /** Make `git status --porcelain` report these lines. Empty means clean. */
   setDirty: (porcelain: string[]) => void;
   /** Make the npm stand-in exit non-zero for one subcommand (`ci` or `build`). */
@@ -85,13 +108,21 @@ function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string
   const bin = join(root, 'bin');
   const callsDir = join(root, 'calls');
   const control = join(root, 'control');
-  const spoolDir = join(root, 'state', 'run', 'ops');
   const stateDir = join(root, 'ops-state');
+  const specs = options.instances ?? [{ name: 'clawcius' }];
+  // Distinct Discord snowflakes per instance, because `wake` routes by
+  // channel and two instances sharing one would make that routing ambiguous
+  // in the fixture in a way it never is on the host.
+  const channels = ['123456789012345678', '223456789012345678', '323456789012345678'];
+  const instanceState = (name: string) => join(root, 'state', name);
+  const spoolDirOf = (name: string) => join(instanceState(name), 'run', 'ops');
   mkdirSync(bin, { recursive: true });
   mkdirSync(callsDir, { recursive: true });
   mkdirSync(control, { recursive: true });
-  mkdirSync(spoolDir, { recursive: true });
-  mkdirSync(join(root, 'state', 'run', 'wake'), { recursive: true });
+  for (const spec of specs) {
+    mkdirSync(spoolDirOf(spec.name), { recursive: true });
+    mkdirSync(join(instanceState(spec.name), 'run', 'wake'), { recursive: true });
+  }
   mkdirSync(join(root, 'repo'), { recursive: true });
   // The build steps run with cwd set to these, and execFile fails to spawn at
   // all if the cwd does not exist — which would look like a missing binary
@@ -194,7 +225,6 @@ function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string
     configPath,
     [
       `dryRun: ${options.dryRun}`,
-      `spoolDir: ${spoolDir}`,
       `stateDir: ${stateDir}`,
       'pollSeconds: 1',
       `runContainerScript: ${runContainer}`,
@@ -212,16 +242,23 @@ function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string
       '    branch: main',
       `    buildDirs: [${(options.buildDirs ?? ['.']).map((d) => JSON.stringify(d)).join(', ')}]`,
       'instances:',
-      '  - name: clawcius',
-      '    container: clawcius-agent',
-      '    image: clawcius-agent:latest',
-      `    stateDir: ${join(root, 'state')}`,
-      `    envFile: ${join(root, 'env')}`,
-      '    memory: 2g',
-      `    wakerStatusFile: ${statusFile('clawcius')}`,
-      `    wakeSpoolDir: ${join(root, 'state', 'run', 'wake')}`,
-      '    wakeChannelId: "123456789012345678"',
-      '    buildRepo: clawcius',
+      // Each instance's spool is left to the default — `<stateDir>/run/ops` —
+      // because that default is itself under test. Writing it out here would
+      // mean the suite never exercises the derivation that makes a newly
+      // added instance reachable without anybody remembering a second key.
+      ...specs.flatMap((spec, index) => [
+        `  - name: ${spec.name}`,
+        `    container: ${spec.name}-agent`,
+        `    image: ${spec.name}-agent:latest`,
+        `    stateDir: ${instanceState(spec.name)}`,
+        `    envFile: ${join(root, 'env')}`,
+        '    memory: 2g',
+        `    wakerStatusFile: ${statusFile(spec.name)}`,
+        `    wakeSpoolDir: ${join(instanceState(spec.name), 'run', 'wake')}`,
+        `    wakeChannelId: "${channels[index] ?? '923456789012345678'}"`,
+        '    buildRepo: clawcius',
+        ...(spec.extra ?? []),
+      ]),
       'limits:',
       '  maxRequestBytes: 4096',
       '  maxPerSweep: 3',
@@ -242,7 +279,7 @@ function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string
       '  maxQuarantined: 8',
       'snapshotVerify:',
       '  enabled: true',
-      '  instances: [clawcius]',
+      `  instances: [${specs.map((spec) => spec.name).join(', ')}]`,
       '  startTimeoutSeconds: 5',
       '  probe: [/bin/true]',
       '',
@@ -267,6 +304,7 @@ function makeHost(options: { dryRun: boolean; suffix: string; buildDirs?: string
             .filter((line) => line.length > 0),
         );
     },
+    spoolDir: spoolDirOf,
     setStatus: (instance, body) => {
       writeFileSync(statusFile(instance), JSON.stringify(body));
     },
@@ -528,6 +566,7 @@ test('an oversized request is discarded without being read', async () => {
   const logs: string[] = [];
   const spool = new OpsSpool({
     dir,
+    instance: 'clawcius',
     maxBytes: 100,
     maxPerSweep: 10,
     maxFiles: 50,
@@ -552,6 +591,7 @@ test('the per-sweep cap bounds work and leaves the rest for later', async () => 
   const seen: string[] = [];
   const spool = new OpsSpool({
     dir,
+    instance: 'clawcius',
     maxBytes: 4096,
     maxPerSweep: 2,
     maxFiles: 50,
@@ -579,6 +619,7 @@ test('a flooded spool is drained unread', () => {
   const logs: string[] = [];
   const spool = new OpsSpool({
     dir,
+    instance: 'clawcius',
     maxBytes: 4096,
     maxPerSweep: 100,
     maxFiles: 4,
@@ -603,6 +644,7 @@ test('implausible file names are discarded unread', () => {
   const seen: string[] = [];
   const spool = new OpsSpool({
     dir,
+    instance: 'clawcius',
     maxBytes: 4096,
     maxPerSweep: 10,
     maxFiles: 50,
@@ -630,6 +672,7 @@ test('a request is removed before the handler runs, so a throw cannot loop', () 
   let calls = 0;
   const spool = new OpsSpool({
     dir,
+    instance: 'clawcius',
     maxBytes: 4096,
     maxPerSweep: 10,
     maxFiles: 50,
@@ -728,18 +771,20 @@ const MINIMAL_INSTANCE = (root: string) => [
   '    wakeChannelId: "123456789012345678"',
 ];
 
-test('stateDir inside spoolDir is refused', () => {
+test('stateDir inside an instance spool is refused', () => {
+  // The default spool for this instance is /var/lib/x/run/ops, and the state
+  // directory is put inside it. Written without naming opsSpoolDir on purpose:
+  // the derived default is a real path with real consequences and the
+  // containment checks have to see it, not just the explicit form.
   const path = writeConfig([
-    'spoolDir: /var/lib/x/run/ops',
-    'stateDir: /var/lib/x/run/ops/state',
+    'stateDir: /var/lib/x/state/run/ops/state',
     ...MINIMAL_INSTANCE('/var/lib/x'),
   ]);
-  assert.throws(() => loadOpsConfig(path), /stateDir .* is inside spoolDir/);
+  assert.throws(() => loadOpsConfig(path), /stateDir .* is inside instances\[clawcius\]\.opsSpoolDir/);
 });
 
 test('a waker status file inside a container mount is refused', () => {
   const path = writeConfig([
-    'spoolDir: /var/lib/x/run/ops',
     'stateDir: /var/lib/ops-state',
     'instances:',
     '  - name: clawcius',
@@ -759,12 +804,12 @@ test('a near-miss prefix is not treated as containment', () => {
   // /var/lib/clawcius-ops is NOT inside /var/lib/clawcius, and a naive
   // startsWith would say it is.
   const path = writeConfig([
-    'spoolDir: /var/lib/clawcius',
     'stateDir: /var/lib/clawcius-ops',
-    ...MINIMAL_INSTANCE('/var/lib/y'),
+    ...MINIMAL_INSTANCE('/var/lib/clawcius'),
   ]);
   const config = loadOpsConfig(path);
   assert.equal(config.stateDir, '/var/lib/clawcius-ops');
+  assert.equal(config.instances[0]?.opsSpoolDir, '/var/lib/clawcius/state/run/ops');
 });
 
 test('structural config errors fail the boot with the key named', () => {
@@ -943,7 +988,7 @@ test('armed deadlines persist and can be disarmed', () => {
 test('a unit outside the allowlist is refused with the allowlist named', async () => {
   const host = makeHost({ dryRun: true, suffix: 'unit' });
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"restart","unit":"sshd.service"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"restart","unit":"sshd.service"}' });
   await settle(executor);
 
   const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
@@ -957,7 +1002,7 @@ test('a unit outside the allowlist is refused with the allowlist named', async (
 test('the executor refuses to restart itself', async () => {
   const host = makeHost({ dryRun: true, suffix: 'self' });
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"restart","unit":"clawcius-ops.service"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"restart","unit":"clawcius-ops.service"}' });
   await settle(executor);
   const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
   assert.match(String(rejected[0]?.['detail']), /this process/);
@@ -967,7 +1012,7 @@ test('the executor refuses to restart itself', async () => {
 test('an instance outside the allowlist is refused', async () => {
   const host = makeHost({ dryRun: true, suffix: 'inst' });
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"hamachi"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"hamachi"}' });
   await settle(executor);
   const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
   assert.match(String(rejected[0]?.['detail']), /not in the instances allowlist/);
@@ -980,7 +1025,7 @@ test('a destructive verb abandons rather than interrupting a live turn', async (
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
 
   const entries = journalEntries(host.config);
@@ -1001,7 +1046,7 @@ test('a destructive verb abandons rather than interrupting a live turn', async (
 test('a missing waker status file also blocks a destructive verb', async () => {
   const host = makeHost({ dryRun: true, suffix: 'nostatus' });
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
   const entries = journalEntries(host.config);
   assert.equal(
@@ -1024,7 +1069,7 @@ test('the rolling-hour cap refuses work with a stated reason', async () => {
 
   // limits.maxPerHour is 6 in the fixture.
   for (let i = 0; i < 9; i += 1) {
-    executor.intake({ name: `r${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
+    executor.intake({ requester: 'clawcius', name: `r${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
   }
   await settle(executor);
 
@@ -1046,13 +1091,13 @@ test('one operation at a time: the second request queues behind the first', asyn
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
 
   // Give the first one a moment to take the lock and start waiting.
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(executor.snapshot().current, 'redeploy clawcius');
 
-  executor.intake({ name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
   assert.equal(executor.snapshot().queued, 1, 'the second must queue, not run');
 
   // Now go idle; the first finishes and the second follows.
@@ -1078,12 +1123,12 @@ test('the queue has a ceiling and says so', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
 
   const executor = new Executor(config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   // limits.maxQueued is 2.
   for (let i = 0; i < 4; i += 1) {
-    executor.intake({ name: `q${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
+    executor.intake({ requester: 'clawcius', name: `q${i}.json`, body: '{"verb":"snapshot","instance":"clawcius"}' });
   }
 
   const refused = journalEntries(host.config).filter(
@@ -1102,6 +1147,7 @@ test('a live redeploy takes a snapshot, recreates, arms a deadline and files a w
 
   const executor = new Executor(host.config);
   executor.intake({
+    requester: 'clawcius',
     name: 'a.json',
     body: '{"verb":"redeploy","instance":"clawcius","reason":"new build"}',
   });
@@ -1125,7 +1171,7 @@ test('a live redeploy takes a snapshot, recreates, arms a deadline and files a w
   assert.equal(pending?.build, 'deadbeefcafe0000000000000000000000000000');
 
   // And the instance was told, in its own wake spool.
-  const wakeDir = join(host.root, 'state', 'run', 'wake');
+  const wakeDir = join(host.root, 'state', 'clawcius', 'run', 'wake');
   const files = readdirSync(wakeDir).filter((n) => n.endsWith('.json'));
   assert.equal(files.length, 1);
   const wakeFile = files[0] ?? '';
@@ -1143,11 +1189,11 @@ test('a dry run arms nothing and files nothing', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
 
   assert.equal(executor.state.pendingFor('clawcius'), null, 'a dry run must not arm a rollback');
-  const wakeDir = join(host.root, 'state', 'run', 'wake');
+  const wakeDir = join(host.root, 'state', 'clawcius', 'run', 'wake');
   assert.equal(
     readdirSync(wakeDir).filter((n) => n.endsWith('.json')).length,
     0,
@@ -1161,11 +1207,12 @@ test('a check-in meets the deadline and resets the failure count', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
 
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
   assert.ok(executor.state.pendingFor('clawcius'));
 
   executor.intake({
+    requester: 'clawcius',
     name: 'b.json',
     body: '{"verb":"checkin","instance":"clawcius","detail":"cron is back, login intact"}',
   });
@@ -1190,7 +1237,7 @@ test('a missed deadline rolls back, quarantines the build, and refuses it again'
   };
 
   const executor = new Executor(config);
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
   const pending = executor.state.pendingFor('clawcius');
   assert.ok(pending);
@@ -1226,7 +1273,7 @@ test('a missed deadline rolls back, quarantines the build, and refuses it again'
   // And the build is quarantined — permanently, not backed off.
   assert.ok(executor.state.isQuarantined('clawcius', build));
 
-  executor.intake({ name: 'c.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'c.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
   const breaker = journalEntries(config).filter(
     (entry) => entry['kind'] === 'breaker' && /will not be deployed again/.test(String(entry['detail'])),
@@ -1251,8 +1298,8 @@ test('consecutive failed recoveries freeze the executor, and a freeze refuses de
   const executor = new Executor(host.config);
   assert.equal(executor.state.state.frozen, true, 'the freeze is read back from disk at boot');
 
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
-  executor.intake({ name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
   await settle(executor);
 
   const entries = journalEntries(host.config);
@@ -1305,7 +1352,7 @@ test('a pull is refused on the wrong branch and outside the allowlist', async ()
   const host = makeHost({ dryRun: false, suffix: 'pull' });
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
   await settle(executor);
   // The stand-in git reports branch `main` and a clean tree, so this succeeds.
   assert.equal(
@@ -1317,7 +1364,7 @@ test('a pull is refused on the wrong branch and outside the allowlist', async ()
   const pull = host.calls().find((call) => call[0] === 'git' && call.includes('pull'));
   assert.deepEqual(pull, ['git', '-C', join(host.root, 'repo'), 'pull', '--ff-only']);
 
-  executor.intake({ name: 'b.json', body: '{"verb":"pull","repo":"not-allowed"}' });
+  executor.intake({ requester: 'clawcius', name: 'b.json', body: '{"verb":"pull","repo":"not-allowed"}' });
   await settle(executor);
   assert.equal(
     journalEntries(host.config).some((entry) =>
@@ -1353,7 +1400,7 @@ test('pull builds before anything can be restarted onto it', async () => {
   const host = makeHost({ dryRun: false, suffix: 'pullbuild', buildDirs: ['.', 'status'] });
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
   await settle(executor);
 
   const calls = host.calls();
@@ -1406,7 +1453,7 @@ test('a failed build aborts the operation and restarts nothing', async () => {
   host.failBuild('build');
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
   await settle(executor);
 
   const npm = npmCalls(host.calls());
@@ -1435,7 +1482,7 @@ test('a failed build stops a redeploy before the container is touched', async ()
   host.failBuild('ci');
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
 
   const order = host.calls().map((call) => call[0]);
@@ -1459,7 +1506,7 @@ test('redeploy builds before it snapshots or recreates', async () => {
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
 
   const order = host.calls().map((call) => call[0]);
@@ -1479,7 +1526,7 @@ test('a dirty tree refuses the pull, names the files, and forces nothing', async
   host.setDirty([' M docker/run-container.sh', '?? notes.txt']);
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
   await settle(executor);
 
   const entries = journalEntries(host.config);
@@ -1522,7 +1569,7 @@ test('a dirty tree refuses a redeploy too, because the breaker names builds by H
   host.setDirty([' M src/index.ts']);
   const executor = new Executor(host.config);
 
-  executor.intake({ name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"redeploy","instance":"clawcius"}' });
   await settle(executor);
 
   const order = host.calls().map((call) => call[0]);
@@ -1540,7 +1587,7 @@ test('a git status that cannot be read is treated as dirty, not as clean', async
   const host = makeHost({ dryRun: false, suffix: 'statusbroken' });
   const executor = new Executor({ ...host.config, gitPath: '/nonexistent/git' });
 
-  executor.intake({ name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"pull","repo":"clawcius"}' });
   await settle(executor);
 
   // The branch probe fails first here, which is itself the right answer; the
@@ -1663,7 +1710,6 @@ test('buildDirs may not escape the checkout', () => {
     writeFileSync(
       join(root, 'ops-config.yaml'),
       [
-        `spoolDir: ${join(root, 'spool')}`,
         `stateDir: ${join(root, 'state')}`,
         'repos:',
         '  - name: clawcius',
@@ -1692,7 +1738,7 @@ test('the ops-status.json the page reads is valid and describes the current stat
   const host = makeHost({ dryRun: true, suffix: 'status' });
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
   const executor = new Executor(host.config);
-  executor.intake({ name: 'a.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
+  executor.intake({ requester: 'clawcius', name: 'a.json', body: '{"verb":"snapshot","instance":"clawcius"}' });
   await settle(executor);
 
   const payload = JSON.parse(
@@ -1759,7 +1805,8 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
   const host = makeHost({ dryRun: true, suffix: 'e2e' });
   const executor = new Executor(host.config);
   const spool = new OpsSpool({
-    dir: host.config.spoolDir,
+    dir: host.spoolDir('clawcius'),
+    instance: 'clawcius',
     maxBytes: host.config.limits.maxRequestBytes,
     maxPerSweep: host.config.limits.maxPerSweep,
     maxFiles: host.config.limits.maxSpoolFiles,
@@ -1768,9 +1815,13 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
     onRequest: (raw) => executor.intake(raw),
   });
 
-  fileRequest(host.config.spoolDir, '1-good', '{"verb":"restart","unit":"clawcius.service"}');
-  fileRequest(host.config.spoolDir, '2-bad', '{"verb":"nuke","unit":"clawcius.service"}');
-  fileRequest(host.config.spoolDir, '3-evil', '{"verb":"restart","unit":"../../../sshd.service"}');
+  fileRequest(host.spoolDir('clawcius'), '1-good', '{"verb":"restart","unit":"clawcius.service"}');
+  fileRequest(host.spoolDir('clawcius'), '2-bad', '{"verb":"nuke","unit":"clawcius.service"}');
+  fileRequest(
+    host.spoolDir('clawcius'),
+    '3-evil',
+    '{"verb":"restart","unit":"../../../sshd.service"}',
+  );
 
   spool.start();
   await settle(executor);
@@ -1791,5 +1842,528 @@ test('an end-to-end spool drop reaches the executor and is refused correctly', a
   );
   // Dry run: the allowed restart was logged, not executed.
   assert.equal(host.calls().some((call) => call[0] === 'systemctl'), false);
+  executor.stop();
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Per-instance spools, provenance, and the restriction
+//
+// Added 2026-08-10. The bug these are about was invisible in the old suite for
+// a structural reason worth stating: the fixture had ONE instance and ONE
+// spool, which is precisely the world in which a shared spool looks correct.
+// Every test below needs two instances to mean anything, which is why the
+// fixture grew the ability to have them before any of this was written.
+// ══════════════════════════════════════════════════════════════════════════
+
+/** A host with both agents, as the real one has had since 2026-08-08. */
+function twoInstances(suffix: string, extra?: Record<string, string[]>) {
+  return makeHost({
+    dryRun: true,
+    suffix,
+    instances: [
+      { name: 'clawcius', extra: extra?.['clawcius'] },
+      { name: 'hamachi', extra: extra?.['hamachi'] },
+    ],
+  });
+}
+
+test('each instance gets its own spool, defaulted inside its own bind mount', () => {
+  const host = twoInstances('spools');
+  const [clawcius, hamachi] = host.config.instances;
+
+  // The property that was actually broken: Hamachi's spool is under Hamachi's
+  // state directory, which is what run-container.sh mounts into Hamachi's
+  // container. The old single spool was under Clawcius's, and did not exist
+  // inside Hamachi's container at all.
+  assert.equal(clawcius?.opsSpoolDir, join(clawcius?.stateDir ?? '', 'run', 'ops'));
+  assert.equal(hamachi?.opsSpoolDir, join(hamachi?.stateDir ?? '', 'run', 'ops'));
+  assert.notEqual(clawcius?.opsSpoolDir, hamachi?.opsSpoolDir);
+  assert.equal(
+    hamachi?.opsSpoolDir.startsWith(clawcius?.stateDir ?? ''),
+    false,
+    "no instance's spool may live under another instance's state directory",
+  );
+});
+
+test('two spools are watched concurrently and each request is attributed to its own', async () => {
+  const host = twoInstances('concurrent');
+  const executor = new Executor(host.config);
+
+  const spools = host.config.instances.map(
+    (instance) =>
+      new OpsSpool({
+        dir: instance.opsSpoolDir,
+        instance: instance.name,
+        maxBytes: host.config.limits.maxRequestBytes,
+        maxPerSweep: host.config.limits.maxPerSweep,
+        maxFiles: host.config.limits.maxSpoolFiles,
+        pollSeconds: 3600,
+        log: () => {},
+        onRequest: (raw) => executor.intake(raw),
+      }),
+  );
+
+  // The same verb, the same target, filed into two different directories. On
+  // the old shared spool these two files were indistinguishable once written.
+  fileRequest(host.spoolDir('clawcius'), '1', '{"verb":"snapshot","instance":"hamachi"}');
+  fileRequest(host.spoolDir('hamachi'), '2', '{"verb":"snapshot","instance":"hamachi"}');
+
+  for (const spool of spools) spool.start();
+  await settle(executor);
+  for (const spool of spools) spool.stop();
+
+  const started = journalEntries(host.config).filter((entry) => entry['kind'] === 'started');
+  assert.equal(started.length, 2);
+  assert.deepEqual(
+    started.map((entry) => entry['requester']).sort(),
+    ['clawcius', 'hamachi'],
+    'both spools were drained, and each request carries the name of the one it came from',
+  );
+  // Both name the same target; only the requester tells them apart. That is
+  // the whole change in one assertion.
+  assert.deepEqual(started.map((entry) => entry['instance']), ['hamachi', 'hamachi']);
+  executor.stop();
+});
+
+test('a request in instance A\'s spool is attributed to A, whatever the file claims', async () => {
+  const host = twoInstances('forgery');
+  const executor = new Executor(host.config);
+
+  const spool = new OpsSpool({
+    dir: host.spoolDir('hamachi'),
+    instance: 'hamachi',
+    maxBytes: host.config.limits.maxRequestBytes,
+    maxPerSweep: host.config.limits.maxPerSweep,
+    maxFiles: host.config.limits.maxSpoolFiles,
+    pollSeconds: 3600,
+    log: () => {},
+    onRequest: (raw) => executor.intake(raw),
+  });
+
+  // The obvious attack on any provenance scheme: say you are someone else.
+  fileRequest(
+    host.spoolDir('hamachi'),
+    '1',
+    '{"verb":"snapshot","instance":"hamachi","requester":"clawcius","from":"clawcius"}',
+  );
+
+  spool.start();
+  await settle(executor);
+  spool.stop();
+
+  const entries = journalEntries(host.config);
+  assert.equal(
+    entries.every((entry) => entry['requester'] === undefined || entry['requester'] === 'hamachi'),
+    true,
+    'the spool directory decides, not the file',
+  );
+  // And the attempt is visible rather than merely ineffective: `requester` is
+  // not a known field, so it is reported as ignored.
+  assert.equal(
+    entries.some((entry) => /ignoring unknown field\(s\): requester, from/.test(String(entry['detail']))),
+    true,
+  );
+  executor.stop();
+});
+
+test('provenance distinguishes an instance rebuilding itself from one rebuilding its neighbour', async () => {
+  const host = twoInstances('neighbour');
+  const executor = new Executor(host.config);
+
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"snapshot","instance":"hamachi"}',
+  });
+  await settle(executor);
+  executor.intake({
+    requester: 'hamachi',
+    name: 'b.json',
+    body: '{"verb":"snapshot","instance":"clawcius"}',
+  });
+  await settle(executor);
+
+  const finished = journalEntries(host.config).filter((entry) => entry['kind'] === 'finished');
+  assert.deepEqual(
+    finished.map((entry) => `${String(entry['requester'])} -> ${String(entry['instance'])}`),
+    ['hamachi -> hamachi', 'hamachi -> clawcius'],
+    'these two lines were byte-identical before per-instance spools existed',
+  );
+  executor.stop();
+});
+
+test('the executor attributes its own automatic rollback to itself, not to the instance', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'selfattrib' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"redeploy","instance":"clawcius"}',
+  });
+  await settle(executor);
+
+  const pending = executor.state.pendingFor('clawcius');
+  assert.ok(pending);
+  executor.state.arm({ ...pending, deadlineAt: Date.now() - 1000 });
+  executor.restoreDeadlines();
+  await settle(executor);
+
+  const missed = journalEntries(host.config).filter((entry) => entry['kind'] === 'deadline-missed');
+  assert.ok(missed.length > 0);
+  assert.equal(
+    missed.every((entry) => entry['requester'] === '(executor)'),
+    true,
+    'a rollback nobody asked for must not be attributed to the instance it happens to',
+  );
+  executor.stop();
+});
+
+test('a per-instance restriction refuses an out-of-scope request and names why', async () => {
+  const host = twoInstances('scope', {
+    // Hamachi may look after itself and nothing else. Clawcius is left
+    // unrestricted, which is the default and the pre-existing behaviour.
+    hamachi: ['    mayRequest:', '      instances: [hamachi]', '      units: [clawcius.service]'],
+  });
+
+  assert.equal(host.config.instances[0]?.mayRequest, null, 'absent means unrestricted');
+  assert.deepEqual(host.config.instances[1]?.mayRequest?.instances, ['hamachi']);
+  // A key left out of a present mayRequest is still unrestricted.
+  assert.equal(host.config.instances[1]?.mayRequest?.repos, null);
+
+  const executor = new Executor(host.config);
+
+  // In scope: its own container.
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"snapshot","instance":"hamachi"}',
+  });
+  await settle(executor);
+
+  // Out of scope: the neighbour's.
+  executor.intake({
+    requester: 'hamachi',
+    name: 'b.json',
+    body: '{"verb":"snapshot","instance":"clawcius"}',
+  });
+  await settle(executor);
+
+  // And the same request from the unrestricted instance still goes through,
+  // which is what makes this a per-instance rule rather than an allowlist gap.
+  executor.intake({
+    requester: 'clawcius',
+    name: 'c.json',
+    body: '{"verb":"snapshot","instance":"clawcius"}',
+  });
+  await settle(executor);
+
+  const entries = journalEntries(host.config);
+  const rejected = entries.filter((entry) => entry['kind'] === 'rejected');
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0]?.['requester'], 'hamachi');
+  assert.match(String(rejected[0]?.['detail']), /out of scope/);
+  assert.match(String(rejected[0]?.['detail']), /may not name instance "clawcius"/);
+
+  const started = entries.filter((entry) => entry['kind'] === 'started');
+  assert.deepEqual(
+    started.map((entry) => `${String(entry['requester'])} -> ${String(entry['instance'])}`),
+    ['hamachi -> hamachi', 'clawcius -> clawcius'],
+    'the in-scope request and the unrestricted instance both ran',
+  );
+  executor.stop();
+});
+
+test('an out-of-scope request does not consume the hourly budget', async () => {
+  const host = twoInstances('scoperate', {
+    hamachi: ['    mayRequest:', '      verbs: [checkin]'],
+  });
+  const executor = new Executor(host.config);
+
+  // maxPerHour is 6 in the fixture. Ten refused requests must not exhaust it.
+  for (let i = 0; i < 10; i += 1) {
+    executor.intake({
+      requester: 'hamachi',
+      name: `r${i}.json`,
+      body: '{"verb":"snapshot","instance":"hamachi"}',
+    });
+  }
+  await settle(executor);
+
+  executor.intake({
+    requester: 'clawcius',
+    name: 'ok.json',
+    body: '{"verb":"snapshot","instance":"clawcius"}',
+  });
+  await settle(executor);
+
+  const entries = journalEntries(host.config);
+  assert.equal(
+    entries.some((entry) => /rate limit/.test(String(entry['detail']))),
+    false,
+    'refusals are free; an agent looping on requests it may not make must not starve the other',
+  );
+  assert.equal(
+    entries.some((entry) => entry['kind'] === 'started' && entry['requester'] === 'clawcius'),
+    true,
+  );
+  executor.stop();
+});
+
+test('a restricted instance may not wake its neighbour, which routes by channel', async () => {
+  const host = twoInstances('scopewake', {
+    hamachi: ['    mayRequest:', '      instances: [hamachi]'],
+  });
+  const executor = new Executor(host.config);
+
+  // Clawcius's channel, from Hamachi's spool. The target is not a field on the
+  // request — it is discovered by routing — so this is refused in #doWake
+  // rather than at intake.
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"wake","channel":"123456789012345678","detail":"hello neighbour"}',
+  });
+  await settle(executor);
+
+  const rejected = journalEntries(host.config).filter((entry) => entry['kind'] === 'rejected');
+  assert.equal(rejected.length, 1);
+  assert.match(String(rejected[0]?.['detail']), /may not wake clawcius/);
+  assert.equal(
+    readdirSync(join(host.root, 'state', 'clawcius', 'run', 'wake')).filter((n) =>
+      n.endsWith('.json'),
+    ).length,
+    0,
+    'no wake file was written into the neighbour\'s spool',
+  );
+  executor.stop();
+});
+
+test('a mayRequest naming something that does not exist fails the boot', () => {
+  const bad = (lines: string[]) =>
+    writeConfig([
+      'stateDir: /var/lib/ops-state',
+      'units:',
+      '  - name: clawcius.service',
+      ...MINIMAL_INSTANCE('/var/lib/x'),
+      ...lines,
+    ]);
+
+  // Each of these would otherwise be a silent, total denial: the operator
+  // believes they granted something and every request is refused with a
+  // message that reads like a problem somewhere else.
+  assert.throws(
+    () => loadOpsConfig(bad(['    mayRequest:', '      units: [sshd.service]'])),
+    /mayRequest\.units .*names no entry under units/,
+  );
+  assert.throws(
+    () => loadOpsConfig(bad(['    mayRequest:', '      instances: [nope]'])),
+    /mayRequest\.instances .*names no entry under instances/,
+  );
+  assert.throws(
+    () => loadOpsConfig(bad(['    mayRequest:', '      verbs: [rm-rf]'])),
+    /mayRequest\.verbs .*is not a verb/,
+  );
+});
+
+// ── Containment, across several spools ────────────────────────────────────
+
+test('two instances may not share a spool', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    '    opsSpoolDir: /var/lib/shared/ops',
+    '  - name: hamachi',
+    '    container: hamachi-agent',
+    '    image: hamachi-agent:latest',
+    '    stateDir: /var/lib/y',
+    '    envFile: /var/lib/y/env',
+    '    wakerStatusFile: /var/lib/y/waker-status.json',
+    '    wakeSpoolDir: /var/lib/y/run/wake',
+    '    wakeChannelId: "223456789012345678"',
+    '    opsSpoolDir: /var/lib/shared/ops',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /share opsSpoolDir/);
+});
+
+test('one instance\'s spool may not be nested inside another\'s', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    '    opsSpoolDir: /var/lib/x/run/ops',
+    '  - name: hamachi',
+    '    container: hamachi-agent',
+    '    image: hamachi-agent:latest',
+    '    stateDir: /var/lib/y',
+    '    envFile: /var/lib/y/env',
+    '    wakerStatusFile: /var/lib/y/waker-status.json',
+    '    wakeSpoolDir: /var/lib/y/run/wake',
+    '    wakeChannelId: "223456789012345678"',
+    // Inside Clawcius's spool: Clawcius could write files that arrive
+    // attributed to Hamachi.
+    '    opsSpoolDir: /var/lib/x/run/ops/hamachi',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /is inside instances\[clawcius\]\.opsSpoolDir/);
+});
+
+test('a waker status file inside ANY instance\'s ops spool is refused', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    'instances:',
+    '  - name: clawcius',
+    '    container: clawcius-agent',
+    '    image: clawcius-agent:latest',
+    '    stateDir: /var/lib/x',
+    '    envFile: /var/lib/x/env',
+    // Hamachi's spool. Clawcius could declare Clawcius idle by writing it.
+    '    wakerStatusFile: /var/lib/y/run/ops/waker-status.json',
+    '    wakeSpoolDir: /var/lib/x/run/wake',
+    '    wakeChannelId: "123456789012345678"',
+    '  - name: hamachi',
+    '    container: hamachi-agent',
+    '    image: hamachi-agent:latest',
+    '    stateDir: /var/lib/y',
+    '    envFile: /var/lib/y/env',
+    '    wakerStatusFile: /var/lib/y/waker-status.json',
+    '    wakeSpoolDir: /var/lib/y/run/wake',
+    '    wakeChannelId: "223456789012345678"',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /wakerStatusFile is inside instances\[hamachi\]\.opsSpoolDir/);
+});
+
+test('an ops spool that would swallow a wake spool is refused', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    // /var/lib/x/state/run contains the wake spool at .../run/wake. The ops
+    // spool unlinks every file it sweeps before parsing it, so this would eat
+    // the waker's queue silently.
+    '    opsSpoolDir: /var/lib/x/state/run',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /would silently eat wakes/);
+});
+
+test('the state directory may not be inside any of several spools', () => {
+  const base = (stateDir: string) =>
+    writeConfig([
+      `stateDir: ${stateDir}`,
+      ...MINIMAL_INSTANCE('/var/lib/x'),
+      '  - name: hamachi',
+      '    container: hamachi-agent',
+      '    image: hamachi-agent:latest',
+      '    stateDir: /var/lib/y',
+      '    envFile: /var/lib/y/env',
+      '    wakerStatusFile: /var/lib/y/waker-status.json',
+      '    wakeSpoolDir: /var/lib/y/run/wake',
+      '    wakeChannelId: "223456789012345678"',
+    ]);
+
+  // Inside the SECOND instance's spool. A check written against one spool
+  // passes this and is wrong.
+  assert.throws(
+    () => loadOpsConfig(base('/var/lib/y/run/ops/state')),
+    /stateDir .* is inside instances\[hamachi\]\.opsSpoolDir/,
+  );
+  assert.throws(
+    () => loadOpsConfig(base('/var/lib/x/state/run/ops/state')),
+    /stateDir .* is inside instances\[clawcius\]\.opsSpoolDir/,
+  );
+  // And a state directory outside both is fine.
+  assert.equal(loadOpsConfig(base('/var/lib/ops-state')).stateDir, '/var/lib/ops-state');
+});
+
+// ── Migration off the old single spoolDir ─────────────────────────────────
+
+test('the deprecated spoolDir is accepted as an alias for the instance that owns it', () => {
+  // Exactly the shape of the config running on the host on 2026-08-10.
+  const path = writeConfig([
+    'stateDir: /var/lib/clawcius-ops',
+    'spoolDir: /var/lib/clawcius/run/ops',
+    'instances:',
+    '  - name: clawcius',
+    '    container: clawcius-agent',
+    '    image: clawcius-agent:latest',
+    '    stateDir: /var/lib/clawcius',
+    '    envFile: /var/lib/clawcius/env',
+    '    wakerStatusFile: /var/lib/clawcius/waker-status.json',
+    '    wakeSpoolDir: /var/lib/clawcius/run/wake',
+    '    wakeChannelId: "123456789012345678"',
+    '  - name: hamachi',
+    '    container: hamachi-agent',
+    '    image: hamachi-agent:latest',
+    '    stateDir: /var/lib/hamachi',
+    '    envFile: /var/lib/hamachi/env',
+    '    wakerStatusFile: /var/lib/hamachi/waker-status.json',
+    '    wakeSpoolDir: /var/lib/hamachi/run/wake',
+    '    wakeChannelId: "223456789012345678"',
+  ]);
+
+  const config = loadOpsConfig(path);
+  // Clawcius keeps watching exactly what it watched before the upgrade…
+  assert.equal(config.instances[0]?.opsSpoolDir, '/var/lib/clawcius/run/ops');
+  // …and Hamachi finally has one, inside the mount it has always had.
+  assert.equal(config.instances[1]?.opsSpoolDir, '/var/lib/hamachi/run/ops');
+  // Loud, and durable: the notice goes into the boot journal, not just stdout.
+  assert.equal(config.deprecations.length, 1);
+  assert.match(config.deprecations[0] ?? '', /DEPRECATED/);
+  assert.match(config.deprecations[0] ?? '', /attributed to instance "clawcius"/);
+});
+
+test('a spoolDir belonging to nobody fails the boot with the lines to write', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    // Inside no instance's stateDir, so it cannot be attributed — and an
+    // unattributable spool is the exact thing this release abolishes.
+    'spoolDir: /var/lib/somewhere-else/ops',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+  ]);
+  assert.throws(() => loadOpsConfig(path), /cannot be attributed to any configured instance/);
+  assert.throws(() => loadOpsConfig(path), /opsSpoolDir: \/var\/lib\/x\/state\/run\/ops/);
+});
+
+test('spoolDir and opsSpoolDir disagreeing fails rather than picking one', () => {
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    'spoolDir: /var/lib/x/state/run/ops',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    '    opsSpoolDir: /var/lib/x/other/ops',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /name different directories/);
+});
+
+test('the check-in instructions point the instance at its OWN spool', async () => {
+  const host = twoInstances('checkinpath');
+  const liveHost = makeHost({
+    dryRun: false,
+    suffix: 'checkinpath-live',
+    instances: [{ name: 'clawcius' }, { name: 'hamachi' }],
+  });
+  liveHost.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
+
+  const executor = new Executor(liveHost.config);
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"redeploy","instance":"hamachi"}',
+  });
+  await settle(executor);
+
+  const wakeDir = join(liveHost.root, 'state', 'hamachi', 'run', 'wake');
+  const files = readdirSync(wakeDir).filter((n) => n.endsWith('.json'));
+  assert.equal(files.length, 1);
+  const wake = JSON.parse(readFileSync(join(wakeDir, files[0] ?? ''), 'utf8')) as Record<
+    string,
+    string
+  >;
+  // The one instruction sent to an agent that has just been rebuilt, at the
+  // moment it most needs to answer. Pointing it at the other instance's spool
+  // is how a working rebuild becomes a rolled-back one.
+  assert.match(wake['prompt'] ?? '', new RegExp(liveHost.spoolDir('hamachi')));
+  assert.equal(
+    (wake['prompt'] ?? '').includes(liveHost.spoolDir('clawcius')),
+    false,
+  );
+  assert.ok(host.config.instances.length === 2);
   executor.stop();
 });

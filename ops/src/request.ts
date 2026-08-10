@@ -161,7 +161,22 @@ function text(value: unknown): string {
   return value.replace(CONTROL_CHARS_EXCEPT_WHITESPACE, ' ').slice(0, MAX_TEXT_CHARS).trim();
 }
 
-/** Fields this schema knows. Anything else is reported, never acted on. */
+/**
+ * Fields this schema knows. Anything else is reported, never acted on.
+ *
+ * Note what is deliberately NOT here: `requester`, `from`, `instanceName` or
+ * any other way for a request to say who wrote it. Provenance is not a field,
+ * because a field is something the author chooses. Since 2026-08-10 the
+ * requester is the SPOOL DIRECTORY the file was found in — one per instance,
+ * each bind-mounted into exactly one container — and it is stamped on in
+ * spool.ts where the file's contents cannot reach it.
+ *
+ * A request that writes `"requester": "clawcius"` therefore lands in the
+ * unknown-field list, is logged as ignored, and is still attributed to
+ * whichever spool it was actually written into. The self-test asserts exactly
+ * that, because "the attacker supplies their own identity" is the obvious way
+ * to get this wrong and it would look correct in every log until it mattered.
+ */
 const KNOWN_FIELDS = new Set([
   'verb',
   'unit',
