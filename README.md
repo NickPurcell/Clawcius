@@ -64,12 +64,22 @@ route to find.
 The container is long-lived on purpose: cron jobs, daemons and Discord bots the
 agent writes keep running between turns, with no model in the loop.
 
+There is no docker socket and no host socket inside, so the agent cannot touch
+its own deployment directly. What it has instead is a spool: it files a request
+for one of a short list of operations — restart a service, pull a checkout,
+recreate or roll back a container — and a separate root daemon reads it. Every
+argument is matched against an allowlist by exact string, nothing is ever
+handed to a shell, and after anything destructive the agent has a deadline to
+say it came back or it is rolled back automatically. See
+[`ops/README.md`](ops/README.md); it ships in dry-run.
+
 ## Configuration
 
 | File | Holds | Committed |
 |---|---|---|
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
 | `squid/squid.conf` | The egress allowlist — the only copy | yes |
+| `ops/ops-config.yaml` | What the ops executor is allowed to do, by exact name | yes |
 | `status/status-config.yaml` | Transcript roots, port, liveness thresholds | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 
@@ -102,3 +112,8 @@ from clean, with the workspace mount untouched:
 ```sh
 docker/up.sh --recreate   # discard the writable layer, rebuild from the image
 ```
+
+Those snapshots are now restore-tested rather than trusted:
+`clawcius-snapshot-verify.timer` boots the newest one in a throwaway container
+nightly and fails loudly if it does not come up. The usual cause of a failed
+rollback is a restore path nobody ever ran.

@@ -1,0 +1,25 @@
+{
+  "name": "clawcius-ops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-side executor for a fixed set of privileged operations requested by the sandboxed agents",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "start": "node dist/index.js",
+    "verify": "node dist/verify-main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "selftest": "tsc -p tsconfig.json && node --test dist/selftest.js"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
