@@ -67,6 +67,15 @@ WAKE_DIR=$CLAWCIUS_STATE/run
 OPS_DIR=$WAKE_DIR/ops
 SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli
+GWS_CLI=/home/npurcell/clawcius/gws-cli
+
+# Google Workspace service account key, mounted only if it exists.
+#
+# Optional on purpose: the repo ships gws-cli whether or not anyone has set up
+# Google credentials, and a missing file passed to `docker run -v` would be
+# created as an empty *directory*, which fails confusingly at first use rather
+# than at startup.
+GWS_KEY=${GWS_KEY:-/home/npurcell/clawcius/secrets/gws-service-account.json}
 
 # The agent's Claude home, owned entirely by this instance.
 #
@@ -240,6 +249,13 @@ AGENT_TZ="${AGENT_TZ:-America/Los_Angeles}"
 # outside it would need its own mount and would be reachable by whoever was
 # given one, which is the arrangement that broke.
 
+GWS_MOUNT=()
+if [ -f "$GWS_KEY" ]; then
+  GWS_MOUNT=(-v "$GWS_KEY:/home/agent/.config/gws/service-account.json:ro")
+else
+  echo "note: no Google Workspace key at $GWS_KEY — gdoc will report it is unconfigured"
+fi
+
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -257,6 +273,8 @@ docker run -d \
   -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \
   -v "$SKILLS:$SKILLS:ro" \
   -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
+  -v "$GWS_CLI:$GWS_CLI:ro" \
+  "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \
   --memory="$MEMORY" \
   --pids-limit=512 \
