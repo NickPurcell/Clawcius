@@ -839,10 +839,39 @@ export function isInside(child: string, parent: string): boolean {
  * Mutates the matched entry's `opsSpoolDir`, so the instance carries on
  * watching the same directory it was watching before the upgrade. Returns the
  * deprecation notice for the boot journal.
+ *
+ * ── `explicit` — added 2026-08-11, because "written down" is not "default" ──
+ *
+ * `explicit` is the set of instance names whose `opsSpoolDir` was actually
+ * present in the YAML. It has to be passed in, because by the time this runs
+ * the value has already been resolved through `absPath(..., default)` and an
+ * explicitly written default is byte-identical to an absent key.
+ *
+ * Review of PR #8 found what that cost. The disagreement check used to read
+ * `opsSpoolDir !== <the derived default> && opsSpoolDir !== legacy`, so an
+ * operator who wrote the default out by hand — `opsSpoolDir:
+ * /var/lib/clawcius/run/ops`, which is a perfectly ordinary thing to do while
+ * moving off the old key — and left a stale top-level `spoolDir` pointing
+ * somewhere else in the same stateDir got neither the failure nor their own
+ * value: the first conjunct was false, the throw was skipped, and the line
+ * below silently overwrote what they had written with the legacy path.
+ *
+ * The consequence is precisely the failure this release exists to end, with an
+ * extra step. `docker/run-container.sh` hard-codes the container's spool to
+ * `<stateDir>/run/ops` and that path is not in the config, so the executor
+ * would end up watching the old directory while the container wrote the new
+ * one, and every request would vanish silently in both directions. No
+ * containment check catches it — both paths are legal, they simply are not the
+ * same path.
+ *
+ * So the rule is now the one the README always claimed: an explicit
+ * `opsSpoolDir` that disagrees with the legacy key fails the boot, whatever its
+ * value happens to be, and an explicit one is never overwritten.
  */
 function migrateLegacySpoolDir(
   root: Record<string, unknown>,
   instances: InstanceEntry[],
+  explicit: ReadonlySet<string>,
 ): string[] {
   const raw = root['spoolDir'];
   if (raw === undefined || raw === null) return [];
@@ -888,19 +917,30 @@ function migrateLegacySpoolDir(
   const owner = owners[0]!;
   const wouldBe = defaultOpsSpoolDir(owner.stateDir);
 
-  if (owner.opsSpoolDir !== wouldBe && owner.opsSpoolDir !== legacy) {
-    // The operator wrote both keys and they disagree. Two answers to one
-    // question is the one case where silence is indefensible: whichever the
-    // loader picked, the other would look like it had been honoured.
-    throw new Error(
-      `ops-config.yaml: the deprecated top-level "spoolDir" (${legacy}) and ` +
-        `instances[${owner.name}].opsSpoolDir (${owner.opsSpoolDir}) name different ` +
-        'directories. Delete the top-level key; the per-instance one is the only one ' +
-        'that can say whose spool it is.',
-    );
+  if (explicit.has(owner.name)) {
+    // The operator wrote both keys. If they disagree, that is two answers to
+    // one question and the one case where silence is indefensible: whichever
+    // the loader picked, the other would look like it had been honoured.
+    //
+    // Tested against "was it written" and not against "is it the default",
+    // because those are different questions and only the first one is about
+    // the operator's intent. See the header.
+    if (owner.opsSpoolDir !== legacy) {
+      throw new Error(
+        `ops-config.yaml: the deprecated top-level "spoolDir" (${legacy}) and ` +
+          `instances[${owner.name}].opsSpoolDir (${owner.opsSpoolDir}) name different ` +
+          'directories. Delete the top-level key; the per-instance one is the only one ' +
+          'that can say whose spool it is. (This fails even when the per-instance value ' +
+          'is the default written out by hand: an explicit key means the operator meant ' +
+          'it, and quietly replacing it is how the executor ends up watching a directory ' +
+          'no container writes.)',
+      );
+    }
+    // Written twice, identically. Nothing to migrate; the deprecation notice
+    // below still goes into the journal.
+  } else {
+    owner.opsSpoolDir = legacy;
   }
-
-  owner.opsSpoolDir = legacy;
 
   return [
     `the top-level "spoolDir" key is DEPRECATED. ${legacy} has been attributed to ` +
@@ -986,6 +1026,17 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     };
   });
 
+  /**
+   * Instances whose `opsSpoolDir` was actually written in the file.
+   *
+   * Kept beside the entries rather than on them: the resolved value cannot
+   * answer "was this written down", because an explicitly written default is
+   * identical to an absent key, and `migrateLegacySpoolDir` has to be able to
+   * tell those apart. Same distinction `strListOrNull` exists to preserve for
+   * `mayRequest`, for the same reason — absence means something.
+   */
+  const explicitOpsSpoolDir = new Set<string>();
+
   const instances: InstanceEntry[] = list(root['instances'], 'instances').map((raw, index) => {
     const at = `instances[${index}]`;
     const entry = section(raw, at);
@@ -1023,6 +1074,9 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       `${at}.opsSpoolDir`,
       defaultOpsSpoolDir(stateDir),
     );
+    if (entry['opsSpoolDir'] !== undefined && entry['opsSpoolDir'] !== null) {
+      explicitOpsSpoolDir.add(name);
+    }
 
     // Absent is unrestricted. That is the pre-2026-08-10 behaviour and it is
     // what an upgrade gets, deliberately: this change ships a *mechanism*, and
@@ -1089,7 +1143,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     };
   });
 
-  const deprecations = migrateLegacySpoolDir(root, instances);
+  const deprecations = migrateLegacySpoolDir(root, instances, explicitOpsSpoolDir);
 
   // ── mayRequest.units / mayRequest.repos: parsed, validated, inert ────────
   //
@@ -1350,6 +1404,30 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       }
 
       if (instance === other) continue;
+
+      // The same argument as the two checks above, for the pairing they both
+      // missed. Added 2026-08-11, after review of PR #8 pointed out that the
+      // coverage was asymmetric: a status file was checked against its OWN
+      // wake spool and against ANY ops spool, but never against another
+      // instance's wake spool — which is bind-mounted read-write into that
+      // other container exactly like the ops spool is.
+      //
+      // So instance A's status file sitting under B's wake spool meant B's
+      // agent could create or overwrite it and declare A idle whenever it
+      // liked: A gets recreated mid-turn, or a rollback of A proceeds over a
+      // live conversation. The check that would have caught it was three lines
+      // away and written for precisely this, which is the usual shape of a
+      // coverage gap — the loop's own comment says "a fat-fingered path lands
+      // in the neighbour" and then only looked in half the neighbourhood.
+      if (isInside(instance.wakerStatusFile, other.wakeSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}].wakerStatusFile is inside ` +
+            `instances[${other.name}].wakeSpoolDir (${other.wakeSpoolDir}), which is ` +
+            `bind-mounted read-write into ${other.name}'s container. ${other.name} could ` +
+            `then declare ${instance.name} idle, and the executor believes that file when ` +
+            'it decides whether destroying a container would interrupt a live turn.',
+        );
+      }
 
       // Two instances, one spool: the exact thing this release exists to end.
       // The directory a request arrives in is now the only evidence of who

@@ -499,6 +499,25 @@ would take standing instructions from anything they could merge. It is
 `/var/lib/clawcius-host-agent`, and the loader refuses a `workDir` inside any
 repo path, any spool, or `stateDir`.
 
+**The idle signal is out of reach too.** Each waker publishes
+`/var/lib/<instance>/waker-status.json`, a sibling of the bind-mounted `run/`
+directory rather than a child of it. The executor believes that file when it
+decides whether recreating a container would kill a live turn; an agent that
+could write "no turns in flight" could talk root into destroying a session
+mid-conversation. Both config loaders — the waker's and this one's — refuse to
+start if the path ends up inside a mount: its own wake spool, its own or any
+other instance's ops spool, and (since 2026-08-11) *another instance's wake
+spool*, which was the one pairing the first version of these checks missed.
+
+**The spool's own directory is not trusted either.** It sits inside a mount the
+agent owns, so the agent can delete it and put a symlink in its place. Nothing
+in the executor follows one: see "What it will not do, and why" above. This is
+the sharpest instance of the general rule, because the process on the other end
+of the path is root and the operations are `chown`, `readdir` and `unlink`. A
+spool that is a real directory but owned by the wrong uid is not followed
+either, and — since the second review of PR #8 — is no longer *silent*: the
+sweeper says so on the first sweep that sees it, with the `chown` to run.
+
 ### What this does *not* protect against
 
 Honest list, and it is longer than it was.
@@ -555,6 +574,16 @@ Honest list, and it is longer than it was.
   reaches a model's prompt, which is not safer than reaching a shell — it is the
   deal. The rest end up in the journal, in `ops-status.json`, and in wake
   prompts; anything rendering them owes them the same suspicion.
+- **The symlink defence around the spool directory is a check, not a
+  transaction.** Every sweep `lstat`s the spool and refuses anything that is
+  not a real directory, and every request file is opened `O_NOFOLLOW |
+  O_NONBLOCK`; but Node exposes no `unlinkat`, so the sweep re-resolves the
+  directory by name for each file it removes. An agent swapping the directory
+  for a symlink inside that window could in principle still get a `.json`
+  removed elsewhere. The persistent case — plant a link and wait for the
+  restart, which was the actual bug — is refused and reported. Fixing the
+  residual race needs directory descriptors and `*at()` syscalls this runtime
+  does not offer, so it is written down rather than half-done.
 - **Root is root.** This service being small and readable is still the
   mitigation for the supervisor. It is not a mitigation for the session.
 
@@ -802,18 +831,91 @@ Dockerfile builds the agent user with `AGENT_UID=1000` to match, so the
 directory lands owned by the uid the container runs as without a `chown`
 anywhere.
 
-**The executor also repairs them at startup**, because it must not depend on a
-container having ever been started. `ensureSpoolDir()` creates the directory if
-missing and then `stat`s the instance's state directory and chowns the spool to
-match — the same rule as `build.ts`, where the owner is discovered rather than
-configured, because this daemon is not entitled to an opinion about who owns a
-directory it was pointed at. A failure there is logged loudly with the exact
-`chown` to run, and is never fatal.
+**The executor also creates them at startup**, because it must not depend on a
+container having ever been started. `ensureSpoolDir()` walks down from the
+instance's state directory creating each missing level, and chowns and chmods
+each level *it creates* to match that state directory — the same rule as
+`build.ts`, where the owner is discovered rather than configured, because this
+daemon is not entitled to an opinion about who owns a directory it was pointed
+at. A failure there is logged loudly with the exact `chown` to run, and is
+never fatal.
 
-The alternative — letting root `mkdir` it and leaving it at that — produces a
-root-owned 0770 directory that the container cannot write, and the symptom is
-an agent whose requests are never seen. That is the same silent shape as the
-bug this whole section is about, so it is not left to chance.
+The alternative — letting root `mkdir -p` it and leaving it at that — produces
+a root-owned tree the container cannot write, and the symptom is an agent whose
+requests are never seen. That is the same silent shape as the bug this whole
+section is about, so it is not left to chance. Note that "the levels it
+creates", plural, and the explicit `fchmod` are both load-bearing: `mkdir -p`
+as root creates the intermediate `run/` root-owned too, and `mkdir`'s mode
+argument is masked by the umask, so `0770` arrives as `0750` and the
+container's group silently loses write.
+
+#### What it will **not** do, and why (rewritten 2026-08-11)
+
+**It never follows a symlink, and it never chowns anything it did not just
+create.**
+
+The first version of this function did both, and it was a privilege escalation
+out of the sandbox — in the change written to let agents file requests safely.
+Review of PR #8 caught it before it ran anywhere.
+
+The mechanism: the spool's *parent*, `<stateDir>/run`, is bind-mounted
+read-write into the container and is owned by the uid the agent runs as. The
+agent therefore owns the directory entry called `ops` and can replace it:
+
+```sh
+rm -rf run/ops && ln -s /root/.ssh run/ops    # from inside the container
+```
+
+Restarts are routine — a pull, a redeploy, a reboot — so the next executor
+start ran, as root, `mkdirSync(recursive)` (which returns quietly on an
+existing symlink-to-directory), then `statSync` and `chownSync`, both of which
+follow the terminal symlink. Result: root chowns any path on the host the agent
+chose to `1000:1000`. `/etc`, the checkout, or `/var/lib/clawcius-ops` itself —
+the state directory whose unreachability is the entire argument for why the
+circuit breaker cannot be edited by the instance it has quarantined.
+
+`lchown` alone would have been the small fix. The rule is stricter than that,
+because the real question is whether a root process should be repairing paths
+whose parent directory is owned by the adversary:
+
+- every level is `lstat`ed, and anything that is not a real directory —
+  symlink, file, socket — is **refused, reported and left exactly where it
+  is**. It is not repaired, and it is not deleted either: deleting as root
+  inside a directory the agent owns is another primitive, and the agent can
+  remove its own link. The instance's requests stop arriving until a human
+  looks, which is correct — the only party who can put a symlink there is the
+  one whose requests those would have been;
+- the chown and chmod go through a descriptor opened `O_NOFOLLOW |
+  O_DIRECTORY`, whose `fstat` is compared by device and inode against the
+  `lstat`. Whatever is chowned is the object that was checked, or nothing is;
+- an **existing** directory with the wrong owner is a loud warning with the
+  exact `chown` to run, and nothing else. The old "repair" bought the case
+  where a previous root `mkdir` left a bad owner; it cost the case where the
+  adversary picks the target. That warning is emitted **on every sweep**, from
+  the sweeper itself, and not only by `ensureSpoolDir` — because the second
+  review of PR #8 pointed out that the daemon only ever called `ensureSpoolDir`
+  when the spool was *missing*, so a spool that was already there with the
+  wrong owner was swept happily and forever while the container got `EACCES` on
+  every `mv` and nothing was logged at all. That state is reachable without an
+  adversary: `run-container.sh`'s `mkdir -p "$OPS_DIR"` assumes it runs as
+  `npurcell`, and the executor invokes that script itself, as root, on a
+  `--recreate`. A warning that the running configuration cannot reach is not a
+  warning. It is repeated at most once per state change rather than every five
+  seconds, and it does not stop the sweep: a real directory is safe to read,
+  and refusing here would turn a diagnostic into an outage;
+- if the state directory does not exist yet, **nothing is created at all**.
+  There is no correct owner to copy, and a root-owned tree is worse than an
+  absent one — the absent one is fixed by the instance unit starting, and this
+  is retried on every sweep, so a first-boot ordering race heals itself without
+  a restart.
+
+The same rule runs on **every sweep**, not just at startup: `drain()` does
+`readdir` and `unlink` as root, and the agent can swap the directory for a
+symlink at any moment of the process's life, not only before it starts. Files
+inside the spool get it too — they are opened `O_NOFOLLOW | O_NONBLOCK` and
+sized with `fstat` on the descriptor, so a `req.json` that is really a symlink
+to a host file is discarded rather than read into the journal, and one that is
+really a FIFO cannot park the daemon that holds every rollback deadline.
 
 ### Optional: restricting an instance. Off by default.
 
@@ -903,6 +1005,19 @@ So on boot, a top-level `spoolDir:`:
   an explicit `opsSpoolDir` — with the exact YAML to write. An unattributable
   spool is the precise thing this change abolishes; guessing at provenance
   would be worse than the shared spool was.
+
+"Explicit" means *written in the file*, not *different from the default*. Those
+are different questions and the loader used to ask the wrong one: because
+`opsSpoolDir` is resolved against its default before this check, an operator
+who spelled the default out by hand — `opsSpoolDir: /var/lib/clawcius/run/ops`,
+an ordinary thing to write while migrating off the old key — looked identical
+to one who had written nothing, so a stale `spoolDir` pointing somewhere else
+in the same `stateDir` silently replaced their value instead of failing. The
+executor would then watch a directory no container writes, because
+`run-container.sh` hard-codes the container's spool to `<stateDir>/run/ops` and
+that path is not in the config at all. Fixed 2026-08-11, after review of PR #8;
+the loader now tracks presence separately, the same distinction `strListOrNull`
+exists to preserve for `mayRequest`.
 
 Delete the key once you have read the notice.
 
@@ -1268,6 +1383,30 @@ journal lines, an automatic rollback attributed to `(executor)`, the
 deprecated `spoolDir` migration, and the check-in instructions naming the
 instance's *own* spool.
 
+The spool-directory tests from PR #8's two reviews came in with that branch and
+are the sharpest ones in the file, because every failure they describe is
+silent and privileged:
+
+- a symlink where the spool should be is refused rather than chowned: the link
+  is still a link afterwards, the directory it points at still has every file
+  it had, and nothing behind it was read as a request or unlinked by the root
+  sweep. A non-directory of any kind gets the same treatment, and so does a
+  symlinked `.json` *inside* a real spool;
+- a fresh host — state directory present, nothing under it — ends up with
+  `run/` **and** `run/ops` existing, owned like the state directory, mode 0770
+  and not the umask's 0750; a *missing* state directory creates nothing at all,
+  and the spool appears by itself on a later sweep;
+- an already-existing spool whose owner does not match the state directory
+  produces the WARNING **from the sweeper**, carrying the exact `chown` — once,
+  not once per sweep — while the directory is left exactly as it was found and
+  requests filed in it still arrive;
+- a **FIFO** named like a request (`mkfifo 1.json`, which the agent owns the
+  directory to do) is discarded, and the request behind it is still delivered.
+  It runs in a child process with a deadline, because the regression it guards
+  against is a *hang*: without `O_NONBLOCK` the sweep blocks in `open(2)` until
+  a writer appears, and a test that hangs cannot report from inside the thread
+  that is hung.
+
 ### Verified by hand, against the real CLI
 
 Everything in [Dry run](#dry-run--on-by-default-and-genuinely-unable-to-act)
@@ -1298,9 +1437,13 @@ use it.
 - **No unit in `systemd/` has been loaded since the audit below** — which is
   exactly the condition that produced the two units that shipped unable to run
   at all.
-- `ensureOwnedDir`'s `chown` has never run as root here, because the self-test
-  does not run as root and cannot. Check with `ls -ld /var/lib/*/run/ops
-  /var/lib/clawcius-host-agent` after the first start.
+- `ensureSpoolDir`'s `fchown` and `ensureDirOwnedBy`'s `chown` have never run
+  as root here, because the self-test does not run as root and cannot. What
+  *is* tested without root is everything that decides whether the chown happens
+  at all: the refusals, the `O_NOFOLLOW` open, which levels get created, and
+  the mode. Check with `ls -ld /var/lib/*/run/ops /var/lib/clawcius-host-agent`
+  after the first start — and if that ever shows a symlink, read the executor's
+  log rather than fixing it quietly.
 - The wake the executor files after a task has never been picked up by a live
   waker.
 

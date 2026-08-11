@@ -62,21 +62,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  chownSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadOpsConfig, type OpsConfig } from './config.js';
 import { parseRequest, describeRequest, isDestructive, VERBS } from './request.js';
-import { OpsSpool } from './spool.js';
+import { OpsSpool, ensureSpoolDir } from './spool.js';
 import { readIdle } from './idle.js';
 import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
@@ -213,6 +218,7 @@ function makeHost(options: {
     mkdirSync(join(instanceState(spec.name), 'run', 'wake'), { recursive: true });
   }
   mkdirSync(join(root, 'repo'), { recursive: true });
+  mkdirSync(join(root, 'tools'), { recursive: true });
   // The build steps run with cwd set to these, and execFile fails to spawn at
   // all if the cwd does not exist — which would look like a missing binary
   // rather than a missing directory.
@@ -512,11 +518,21 @@ emit({
       'units:',
       '  - name: clawcius.service',
       '    description: the waker',
+      // A second unit and a second repo, so that "allowed for one instance,
+      // refused for another" is expressible. With one of each, every refusal
+      // in a mayRequest test would also be refused by the global allowlist,
+      // and the test could not tell which rule had fired.
+      '  - name: hamachi.service',
+      '    description: the second waker',
       'repos:',
       '  - name: clawcius',
       `    path: ${join(root, 'repo')}`,
       '    branch: main',
       `    buildDirs: [${(options.buildDirs ?? ['.']).map((d) => JSON.stringify(d)).join(', ')}]`,
+      '  - name: tools',
+      `    path: ${join(root, 'tools')}`,
+      '    branch: main',
+      '    buildDirs: []',
       'instances:',
       // Each instance's spool is left to the default — `<stateDir>/run/ops` —
       // because that default is itself under test. Writing it out here would
@@ -1067,6 +1083,335 @@ test('a request is removed before the handler runs, so a throw cannot loop', () 
 
   assert.equal(calls, 1, 'a request that throws is not retried');
   assert.equal(existsSync(join(dir, 'boom.json')), false);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// The spool DIRECTORY, as opposed to the files in it
+//
+// Added 2026-08-11, after review of PR #8 found that `ensureSpoolDir()` was an
+// arbitrary-path root chown. The whole section exists because of one fact that
+// is easy to forget while reading this file: the spool's PARENT
+// (`<stateDir>/run`) is bind-mounted read-write into the container and is
+// owned by the agent. The agent cannot forge a request, but it can absolutely
+// delete the directory those requests arrive in and put something else there.
+//
+// So every one of these tests is about a root process meeting a path that the
+// least trusted party on the machine controls the name of. None of them needs
+// root to run: what is asserted is what was created, what was refused, and —
+// most importantly — what was left alone.
+// ══════════════════════════════════════════════════════════════════════════
+
+test('a symlink where the spool should be is refused, not chowned and not swept', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-symlink-'));
+  const stateDir = join(root, 'state');
+  mkdirSync(join(stateDir, 'run'), { recursive: true });
+  const spool = join(stateDir, 'run', 'ops');
+
+  // Whatever the agent points the link at. On the host the interesting choices
+  // are /etc, /root/.ssh, the checkout — or /var/lib/clawcius-ops, the
+  // executor's own state directory, whose unreachability is the only reason
+  // the circuit breaker cannot be edited by the instance it has quarantined.
+  const victim = join(root, 'victim');
+  mkdirSync(victim);
+  const loot = join(victim, 'important.json');
+  writeFileSync(loot, '{"verb":"snapshot","instance":"clawcius"}');
+  symlinkSync(victim, spool);
+
+  const logs: string[] = [];
+  const usable = ensureSpoolDir(spool, stateDir, (line) => logs.push(line));
+
+  assert.equal(usable, false, 'a symlink is not a spool that needs repairing');
+  assert.match(logs.join('\n'), /REFUSING/);
+  assert.match(logs.join('\n'), /symlink/);
+  // Untouched in both directions. The link is still a link — deleting it as
+  // root inside a directory the agent owns is another primitive, and the agent
+  // can remove it itself — and the target still has everything it had.
+  assert.equal(lstatSync(spool).isSymbolicLink(), true, 'not deleted, just refused');
+  assert.equal(existsSync(loot), true);
+
+  // And the sweeper has to agree, which is the half that matters most:
+  // `drain()` does `readdir` and, critically, `unlink` as root. A followed
+  // symlink there deletes every file behind it that ends in `.json` — and
+  // feeds their contents to the request parser on the way out.
+  const seen: string[] = [];
+  const watcher = new OpsSpool({
+    dir: spool,
+    instance: 'clawcius',
+    ownerOf: stateDir,
+    maxBytes: 4096,
+    maxPerSweep: 3,
+    maxFiles: 5,
+    pollSeconds: 3600,
+    log: (line) => logs.push(line),
+    onRequest: (raw) => seen.push(raw.name),
+  });
+  watcher.start();
+  watcher.drain();
+  watcher.stop();
+
+  assert.deepEqual(seen, [], 'nothing behind the link may be read as a request');
+  assert.equal(existsSync(loot), true, 'and nothing behind it may be unlinked');
+});
+
+test('a file or a symlink where the spool should be is never followed or read through', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-notdir-'));
+  const stateDir = join(root, 'state');
+  mkdirSync(join(stateDir, 'run'), { recursive: true });
+  const spool = join(stateDir, 'run', 'ops');
+  // Not a symlink this time, just not a directory. Same refusal: the executor
+  // does not remove it and does not try to turn it into one.
+  writeFileSync(spool, 'not a directory');
+
+  const logs: string[] = [];
+  assert.equal(ensureSpoolDir(spool, stateDir, (line) => logs.push(line)), false);
+  assert.match(logs.join('\n'), /not a directory/);
+  assert.equal(readFileSync(spool, 'utf8'), 'not a directory');
+
+  // A symlinked FILE inside a real spool is the same argument one level down:
+  // the executor would otherwise read a host file as a request, report its
+  // contents as malformed JSON in the journal, and unlink the link.
+  const real = mkdtempSync(join(tmpdir(), 'ops-spool-links-'));
+  const secret = join(real, 'secret.txt');
+  writeFileSync(secret, 'not for the journal');
+  symlinkSync(secret, join(real, 'a.json'));
+
+  const seen: string[] = [];
+  const spoolObj = new OpsSpool({
+    dir: real,
+    instance: 'clawcius',
+    maxBytes: 4096,
+    maxPerSweep: 3,
+    maxFiles: 5,
+    pollSeconds: 3600,
+    log: (line) => logs.push(line),
+    onRequest: (raw) => seen.push(raw.body),
+  });
+  spoolObj.start();
+  spoolObj.drain();
+  spoolObj.stop();
+
+  assert.deepEqual(seen, [], 'a symlink is not a regular file');
+  assert.equal(readFileSync(secret, 'utf8'), 'not for the journal', 'the target is untouched');
+});
+
+test('a FIFO named like a request cannot park the sweep, and with it every deadline', () => {
+  // Added 2026-08-11, second review of PR #8: the test above is named for a
+  // FIFO and never made one, so the `O_NONBLOCK` that the whole no-hang claim
+  // rests on was unexercised. Deleting the flag left the suite green.
+  //
+  // The threat is small to write and large to suffer. The agent owns the spool
+  // directory, so it can `mkfifo 1.json`. A synchronous `open(O_RDONLY)` on a
+  // FIFO with no writer blocks until one appears — forever, if the agent never
+  // opens the other end. `O_NOFOLLOW` does not help (a FIFO is not a symlink)
+  // and the `fstat().isFile()` guard runs only after `open` has returned, so
+  // `O_NONBLOCK` is the only thing between here and a wedged daemon — and this
+  // daemon is the one holding every armed rollback deadline, so a hang here is
+  // an outage that cannot be rolled back.
+  //
+  // Which is also why this runs in a CHILD process. A hang cannot be asserted
+  // about from inside the thread that is hung: `openSync` is synchronous, no
+  // timer would ever run, and the test would take the whole suite down with it
+  // instead of failing. The child gets a deadline; missing it is the failure.
+  const dir = mkdtempSync(join(tmpdir(), 'ops-spool-fifo-'));
+  const fifo = join(dir, '1.json');
+  execFileSync('mkfifo', [fifo]);
+  assert.equal(lstatSync(fifo).isFIFO(), true, 'the fixture must really be a FIFO');
+
+  // Sorted after the FIFO, so it is only reached if the FIFO did not stop the
+  // sweep. A sweep that hangs never gets here even if the process is killed.
+  fileRequest(dir, '2', '{"verb":"snapshot","instance":"clawcius"}');
+
+  // Beside the spool, not in it: everything in the spool is evidence.
+  const script = join(mkdtempSync(join(tmpdir(), 'ops-spool-fifo-runner-')), 'drain.mjs');
+  writeFileSync(
+    script,
+    [
+      `import { OpsSpool } from ${JSON.stringify(new URL('./spool.js', import.meta.url).href)};`,
+      'const seen = [];',
+      'const logs = [];',
+      'const spool = new OpsSpool({',
+      '  dir: process.argv[2], instance: "clawcius", maxBytes: 4096, maxPerSweep: 10,',
+      '  maxFiles: 50, pollSeconds: 3600,',
+      '  log: (line) => logs.push(line), onRequest: (raw) => seen.push(raw.name),',
+      '});',
+      'spool.drain();',
+      'process.stdout.write(JSON.stringify({ seen, logs }));',
+    ].join('\n'),
+  );
+
+  let output: string;
+  try {
+    output = execFileSync(process.execPath, [script, dir], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      // The child is blocked inside a syscall if this regresses; do not
+      // negotiate with it.
+      killSignal: 'SIGKILL',
+    });
+  } catch (error) {
+    assert.fail(
+      'the sweep did not finish with a FIFO in the spool — the request files are opened ' +
+        'O_RDONLY | O_NOFOLLOW | O_NONBLOCK, and without O_NONBLOCK this open blocks until ' +
+        `a writer appears, hanging the daemon that holds every rollback deadline: ${String(error)}`,
+    );
+  }
+
+  const result = JSON.parse(output) as { seen: string[]; logs: string[] };
+  assert.deepEqual(result.seen, ['2.json'], 'a FIFO is not a request, and it did not stop the one behind it');
+  assert.match(result.logs.join('\n'), /1\.json: not a regular file/);
+  assert.equal(existsSync(fifo), false, 'and it is discarded rather than left to be met again');
+});
+
+test('a fresh host gets a spool the container can actually write, ancestors included', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-fresh-'));
+  // The state directory exists — systemd's StateDirectory= or the instance
+  // unit's first start made it — but nothing under it does, because no
+  // container has ever run. This is the case ensureSpoolDir exists for, and
+  // the case it got wrong until 2026-08-11: it created `run/` and `run/ops`
+  // as root and chowned neither, so the container could not traverse to its
+  // own spool and its requests silently never arrived.
+  const stateDir = join(root, 'state');
+  mkdirSync(stateDir);
+  const spool = join(stateDir, 'run', 'ops');
+
+  const logs: string[] = [];
+  assert.equal(ensureSpoolDir(spool, stateDir, (line) => logs.push(line)), true);
+
+  const reference = statSync(stateDir);
+  for (const dir of [join(stateDir, 'run'), spool]) {
+    const stat = statSync(dir);
+    assert.equal(stat.isDirectory(), true, `${dir} must exist`);
+    assert.equal(stat.uid, reference.uid, `${dir} must be owned like the state directory`);
+    assert.equal(stat.gid, reference.gid, `${dir} — the intermediate one matters too`);
+    // 0770 applied with fchmod, not left to mkdir's mode argument: that one is
+    // masked by the umask, and 0770 & ~022 is 0750, which is a spool the
+    // container's group cannot write. The symptom is an agent whose requests
+    // vanish, which is the failure this function exists to prevent.
+    assert.equal(stat.mode & 0o777, 0o770, `${dir} must be group-writable`);
+  }
+});
+
+test('an already-existing spool with the wrong owner is swept, but never silently', () => {
+  // Added 2026-08-11, second review of PR #8. The warning below existed and
+  // the daemon could not reach it: `#ready()` only called `ensureSpoolDir` when
+  // the directory was MISSING, so a spool that already existed with the wrong
+  // owner was watched, swept and never mentioned. The container gets EACCES on
+  // every `mv`, its requests never arrive, and the journal says nothing —
+  // which is the failure mode this whole PR is about.
+  //
+  // It is a state the host reaches without an adversary: `run-container.sh`'s
+  // `mkdir -p "$OPS_DIR"` assumes it runs as `npurcell`, and the executor
+  // invokes that script itself, as root, on a `--recreate`.
+  //
+  // Arranging a wrongly-owned directory without root is the awkward part. A
+  // test that is not root cannot chown anything to anyone, so the mismatch is
+  // made from whichever side this process can reach: as root, by chowning the
+  // spool away; otherwise by pointing `ownerOf` at a directory this user does
+  // not own. Either way the property under test is the same one — the spool's
+  // uid/gid differ from the state directory's, and the daemon must say so.
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-badowner-'));
+  const stateDir = join(root, 'state');
+  const spool = join(stateDir, 'run', 'ops');
+  mkdirSync(spool, { recursive: true, mode: 0o770 });
+
+  let ownerOf = stateDir;
+  if ((process.getuid?.() ?? 0) === 0) {
+    chownSync(spool, 65534, 65534);
+  } else {
+    // Owned by root on every host there is, and this process is not root.
+    ownerOf = '/';
+    assert.notEqual(lstatSync(ownerOf).uid, lstatSync(spool).uid, 'the fixture needs a mismatch');
+  }
+  const want = lstatSync(ownerOf);
+
+  const logs: string[] = [];
+  const seen: string[] = [];
+  const spoolObj = new OpsSpool({
+    dir: spool,
+    instance: 'clawcius',
+    ownerOf,
+    maxBytes: 4096,
+    maxPerSweep: 3,
+    maxFiles: 5,
+    pollSeconds: 3600,
+    log: (line) => logs.push(line),
+    onRequest: (raw) => seen.push(raw.name),
+  });
+
+  // Everything the daemon would do in three sweeps, then the assertions —
+  // with `stop()` guaranteed, because `start()` attaches an fs.watch and a
+  // failed assertion between the two would leave the test runner holding an
+  // open handle and hanging forever instead of reporting.
+  try {
+    spoolObj.start();
+    // Still swept — a real directory is safe to read, and the operator may
+    // have fixed the mode without the owner. Refusing here would turn a
+    // warning into an outage.
+    fileRequest(spool, '1', '{"verb":"snapshot","instance":"clawcius"}');
+    spoolObj.drain();
+    // And the complaint is made once, not once per five-second sweep, or the
+    // incident buries itself in its own alarm.
+    spoolObj.drain();
+    spoolObj.drain();
+  } finally {
+    spoolObj.stop();
+  }
+
+  const warning = logs.filter((line) => /WARNING/.test(line));
+  assert.equal(warning.length, 1, 'a locked-out agent must produce a journal line, not silence');
+  assert.match(String(warning[0]), /probably cannot write its own spool/);
+  // The exact command to run, because "ownership is wrong" without it is a
+  // puzzle at 3am.
+  assert.equal(
+    String(warning[0]).includes(`chown ${want.uid}:${want.gid} ${spool} && chmod 0770 ${spool}`),
+    true,
+    'the warning has to carry the exact command',
+  );
+
+  // Not repaired: the directory above it is writable by the container, and
+  // chowning a path we did not create is how a symlink becomes a root chown.
+  const after = lstatSync(spool);
+  assert.equal(after.uid !== want.uid || after.gid !== want.gid, true, 'reported, not repaired');
+
+  assert.deepEqual(seen, ['1.json'], 'a warning is not a refusal; the requests still arrive here');
+});
+
+test('with no state directory to copy ownership from, nothing is created as root', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-noowner-'));
+  const stateDir = join(root, 'state');
+  const spool = join(stateDir, 'run', 'ops');
+
+  const logs: string[] = [];
+  const seen: string[] = [];
+  const spoolObj = new OpsSpool({
+    dir: spool,
+    instance: 'clawcius',
+    ownerOf: stateDir,
+    maxBytes: 4096,
+    maxPerSweep: 3,
+    maxFiles: 5,
+    pollSeconds: 3600,
+    log: (line) => logs.push(line),
+    onRequest: (raw) => seen.push(raw.name),
+  });
+
+  spoolObj.start();
+  assert.equal(existsSync(stateDir), false, 'a root-owned tree is worse than no tree');
+  assert.match(logs.join('\n'), /does not exist yet/);
+
+  // `clawcius-ops.service` is deliberately not ordered after the instance
+  // units, so it can and does win this race on a first boot. It has to recover
+  // without anybody restarting it: the state directory appears, and the next
+  // ordinary sweep creates the spool and starts delivering.
+  mkdirSync(stateDir);
+  spoolObj.drain();
+  assert.equal(statSync(spool).isDirectory(), true, 'the sweep repaired it');
+
+  fileRequest(spool, '1', '{"verb":"snapshot","instance":"clawcius"}');
+  spoolObj.drain();
+  spoolObj.stop();
+
+  assert.deepEqual(seen, ['1.json'], 'and requests arrive from then on');
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1659,6 +2004,99 @@ test('a missed deadline rolls back, quarantines the build, and refuses it again'
   );
   assert.ok(breaker.length >= 1, 'a quarantined build must be refused');
 
+  executor.stop();
+});
+
+test('a deadline rollback that queues behind a busy operation still quarantines', async () => {
+  // The finding from review of PR #8, 2026-08-11. The deadline handler used to
+  // pass the origin and the pending record straight into #doRollback, which
+  // only happened on the branch where the executor was idle. If it was busy,
+  // the job went on the queue and both were lost: #dispatch called
+  // #doRollback(job, 'requested'), the whole quarantine/breaker/freeze block
+  // is gated on origin === 'deadline', and so the failed build was restored
+  // and left free to be deployed again — defeating the breaker in exactly the
+  // situation it exists for, since #waitForIdle can hold the lock for half an
+  // hour and deadlines expire during incidents, not during quiet afternoons.
+  const host = makeHost({
+    dryRun: false,
+    suffix: 'deadlinequeued',
+    instances: [{ name: 'clawcius' }, { name: 'hamachi' }],
+  });
+  const config: OpsConfig = {
+    ...host.config,
+    // One second to check in, and an idle wait long enough to park an
+    // operation across it.
+    deadline: { minutes: 1 / 60, autoRollback: true },
+    idle: { ...host.config.idle, maxWaitMinutes: 1, pollSeconds: 1 },
+  };
+
+  host.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+
+  host.setPlan(['true']);
+  const executor = new Executor(config);
+
+  // A task against Hamachi, which arms its check-in deadline.
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"hamachi","task":"recreate the container"}',
+  });
+  await settle(executor, 40_000);
+  const pending = executor.state.pendingFor('hamachi');
+  assert.ok(pending, 'the task must have armed a deadline');
+  const build = pending?.build ?? '';
+  assert.ok(build);
+
+  // Now park the executor on something else: a rollback of Clawcius, which is
+  // mid-turn, so it sits in #waitForIdle holding the lock.
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
+  executor.intake({
+    requester: 'clawcius',
+    name: 'b.json',
+    body: '{"verb":"rollback","instance":"clawcius"}',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(executor.snapshot().current, 'rollback clawcius', 'the lock is held');
+
+  // Hamachi's deadline passes while that is stuck. The rollback has nowhere to
+  // go but the queue.
+  await new Promise((resolve) => setTimeout(resolve, 1300));
+  assert.equal(executor.snapshot().queued, 1, 'the automatic rollback queued behind it');
+  assert.equal(
+    journalEntries(config).some(
+      (entry) => entry['kind'] === 'queued' && /automatic rollback waiting behind/.test(String(entry['detail'])),
+    ),
+    true,
+  );
+
+  // Let the parked operation through; the queued rollback follows it.
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  await settle(executor, 30_000);
+
+  // The assertion the old code failed: the build that missed its deadline is
+  // quarantined even though the rollback went through the queue.
+  assert.ok(
+    executor.state.isQuarantined('hamachi', build),
+    'a rollback that waited its turn is still a deadline rollback',
+  );
+  assert.equal(
+    journalEntries(config).some(
+      (entry) =>
+        entry['kind'] === 'breaker' &&
+        entry['instance'] === 'hamachi' &&
+        /will not be deployed again/.test(String(entry['detail'])),
+    ),
+    true,
+  );
+  // And it is still the executor's own action, not the instance's.
+  assert.equal(
+    journalEntries(config).some(
+      (entry) => entry['kind'] === 'started' && /rollback hamachi/.test(String(entry['what'])) &&
+        entry['requester'] === '(executor)',
+    ),
+    true,
+  );
   executor.stop();
 });
 
@@ -2924,6 +3362,90 @@ test('a per-instance restriction refuses an out-of-scope request and names why',
   executor.stop();
 });
 
+test('mayRequest.units and mayRequest.repos are accepted, ignored, and said so about', () => {
+  // These two came back from the review of PR #8 with real enforcement tests
+  // attached, and this branch deleted the only verbs that carried a unit or a
+  // repo (`restart` and `pull`). So the enforcement they tested is gone, and
+  // pretending otherwise with a green test would be worse than no test: the
+  // whole complaint in that finding was that an operator believes a
+  // restriction is in force when it is not.
+  //
+  // What is asserted instead is the thing that IS still true, and it is the
+  // more important half: writing them does not fail the boot — this unit is
+  // Restart=always and holds every armed deadline, so a config the loader
+  // refuses is a root daemon in a restart loop — and it does not pass in
+  // silence either. The notice names the key that still works.
+  const host = twoInstances('scopedeadkeys', {
+    hamachi: [
+      '    mayRequest:',
+      '      units: [hamachi.service]',
+      '      repos: [tools]',
+    ],
+  });
+  assert.deepEqual(host.config.instances[1]?.mayRequest?.units, ['hamachi.service']);
+  assert.deepEqual(host.config.instances[1]?.mayRequest?.repos, ['tools']);
+
+  const notice = host.config.deprecations.join('\n');
+  assert.match(notice, /mayRequest\.units and \.repos no longer restricts anything/);
+  assert.match(notice, /IGNORED/);
+  assert.match(notice, /mayRequest\.instances: \[hamachi\]/, 'and it says what to write instead');
+});
+
+test('an empty mayRequest list denies every instance, and says so', async () => {
+  // Present-and-empty is not absent. `instances: []` is a legitimate way to
+  // say "this instance may never ask for anything about anybody", and the
+  // loader has to keep the two distinguishable or the meaning inverts.
+  const host = twoInstances('scopeempty', {
+    hamachi: ['    mayRequest:', '      instances: []'],
+  });
+  assert.deepEqual(host.config.instances[1]?.mayRequest?.instances, []);
+  assert.equal(host.config.instances[1]?.mayRequest?.verbs, null, 'absent stays unrestricted');
+
+  // And then the half that was missing until 2026-08-11: the loader parsing
+  // `[]` as `[]` proves nothing about the runtime, where an empty list is one
+  // `length === 0` away from being read as "no restriction". Empty denies
+  // everything — the instance's own name, its neighbour's, and the unnamed
+  // task that would otherwise take every instance into scope.
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setStatus('hamachi', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+  const executor = new Executor(host.config);
+
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"hamachi","task":"restart the waker"}',
+  });
+  await settle(executor, 40_000);
+  executor.intake({
+    requester: 'hamachi',
+    name: 'b.json',
+    body: '{"verb":"task","task":"free some disk space"}',
+  });
+  await settle(executor, 40_000);
+  // The unrestricted neighbour still gets through, so this is a rule about
+  // hamachi and not a broken fixture.
+  executor.intake({
+    requester: 'clawcius',
+    name: 'c.json',
+    body: '{"verb":"task","instance":"clawcius","task":"restart the waker"}',
+  });
+  await settle(executor, 40_000);
+  executor.stop();
+
+  const entries = journalEntries(host.config);
+  const rejected = entries.filter((entry) => entry['kind'] === 'rejected');
+  assert.equal(rejected.length, 2, 'an empty list denies, it does not permit');
+  assert.match(String(rejected[0]?.['detail']), /may not name instance "hamachi"/);
+  assert.match(String(rejected[1]?.['detail']), /naming no instance/);
+  assert.deepEqual(
+    entries
+      .filter((entry) => entry['kind'] === 'started')
+      .map((entry) => String(entry['requester'])),
+    ['clawcius'],
+  );
+});
+
 test('an out-of-scope request does not consume the hourly budget', async () => {
   const host = twoInstances('scoperate', {
     hamachi: ['    mayRequest:', '      verbs: [checkin]'],
@@ -3081,6 +3603,46 @@ test('a waker status file inside ANY instance\'s ops spool is refused', () => {
   assert.throws(() => loadOpsConfig(path), /wakerStatusFile is inside instances\[hamachi\]\.opsSpoolDir/);
 });
 
+test("a waker status file inside ANOTHER instance's WAKE spool is refused too", () => {
+  // The pairing the first version of these checks missed, found in review of
+  // PR #8 on 2026-08-11. A status file was checked against its own wake spool
+  // and against any ops spool, but never against a NEIGHBOUR's wake spool —
+  // which is bind-mounted read-write into that neighbour's container exactly
+  // like the ops spool is. Hamachi could have written Clawcius's status file
+  // and declared it idle, and Clawcius would have been recreated mid-turn.
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    'instances:',
+    '  - name: clawcius',
+    '    container: clawcius-agent',
+    '    image: clawcius-agent:latest',
+    '    stateDir: /var/lib/x',
+    '    envFile: /var/lib/x/env',
+    '    wakerStatusFile: /var/lib/y/run/wake/waker-status.json',
+    '    wakeSpoolDir: /var/lib/x/run/wake',
+    '    wakeChannelId: "123456789012345678"',
+    '  - name: hamachi',
+    '    container: hamachi-agent',
+    '    image: hamachi-agent:latest',
+    '    stateDir: /var/lib/y',
+    '    envFile: /var/lib/y/env',
+    '    wakerStatusFile: /var/lib/y/waker-status.json',
+    '    wakeSpoolDir: /var/lib/y/run/wake',
+    '    wakeChannelId: "223456789012345678"',
+  ]);
+  assert.throws(
+    () => loadOpsConfig(path),
+    /wakerStatusFile is inside instances\[hamachi\]\.wakeSpoolDir/,
+  );
+
+  // The default arrangement — status files outside every spool — still loads.
+  const good = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+  ]);
+  assert.equal(loadOpsConfig(good).instances.length, 1);
+});
+
 test('an ops spool that would swallow a wake spool is refused', () => {
   const path = writeConfig([
     'stateDir: /var/lib/ops-state',
@@ -3179,6 +3741,50 @@ test('spoolDir and opsSpoolDir disagreeing fails rather than picking one', () =>
     '    opsSpoolDir: /var/lib/x/other/ops',
   ]);
   assert.throws(() => loadOpsConfig(path), /name different directories/);
+});
+
+test('an explicit opsSpoolDir is never silently replaced by the legacy key', () => {
+  // The hole found in review of PR #8 on 2026-08-11: the disagreement check
+  // asked "is this value the derived default?" instead of "did the operator
+  // write it?", and those are different questions. An operator spelling the
+  // default out by hand — an entirely ordinary thing to do while migrating off
+  // the old key — had it silently overwritten with the legacy path, and since
+  // run-container.sh hard-codes the container's spool to <stateDir>/run/ops,
+  // the executor would then watch a directory no container writes. Every
+  // request would vanish: the exact failure this release exists to end.
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    'spoolDir: /var/lib/x/state/oldreqs',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    // The default, written out. Indistinguishable from an absent key by value,
+    // which is why the loader tracks presence separately.
+    '    opsSpoolDir: /var/lib/x/state/run/ops',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /name different directories/);
+  assert.throws(() => loadOpsConfig(path), /an explicit key means the operator meant it/);
+
+  // Written twice and agreeing is not an error — there is nothing to migrate,
+  // and the deprecation notice still goes into the boot journal.
+  const agreeing = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    'spoolDir: /var/lib/x/state/oldreqs',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    '    opsSpoolDir: /var/lib/x/state/oldreqs',
+  ]);
+  const config = loadOpsConfig(agreeing);
+  assert.equal(config.instances[0]?.opsSpoolDir, '/var/lib/x/state/oldreqs');
+  assert.equal(config.deprecations.length, 1);
+
+  // And with no explicit key at all, the legacy value is still adopted — that
+  // is the migration path, and it must keep working.
+  const migrated = loadOpsConfig(
+    writeConfig([
+      'stateDir: /var/lib/ops-state',
+      'spoolDir: /var/lib/x/state/oldreqs',
+      ...MINIMAL_INSTANCE('/var/lib/x'),
+    ]),
+  );
+  assert.equal(migrated.instances[0]?.opsSpoolDir, '/var/lib/x/state/oldreqs');
 });
 
 test('the check-in instructions point the instance at its OWN spool', async () => {
