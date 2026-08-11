@@ -355,21 +355,34 @@ boundary; a bind-mounted directory needs no such exception.
 
 ## 7. The ops executor
 
-The same idea as § 6b, generalised from "wake me" to a short list of privileged
-host operations, so the agents can maintain their own deployments without a
-person having to log in and restart a service.
+The same idea as § 6b, generalised from "wake me" to **anything** — the agents
+describe what needs doing in free text and a Claude Code session runs on the
+host and does it.
 
-`ops/README.md` is the full write-up — the verb list, the trust model, and why
-it is a separate daemon. The short version of the last one: `restart
-clawcius.service` is one of the operations, and a process cannot restart itself
-without dying mid-operation. The executor has to outlive the things it
-restarts, so it is its own unit with no Discord connection, no credential and
-no model.
+That is a change of kind, not of degree, and it happened on 2026-08-10 after an
+evening in which standing up three services took a dozen ad-hoc shell commands
+the operator had to type himself. **For this component the sandbox has stopped
+being a security boundary.** What replaces it is a snapshot before every task, an
+automatic rollback after a failed one, a complete audit of every command, and
+the fact that this is a personal VPS with snapshots. The operator accepted that
+trade explicitly, twice.
 
-**It ships in dry-run.** `dryRun: true` in `ops/ops-config.yaml` makes it take
-every decision and log the exact argv it would have run, without running any of
-it. Leave it on until a week of `journalctl -u clawcius-ops` holds no
-surprises. This is a root process with docker and systemctl.
+`ops/README.md` is the full write-up and `ops/src/host-agent.ts` is where the
+reasoning lives. **Read at least the trust model before turning `dryRun` off.**
+
+The executor is still its own unit, and the reason is unchanged: `restart
+clawcius.service` is one of the things a task will ask for, and a process cannot
+restart itself without dying mid-operation. It has to outlive the things it
+restarts. It still has no Discord connection and no GitHub token — the session
+reports its result back through the spool and the sandboxed agent does the
+talking, so that a process with a shell cannot speak as the bot.
+
+**It ships in dry-run, and dry-run is real.** `dryRun: true` in
+`ops/ops-config.yaml` makes the executor take every decision and log the exact
+argv it would have run, and it removes the Bash tool from the host agent session
+entirely — verified against the real CLI, not assumed. The session investigates
+with read-only tools and writes out the list of commands it would have run.
+Leave it on until a week of `journalctl -u clawcius-ops` holds no surprises.
 
 ### `pull` builds, and the build is not run as root
 
@@ -457,13 +470,17 @@ the second one is the case that was broken, and it is the one worth proving.
 for c in clawcius hamachi; do
   docker exec "$c-agent" sh -c "
     OPS=/var/lib/$c/run/ops; S=\$(date +%s)
-    printf '%s' '{\"verb\":\"restart\",\"unit\":\"clawcius.service\",\"reason\":\"smoke test\"}' \
+    printf '%s' '{\"verb\":\"task\",\"instance\":\"$c\",\"task\":\"report the output of systemctl is-active clawcius.service and change nothing\",\"reason\":\"smoke test\"}' \
       > \$OPS/\$S.tmp && mv \$OPS/\$S.tmp \$OPS/\$S.json"
 done
-journalctl -u clawcius-ops -n 20
-# [ops] request: restart clawcius.service (from clawcius) — filed by clawcius as …
-# [ops] request: restart clawcius.service (from hamachi)  — filed by hamachi as …
+journalctl -u clawcius-ops -n 40
+# [ops] request: task clawcius: report the output of systemctl… (from clawcius) — …
+# [ops] request: task hamachi: report the output of systemctl…  (from hamachi)  — …
 ```
+
+In dry-run the session has no Bash tool, so the smoke test proves the whole
+pipeline — spool, provenance, lock, snapshot decision, session, audit, report —
+without anything running. Read what it says it would have done.
 
 The `(from …)` is the point of the change: with one shared spool those two
 lines were identical, and the executor had no way to tell which agent had
@@ -471,7 +488,7 @@ asked.
 
 ### The status file each waker publishes
 
-`redeploy` and `rollback` recreate a container, and every live agent session is
+A task may recreate a container, and every live agent session is
 a `docker exec` into it — doing that mid-turn kills someone's conversation. The
 executor learns whether that would happen from a small JSON file each waker
 writes:
@@ -499,8 +516,24 @@ cat /var/lib/clawcius/waker-status.json
 
 ### Going live
 
-Set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Set the
-two `wakeChannelId` values first — they are placeholder zeros in the shipped
+Before you do: install the sudoers file and **check it parses**, from a second
+shell that already has root, because a syntax error in `/etc/sudoers.d` breaks
+sudo for everybody:
+
+```sh
+sudo install -m 0440 -o root -g root ops/clawcius-sudoers /etc/sudoers.d/clawcius
+sudo visudo -c -f /etc/sudoers.d/clawcius
+sudo -u npurcell sudo -n journalctl -u clawcius --no-pager -n 1   # should work
+sudo -u npurcell sudo -n sh -c id                                 # should NOT
+```
+
+`ops/README.md` § Sudoers says what each grant is for and what is deliberately
+absent. Note that it does **not** grant docker: npurcell reaches docker through
+group membership, which is root-equivalent, so the sudoers scoping is about
+keeping the easy path the audited one rather than about containment.
+
+Then set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Set
+the two `wakeChannelId` values first — they are placeholder zeros in the shipped
 config, and they are where the "you were rebuilt, verify and check in" wake is
 delivered. Without a real channel the agent never hears that it is on a
 deadline, and fifteen minutes later it gets rolled back for not answering a
@@ -512,19 +545,21 @@ sudo systemctl restart clawcius-ops
 
 ### When it freezes
 
-After two consecutive missed check-ins the executor stops accepting destructive
-verbs and says so, loudly, in the journal. That is deliberate: something is
-wrong that redeploying cannot fix, and continuing would mean reinstalling the
-outage every fifteen minutes.
+After two consecutive failed recoveries — a missed check-in, or a task that had
+to be rolled back — the executor stops accepting tasks and rollbacks and says
+so, loudly, in the journal. `checkin` and `wake` still work, so an instance that
+is alive can still say so. That is deliberate: something is wrong that another
+task cannot fix, and continuing would mean reinstalling the outage every fifteen
+minutes.
 
 ```sh
 sudo ops/unfreeze.sh                    # prints why, asks, then clears
 sudo systemctl restart clawcius-ops
 ```
 
-The quarantine list is not cleared by that, and there is no verb for any of it.
-An agent that can unfreeze the breaker holding back its own broken build is
-back where we started.
+The quarantine list is not cleared by that. There is no verb for it either —
+though a task could obviously run `unfreeze.sh` itself, which is one more thing
+the audit log is for, and one more reason to read it.
 
 ### The units, after the audit
 
@@ -611,12 +646,37 @@ unit. Full detail, including the security model, is in
   come up. The timer is written and its logic is covered by the ops self-test
   against stand-in binaries, but it has not yet run against real images here —
   so the gap stays open until the first green run at 05:30.
-- **The ops executor has never executed anything.** Everything up to the
-  `execFile` is tested (see `ops/README.md` § *What has and has not been
-  tested*), and everything past it is not: no `systemctl restart` performed, no
-  container recreated, no snapshot committed or restored, no post-rebuild wake
-  picked up by a live waker. It ships with `dryRun: true` for exactly this
-  reason.
+- **The ops executor has never executed anything, and has never started a host
+  agent session.** Everything up to the spawn is tested against stand-ins (see
+  `ops/README.md` § *What has and has not been tested*), and everything past it
+  is not: no `claude` session started by the daemon, no `systemctl restart`
+  performed, no container recreated, no snapshot committed or restored, no
+  post-task wake picked up by a live waker. It ships with `dryRun: true` for
+  exactly this reason, and in that mode the session has no Bash tool at all.
+- **The sandbox is no longer a security boundary for `clawcius-ops`.** Since
+  2026-08-10 it starts a Claude Code session on the host with a shell and
+  passwordless sudo. The controls that replace the old verb allowlist are a
+  pre-task snapshot, an automatic rollback, and a complete audit log. This is a
+  deliberate, documented trade and not an oversight; `ops/README.md` § *The
+  trust model* is the honest version.
+- **That session no longer runs as `npurcell` — and the migration to make that
+  true has never been run.** Until 2026-08-11 it ran as the checkout's owner,
+  which is `npurcell`, which is in the `docker` group, which the line above
+  calls *"effectively root on the host"* — so the sudoers scoping was not a
+  boundary and the audit was not tamper-proof. It now runs as an unprivileged
+  system account (`clawcius-ops`) that the daemon refuses to start without, and
+  **that account does not exist on this host yet**. Until
+  [`MIGRATION.md`](MIGRATION.md) is executed, every ops task is refused with the
+  reason and the fix; the daemon still boots and still honours its rollback
+  deadlines.
+- **`ops/clawcius-sudoers` has never been parsed by `visudo -c`.** It was
+  written on a machine without sudo, and it was rewritten (larger, and against
+  a different user) on 2026-08-11. Check it before installing, from a second
+  shell that already holds root — `MIGRATION.md` § 3 has the sequence.
+- **The host agent's rollback covers containers only.** `docker commit` captures
+  an agent container's writable layer; it does not capture `/etc`, the checkout
+  or unit files. A task that breaks the host filesystem is undone by the VPS
+  snapshot and by git, by a person.
 - **The `wakeChannelId` values in `ops/ops-config.yaml` are placeholder
   zeros.** Until they are real channels the post-rebuild wake goes nowhere, and
   an instance would be rolled back for failing to answer a question it never

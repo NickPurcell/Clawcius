@@ -1,63 +1,124 @@
 /**
- * The executor: one operation at a time, from a fixed verb list, with a
- * deadline on anything that could take an agent off the air.
+ * The executor: one task at a time, snapshotted before, audited throughout,
+ * rolled back if it goes wrong.
  *
- * ── Why this is a separate daemon ────────────────────────────────────────
+ * ── What this file used to be, and why it is not that any more ───────────
  *
- * `restart clawcius.service` is one of the operations. A process cannot
- * restart itself: systemd sends it SIGTERM, it dies, and whatever it was in
- * the middle of dies with it — including the record of what it was doing and
- * the deadline it had just armed. Folding this into the waker would mean the
- * single most useful operation is the one operation that cannot be performed
- * reliably.
+ * Until 2026-08-10 this was a dispatcher over a closed list of seven verbs,
+ * each with its own argument allowlist, and the paragraph below this one said
+ * — in bold, twice — that there must never be a model in this service. The
+ * argument was: this process runs as root with docker and systemctl, its input
+ * comes from containers that read text strangers wrote, and its entire safety
+ * case is that the set of things it can do is finite and readable in one
+ * sitting.
  *
- * The same argument applies with more force to `redeploy`: the waker's agent
- * sessions ARE `docker exec`s into the container being recreated, so a waker
- * running its own redeploy would be tearing down the processes it is made of.
- * The executor has to outlive the things it restarts, so it is a unit of its
- * own, with no Discord connection, no Anthropic credential and no model.
+ * That argument was and is correct. It has been overruled, deliberately, by the
+ * operator, who was warned twice and accepted the trade in writing. What
+ * happened is in ops/src/host-agent.ts at length; the short version is that
+ * standing up three services on the evening of 2026-08-10 took a dozen ad-hoc
+ * shell commands the operator had to type himself — chown, mkdir, editing a
+ * config, installing units, and above all pasting `journalctl` output back to
+ * an agent that could not read it — and not one of them was a verb. A closed
+ * set can only hold what somebody imagined in advance, and every gap in it
+ * turns the operator into the agent's hands, which is the exact labour this
+ * system exists to remove.
  *
- * ── No model. Ever. ──────────────────────────────────────────────────────
+ * ── What this file is now: a supervisor, not a rulebook ──────────────────
  *
- * There is no LLM in this file and there must never be one. This process runs
- * as root with docker and systemctl. Its entire safety argument is that the
- * set of things it can do is finite, enumerated, and readable in one sitting.
- * A model here would mean the set of things it can do is "whatever the model
- * was talked into", and the party doing the talking is on the other side of
- * the sandbox boundary this is supposed to defend.
+ * Everything here that was ever about *transport* and *safety* is unchanged,
+ * because none of it was ever about the verbs:
+ *
+ *   - one spool per instance, and provenance that comes from the directory a
+ *     file was found in rather than from anything the file says;
+ *   - the lock: one operation at a time, a bounded queue, refusals with reasons;
+ *   - the durable journal, fsynced before each step proceeds;
+ *   - the circuit breaker: quarantine after a rollback, freeze after repeated
+ *     failed recoveries, all of it persisted;
+ *   - dry-run;
+ *   - the idle wait before anything that could kill a live turn;
+ *   - the check-in deadline and the automatic rollback on silence.
+ *
+ * What was deleted is the fixed-verb dispatch and its argument allowlists. What
+ * was added is four things, and they are what stands where the verb list stood:
+ *
+ *   **A snapshot before every task.** `redeploy` used to take one; now every
+ *   task does, for every instance in scope. The safety property is no longer
+ *   "it can only do approved things", it is "whatever it does to a container
+ *   can be undone".
+ *
+ *   **A rollback after a failed one.** The agent reporting failure, or the
+ *   post-task health check finding a unit or a container that was up before and
+ *   is not up now, restores the pre-task snapshot without being asked.
+ *
+ *   **A complete audit.** Every Bash command the session issues is written into
+ *   journal.jsonl, in full, as it is issued and before its result is known.
+ *   That log is the accountability mechanism now. A command that runs and is
+ *   not logged is the failure mode that matters, which is why an unparseable
+ *   line in the agent's output stream FAILS THE TASK rather than being skipped.
+ *
+ *   **A dry-run that cannot act.** Not "asked not to": the Bash tool, and every
+ *   other tool that can change the machine, is removed from the session by the
+ *   permission system. Verified against the real CLI; see host-agent.ts.
+ *
+ * ── What is honestly NOT protected against ───────────────────────────────
+ *
+ * The rollback is container-scoped. `docker commit` captures an agent
+ * container's writable layer; it does not capture /etc, the checkout, or
+ * anything else on the host. A task that breaks the host filesystem is undone
+ * by the VPS snapshot and by git, by a person. That is the deal, it is written
+ * down in ops/README.md, and it should not be discovered here.
  *
  * ── The lock ─────────────────────────────────────────────────────────────
  *
- * One operation at a time. Not a semaphore, not a per-instance lock, not a
- * "these two are independent so they can overlap" optimisation. A rollback of
- * one instance and a redeploy of another both run docker and both take
- * minutes, and reasoning about which pairs are safe to interleave is exactly
- * the sort of reasoning that is right until the day it is not. A second
- * request queues; past `limits.maxQueued` it is refused with a stated reason,
- * because a refusal the agent can read beats a request that silently
- * evaporates.
+ * One operation at a time. Not a semaphore, not per-instance, not "these two
+ * are independent so they can overlap". Two host agent sessions with sudo,
+ * running concurrently on the same box, is not a scenario anybody should have
+ * to reason about — and it is far worse than the two overlapping docker
+ * operations this lock was originally written to prevent. A second request
+ * queues; past `limits.maxQueued` it is refused with a stated reason, because a
+ * refusal the agent can read beats a request that silently evaporates.
  */
 
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { InstanceEntry, OpsConfig, RepoEntry, UnitEntry } from './config.js';
-import { Journal, type OpsStatusSnapshot } from './journal.js';
+import type { InstanceEntry, OpsConfig, RepoEntry } from './config.js';
+import { Journal, type OpsStatusSnapshot, type TaskSummary } from './journal.js';
 import { StateStore, type PendingCheckin } from './state.js';
 import { readIdle } from './idle.js';
 import { Runner, render, summarise, type CommandResult } from './runner.js';
 import { describeRequest, isDestructive, parseRequest, type OpsRequest } from './request.js';
-import { dirtyRefusal, readDirty, runBuild } from './build.js';
-import type { RawRequest } from './spool.js';
+import { readDirty } from './build.js';
+import {
+  identityOptionsFor,
+  runHostAgent,
+  type AuditEvent,
+  type HostAgentOutcome,
+} from './host-agent.js';
+import {
+  agentProblems,
+  agentWarnings,
+  describeAgentUser,
+  resolveAgentUser,
+  type AgentUser,
+  type AgentUserResult,
+} from './agent-user.js';
+import { ensureDirOwnedBy, type RawRequest } from './spool.js';
 
 /**
- * The executor's own unit, which it refuses to restart.
+ * The executor's own unit.
  *
- * Putting it in the config allowlist would be a mistake anyone could make; the
- * failure is that `systemctl restart clawcius-ops` kills the process mid-verb,
- * systemd brings it back with an empty queue, and the operation is simply
- * gone — no failure, no journal entry saying it did not finish, just a request
- * that was accepted and never happened. Refused by name rather than trusted to
- * config, and the operator is told to use systemctl by hand.
+ * There is no longer a `restart` verb to refuse, and this daemon can no longer
+ * stop the host agent restarting it — the session has a shell, and `sudo
+ * systemctl restart clawcius-ops` is one line. So this constant has changed
+ * job: it is named in the host agent's standing prompt as the one unit it must
+ * not touch, and it is excluded from the health sample (a process that is
+ * running does not need to ask whether it is running).
+ *
+ * The failure it is warning about is unchanged and is worth restating, because
+ * it is now prevented by an instruction rather than by a check: restarting this
+ * unit kills the task mid-flight, systemd brings the daemon back with an empty
+ * queue, and the operation is simply gone — no failure, no journal entry saying
+ * it did not finish. The audit would end mid-sentence and nothing would say why.
  */
 const SELF_UNIT = 'clawcius-ops.service';
 
@@ -74,6 +135,23 @@ const SELF_REQUESTER = '(executor)';
 
 /** Snapshot tags, exactly as `docker/snapshot.sh` writes them. */
 const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
+
+/**
+ * How long a RECOVERY waits for an idle turn before going ahead regardless.
+ *
+ * Not `idle.maxWaitMinutes`, and deliberately not configurable. That setting
+ * answers "how long may a requested operation hold the lock being polite",
+ * whose right answer is minutes-to-half-an-hour. This answers a different
+ * question — "how long do we leave an instance on a build that took it down,
+ * on the chance that it is only busy" — and the right answer to that is short
+ * whatever the other one is set to. A minute is long enough for an agent that
+ * is alive and mid-turn to finish something small, and short enough that an
+ * incident is not still waiting on politeness when somebody looks.
+ *
+ * Capped by `idle.maxWaitMinutes` at the call site, so an operator who wrote 0
+ * ("never wait") still gets 0.
+ */
+const RECOVERY_IDLE_WAIT_MINUTES = 1;
 
 /**
  * One unit of work: a validated request, and who filed it.
@@ -136,6 +214,10 @@ export class Executor {
   #accepted: number[] = [];
   #deadlineTimers = new Map<string, NodeJS.Timeout>();
   #lastVerify: { at: number; ok: boolean; detail: string } | null = null;
+  /** The last task, for the status page. The journal holds every one of them. */
+  #lastTask: TaskSummary | null = null;
+  /** Bash invocations audited since boot. A counter the status page can show. */
+  #auditedCommands = 0;
   #stopped = false;
 
   constructor(config: OpsConfig) {
@@ -184,6 +266,31 @@ export class Executor {
       })),
       consecutiveFailedRecoveries: state.consecutiveFailedRecoveries,
       lastVerify: this.#lastVerify,
+      // Everything below is new on 2026-08-10 and is ADDITIVE. The contract
+      // with status/ is that the executor writes <stateDir>/ops-status.json
+      // atomically and the page reads it off disk — no socket, no API, no
+      // shared library — so a reader that predates these fields keeps working
+      // and a reader that wants them does not have to be told where to look.
+      // The audit itself needs no new plumbing at all: audit entries are
+      // journal entries, so they already appear in `events`, with the full
+      // command string in the `command` field the page already knows about.
+      hostAgent: {
+        enabled: this.#config.hostAgent.enabled,
+        claudePath: this.#config.hostAgent.claudePath,
+        timeoutMinutes: this.#config.hostAgent.timeoutMinutes,
+        maxCostUsd: this.#config.hostAgent.maxCostUsd,
+        // Added 2026-08-11 and additive, like everything else in this object.
+        // The status page's honest sentence about this daemon used to be "it
+        // runs a shell as npurcell"; it can now say which account, and — the
+        // part worth publishing — whether that account is currently in a state
+        // this daemon will run a session as. A page that says "host agent:
+        // enabled" while every task is being refused for a docker-group
+        // membership would be reassurance rather than status.
+        user: this.#config.hostAgent.user,
+        identity: this.#identityStatus(),
+      },
+      auditedCommands: this.#auditedCommands,
+      lastTask: this.#lastTask,
     };
   }
 
@@ -327,8 +434,9 @@ export class Executor {
     if (this.#state.state.frozen && isDestructive(request.verb)) {
       this.#reject(
         job,
-        `the executor is FROZEN: ${this.#state.state.frozenReason}. Destructive verbs are ` +
-          'refused until a human clears it with ops/unfreeze.sh. Nothing will be retried.',
+        `the executor is FROZEN: ${this.#state.state.frozenReason}. Tasks and rollbacks are ` +
+          'refused until a human clears it with ops/unfreeze.sh. Nothing will be retried. ' +
+          'checkin and wake still work, so an instance that is alive can still say so.',
       );
       return;
     }
@@ -396,12 +504,27 @@ export class Executor {
     if (request.instance && scope.instances && !scope.instances.includes(request.instance)) {
       return this.#scopeRefusal(job, 'instance', request.instance, scope.instances);
     }
-    if (request.unit && scope.units && !scope.units.includes(request.unit)) {
-      return this.#scopeRefusal(job, 'unit', request.unit, scope.units);
+
+    // A task with no named instance takes EVERY instance into scope — that is
+    // the fail-safe default described on #scopeOf. For an instance the operator
+    // has deliberately restricted to a subset, that default would quietly hand
+    // it the whole host, which is the one shape of request where "unnamed"
+    // means "wider than allowed" rather than "narrower and slower". So it is
+    // refused, with the fix in the message.
+    if (request.verb === 'task' && !request.instance && scope.instances) {
+      return (
+        `out of scope: "${job.requester}" is restricted to instance(s) ` +
+        `${scope.instances.join(', ') || '(none)'} and filed a task naming no instance. An ` +
+        'unnamed task takes every configured instance into scope — it is snapshotted, ' +
+        'idle-waited and rolled back across all of them — so for a restricted instance that ' +
+        'would be wider than what it is allowed, not narrower. Refile it with ' +
+        `"instance": "${scope.instances[0] ?? '<one you are allowed>'}". Nothing was run.`
+      );
     }
-    if (request.repo && scope.repos && !scope.repos.includes(request.repo)) {
-      return this.#scopeRefusal(job, 'repo', request.repo, scope.repos);
-    }
+
+    // mayRequest.units and mayRequest.repos are not checked, because no request
+    // carries a unit or a repo any more. They are reported as deprecated at
+    // boot rather than silently satisfied here; see config.ts.
     return null;
   }
 
@@ -474,27 +597,21 @@ export class Executor {
   // ── Dispatch ────────────────────────────────────────────────────────────
 
   /**
-   * The closed switch.
+   * Four cases, and the switch is still closed.
    *
-   * Note what is absent: a `default` that does something. The verb has already
-   * been checked against the frozen list in `parseRequest`, and TypeScript's
+   * `task` is the one that carries free text; the other three are plumbing that
+   * survived the cull because none of them is a capability the host agent would
+   * do better, and two of them must keep working when the host agent does not.
+   * The reasoning per verb is in request.ts next to VERBS.
+   *
+   * Note what is still absent: a `default` that does something. TypeScript's
    * exhaustiveness check on the union is the second layer — adding a verb to
-   * `VERBS` without handling it here is a compile error, not a runtime
-   * surprise.
+   * `VERBS` without handling it here is a compile error, not a runtime surprise.
    */
   async #dispatch(job: Job): Promise<void> {
     switch (job.request.verb) {
-      case 'restart':
-        await this.#doRestart(job);
-        return;
-      case 'pull':
-        await this.#doPull(job);
-        return;
-      case 'snapshot':
-        await this.#doSnapshot(job);
-        return;
-      case 'redeploy':
-        await this.#doRedeploy(job);
+      case 'task':
+        await this.#doTask(job);
         return;
       case 'rollback':
         // The origin comes off the job, never off which branch queued it.
@@ -519,14 +636,14 @@ export class Executor {
 
   // ── Allowlist resolution ────────────────────────────────────────────────
   //
-  // These three are the only places a string from the spool is compared with
-  // anything, and all three are exact equality against config. What comes back
-  // is the CONFIG ENTRY — every command downstream is built from that object,
-  // never from the request. The request selects; it never supplies.
-
-  #resolveUnit(name: string): UnitEntry | null {
-    return this.#config.units.find((unit) => unit.name === name) ?? null;
-  }
+  // What is left of it. `instance` is still compared by exact string equality
+  // against config, and what reaches a command is the CONFIG ENTRY — every
+  // docker argv downstream is built from that object, never from the request.
+  // The request selects; it never supplies.
+  //
+  // That rule is intact for `rollback` and for the snapshot/restore paths,
+  // which are the only places a request's string still reaches an argv. It
+  // does not and cannot apply to a task, which is prose.
 
   #resolveRepo(name: string): RepoEntry | null {
     return this.#config.repos.find((repo) => repo.name === name) ?? null;
@@ -536,320 +653,692 @@ export class Executor {
     return this.#config.instances.find((instance) => instance.name === name) ?? null;
   }
 
-  // ── restart ─────────────────────────────────────────────────────────────
-
-  async #doRestart(job: Job): Promise<void> {
-    const { request } = job;
-    if (request.unit === SELF_UNIT) {
-      this.#reject(
-        job,
-        `${SELF_UNIT} is this process. Restarting it from inside itself would kill the ` +
-          'operation mid-flight and lose the record of it. Do it by hand on the host.',
-      );
-      return;
-    }
-
-    const unit = this.#resolveUnit(request.unit);
-    if (!unit) {
-      this.#reject(
-        job,
-        `"${request.unit}" is not in the units allowlist. Allowed: ` +
-          `${this.#config.units.map((entry) => entry.name).join(', ') || '(none configured)'}`,
-      );
-      return;
-    }
-
-    const result = await this.#runner.run([
-      this.#config.systemctlPath,
-      'restart',
-      unit.name,
-    ]);
-    this.#finish(job, result, `restart ${unit.name} (${unit.description})`);
-  }
-
-  // ── pull ────────────────────────────────────────────────────────────────
-  //
-  // `pull` is "bring this checkout up to date and make it runnable", not
-  // "run git pull". The two came apart on 2026-08-09 and cost an hour; see
-  // #buildCheckout below and the header of ops/src/build.ts for the whole
-  // account. A verb that fetches source and stops, next to a `restart` verb, is
-  // an invitation to restart onto a stale dist/ — and unlike a human, an
-  // executor accepts that invitation every single time it is offered.
-
-  async #doPull(job: Job): Promise<void> {
-    const { request } = job;
-    const repo = this.#resolveRepo(request.repo);
-    if (!repo) {
-      this.#reject(
-        job,
-        `"${request.repo}" is not in the repos allowlist. Allowed: ` +
-          `${this.#config.repos.map((entry) => entry.name).join(', ') || '(none configured)'}`,
-      );
-      return;
-    }
-
-    // Two probes before touching anything, both read-only, both run even in
-    // dry-run — a dry run that cannot see the checkout would report a pull it
-    // has no reason to believe would succeed.
-    const branch = await this.#runner.probe(
-      [this.#config.gitPath, '-C', repo.path, 'rev-parse', '--abbrev-ref', 'HEAD'],
-      { timeoutSeconds: 30 },
-    );
-    if (!branch.ok) {
-      this.#fail(job, `cannot read HEAD in ${repo.path}: ${branch.stderr || summarise(branch)}`);
-      return;
-    }
-    const current = branch.stdout.trim();
-    if (current !== repo.branch) {
-      this.#fail(
-        job,
-        `${repo.path} is on "${current}", not the configured "${repo.branch}". Refusing to ` +
-          'pull: fast-forwarding a branch nobody expected to be checked out is how you ' +
-          'deploy something no one meant to deploy.',
-      );
-      return;
-    }
-
-    // The dirty check comes BEFORE the pull, not after git has refused it.
-    //
-    // Git would stop on its own — it did, on this host, on 2026-08-09, with
-    // "Your local changes to the following files would be overwritten by
-    // merge: docker/run-container.sh" — and it was right to. But relying on
-    // that means the refusal arrives as a non-zero exit and a wall of stderr,
-    // in the one situation where what the operator needs is a short list of
-    // filenames and an explicit statement that nothing was touched. Checking
-    // first also means the failure is identical whether the conflict is in a
-    // tracked file git would block on or an untracked one it would happily
-    // clobber.
-    if (!(await this.#requireCleanTree(job, repo))) return;
-
-    // `--ff-only`. A merge commit created unattended by a root daemon, in a
-    // checkout that is about to be deployed, is not something anyone wants to
-    // discover later. Diverged means a human looks at it.
-    const result = await this.#runner.run(
-      [this.#config.gitPath, '-C', repo.path, 'pull', '--ff-only'],
-      { timeoutSeconds: 300 },
-    );
-    this.#finish(job, result, `pull ${repo.name} (${repo.path}, ${repo.branch})`);
-    if (!result.ok) return;
-
-    // And then build it, because the source arriving on disk is not the thing
-    // any unit runs.
-    await this.#buildCheckout(job, repo);
-  }
-
-  // ── The dirty tree, and the build ───────────────────────────────────────
-
   /**
-   * Refuse the operation if anything in the checkout is uncommitted.
+   * The service account the host agent runs as, resolved fresh.
    *
-   * Returns false having already journalled the failure, so callers read as
-   * `if (!(await this.#requireCleanTree(...))) return;`.
-   *
-   * There is no counterpart to this that forces past it. No `force` field on a
-   * request, no `allowDirty` key in the config, no second code path. The
-   * closest this daemon comes to touching an uncommitted file is reading its
-   * name out of `git status --porcelain` and printing it.
+   * Public so `index.ts` can print it in the boot banner and so the self-test
+   * can assert on the refusals without starting a task. Deliberately NOT
+   * memoised: see #doTask for why a cached answer would miss the exact change
+   * this check exists to catch.
    */
-  async #requireCleanTree(job: Job, repo: RepoEntry): Promise<boolean> {
-    const dirty = await readDirty(this.#runner, this.#config, repo);
-    if (!dirty.ok) {
-      // Cannot tell. Treated as a refusal rather than as "probably clean",
-      // for the same reason a missing waker status file reads as busy: the
-      // unknown state and the dangerous state are the same state, and the only
-      // value worth being wrong about in the safe direction is this one.
-      this.#fail(job, `${dirty.reason}. Refusing to act on a checkout whose state is unknown.`);
-      return false;
-    }
-    if (dirty.files.length === 0) return true;
-
-    this.#fail(job, dirtyRefusal(repo, dirty.files));
-    return false;
+  resolveAgentIdentity(): AgentUserResult {
+    return this.#resolveAgent();
   }
 
-  /**
-   * `npm ci && npm run build`, as the user who owns the checkout.
-   *
-   * Returns false having already journalled the failure. Every caller must
-   * treat that as fatal to the operation — nothing gets restarted or recreated
-   * after a failed build, because the two states a failed build leaves behind
-   * are "stale" and "half-written" and starting on either is the failure this
-   * step was added to prevent.
-   *
-   * The dirty-tree check runs here too, not only in `pull`. A redeploy of a
-   * checkout with uncommitted edits builds something that HEAD does not
-   * describe, and HEAD is precisely what the circuit breaker records as "the
-   * build" — so a rollback would quarantine a commit that was never what ran.
-   * A breaker that blocks the wrong sha is worse than none, because it also
-   * blocks the fix.
-   */
-  async #buildCheckout(job: Job, repo: RepoEntry): Promise<boolean> {
-    if (!(await this.#requireCleanTree(job, repo))) return false;
+  /** One line about the agent account, for `ops-status.json`. Never a decision. */
+  #identityStatus(): { ok: boolean; detail: string } {
+    if (!this.#config.hostAgent.enabled) {
+      return { ok: false, detail: 'hostAgent.enabled is false; tasks are refused' };
+    }
+    const agent = this.#resolveAgent();
+    if (!agent.ok) return { ok: false, detail: agent.reason.split('\n')[0] ?? agent.reason };
+    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
+    if (problems.length > 0) {
+      return {
+        ok: false,
+        detail: `${describeAgentUser(agent.user)} — ${problems.length} refusal(s): ` +
+          `${problems.map((problem) => problem.split('\n')[0]).join(' | ')}`,
+      };
+    }
+    return { ok: true, detail: describeAgentUser(agent.user) };
+  }
 
-    const outcome = await runBuild(this.#runner, this.#config, repo);
-    this.#journal.write({
-      kind: outcome.ok ? 'build' : 'failed',
-      what: `build ${repo.name}`,
-      instance: job.request.instance || undefined,
-      requester: job.requester,
-      ok: outcome.ok,
-      dryRun: this.#config.dryRun,
-      detail: outcome.detail,
+  #resolveAgent(): AgentUserResult {
+    return resolveAgentUser(this.#config.hostAgent.user, {
+      passwdPath: this.#config.hostAgent.passwdPath,
+      groupPath: this.#config.hostAgent.groupPath,
     });
-    if (!outcome.ok) {
-      process.stderr.write(`[ops] BUILD FAILED for ${repo.name}. Nothing restarted.\n`);
-    }
-    return outcome.ok;
   }
 
-  // ── snapshot ────────────────────────────────────────────────────────────
+  // ── task ────────────────────────────────────────────────────────────────
 
-  async #doSnapshot(job: Job): Promise<void> {
-    const instance = this.#resolveInstance(job.request.instance);
-    if (!instance) {
+  /**
+   * Which instances a task is allowed to disturb, and therefore which ones get
+   * snapshotted, idle-waited, health-checked and rolled back.
+   *
+   * A named instance narrows it to that one. NO named instance means ALL of
+   * them, and that default is the expensive one on purpose. "Which containers
+   * might this sentence disturb" has no answer — the sentence is prose and the
+   * session has a shell — and the only safe reading of "no answer" is the same
+   * one `readIdle` uses for a missing waker status file: assume the dangerous
+   * case. Naming an instance is how an agent buys a cheap, fast task; the cost
+   * of not naming one is a couple of `docker commit`s and a wait for both
+   * agents to go idle.
+   */
+  #scopeOf(request: OpsRequest): InstanceEntry[] {
+    if (request.instance) {
+      const one = this.#resolveInstance(request.instance);
+      return one ? [one] : [];
+    }
+    return [...this.#config.instances];
+  }
+
+  /**
+   * Hand a task to a Claude Code session on the host and supervise it.
+   *
+   * The order of the steps is the design, and every one of them is here because
+   * of something that has actually gone wrong on this host:
+   *
+   *   1. refuse if disabled or if the owner cannot be determined — a session
+   *      run as root would leave root-owned files behind exactly the way the
+   *      2026-08-09 `npm ci` did, only now for anything it touches;
+   *   2. sample health BEFORE, so that "this was already broken" and "this task
+   *      broke it" are distinguishable afterwards. Without a baseline the check
+   *      would blame every task for every pre-existing failure and would be
+   *      turned off within a week;
+   *   3. snapshot every instance in scope, and record the tag to go back to.
+   *      Taken now rather than looked up later for the same reason `redeploy`
+   *      took one first: afterwards, the newest snapshot could easily be one
+   *      taken of the broken state;
+   *   4. wait for an idle turn on every instance in scope, because a task may
+   *      recreate a container and every live session is a `docker exec` into
+   *      one;
+   *   5. run the session, auditing every command as it is issued;
+   *   6. sample health AFTER, compare, and roll back if anything regressed or
+   *      the agent reported failure;
+   *   7. arm a check-in deadline for each instance the task actually touched —
+   *      which the audit can answer, because it holds every command.
+   */
+  async #doTask(job: Job): Promise<void> {
+    const { request } = job;
+
+    if (!this.#config.hostAgent.enabled) {
+      this.#reject(
+        job,
+        'hostAgent.enabled is false in ops-config.yaml, so tasks are refused. Deadlines, ' +
+          'check-ins and rollbacks still work — this is the setting to leave the host in ' +
+          'while somebody works out what the last task did, and it is strictly better than ' +
+          'stopping the unit, which would drop every armed deadline.',
+      );
+      return;
+    }
+
+    if (request.instance && !this.#resolveInstance(request.instance)) {
       this.#rejectUnknownInstance(job);
       return;
     }
 
-    const result = await this.#snapshotInstance(instance);
-    this.#finish(job, result, `snapshot ${instance.name}`);
+    // ── Who is this session, and is that account still contained? ────────
+    //
+    // Re-resolved from /etc/passwd and /etc/group here, for every task, rather
+    // than cached from boot. That is the whole reason the check lives at task
+    // time: the membership it exists to catch — `usermod -aG docker
+    // clawcius-ops`, typed to make something work — is added to a RUNNING host,
+    // and a boot-time check on a unit that stays up for weeks would not see it
+    // until the next restart. Costs two small file reads per task.
+    const agent = this.#resolveAgent();
+    if (!agent.ok) {
+      this.#fail(job, `${agent.reason}\n\nThe host agent was not started.`);
+      return;
+    }
+    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
+    if (problems.length > 0) {
+      this.#fail(
+        job,
+        `refusing to run a task as ${describeAgentUser(agent.user)}:\n\n` +
+          problems.map((problem) => `  * ${problem}`).join('\n\n') +
+          '\n\nSince 2026-08-11 the containment story for this service is that the session ' +
+          'runs as an unprivileged account of its own. The sudoers scoping, the root-owned ' +
+          'journal and the claim that it holds no credential are all downstream of that one ' +
+          'fact and none of them survive without it. Nothing was run; the executor is still ' +
+          'holding its deadlines and will still perform rollbacks and check-ins.',
+      );
+      return;
+    }
+    for (const warning of agentWarnings(agent.user, identityOptionsFor(this.#config))) {
+      this.#journal.write({
+        kind: 'request',
+        what: describeRequest(request),
+        requester: job.requester,
+        detail: `host agent identity warning: ${warning}`,
+      });
+    }
+
+    // Idempotent, and here as well as at boot on purpose. `execFile`/`spawn`
+    // report a missing cwd as ENOENT on the BINARY, which reads as "claude is
+    // not installed" and sends whoever is debugging it to the wrong place
+    // entirely. Costs a stat; saves an evening.
+    //
+    // Owned by the agent account rather than by the checkout's owner, which is
+    // the change of 2026-08-11: the session writes here and it is no longer the
+    // same user as the one that owns /home/npurcell/clawcius.
+    ensureDirOwnedBy(
+      this.#config.hostAgent.workDir,
+      { uid: agent.user.uid, gid: agent.user.gid },
+      (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
+      0o750,
+      `so the host agent (${agent.user.user}) can write its own working directory`,
+    );
+
+    const scope = this.#scopeOf(request);
+    const before = await this.#sampleHealth();
+
+    // ── Snapshot everything in scope, before anything happens ────────────
+    const rollbackTags = new Map<string, string>();
+    for (const instance of scope) {
+      const snapshot = await this.#snapshotInstance(instance);
+      if (!snapshot.ok) {
+        this.#fail(
+          job,
+          `could not snapshot ${instance.name} before starting the task: ` +
+            `${snapshot.stderr || summarise(snapshot)}. REFUSING to run it — a task with a ` +
+            'shell and no rollback target is not a deployment, it is a coin toss. Since ' +
+            '2026-08-10 the ability to undo is what replaced the verb allowlist, so this is ' +
+            'not a formality that can be skipped when it is inconvenient.',
+        );
+        return;
+      }
+      const tag = await this.#newestSnapshotTag(instance);
+      if (!tag && !this.#config.dryRun) {
+        this.#fail(
+          job,
+          `no snapshot images exist for ${this.#imageRepo(instance)} even after taking one. ` +
+            'Refusing to run a task with nothing to go back to.',
+        );
+        return;
+      }
+      if (tag) rollbackTags.set(instance.name, tag);
+    }
+
+    // ── Wait for an idle turn on everything in scope ─────────────────────
+    for (const instance of scope) {
+      if (!(await this.#waitForIdle(job, instance, describeRequest(request)))) return;
+    }
+
+    // ── Run it ───────────────────────────────────────────────────────────
+    const commands: string[] = [];
+    const startedAt = Date.now();
+    let outcome: HostAgentOutcome;
+    try {
+      outcome = await runHostAgent({
+        config: this.#config,
+        agent: agent.user,
+        task: request.task,
+        requester: job.requester,
+        briefing: await this.#briefing(scope, agent.user),
+        onAudit: (event) => {
+          if (event.kind === 'bash') commands.push(event.command);
+          this.#audit(job, event);
+        },
+        onLog: (line) => process.stdout.write(`[ops] ${line}\n`),
+      });
+    } catch (error) {
+      // Includes the credential assertion in host-agent.ts, which throws rather
+      // than warning. Nothing was started, so nothing needs rolling back — but
+      // the snapshots were taken and are kept, because a snapshot nobody needed
+      // costs disk and a snapshot somebody needed and did not have costs an
+      // instance.
+      this.#fail(job, `the host agent was not started: ${String(error)}`);
+      return;
+    }
+
+    this.#lastTask = {
+      at: startedAt,
+      requester: job.requester,
+      instance: request.instance || '(all)',
+      what: describeRequest(request),
+      commands: outcome.commands.length,
+      turns: outcome.turns,
+      costUsd: outcome.costUsd,
+      ok: outcome.ok,
+      dryRun: outcome.dryRun,
+      sessionId: outcome.sessionId,
+    };
+
+    // ── Was the audit complete? ──────────────────────────────────────────
+    //
+    // Checked before the outcome is believed, and it FAILS the task. Every
+    // command the session ran arrived through the stream that produced this
+    // count, so a line that could not be parsed is a command that may have run
+    // without being recorded. Since 2026-08-10 the audit is what stands where
+    // the verb allowlist stood; an audit with an admitted hole in it is not a
+    // smaller version of the same thing, it is the absence of the only control
+    // there is.
+    const auditBroken = outcome.unparsedLines > 0;
+
+    // The agent is told to say "failed" plainly and first when it fails. This
+    // is a heuristic over model prose and it is deliberately in plain sight
+    // rather than buried: it only ever moves the verdict towards failure, and
+    // the cost of a false positive is an unnecessary rollback to a snapshot
+    // taken sixty seconds earlier.
+    const saidFailed = /\bfailed\b/i.test(outcome.resultText.slice(0, 400));
+
+    const after = await this.#sampleHealth();
+    const regressions = compareHealth(before, after);
+
+    const ok = outcome.ok && !auditBroken && !saidFailed && regressions.length === 0;
+
+    this.#journal.write({
+      kind: ok ? 'finished' : 'failed',
+      what: describeRequest(request),
+      instance: request.instance || undefined,
+      requester: job.requester,
+      ok,
+      dryRun: outcome.dryRun,
+      detail:
+        `host agent session ${outcome.sessionId}: ${outcome.reason} — ${outcome.detail} ` +
+        `${outcome.commands.length} command(s), ${outcome.turns} turn(s), ` +
+        `$${outcome.costUsd.toFixed(4)}, ${(outcome.durationMs / 1000).toFixed(1)}s` +
+        (outcome.denials ? `, ${outcome.denials} call(s) refused by the permission system` : '') +
+        (auditBroken
+          ? `\nAUDIT INCOMPLETE: ${outcome.unparsedLines} unparseable line(s) in the output ` +
+            'stream. The task is failed for this on its own. A command that runs and is not ' +
+            'logged is the one failure this design cannot tolerate.'
+          : '') +
+        (saidFailed && outcome.ok
+          ? '\nThe agent exited cleanly but its report says "failed", which is taken at its ' +
+            'word.'
+          : '') +
+        (regressions.length
+          ? `\nHEALTH REGRESSED: ${regressions.join('; ')}`
+          : '') +
+        `\nreport: ${outcome.resultText.slice(0, 4000) || '(none)'}`,
+    });
+
+    // ── Roll back, if it went wrong ──────────────────────────────────────
+    let rolledBack: string[] = [];
+    if (!ok && !outcome.dryRun) {
+      rolledBack = await this.#restoreAll(job, scope, rollbackTags);
+    }
+
+    this.#reportBack(job, request, outcome, regressions, rolledBack, ok);
+
+    if (!ok) {
+      // Only a rollback that actually happened counts towards the breaker. A
+      // task that failed harmlessly — a typo, a refusal, an agent that decided
+      // the request was unsafe — must not push the executor towards a freeze,
+      // or two bad sentences in a row would take the whole mechanism offline.
+      if (rolledBack.length > 0) {
+        this.#noteRecoveryFailure(`a task was rolled back: ${describeRequest(request)}`);
+      }
+      return;
+    }
+
+    if (outcome.dryRun) return;
+
+    // ── Arm a deadline for whatever it actually touched ──────────────────
+    for (const instance of this.#touched(scope, request, outcome.commands)) {
+      this.#armDeadline(instance, {
+        build: await this.#buildId(instance),
+        rollbackTag: rollbackTags.get(instance.name) ?? '',
+        reason:
+          request.reason ||
+          `a task filed by ${job.requester} touched ${instance.name}: ` +
+            describeRequest(request),
+        requester: job.requester,
+        skipped: false,
+      });
+    }
   }
+
+  /**
+   * Which instances did the task actually touch?
+   *
+   * Answered from the audit, which is the point of having one. A named instance
+   * always counts. Beyond that, any instance whose container name, image or
+   * script appears in any command the session ran is treated as touched, and
+   * therefore owes a check-in.
+   *
+   * This is a substring match over shell text, which is to say it is
+   * over-broad: `echo "not touching hamachi-agent"` counts. That is the right
+   * direction to be wrong in. A false positive costs one wake and one check-in;
+   * a false negative is an instance that was recreated with nobody waiting to
+   * hear whether it came back, which is the failure the deadline exists for.
+   */
+  #touched(scope: InstanceEntry[], request: OpsRequest, commands: string[]): InstanceEntry[] {
+    const haystack = commands.join('\n');
+    return scope.filter((instance) => {
+      if (request.instance === instance.name) return true;
+      return (
+        haystack.includes(instance.container) ||
+        haystack.includes(instance.image) ||
+        haystack.includes(this.#config.runContainerScript) ||
+        haystack.includes(this.#config.snapshotScript)
+      );
+    });
+  }
+
+  /** One audit line into the durable record, before the command's result is known. */
+  #audit(job: Job, event: AuditEvent): void {
+    this.#auditedCommands += event.kind === 'bash' ? 1 : 0;
+    this.#journal.write({
+      kind: 'audit',
+      what: event.kind === 'bash' ? 'bash' : `${event.kind} ${event.tool}`,
+      instance: job.request.instance || undefined,
+      requester: job.requester,
+      dryRun: this.#config.dryRun,
+      // The FULL command string, in the field the status page already renders
+      // as a command. Not summarised, not shell-quoted, not re-parsed — this is
+      // a record of what was issued, and anything that "tidied" it would be
+      // lying about the bytes.
+      ...(event.command ? { command: event.command } : {}),
+      detail: event.detail,
+    });
+  }
+
+  // ── Health, before and after ────────────────────────────────────────────
+
+  /**
+   * What is up right now: every configured unit, every configured container.
+   *
+   * Read-only, so it runs through `probe` and executes even in dry-run — for
+   * the same reason every other probe does. A dry run that cannot see the
+   * machine reports fiction rather than a prediction.
+   *
+   * This is a deliberately small check. It does not know whether a service is
+   * doing anything useful, only whether systemd and docker still think it is
+   * alive. That is enough to catch the class of failure that matters here: a
+   * task that edits a unit file and restarts it into a crash loop, or removes a
+   * container and does not bring it back.
+   */
+  async #sampleHealth(): Promise<HealthSample> {
+    const units: Record<string, string> = {};
+    for (const unit of this.#config.units) {
+      if (unit.name === SELF_UNIT) continue;
+      const result = await this.#runner.probe(
+        [this.#config.systemctlPath, 'is-active', unit.name],
+        { timeoutSeconds: 30 },
+      );
+      // `is-active` exits non-zero for anything that is not active and prints
+      // the state either way, so stdout is the answer and the exit code is not.
+      units[unit.name] = result.stdout.trim() || (result.ok ? 'active' : 'unknown');
+    }
+
+    const containers: Record<string, string> = {};
+    for (const instance of this.#config.instances) {
+      const result = await this.#runner.probe(
+        [this.#config.dockerPath, 'container', 'inspect', '-f', '{{.State.Status}}', instance.container],
+        { timeoutSeconds: 30 },
+      );
+      containers[instance.container] = result.stdout.trim() || 'absent';
+    }
+
+    return { units, containers };
+  }
+
+  // ── The briefing ────────────────────────────────────────────────────────
+
+  /**
+   * What the executor tells the session about the host.
+   *
+   * ┌──────────────────────────────────────────────────────────────────────┐
+   * │ EVERYTHING IN HERE IS GATHERED BY THIS PROCESS. NOTHING IS INGESTED. │
+   * │                                                                      │
+   * │ These are facts read off the machine with read-only commands — unit  │
+   * │ states, container states, HEAD, the list of uncommitted filenames.    │
+   * │ There is no file content here, no diff, no PR body, no web page and   │
+   * │ no other agent's output, and adding one would quietly convert this    │
+   * │ session from "holds everything, reads nothing hostile" into a         │
+   * │ prompt-injectable root shell. See host-agent.ts.                      │
+   * └──────────────────────────────────────────────────────────────────────┘
+   *
+   * The dirty-file list is the one that earns its place twice: the standing
+   * prompt forbids forcing past a dirty tree, and a prohibition that arrives
+   * with the actual filenames attached is one the session can act on instead of
+   * discovering the hard way.
+   */
+  async #briefing(scope: InstanceEntry[], agent: AgentUser): Promise<string> {
+    const lines: string[] = [];
+
+    // Who the session is, stated rather than left to be discovered with `id`.
+    // Not decoration: a session that believes it is the operator will try
+    // things that get refused and then try to work around the refusal, and the
+    // fastest way to stop that is to tell it what account it holds and where
+    // the list of its grants is written down.
+    lines.push(
+      `You are running as ${describeAgentUser(agent)}. Your sudo grants are enumerated in ` +
+        `${this.#config.repos[0]?.path ?? '<checkout>'}/ops/clawcius-sudoers — read it before ` +
+        'assuming something is broken.',
+    );
+    lines.push('');
+
+    lines.push('Instances (name, container, state directory, waker status file):');
+    for (const instance of this.#config.instances) {
+      lines.push(
+        `  - ${instance.name}: container ${instance.container}, image ${instance.image}, ` +
+          `state ${instance.stateDir}, ops spool ${instance.opsSpoolDir}`,
+      );
+    }
+    lines.push(
+      `In scope for this task (snapshotted before it started, health-checked after, and ` +
+        `rolled back if it fails): ${scope.map((i) => i.name).join(', ') || '(none)'}.`,
+    );
+    lines.push('');
+
+    const health = await this.#sampleHealth();
+    lines.push('Units, as of right now:');
+    for (const [name, state] of Object.entries(health.units)) lines.push(`  - ${name}: ${state}`);
+    lines.push('Containers, as of right now:');
+    for (const [name, state] of Object.entries(health.containers)) lines.push(`  - ${name}: ${state}`);
+    lines.push('');
+
+    for (const repo of this.#config.repos) {
+      lines.push(`Checkout "${repo.name}" at ${repo.path} (expected branch ${repo.branch}):`);
+      const branch = await this.#runner.probe(
+        [this.#config.gitPath, '-C', repo.path, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        { timeoutSeconds: 30 },
+      );
+      const head = await this.#runner.probe(
+        [this.#config.gitPath, '-C', repo.path, 'rev-parse', 'HEAD'],
+        { timeoutSeconds: 30 },
+      );
+      lines.push(`  - HEAD: ${head.stdout.trim() || '(unknown)'} on ${branch.stdout.trim() || '(unknown)'}`);
+      const dirty = await readDirty(this.#runner, this.#config, repo);
+      if (!dirty.ok) {
+        lines.push(`  - git status could not be read: ${dirty.reason}. Treat the tree as dirty.`);
+      } else if (dirty.files.length === 0) {
+        lines.push('  - working tree is clean');
+      } else {
+        lines.push(
+          `  - ${dirty.files.length} UNCOMMITTED change(s). Do not reset, checkout -f, stash ` +
+            'or clean them; on 2026-08-09 files in exactly this state turned out to be real ' +
+            'fixes made by hand during an incident:',
+        );
+        for (const file of dirty.files.slice(0, 40)) lines.push(`      ${file}`);
+        if (dirty.files.length > 40) lines.push(`      …and ${dirty.files.length - 40} more`);
+      }
+      if (repo.buildDirs.length > 0) {
+        lines.push(
+          `  - if you pull this, build it: npm ci && npm run build in ` +
+            `${repo.buildDirs.map((dir) => join(repo.path, dir)).join(', ')} — nothing here ` +
+            'compiles on start.',
+        );
+      }
+    }
+
+    lines.push('');
+    lines.push(`Executor state directory (do not write here): ${this.#config.stateDir}`);
+    lines.push(`Your working directory: ${this.#config.hostAgent.workDir}`);
+    lines.push(
+      'Snapshot script: ' +
+        `${this.#config.snapshotScript}; container script: ${this.#config.runContainerScript}.`,
+    );
+
+    return lines.join('\n');
+  }
+
+  // ── Snapshots and restores ──────────────────────────────────────────────
 
   /**
    * Commit the instance's writable layer to an image.
    *
-   * Not destructive: `docker commit` on a running container does not stop it.
-   * This is what makes it usable as the "capture the current good state"
-   * step in front of a redeploy.
+   * Not destructive: `docker commit` on a running container does not stop it,
+   * which is what makes it usable as the "capture the current good state" step
+   * in front of everything.
+   *
+   * `KEEP` is passed explicitly. `docker/snapshot.sh` defaults to 8, which was
+   * sized for one snapshot a night before a redeploy. Since 2026-08-10 one is
+   * taken before EVERY task, and at 8 a busy evening would evict the previous
+   * night's backup by morning — the retention ring is shared between this and
+   * the nightly timer, and whoever runs last prunes to their own ceiling.
    */
   async #snapshotInstance(instance: InstanceEntry): Promise<CommandResult> {
     return this.#runner.run([this.#config.snapshotScript], {
       env: {
         CLAWCIUS_CONTAINER: instance.container,
         CLAWCIUS_SNAPSHOT_REPO: this.#imageRepo(instance),
+        KEEP: String(this.#config.snapshotKeep),
       },
       timeoutSeconds: 900,
     });
   }
 
-  // ── redeploy ────────────────────────────────────────────────────────────
-
-  async #doRedeploy(job: Job): Promise<void> {
-    const { request } = job;
-    const instance = this.#resolveInstance(request.instance);
-    if (!instance) {
-      this.#rejectUnknownInstance(job);
-      return;
-    }
-
-    // ── Circuit breaker, before anything else ────────────────────────────
-    const build = await this.#buildId(instance);
-    const quarantined = build ? this.#state.isQuarantined(instance.name, build) : null;
-    if (quarantined) {
+  /**
+   * Put every in-scope instance back to the snapshot taken before the task.
+   *
+   * Returns the names actually restored. Deliberately does NOT wait for an idle
+   * turn: the idle wait already happened before the task, and a container that
+   * a failed task has just wedged may never report idle again — which would
+   * turn "roll back on failure" into "roll back unless the failure was bad
+   * enough to matter". A live turn lost during a rollback is the cost of the
+   * task having failed, not a reason to leave the instance broken.
+   *
+   * A restore that itself fails is journalled and does not stop the others.
+   * One broken instance is a bad night; two, because the loop gave up on the
+   * first, is a worse one.
+   */
+  async #restoreAll(
+    job: Job,
+    scope: InstanceEntry[],
+    tags: Map<string, string>,
+  ): Promise<string[]> {
+    const restored: string[] = [];
+    for (const instance of scope) {
+      const tag = tags.get(instance.name);
+      if (!tag) {
+        this.#journal.write({
+          kind: 'failed',
+          what: `rollback ${instance.name}`,
+          instance: instance.name,
+          requester: SELF_REQUESTER,
+          ok: false,
+          detail:
+            'the task failed and there is no pre-task snapshot tag for this instance, so ' +
+            'there is nothing to restore. This should be unreachable — the task is refused ' +
+            'when the pre-task snapshot fails — and if you are reading it, find out why.',
+        });
+        continue;
+      }
+      const result = await this.#restoreSnapshot(instance, tag);
       this.#journal.write({
-        kind: 'breaker',
-        what: describeRequest(request),
+        kind: result.ok ? 'finished' : 'failed',
+        what: `rollback ${instance.name} to ${tag}`,
         instance: instance.name,
-        requester: job.requester,
-        ok: false,
+        requester: SELF_REQUESTER,
+        ok: result.ok,
+        dryRun: result.skipped,
+        command: render(result.argv),
         detail:
-          `build ${build.slice(0, 12)} was rolled back on ` +
-          `${new Date(quarantined.at).toISOString()} (${quarantined.reason}) and will not be ` +
-          'deployed again. Commit a fix — a new build is a different build and goes ' +
-          'through. Retrying this one is refused permanently, not backed off.',
+          `automatic: restoring the snapshot taken before "${describeRequest(job.request)}" ` +
+          `failed. ${summarise(result)}` +
+          (result.stderr.trim() ? `\nstderr: ${result.stderr.trim().slice(0, 2000)}` : ''),
       });
-      return;
+      if (result.ok) restored.push(instance.name);
     }
+    return restored;
+  }
 
-    // ── Build, before anything is destroyed ──────────────────────────────
-    //
-    // First because it is the cheapest thing that can say no. A failed `tsc`
-    // costs a minute; discovering the same failure after the pre-snapshot has
-    // committed two gigabytes and the container has been torn down costs the
-    // instance. The ordering is asserted in the self-test rather than left to
-    // whoever next edits this function.
-    //
-    // It is worth being precise about what this build does and does not do.
-    // `run-container.sh --recreate` starts a container from an image that was
-    // built separately; this step does not rebuild that image. What it does
-    // rebuild is the host checkout the breaker identifies this deploy by, and
-    // that `.claude/` and `discord-cli/` are bind-mounted from — so a redeploy
-    // whose checkout has not been built is a deploy of a commit whose compiled
-    // form does not exist on the machine. That was the shape of the
-    // 2026-08-09 hour, and the fix is not to be clever about which half of it
-    // matters.
-    const buildRepo = instance.buildRepo ? this.#resolveRepo(instance.buildRepo) : null;
-    if (buildRepo) {
-      if (!(await this.#buildCheckout(job, buildRepo))) return;
-    } else {
-      // Not fatal — an instance with no buildRepo has already told the breaker
-      // it cannot be identified by a commit, and #buildId says so loudly. But
-      // it is said again here, because "nothing was built" is the exact
-      // condition this verb was changed to stop happening silently.
-      this.#journal.write({
-        kind: 'build',
-        what: describeRequest(request),
-        instance: instance.name,
-        requester: job.requester,
-        detail:
-          `${instance.name} has no buildRepo, so NOTHING WAS BUILT before this redeploy. ` +
-          'Whatever compiled output is on disk is what will run. Set buildRepo in ' +
-          'ops-config.yaml if this instance runs code from a checkout on this host.',
-      });
-    }
-
-    // ── Capture what we would roll back TO, before changing anything ─────
-    //
-    // Taken now rather than looked up later on purpose: after the recreate,
-    // the newest snapshot of this instance could easily be one taken of the
-    // broken build, and rolling back to it would be a very expensive no-op.
-    const preSnapshot = await this.#snapshotInstance(instance);
-    if (!preSnapshot.ok) {
-      this.#fail(
-        job,
-        `could not snapshot ${instance.name} before recreating it: ` +
-          `${preSnapshot.stderr || summarise(preSnapshot)}. Refusing to continue — a ` +
-          'destructive operation with no rollback target is not a deployment, it is a ' +
-          'coin toss.',
-      );
-      return;
-    }
-    const rollbackTag = await this.#newestSnapshotTag(instance);
-    if (!rollbackTag && !this.#config.dryRun) {
-      this.#fail(
-        job,
-        `no snapshot images found for ${this.#imageRepo(instance)} even after taking one. ` +
-          'Refusing to recreate the container with nothing to go back to.',
-      );
-      return;
-    }
-
-    // ── Wait for an idle turn ────────────────────────────────────────────
-    const idle = await this.#waitForIdle(job, instance, describeRequest(request));
-    if (!idle) return;
-
-    const result = await this.#runner.run([this.#config.runContainerScript, '--recreate'], {
+  /** Retag a snapshot as the live image and recreate the container from it. */
+  async #restoreSnapshot(instance: InstanceEntry, tag: string): Promise<CommandResult> {
+    const repo = this.#imageRepo(instance);
+    const retag = await this.#runner.run([
+      this.#config.dockerPath,
+      'tag',
+      `${repo}:${tag}`,
+      instance.image,
+    ]);
+    if (!retag.ok) return retag;
+    return this.#runner.run([this.#config.runContainerScript, '--recreate'], {
       env: this.#instanceEnv(instance),
       timeoutSeconds: 900,
     });
+  }
 
-    this.#finish(job, result, `redeploy ${instance.name}`);
-    if (!result.ok) return;
-
-    this.#armDeadline(instance, {
-      build,
-      rollbackTag,
-      // The requester goes into the reason, and from there into the deadline,
-      // the wake and the rollback record. An instance that is rebuilt and then
-      // rolled back should be able to read, months later, whether it asked for
-      // that or whether its neighbour did.
-      reason:
-        request.reason ||
-        `redeploy requested by ${job.requester} via the ops spool` +
-          `${build ? ` at build ${build.slice(0, 12)}` : ''}`,
-      requester: job.requester,
-      skipped: result.skipped,
+  /**
+   * Count one failed recovery, and freeze if that was one too many.
+   *
+   * Shared by the missed-deadline path and the rolled-back-task path, because
+   * they are the same event from the breaker's point of view: something was
+   * done, it did not work, and the machine put it back. Repeating that is how a
+   * bad night becomes an outage that reinstalls itself on a timer.
+   */
+  #noteRecoveryFailure(what: string): void {
+    const failures = this.#state.recordRecoveryFailure();
+    if (failures < this.#config.breaker.maxConsecutiveFailedRecoveries) return;
+    const why =
+      `${failures} consecutive failed recoveries (ceiling ` +
+      `${this.#config.breaker.maxConsecutiveFailedRecoveries}); the last was: ${what}. ` +
+      'Something is wrong that another task cannot fix, and continuing would mean ' +
+      'reinstalling the outage on a timer. Stopped.';
+    this.#state.freeze(why);
+    this.#journal.write({
+      kind: 'frozen',
+      what: 'executor frozen',
+      requester: SELF_REQUESTER,
+      ok: false,
+      detail: why,
     });
+    process.stderr.write(
+      `[ops] ══ FROZEN ══ ${why}\n` +
+        '[ops] Tasks and rollbacks are refused until ops/unfreeze.sh is run on the host.\n',
+    );
+  }
+
+  // ── Reporting back ──────────────────────────────────────────────────────
+
+  /**
+   * Tell the agent that filed the task what happened, through its wake spool.
+   *
+   * This is the whole reason the host agent holds no Discord token. It says
+   * nothing to anybody; it hands its report to the executor, the executor files
+   * a wake into the requesting instance's own spool, and the sandboxed agent —
+   * which has the token, and is the thing the operator is actually talking to —
+   * does the talking.
+   *
+   * The report text is model output that was produced while reading a task an
+   * agent wrote. Whoever renders it downstream owes it the same suspicion as
+   * `reason` and `detail`, and it is delivered as a wake prompt rather than as
+   * anything structured for exactly that reason.
+   */
+  #reportBack(
+    job: Job,
+    request: OpsRequest,
+    outcome: HostAgentOutcome,
+    regressions: string[],
+    rolledBack: string[],
+    ok: boolean,
+  ): void {
+    const instance = this.#resolveInstance(job.requester);
+    if (!instance) return; // filed by the executor itself; nobody to tell.
+
+    this.#fileWake(
+      instance,
+      [
+        `Your ops task ${ok ? 'SUCCEEDED' : 'FAILED'}${outcome.dryRun ? ' (DRY RUN — nothing was executed)' : ''}.`,
+        '',
+        `Task, as you filed it: ${describeRequest(request)}`,
+        `Session ${outcome.sessionId}: ${outcome.commands.length} command(s), ` +
+          `${outcome.turns} turn(s), $${outcome.costUsd.toFixed(4)}, ` +
+          `${(outcome.durationMs / 1000).toFixed(1)}s.`,
+        ...(regressions.length ? ['', `Health regressed: ${regressions.join('; ')}`] : []),
+        ...(rolledBack.length
+          ? [
+              '',
+              `ROLLED BACK: ${rolledBack.join(', ')} — restored to the snapshot taken before ` +
+                'this task started. Anything the task changed inside those containers is gone. ' +
+                'Anything it changed on the HOST filesystem is NOT rolled back; that is the ' +
+                "VPS snapshot's job and a person's decision.",
+            ]
+          : []),
+        '',
+        'The host agent reported:',
+        '',
+        outcome.resultText.slice(0, 6000) || '(it produced no report)',
+        '',
+        'Every command it ran is in the ops journal, in full. If you are about to tell the',
+        'operator what happened, tell them what it actually did, not what you asked for.',
+      ].join('\n'),
+    );
   }
 
   // ── rollback ────────────────────────────────────────────────────────────
@@ -911,7 +1400,46 @@ export class Executor {
       }
     }
 
-    const idle = await this.#waitForIdle(job, instance, describeRequest(request));
+    // ── Waiting for idle: right for a request, wrong for a recovery ───────
+    //
+    // Decided deliberately on 2026-08-11, after review of PR #9 asked which
+    // of the two this path is. It is both, and it was treating both as a
+    // request.
+    //
+    // A requested rollback is somebody's plan: they can be told no, and the
+    // full `idle.maxWaitMinutes` wait followed by abandoning is right.
+    //
+    // A deadline rollback is not a plan, it is a recovery. The instance was
+    // rebuilt and did not check in. The most likely reason it did not is that
+    // the rebuild wedged or crash-looped it — in which case its waker status
+    // file goes stale, `readIdle` correctly reports not-idle, and the old code
+    // sat in this wait for the full thirty minutes and then ABANDONED the
+    // rollback. The instance stays on the build that broke it, and because
+    // that return is before the quarantine below, the breaker never learns
+    // that a recovery failed either. A container that is wedged is exactly
+    // when this rollback matters most, so waiting for it to look healthy
+    // before repairing it is backwards. `#restoreAll` reached the same
+    // conclusion for a failed task and skips the wait outright.
+    //
+    // Not skipped outright here, because the two cases are not identical: a
+    // missed check-in can also mean an agent that is perfectly alive and
+    // simply did not file `checkin` — and interrupting a live turn costs
+    // somebody a conversation. So the wait is kept and bounded to a minute,
+    // and running out of it PROCEEDS rather than abandons. Polite if it can
+    // be, decisive if it cannot.
+    const idle = await this.#waitForIdle(
+      job,
+      instance,
+      describeRequest(request),
+      origin === 'deadline'
+        ? {
+            // Never longer than the operator asked for; `idle.maxWaitMinutes:
+            // 0` still means "do not wait".
+            maxMinutes: Math.min(RECOVERY_IDLE_WAIT_MINUTES, this.#config.idle.maxWaitMinutes),
+            abandonOnTimeout: false,
+          }
+        : {},
+    );
     if (!idle) return;
 
     const retag = await this.#runner.run([
@@ -1126,9 +1654,28 @@ export class Executor {
    * polite wait, and it does not queue itself for later — both of those are
    * ways of turning "we decided not to interrupt anyone" into "we interrupted
    * someone, eventually". The agent can ask again.
+   *
+   * That is the rule for REQUESTED work. Recovery is the other case and it
+   * takes `options`: see `RECOVERY_IDLE_WAIT_MINUTES`, and `#doRollback`,
+   * where the difference is argued.
    */
-  async #waitForIdle(job: Job, instance: InstanceEntry, what: string): Promise<boolean> {
-    const deadline = Date.now() + this.#config.idle.maxWaitMinutes * 60_000;
+  async #waitForIdle(
+    job: Job,
+    instance: InstanceEntry,
+    what: string,
+    options: {
+      /** Ceiling on the wait. Defaults to `idle.maxWaitMinutes`. */
+      maxMinutes?: number;
+      /**
+       * What running out of time means. `true` (the default) abandons the
+       * operation; `false` proceeds anyway, having asked politely.
+       */
+      abandonOnTimeout?: boolean;
+    } = {},
+  ): Promise<boolean> {
+    const maxMinutes = options.maxMinutes ?? this.#config.idle.maxWaitMinutes;
+    const abandonOnTimeout = options.abandonOnTimeout ?? true;
+    const deadline = Date.now() + maxMinutes * 60_000;
     let waited = 0;
     let lastReason = '';
 
@@ -1159,6 +1706,22 @@ export class Executor {
       }
 
       if (Date.now() >= deadline) {
+        if (!abandonOnTimeout) {
+          this.#journal.write({
+            kind: 'idle-wait',
+            what,
+            instance: instance.name,
+            requester: job.requester,
+            detail:
+              `waited ${maxMinutes} minute(s) for ${instance.name} to be idle ` +
+              `(${verdict.reason}) and PROCEEDING ANYWAY. This is a recovery, not a ` +
+              'request: the instance missed its check-in, the most likely reason it is ' +
+              'not reporting idle is that it is wedged, and a rollback abandoned for ' +
+              'politeness leaves it broken on the build that broke it. A live turn lost ' +
+              'here is the cost of the deploy having failed.',
+          });
+          return true;
+        }
         this.#journal.write({
           kind: 'failed',
           what,
@@ -1166,7 +1729,7 @@ export class Executor {
           requester: job.requester,
           ok: false,
           detail:
-            `gave up after ${this.#config.idle.maxWaitMinutes} minutes waiting for ` +
+            `gave up after ${maxMinutes} minutes waiting for ` +
             `${instance.name} to be idle (${verdict.reason}). ABANDONED, not deferred — ` +
             'recreating the container over a live turn would kill it mid-conversation, and ' +
             'a request that quietly waits forever is worse than one that says no.',
@@ -1238,13 +1801,16 @@ export class Executor {
     this.#fileWake(
       instance,
       [
-        `You were rebuilt${options.build ? ` from ${options.build.slice(0, 12)}` : ''}.`,
+        `A host task touched you${options.build ? ` at build ${options.build.slice(0, 12)}` : ''}.`,
         '',
         `Why: ${options.reason}`,
         '',
-        'Your container was recreated, so anything that lived only in its writable layer',
-        'is gone: packages installed by hand, crontabs, running daemons. Check the things',
-        'you depend on, in this order:',
+        'The executor cannot tell exactly what changed — a task is free text carried out by',
+        'a session with a shell, and what it did is in the ops journal, in full, command by',
+        'command. What it CAN tell is that something it ran named your container, so if your',
+        'container was recreated, anything that lived only in its writable layer is gone:',
+        'packages installed by hand, crontabs, running daemons. Check the things you depend',
+        'on, in this order:',
         '',
         '  1. Can you run a turn at all — you are reading this, so yes.',
         '  2. Is your Claude login intact? `claude auth status`.',
@@ -1265,9 +1831,9 @@ export class Executor {
         `      && mv ${join(instance.opsSpoolDir, '$(date +%s)-checkin.tmp')} \\`,
         `           ${join(instance.opsSpoolDir, '$(date +%s)-checkin.json')}`,
         '',
-        'If you do not check in, you will be rolled back to the previous snapshot',
-        `(${options.rollbackTag || 'none available'}) automatically, and this build will be`,
-        'refused from then on. Say something in the channel either way.',
+        'If you do not check in, you will be rolled back automatically to the snapshot taken',
+        `immediately BEFORE that task ran (${options.rollbackTag || 'none available'}), and`,
+        'this build will be refused from then on. Say something in the channel either way.',
       ].join('\n'),
     );
   }
@@ -1321,8 +1887,7 @@ export class Executor {
 
     const request: OpsRequest = {
       verb: 'rollback',
-      unit: '',
-      repo: '',
+      task: '',
       instance: pending.instance,
       tag: SNAPSHOT_TAG.test(pending.rollbackTag) ? pending.rollbackTag : '',
       channel: '',
@@ -1560,6 +2125,57 @@ export class Executor {
         'will be honoured on the next start, including any that pass while we are down.',
     });
   }
+}
+
+/**
+ * What was up, the last time anybody looked.
+ *
+ * Deliberately two flat maps of strings rather than anything richer. The only
+ * question being asked is "was this the same before and after", and a shape
+ * that can answer that and nothing else cannot be quietly repurposed into a
+ * health *policy*, which is the thing that grows exceptions until it passes
+ * everything.
+ */
+export type HealthSample = {
+  /** unit name → whatever `systemctl is-active` printed. */
+  units: Record<string, string>;
+  /** container name → `{{.State.Status}}`, or `absent`. */
+  containers: Record<string, string>;
+};
+
+/**
+ * What got worse. Returns prose, one entry per regression, empty if nothing did.
+ *
+ * The comparison is deliberately asymmetric: only a transition FROM good TO
+ * not-good counts. A unit that was already dead before the task stays dead
+ * without blaming the task, and a unit the task FIXED is not reported at all.
+ *
+ * That asymmetry is the difference between a check that gets read and a check
+ * that gets turned off. A strict "anything different is a regression" would
+ * fire on every deliberate restart — `systemctl is-active` can report
+ * `activating` for a second — and the first thing anybody would do about a
+ * rollback triggered by a service coming back up correctly is disable the whole
+ * mechanism.
+ *
+ * Exported and pure so the self-test can drive it directly, without docker,
+ * without systemd, and without a task.
+ */
+export function compareHealth(before: HealthSample, after: HealthSample): string[] {
+  const regressions: string[] = [];
+
+  for (const [unit, was] of Object.entries(before.units)) {
+    const now = after.units[unit] ?? 'unknown';
+    if (was === 'active' && now !== 'active') {
+      regressions.push(`${unit} was active and is now "${now}"`);
+    }
+  }
+  for (const [container, was] of Object.entries(before.containers)) {
+    const now = after.containers[container] ?? 'absent';
+    if (was === 'running' && now !== 'running') {
+      regressions.push(`container ${container} was running and is now "${now}"`);
+    }
+  }
+  return regressions;
 }
 
 function sleep(ms: number): Promise<void> {

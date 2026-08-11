@@ -5,23 +5,36 @@
  * this service is allowed to do* is version-controllable YAML, with defaults
  * and validation in TypeScript, and there are no secrets in here.
  *
- * This one is different from the other two in a way worth being explicit
- * about. For the waker, config is behaviour. Here, config is **the entire
- * authorization model**. Every privileged thing this daemon can do is named in
- * this file, by exact string, and nothing it reads from the spool can add to
- * that list. A unit name that is not under `units:` cannot be restarted; an
- * instance not under `instances:` cannot be recreated; a repo not under
- * `repos:` cannot be pulled. There is no wildcard, no pattern, no prefix match
- * and no "if it looks like a unit name" — those are the shapes that turn a
- * validated allowlist back into a free-form string, and the input to that
- * string comes from a container that may be reading attacker-written text off
- * the internet.
+ * ── What this file stopped being on 2026-08-10 ───────────────────────────
  *
- * So the loader is strict to the point of rudeness. A malformed entry fails
- * the boot rather than being skipped: a silently dropped allowlist entry gives
- * you an executor that refuses valid work (annoying, visible), but a silently
- * *widened* one gives you an executor that accepts invalid work (quiet, and
- * the first you hear of it is the incident).
+ * It used to say, at the top and in bold, that this was **the entire
+ * authorization model**: every privileged thing the daemon could do was named
+ * here by exact string and nothing from the spool could add to the list.
+ *
+ * That is no longer true and it must not be read as if it were. The verb list
+ * was replaced by a single `task` verb carrying free text, handed to a Claude
+ * Code session on the host with a shell and sudo. There is no allowlist in
+ * front of prose. What this file holds now is three different kinds of thing,
+ * and confusing them is how somebody ends up believing they are protected:
+ *
+ *   1. **A health manifest.** `units:` and `repos:` no longer gate anything.
+ *      They are the things the executor checks the state of before and after
+ *      every task, so that a task which quietly breaks a service is caught by
+ *      the executor rather than by a person the next morning. Adding a unit
+ *      here does not grant anything; removing one does not deny anything. It
+ *      only changes what is watched.
+ *   2. **Real invariants, still enforced.** The containment assertions — the
+ *      state directory out of every spool's reach, one spool per instance, no
+ *      spool nested in another — are unchanged and still load-bearing, because
+ *      provenance and the durable record still rest on them.
+ *   3. **Operational limits.** Rate, size, timeouts, the deadline, the breaker.
+ *      These bound how *often* and how *long*, never *what*.
+ *
+ * The loader is still strict to the point of rudeness about all three, for the
+ * old reason: a malformed entry that fails the boot gives you an executor that
+ * refuses valid work (annoying, visible), while one that is silently skipped
+ * gives you an executor that is quietly not checking something (quiet, and the
+ * first you hear of it is the incident).
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -30,11 +43,17 @@ import { parse } from 'yaml';
 import { VERBS } from './request.js';
 
 /**
- * A systemd unit this executor may act on.
+ * A systemd unit whose health the executor watches across every task.
  *
- * Matched against the request's `unit` field by exact string equality and
- * nothing else. `name` reaches `systemctl` as one element of an argv array,
- * never as part of a string that a shell will look at.
+ * Until 2026-08-10 this was an allowlist: a unit not named here could not be
+ * restarted. It is not that any more — the host agent runs `systemctl` itself
+ * and this list does not constrain it. What it does now is decide what
+ * `systemctl is-active` is run against before and after every task, so that a
+ * task which takes a service down is noticed by the executor, reported, and
+ * (for the instances in scope) rolled back.
+ *
+ * The practical consequence is the opposite of the old one: leaving a unit out
+ * of this list does not make it safe, it makes it unwatched.
  */
 export type UnitEntry = {
   /** Full unit name including the suffix, e.g. `clawcius.service`. */
@@ -44,10 +63,14 @@ export type UnitEntry = {
 };
 
 /**
- * A git checkout this executor may `git pull` in.
+ * A checkout the executor tells the host agent about, and watches.
  *
- * `path` comes from config and is resolved once at load; the request only ever
- * names the entry, so no path fragment from the spool reaches the filesystem.
+ * Also no longer an allowlist. There is no `pull` verb; the host agent runs git
+ * itself. What this entry does now is appear in the briefing — path, expected
+ * branch, current branch, HEAD, and the list of uncommitted files — so that the
+ * session starts out knowing the state of the tree rather than discovering it,
+ * and so that the standing rule about never forcing past a dirty tree arrives
+ * attached to the actual filenames.
  */
 export type RepoEntry = {
   /** Short name the agent uses in a request. */
@@ -61,8 +84,12 @@ export type RepoEntry = {
    */
   branch: string;
   /**
-   * Directories under `path`, each holding a `package.json`, that get
-   * `npm ci && npm run build` after a pull and before a redeploy.
+   * Directories under `path`, each holding a `package.json`, that must be built
+   * after anything is pulled into this checkout.
+   *
+   * The executor no longer runs these itself — there is no `pull` verb and no
+   * build step. They are named in the host agent's briefing instead, because
+   * the lesson attached to them is worth more than the automation was:
    *
    * Added 2026-08-10. Every unit in this repository starts `node dist/index.js`
    * and not one of them compiles anything, so a pull followed by a restart
@@ -104,20 +131,44 @@ export type RepoEntry = {
  *     and it is not confused with absent because the loader distinguishes a
  *     missing key from an empty list.
  *
- * Every name written here is checked against the real allowlists at boot. A
- * typo in `mayRequest.units` would otherwise be a silent, total denial of a
- * verb the operator believed they had granted — and a restriction that fails
- * closed by accident is indistinguishable, from the agent's side, from an
- * executor that is broken.
+ * Every name written here is checked against the real lists at boot. A typo in
+ * `mayRequest.instances` would otherwise be a silent, total denial of something
+ * the operator believed they had granted — and a restriction that fails closed
+ * by accident is indistinguishable, from the agent's side, from an executor
+ * that is broken.
+ *
+ * ── What survived the verbs, and what did not ────────────────────────────
+ *
+ * `verbs` and `instances` still restrict, because there are still verbs and
+ * requests still name instances. `units` and `repos` no longer restrict
+ * ANYTHING: no request carries a unit or a repo any more, so those two lists
+ * describe a shape of request that cannot be filed. They are still parsed and
+ * still validated, and their presence produces a deprecation notice in the boot
+ * journal rather than a boot failure — same reasoning as the old `spoolDir`
+ * key, and the same reason: this unit is `Restart=always` with no start limit
+ * and refusing to boot on a stale config key turns a cosmetic problem into a
+ * root daemon in a restart loop with every rollback deadline unhonoured.
+ *
+ * The honest warning that goes with them: an operator who wrote
+ * `units: [hamachi.service]` believing it stopped Hamachi restarting its
+ * neighbour is now wrong, and would stay wrong silently. That is exactly why
+ * the notice exists and why it names the file it is in.
+ *
+ * And the larger caveat, which applies to `instances` too: `mayRequest` bounds
+ * what an instance may *ask for*, not what the host agent may *do*. A task
+ * scoped to `hamachi` is still carried out by a session with a shell and sudo,
+ * and nothing but the task text and the standing prompt points it at Hamachi
+ * rather than at anything else on the box. It is a statement of intent that the
+ * journal records, not a boundary.
  */
 export type RequestScope = {
   /** Verbs this instance may use at all. */
   verbs: string[] | null;
-  /** Instances it may name in `redeploy` / `snapshot` / `rollback` / `checkin`. */
+  /** Instances it may name in `task` / `rollback` / `checkin`, and wake targets. */
   instances: string[] | null;
-  /** Units it may `restart`. */
+  /** DEPRECATED and inert: no request carries a unit. */
   units: string[] | null;
-  /** Repos it may `pull`. */
+  /** DEPRECATED and inert: no request carries a repo. */
   repos: string[] | null;
 };
 
@@ -300,6 +351,137 @@ export type SnapshotVerifyConfig = {
   probe: string[];
 };
 
+/**
+ * The host agent: the headless Claude Code session that carries out a task.
+ *
+ * See ops/src/host-agent.ts for the whole argument. The keys here are the ones
+ * an operator has any business changing; everything that is a security decision
+ * — which tools are denied, what the standing prompt says, that the session
+ * runs as an unprivileged account and never as root, that the account may not
+ * be in the docker group, that its environment is built from an allowlist — is
+ * in code, on purpose. A YAML key that can widen a session with sudo is a YAML
+ * key somebody will widen at 3am.
+ *
+ * Note the shape of the two keys added on 2026-08-11: `forbiddenGroups` and
+ * `secretPaths` can only ever make the checks in `agent-user.ts` STRICTER.
+ * There is no key that removes `docker` from the refusal list, and there must
+ * never be one.
+ */
+export type HostAgentConfig = {
+  /**
+   * Off is a real setting and it is worth having.
+   *
+   * With `enabled: false` the daemon still holds every deadline, still watches
+   * every spool, still answers `checkin` and still performs a `rollback` — it
+   * simply refuses `task` with a stated reason. That is the configuration to
+   * put the host in while somebody works out what a task did, and it is
+   * strictly better than stopping the unit, which would drop the deadlines.
+   */
+  enabled: boolean;
+  /**
+   * The service account the session runs as. Default `clawcius-ops`.
+   *
+   * ── Why this is a name now, and not a `stat` ──────────────────────────
+   *
+   * Until 2026-08-11 there was no such key: the session was dropped to
+   * whoever owned the checkout, discovered by `stat`ing it, with a comment
+   * saying the executor "is not entitled to an opinion about who owns a
+   * directory it was pointed at". That reasoning was right for a *build step*
+   * and wrong for an identity. On this host the checkout is owned by
+   * `npurcell`, `npurcell` is in the `docker` group, and the docker group is
+   * root — so the session inherited a root-equivalent identity through a
+   * mechanism nobody had to write down, and every other control in this
+   * directory was decoration.
+   *
+   * So the identity is named, deliberately, in a file that gets reviewed. If
+   * the account does not exist the executor REFUSES TASKS; it does not fall
+   * back to the checkout's owner and it does not fall back to root. See
+   * ops/src/agent-user.ts and MIGRATION.md.
+   */
+  user: string;
+  /**
+   * Where the user and group databases are read from.
+   *
+   * These exist so the self-test can drive the real resolution path against
+   * fixture files without root, docker or a real `clawcius-ops` account —
+   * "fixture the data, not the code" — and because a host whose passwd lives
+   * somewhere unusual should fail with a path in the message rather than with
+   * "no such user". On a real host they are `/etc/passwd` and `/etc/group`
+   * and there is no reason to touch them.
+   *
+   * Both are read as FILES. A host using nsswitch with LDAP/SSSD will not
+   * have its group memberships here and the docker-group assertion would
+   * silently pass. That limit is written down in agent-user.ts rather than
+   * worked around by shelling out to `getent` from a root daemon.
+   */
+  passwdPath: string;
+  groupPath: string;
+  /**
+   * EXTRA group names to refuse to run as a member of.
+   *
+   * Unioned with the built-in list in agent-user.ts (`docker`, `podman`,
+   * `lxd`, `sudo`, `wheel`, `root`, `disk`, `shadow`, `adm`), never a
+   * replacement for it. This key can only make the check stricter. A key that
+   * could take `docker` off the list would be a key somebody takes `docker`
+   * off the list with, at 3am, to make a task work.
+   */
+  forbiddenGroups: string[];
+  /**
+   * Files and directories the agent account must NOT be able to read.
+   *
+   * Every instance's `envFile` is added to this automatically — those hold
+   * `DISCORD_TOKEN`, and `assertNoSecrets` refusing to put that token in the
+   * session's *environment* is worth nothing if the session can `cat` the
+   * file it lives in.
+   *
+   * Checked from mode bits before every task, and a readable secret REFUSES
+   * the task. It cannot see POSIX ACLs or a friendlier bind mount of the same
+   * inode; it is a check against a `.env` left 0644, not against an adversary.
+   */
+  secretPaths: string[];
+  /**
+   * An ssh private key the session uses for git, or empty.
+   *
+   * Becomes `GIT_SSH_COMMAND=ssh -i <key> -o IdentitiesOnly=yes …` in the
+   * session's environment. It is a PATH, on purpose: a read-only deploy key
+   * owned by the agent account is a credential scoped to one repository that
+   * can be revoked on its own, and it is the alternative to handing a session
+   * with a shell the operator's GitHub PAT — which would be a token in the
+   * environment, which `assertNoSecrets` refuses anyway. There is deliberately
+   * no key here that takes a token. See MIGRATION.md § 5.
+   */
+  gitSshKey: string;
+  /** Absolute path to the `claude` binary. Never looked up on PATH. */
+  claudePath: string;
+  /**
+   * Working directory for the session. NOT the checkout.
+   *
+   * Claude Code auto-discovers CLAUDE.md and project settings from its working
+   * directory, and the checkout is a tree the agents can get commits merged
+   * into. Pointing the session at it would let any agent supply standing
+   * instructions to a process with sudo, through a route nobody would think to
+   * audit. The loader refuses a workDir inside any spool or inside stateDir.
+   */
+  workDir: string;
+  /** Wall-clock ceiling on one task. */
+  timeoutMinutes: number;
+  /** Dollar ceiling on one task, enforced by the CLI's own --max-budget-usd. */
+  maxCostUsd: number;
+  /** Model override, or empty for the CLI's default. */
+  model: string;
+  /**
+   * Environment variables passed through by name, on top of the built-in
+   * allowlist in host-agent.ts.
+   *
+   * Anything named here is EXEMPT from the credential-name check, which is the
+   * point: it is how an operator says "yes, I mean it", in a file that gets
+   * reviewed. `DISCORD_TOKEN` named here would still be a mistake; the check
+   * would let it through and the README says why that is the operator's call
+   * and not the loader's.
+   */
+  envPassthrough: string[];
+};
+
 export type OpsConfig = {
   /**
    * Log what would be run, run nothing.
@@ -340,9 +522,21 @@ export type OpsConfig = {
    * found" several minutes after `npm ci` succeeded.
    */
   npmPath: string;
+  /**
+   * Snapshots retained per instance, passed to `docker/snapshot.sh` as KEEP.
+   *
+   * Raised from that script's default of 8 because the executor now takes one
+   * before EVERY task rather than once a night before a redeploy. At 8, a busy
+   * evening of a dozen small tasks would evict every nightly snapshot by
+   * morning — the ring is shared, and whoever runs last prunes to their own
+   * ceiling. Sized so a night of tasks cannot push out the previous night's
+   * backup. It is disk, and the README says so.
+   */
+  snapshotKeep: number;
   units: UnitEntry[];
   repos: RepoEntry[];
   instances: InstanceEntry[];
+  hostAgent: HostAgentConfig;
   limits: LimitsConfig;
   idle: IdleConfig;
   deadline: DeadlineConfig;
@@ -383,9 +577,25 @@ const DEFAULTS: OpsConfig = {
   dockerPath: '/usr/bin/docker',
   gitPath: '/usr/bin/git',
   npmPath: '/home/npurcell/.local/share/node/bin/npm',
+  snapshotKeep: 24,
   units: [],
   repos: [],
   instances: [],
+  hostAgent: {
+    enabled: true,
+    user: 'clawcius-ops',
+    passwdPath: '/etc/passwd',
+    groupPath: '/etc/group',
+    forbiddenGroups: [],
+    secretPaths: [],
+    gitSshKey: '',
+    claudePath: '/usr/local/bin/claude',
+    workDir: '/var/lib/clawcius-host-agent',
+    timeoutMinutes: 30,
+    maxCostUsd: 10,
+    model: '',
+    envPassthrough: [],
+  },
   limits: {
     maxRequestBytes: 16 * 1024,
     maxPerSweep: 8,
@@ -541,6 +751,39 @@ function checkName(value: string, path: string): string {
       path,
       `("${value}") must be a short lowercase name matching ${String(NAME_PATTERN)} — ` +
         'requests are matched against it by exact string equality',
+    );
+  }
+  return value;
+}
+
+/**
+ * Account names this loader will accept for `hostAgent.user`.
+ *
+ * Narrower than what `useradd` allows, for the same reason `NAME_PATTERN` is
+ * narrower than what docker allows: the string ends up in refusal messages, in
+ * the boot banner and in `id`-style advice printed for a human to paste, and
+ * every character class permitted here is one more thing to think about. It
+ * is never interpolated into a command by this daemon — the drop is
+ * `setuid(2)` on a numeric uid — but the sudoers file is written against it by
+ * hand, and a username with a comma or a colon in it would silently change the
+ * meaning of that file.
+ *
+ * `root` is NOT rejected here. It is rejected in `resolveAgentUser`, by uid,
+ * because that catches the account whose name is `toor` as well and because
+ * rejecting it at load time would fail the boot of a `Restart=always` unit —
+ * see the long note in agent-user.ts about why that is the wrong failure shape
+ * for this service.
+ */
+const AGENT_USER_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+function agentUserName(raw: unknown): string {
+  const value = str(raw, 'hostAgent.user', DEFAULTS.hostAgent.user);
+  if (!AGENT_USER_PATTERN.test(value)) {
+    throw new OpsConfigError(
+      'hostAgent.user',
+      `("${value}") must be a plain account name matching ${String(AGENT_USER_PATTERN)}. ` +
+        'It names the unprivileged service account the host agent session runs as; see ' +
+        'MIGRATION.md for how to create it.',
     );
   }
   return value;
@@ -733,6 +976,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
   const deadline = section(root['deadline'], 'deadline');
   const breaker = section(root['breaker'], 'breaker');
   const verify = section(root['snapshotVerify'], 'snapshotVerify');
+  const agent = section(root['hostAgent'], 'hostAgent');
 
   const units: UnitEntry[] = list(root['units'], 'units').map((raw, index) => {
     const entry = section(raw, `units[${index}]`);
@@ -901,6 +1145,32 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
 
   const deprecations = migrateLegacySpoolDir(root, instances, explicitOpsSpoolDir);
 
+  // ── mayRequest.units / mayRequest.repos: parsed, validated, inert ────────
+  //
+  // Accepted rather than rejected, for the same reason the old `spoolDir` key
+  // is: this unit is Restart=always with no start limit and holds the rollback
+  // deadlines, so a config the loader refuses is not one loud error, it is a
+  // root daemon in a five-second restart loop with every armed deadline
+  // unhonoured. But an operator who wrote these believes they restrict
+  // something, and since 2026-08-10 they restrict nothing at all — there is no
+  // request that carries a unit or a repo. Silence there would be a person
+  // believing they are protected, which is worse than the key.
+  for (const instance of instances) {
+    const dead = (['units', 'repos'] as const).filter(
+      (key) => instance.mayRequest?.[key] !== null && instance.mayRequest?.[key] !== undefined,
+    );
+    if (dead.length === 0) continue;
+    deprecations.push(
+      `instances[${instance.name}].mayRequest.${dead.join(' and .')} no longer restricts ` +
+        'anything and is being IGNORED. The verbs that named a unit (restart) and a repo ' +
+        '(pull) were deleted on 2026-08-10; a task is free text and there is no allowlist in ' +
+        'front of it. If the intent was "this instance may only look after itself", the key ' +
+        `that still does that is mayRequest.instances: [${instance.name}] — and read the ` +
+        'trust model section of ops/README.md first, because it bounds what this instance may ' +
+        'ASK for and not what the host agent may DO.',
+    );
+  }
+
   const config: OpsConfig = {
     dryRun: bool(root['dryRun'], 'dryRun', DEFAULTS.dryRun),
     stateDir: absPath(root['stateDir'], 'stateDir', DEFAULTS.stateDir),
@@ -915,9 +1185,53 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     dockerPath: absPath(root['dockerPath'], 'dockerPath', DEFAULTS.dockerPath),
     gitPath: absPath(root['gitPath'], 'gitPath', DEFAULTS.gitPath),
     npmPath: absPath(root['npmPath'], 'npmPath', DEFAULTS.npmPath),
+    snapshotKeep: num(root['snapshotKeep'], 'snapshotKeep', DEFAULTS.snapshotKeep, 1, 500),
     units,
     repos,
     instances,
+    hostAgent: {
+      enabled: bool(agent['enabled'], 'hostAgent.enabled', DEFAULTS.hostAgent.enabled),
+      user: agentUserName(agent['user']),
+      passwdPath: absPath(agent['passwdPath'], 'hostAgent.passwdPath', DEFAULTS.hostAgent.passwdPath),
+      groupPath: absPath(agent['groupPath'], 'hostAgent.groupPath', DEFAULTS.hostAgent.groupPath),
+      forbiddenGroups: strList(
+        agent['forbiddenGroups'],
+        'hostAgent.forbiddenGroups',
+        DEFAULTS.hostAgent.forbiddenGroups,
+      ),
+      // Absolute, because a relative "secret path" would resolve against
+      // whatever working directory systemd happened to give this unit, and a
+      // check that silently points at the wrong file reads as a pass.
+      secretPaths: strList(
+        agent['secretPaths'],
+        'hostAgent.secretPaths',
+        DEFAULTS.hostAgent.secretPaths,
+      ).map((path, index) => {
+        if (!isAbsolute(path)) {
+          throw new OpsConfigError(`hostAgent.secretPaths[${index}]`, 'must be an absolute path');
+        }
+        return resolve(path);
+      }),
+      gitSshKey: agent['gitSshKey']
+        ? absPath(agent['gitSshKey'], 'hostAgent.gitSshKey', DEFAULTS.hostAgent.gitSshKey)
+        : DEFAULTS.hostAgent.gitSshKey,
+      claudePath: absPath(agent['claudePath'], 'hostAgent.claudePath', DEFAULTS.hostAgent.claudePath),
+      workDir: absPath(agent['workDir'], 'hostAgent.workDir', DEFAULTS.hostAgent.workDir),
+      timeoutMinutes: num(
+        agent['timeoutMinutes'],
+        'hostAgent.timeoutMinutes',
+        DEFAULTS.hostAgent.timeoutMinutes,
+        1,
+        720,
+      ),
+      maxCostUsd: num(agent['maxCostUsd'], 'hostAgent.maxCostUsd', DEFAULTS.hostAgent.maxCostUsd, 0.01, 1000),
+      model: str(agent['model'], 'hostAgent.model', DEFAULTS.hostAgent.model),
+      envPassthrough: strList(
+        agent['envPassthrough'],
+        'hostAgent.envPassthrough',
+        DEFAULTS.hostAgent.envPassthrough,
+      ),
+    },
     limits: {
       maxRequestBytes: num(
         limits['maxRequestBytes'],
@@ -1173,6 +1487,62 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
             'nothing refuses everything.',
         );
       }
+    }
+  }
+
+  // ── The host agent's working directory ──────────────────────────────────
+  //
+  // Three things it must not be, each because of a specific failure:
+  //
+  //   - inside a spool: the session writes freely in its own working
+  //     directory, and a spool it can write is a spool it can file requests
+  //     into — forging a request from whichever instance owns that directory,
+  //     which is the one thing provenance is supposed to make impossible. The
+  //     spools are group-writable by the uid the containers run as, so this
+  //     stayed true across the 2026-08-11 change of identity;
+  //   - inside stateDir, or containing it: stateDir is 0750 root-owned and
+  //     holds the journal, the breaker and the deadlines. The session must not
+  //     need to traverse it to work, and must not be able to reach it by
+  //     accident. (With sudo it can reach it anyway. That is in the README's
+  //     honest list, and it is not a reason to make the easy path easier.)
+  //   - inside a checkout: Claude Code auto-discovers CLAUDE.md and project
+  //     settings from its working directory, so a workDir inside a tree the
+  //     agents get commits merged into is a standing-instructions channel into
+  //     a process with sudo.
+  for (const instance of config.instances) {
+    for (const [label, dir] of [
+      ['opsSpoolDir', instance.opsSpoolDir],
+      ['wakeSpoolDir', instance.wakeSpoolDir],
+    ] as const) {
+      if (isInside(config.hostAgent.workDir, dir) || isInside(dir, config.hostAgent.workDir)) {
+        throw new Error(
+          `ops-config.yaml: hostAgent.workDir (${config.hostAgent.workDir}) and ` +
+            `instances[${instance.name}].${label} (${dir}) contain one another. The host ` +
+            'agent session writes into its working directory as its own service account; a ' +
+            'spool it can write is a spool it can forge a request into.',
+        );
+      }
+    }
+  }
+  if (
+    isInside(config.hostAgent.workDir, config.stateDir) ||
+    isInside(config.stateDir, config.hostAgent.workDir)
+  ) {
+    throw new Error(
+      `ops-config.yaml: hostAgent.workDir (${config.hostAgent.workDir}) and stateDir ` +
+        `(${config.stateDir}) contain one another. stateDir holds the journal, the circuit ` +
+        'breaker and the armed deadlines, and is 0750 root-owned; the host agent runs as an ' +
+        'unprivileged service account and must not have it as a working directory.',
+    );
+  }
+  for (const repo of config.repos) {
+    if (isInside(config.hostAgent.workDir, repo.path)) {
+      throw new Error(
+        `ops-config.yaml: hostAgent.workDir (${config.hostAgent.workDir}) is inside the ` +
+          `checkout repos[${repo.name}].path (${repo.path}). Claude Code reads CLAUDE.md and ` +
+          'project settings from its working directory, so this would let anything merged ' +
+          'into that repository supply standing instructions to a session with sudo.',
+      );
     }
   }
 

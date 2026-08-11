@@ -54,6 +54,7 @@
  */
 
 import {
+  chownSync,
   closeSync,
   constants as fsConstants,
   fchmodSync,
@@ -64,6 +65,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  statSync,
   unlinkSync,
   watch,
   type FSWatcher,
@@ -485,6 +487,79 @@ function createOwned(
     } catch {
       /* nothing useful to do about a failed close */
     }
+  }
+}
+
+/**
+ * NOT the spool path. This one creates a directory on the HOST, for the host
+ * agent's working directory, and it is `mkdir -p` + `chown` by name because
+ * nothing in the sandbox owns any part of that path. The spool's parent IS
+ * owned by the sandbox, which is why `ensureSpoolDir` above refuses to repair
+ * anything and does its chown through an O_NOFOLLOW descriptor. Do not point
+ * this at anything an agent can write.
+ *
+ * Added 2026-08-11 for the host agent's working directory, whose owner is no
+ * longer discoverable by `stat`ing anything. It used to be chowned to match the
+ * checkout, because the session ran as the checkout's owner; the session now
+ * runs as a named service account that owns nothing on this host to point at,
+ * so the uid comes from `resolveAgentUser` instead.
+ *
+ * That is a real reversal of the rule written all over this file — "the owner
+ * is discovered, never configured, because this daemon is not entitled to an
+ * opinion about who owns a directory it was pointed at" — and the reversal is
+ * the point of the whole rework. For a SPOOL the rule still holds: the right
+ * owner there is whatever uid the container runs as, which is a fact about the
+ * host that config can only get wrong. For the session's IDENTITY it was
+ * exactly backwards: discovering it from the filesystem is how the session
+ * ended up running as the operator, who is in the docker group.
+ */
+export function ensureDirOwnedBy(
+  dir: string,
+  want: { uid: number; gid: number },
+  log: (line: string) => void,
+  mode: number,
+  why = '',
+): void {
+  let created = false;
+  try {
+    // 0770 rather than 0750 for spools: the container writes there. Group
+    // ownership is what makes that work without the directory being
+    // world-writable.
+    created = mkdirSync(dir, { recursive: true, mode }) !== undefined;
+  } catch (error) {
+    log(`cannot create ${dir}: ${String(error)} — requests filed there will never arrive`);
+    return;
+  }
+
+  let have: { uid: number; gid: number };
+  try {
+    const current = statSync(dir);
+    have = { uid: current.uid, gid: current.gid };
+  } catch (error) {
+    log(`cannot stat ${dir}: ${String(error)} — leaving it alone`);
+    return;
+  }
+
+  if (want.uid === have.uid && want.gid === have.gid) {
+    if (created) log(`created ${dir}, already owned ${have.uid}:${have.gid}`);
+    return;
+  }
+
+  try {
+    chownSync(dir, want.uid, want.gid);
+    log(
+      `chowned ${dir} to ${want.uid}:${want.gid} ${why} — it was ` +
+        `${have.uid}:${have.gid}, which the process that has to write it cannot`,
+    );
+  } catch (error) {
+    // Loud, and with the command in it, because the alternative symptom is an
+    // agent whose requests vanish, or a session that cannot start.
+    log(
+      `WARNING: ${dir} is owned ${have.uid}:${have.gid} but should be ` +
+        `${want.uid}:${want.gid} ${why}, and chown failed (${String(error)}). Fix on the ` +
+        `host with: chown ${want.uid}:${want.gid} ${dir} && chmod ` +
+        `${(mode & 0o7777).toString(8).padStart(4, '0')} ${dir}`,
+    );
   }
 }
 

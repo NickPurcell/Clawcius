@@ -69,6 +69,30 @@ const journal = new Journal(config.stateDir, () => ({
   quarantined: [],
   consecutiveFailedRecoveries: 0,
   lastVerify: null,
+  // Reported as configured, so the page does not show a blank where the most
+  // consequential setting on this host should be. Nothing else here concerns
+  // the host agent: this is a oneshot with no session and there never will be
+  // one — it exists to boot a snapshot and prove it comes up.
+  hostAgent: {
+    enabled: config.hostAgent.enabled,
+    claudePath: config.hostAgent.claudePath,
+    timeoutMinutes: config.hostAgent.timeoutMinutes,
+    maxCostUsd: config.hostAgent.maxCostUsd,
+    user: config.hostAgent.user,
+    // Reported as configured, NOT resolved. This oneshot never starts a
+    // session, so it has no business evaluating the docker-group assertion —
+    // and a stub that published `identity.ok: true` from a process that never
+    // checked would be the verifier vouching for a property it did not test,
+    // on the one page an operator reads to check it.
+    identity: {
+      ok: false,
+      detail:
+        'not evaluated: clawcius-snapshot-verify does not start a host agent session and ' +
+        'does not check the account. The daemon publishes the real answer.',
+    },
+  },
+  auditedCommands: 0,
+  lastTask: null,
 }));
 
 const outcomes = await verifyAll(config, runner);
