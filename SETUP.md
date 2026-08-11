@@ -654,16 +654,25 @@ unit. Full detail, including the security model, is in
   post-task wake picked up by a live waker. It ships with `dryRun: true` for
   exactly this reason, and in that mode the session has no Bash tool at all.
 - **The sandbox is no longer a security boundary for `clawcius-ops`.** Since
-  2026-08-10 it starts a Claude Code session on the host, as `npurcell`, with a
-  shell and passwordless sudo. The controls that replace the old verb allowlist
-  are a pre-task snapshot, an automatic rollback, and a complete audit log —
-  and the audit is not tamper-proof, because `npurcell` is in the `docker`
-  group and the docker group is root. This is a deliberate, documented trade
-  and not an oversight; `ops/README.md` § *The trust model* is the honest
-  version.
+  2026-08-10 it starts a Claude Code session on the host with a shell and
+  passwordless sudo. The controls that replace the old verb allowlist are a
+  pre-task snapshot, an automatic rollback, and a complete audit log. This is a
+  deliberate, documented trade and not an oversight; `ops/README.md` § *The
+  trust model* is the honest version.
+- **That session no longer runs as `npurcell` — and the migration to make that
+  true has never been run.** Until 2026-08-11 it ran as the checkout's owner,
+  which is `npurcell`, which is in the `docker` group, which the line above
+  calls *"effectively root on the host"* — so the sudoers scoping was not a
+  boundary and the audit was not tamper-proof. It now runs as an unprivileged
+  system account (`clawcius-ops`) that the daemon refuses to start without, and
+  **that account does not exist on this host yet**. Until
+  [`MIGRATION.md`](MIGRATION.md) is executed, every ops task is refused with the
+  reason and the fix; the daemon still boots and still honours its rollback
+  deadlines.
 - **`ops/clawcius-sudoers` has never been parsed by `visudo -c`.** It was
-  written on a machine without sudo. Check it before installing, from a second
-  shell that already holds root.
+  written on a machine without sudo, and it was rewritten (larger, and against
+  a different user) on 2026-08-11. Check it before installing, from a second
+  shell that already holds root — `MIGRATION.md` § 3 has the sequence.
 - **The host agent's rollback covers containers only.** `docker commit` captures
   an agent container's writable layer; it does not capture `/etc`, the checkout
   or unit files. A task that breaks the host filesystem is undone by the VPS

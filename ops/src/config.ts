@@ -357,9 +357,15 @@ export type SnapshotVerifyConfig = {
  * See ops/src/host-agent.ts for the whole argument. The keys here are the ones
  * an operator has any business changing; everything that is a security decision
  * — which tools are denied, what the standing prompt says, that the session
- * runs as the checkout's owner and never as root, that its environment is built
- * from an allowlist — is in code, on purpose. A YAML key that can widen a
- * session with sudo is a YAML key somebody will widen at 3am.
+ * runs as an unprivileged account and never as root, that the account may not
+ * be in the docker group, that its environment is built from an allowlist — is
+ * in code, on purpose. A YAML key that can widen a session with sudo is a YAML
+ * key somebody will widen at 3am.
+ *
+ * Note the shape of the two keys added on 2026-08-11: `forbiddenGroups` and
+ * `secretPaths` can only ever make the checks in `agent-user.ts` STRICTER.
+ * There is no key that removes `docker` from the refusal list, and there must
+ * never be one.
  */
 export type HostAgentConfig = {
   /**
@@ -372,6 +378,79 @@ export type HostAgentConfig = {
    * strictly better than stopping the unit, which would drop the deadlines.
    */
   enabled: boolean;
+  /**
+   * The service account the session runs as. Default `clawcius-ops`.
+   *
+   * ── Why this is a name now, and not a `stat` ──────────────────────────
+   *
+   * Until 2026-08-11 there was no such key: the session was dropped to
+   * whoever owned the checkout, discovered by `stat`ing it, with a comment
+   * saying the executor "is not entitled to an opinion about who owns a
+   * directory it was pointed at". That reasoning was right for a *build step*
+   * and wrong for an identity. On this host the checkout is owned by
+   * `npurcell`, `npurcell` is in the `docker` group, and the docker group is
+   * root — so the session inherited a root-equivalent identity through a
+   * mechanism nobody had to write down, and every other control in this
+   * directory was decoration.
+   *
+   * So the identity is named, deliberately, in a file that gets reviewed. If
+   * the account does not exist the executor REFUSES TASKS; it does not fall
+   * back to the checkout's owner and it does not fall back to root. See
+   * ops/src/agent-user.ts and MIGRATION.md.
+   */
+  user: string;
+  /**
+   * Where the user and group databases are read from.
+   *
+   * These exist so the self-test can drive the real resolution path against
+   * fixture files without root, docker or a real `clawcius-ops` account —
+   * "fixture the data, not the code" — and because a host whose passwd lives
+   * somewhere unusual should fail with a path in the message rather than with
+   * "no such user". On a real host they are `/etc/passwd` and `/etc/group`
+   * and there is no reason to touch them.
+   *
+   * Both are read as FILES. A host using nsswitch with LDAP/SSSD will not
+   * have its group memberships here and the docker-group assertion would
+   * silently pass. That limit is written down in agent-user.ts rather than
+   * worked around by shelling out to `getent` from a root daemon.
+   */
+  passwdPath: string;
+  groupPath: string;
+  /**
+   * EXTRA group names to refuse to run as a member of.
+   *
+   * Unioned with the built-in list in agent-user.ts (`docker`, `podman`,
+   * `lxd`, `sudo`, `wheel`, `root`, `disk`, `shadow`, `adm`), never a
+   * replacement for it. This key can only make the check stricter. A key that
+   * could take `docker` off the list would be a key somebody takes `docker`
+   * off the list with, at 3am, to make a task work.
+   */
+  forbiddenGroups: string[];
+  /**
+   * Files and directories the agent account must NOT be able to read.
+   *
+   * Every instance's `envFile` is added to this automatically — those hold
+   * `DISCORD_TOKEN`, and `assertNoSecrets` refusing to put that token in the
+   * session's *environment* is worth nothing if the session can `cat` the
+   * file it lives in.
+   *
+   * Checked from mode bits before every task, and a readable secret REFUSES
+   * the task. It cannot see POSIX ACLs or a friendlier bind mount of the same
+   * inode; it is a check against a `.env` left 0644, not against an adversary.
+   */
+  secretPaths: string[];
+  /**
+   * An ssh private key the session uses for git, or empty.
+   *
+   * Becomes `GIT_SSH_COMMAND=ssh -i <key> -o IdentitiesOnly=yes …` in the
+   * session's environment. It is a PATH, on purpose: a read-only deploy key
+   * owned by the agent account is a credential scoped to one repository that
+   * can be revoked on its own, and it is the alternative to handing a session
+   * with a shell the operator's GitHub PAT — which would be a token in the
+   * environment, which `assertNoSecrets` refuses anyway. There is deliberately
+   * no key here that takes a token. See MIGRATION.md § 5.
+   */
+  gitSshKey: string;
   /** Absolute path to the `claude` binary. Never looked up on PATH. */
   claudePath: string;
   /**
@@ -504,6 +583,12 @@ const DEFAULTS: OpsConfig = {
   instances: [],
   hostAgent: {
     enabled: true,
+    user: 'clawcius-ops',
+    passwdPath: '/etc/passwd',
+    groupPath: '/etc/group',
+    forbiddenGroups: [],
+    secretPaths: [],
+    gitSshKey: '',
     claudePath: '/usr/local/bin/claude',
     workDir: '/var/lib/clawcius-host-agent',
     timeoutMinutes: 30,
@@ -666,6 +751,39 @@ function checkName(value: string, path: string): string {
       path,
       `("${value}") must be a short lowercase name matching ${String(NAME_PATTERN)} — ` +
         'requests are matched against it by exact string equality',
+    );
+  }
+  return value;
+}
+
+/**
+ * Account names this loader will accept for `hostAgent.user`.
+ *
+ * Narrower than what `useradd` allows, for the same reason `NAME_PATTERN` is
+ * narrower than what docker allows: the string ends up in refusal messages, in
+ * the boot banner and in `id`-style advice printed for a human to paste, and
+ * every character class permitted here is one more thing to think about. It
+ * is never interpolated into a command by this daemon — the drop is
+ * `setuid(2)` on a numeric uid — but the sudoers file is written against it by
+ * hand, and a username with a comma or a colon in it would silently change the
+ * meaning of that file.
+ *
+ * `root` is NOT rejected here. It is rejected in `resolveAgentUser`, by uid,
+ * because that catches the account whose name is `toor` as well and because
+ * rejecting it at load time would fail the boot of a `Restart=always` unit —
+ * see the long note in agent-user.ts about why that is the wrong failure shape
+ * for this service.
+ */
+const AGENT_USER_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+function agentUserName(raw: unknown): string {
+  const value = str(raw, 'hostAgent.user', DEFAULTS.hostAgent.user);
+  if (!AGENT_USER_PATTERN.test(value)) {
+    throw new OpsConfigError(
+      'hostAgent.user',
+      `("${value}") must be a plain account name matching ${String(AGENT_USER_PATTERN)}. ` +
+        'It names the unprivileged service account the host agent session runs as; see ' +
+        'MIGRATION.md for how to create it.',
     );
   }
   return value;
@@ -1019,6 +1137,30 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     instances,
     hostAgent: {
       enabled: bool(agent['enabled'], 'hostAgent.enabled', DEFAULTS.hostAgent.enabled),
+      user: agentUserName(agent['user']),
+      passwdPath: absPath(agent['passwdPath'], 'hostAgent.passwdPath', DEFAULTS.hostAgent.passwdPath),
+      groupPath: absPath(agent['groupPath'], 'hostAgent.groupPath', DEFAULTS.hostAgent.groupPath),
+      forbiddenGroups: strList(
+        agent['forbiddenGroups'],
+        'hostAgent.forbiddenGroups',
+        DEFAULTS.hostAgent.forbiddenGroups,
+      ),
+      // Absolute, because a relative "secret path" would resolve against
+      // whatever working directory systemd happened to give this unit, and a
+      // check that silently points at the wrong file reads as a pass.
+      secretPaths: strList(
+        agent['secretPaths'],
+        'hostAgent.secretPaths',
+        DEFAULTS.hostAgent.secretPaths,
+      ).map((path, index) => {
+        if (!isAbsolute(path)) {
+          throw new OpsConfigError(`hostAgent.secretPaths[${index}]`, 'must be an absolute path');
+        }
+        return resolve(path);
+      }),
+      gitSshKey: agent['gitSshKey']
+        ? absPath(agent['gitSshKey'], 'hostAgent.gitSshKey', DEFAULTS.hostAgent.gitSshKey)
+        : DEFAULTS.hostAgent.gitSshKey,
       claudePath: absPath(agent['claudePath'], 'hostAgent.claudePath', DEFAULTS.hostAgent.claudePath),
       workDir: absPath(agent['workDir'], 'hostAgent.workDir', DEFAULTS.hostAgent.workDir),
       timeoutMinutes: num(
@@ -1274,10 +1416,12 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
   //
   // Three things it must not be, each because of a specific failure:
   //
-  //   - inside a spool: the session runs as the checkout's owner and writes
-  //     freely there, and a spool it can write is a spool it can file requests
+  //   - inside a spool: the session writes freely in its own working
+  //     directory, and a spool it can write is a spool it can file requests
   //     into — forging a request from whichever instance owns that directory,
-  //     which is the one thing provenance is supposed to make impossible;
+  //     which is the one thing provenance is supposed to make impossible. The
+  //     spools are group-writable by the uid the containers run as, so this
+  //     stayed true across the 2026-08-11 change of identity;
   //   - inside stateDir, or containing it: stateDir is 0750 root-owned and
   //     holds the journal, the breaker and the deadlines. The session must not
   //     need to traverse it to work, and must not be able to reach it by
@@ -1296,8 +1440,8 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         throw new Error(
           `ops-config.yaml: hostAgent.workDir (${config.hostAgent.workDir}) and ` +
             `instances[${instance.name}].${label} (${dir}) contain one another. The host ` +
-            'agent session writes into its working directory as the checkout owner; a spool ' +
-            'it can write is a spool it can forge a request into.',
+            'agent session writes into its working directory as its own service account; a ' +
+            'spool it can write is a spool it can forge a request into.',
         );
       }
     }
@@ -1309,8 +1453,8 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     throw new Error(
       `ops-config.yaml: hostAgent.workDir (${config.hostAgent.workDir}) and stateDir ` +
         `(${config.stateDir}) contain one another. stateDir holds the journal, the circuit ` +
-        'breaker and the armed deadlines, and is 0750 root-owned; the host agent runs as the ' +
-        'checkout owner and must not have it as a working directory.',
+        'breaker and the armed deadlines, and is 0750 root-owned; the host agent runs as an ' +
+        'unprivileged service account and must not have it as a working directory.',
     );
   }
   for (const repo of config.repos) {

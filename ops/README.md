@@ -22,11 +22,22 @@ place that has to say so honestly.
   │    ops/   wake/        │ ◄──────────── │  every command audited, in full      │
   └────────────────────────┘   wakes back  │  deadline armed on what it touched   │
                                            └───────────────┬──────────────────────┘
-                                                           │ claude -p, as npurcell,
-                                                           │ with Bash and sudo
+                                                           │ claude -p, as clawcius-ops,
+                                                           │ with Bash and a short
+                                                           │ enumerated sudoers file
                                                            ▼
-                                                    the whole machine
+                                            the machine, minus what that account
+                                            is not allowed to reach — which is
+                                            now a real sentence. See § The
+                                            service account.
 ```
+
+> **2026-08-11.** The session used to run as `npurcell`, the operator, who is in
+> the `docker` group. That made every control below decoration: `docker run -v
+> /:/host` is root in one command with no sudo in the path. It now runs as its
+> own unprivileged system account and the daemon refuses to start it otherwise.
+> [§ The service account](#the-service-account-2026-08-11) is the whole story;
+> [`MIGRATION.md`](../MIGRATION.md) is how to get there from here.
 
 ## Why the verbs went
 
@@ -104,8 +115,9 @@ The three that were kept are plumbing, and each survived for its own reason:
 
 ## What a task actually does
 
-1. **Refuse early.** Disabled? Frozen? Out of scope for this requester? Owner of
-   the checkout unknowable? Nothing starts.
+1. **Refuse early.** Disabled? Frozen? Out of scope for this requester? Service
+   account missing, root-equivalent, or able to read a secret? Nothing starts —
+   and, in the last case, nothing is spawned at all.
 2. **Sample health.** `systemctl is-active` for every unit under `units:`,
    `docker container inspect` for every instance. This is the baseline, and
    having one is what makes "this was already broken" distinguishable from "this
@@ -249,8 +261,21 @@ available"*, and the file it was asked to create does not exist afterwards.
 That sentence used to end "…and this service is where the container boundary is
 enforced". It does not any more. **For this component the sandbox has stopped
 being a security boundary.** The operator was warned twice and accepted the
-trade in writing. What is offered in exchange is rollback, the audit log, and
-the fact that this is a personal VPS with snapshots.
+trade in writing. What is offered in exchange is rollback, the audit log, the
+fact that this is a personal VPS with snapshots — and, since 2026-08-11, an
+OS-level boundary that is not a sandbox but is real: the session runs as an
+account that cannot become root.
+
+**The trust model has now changed three times in two days, so here is the
+honest state of it in one place:**
+
+| | 2026-08-09 | 2026-08-10 | 2026-08-11 |
+|---|---|---|---|
+| What bounds the privileged work | a closed list of seven verbs with argument allowlists | nothing in front of prose; a snapshot, a rollback and an audit behind it | the same, **plus** an unprivileged account, an enumerated sudoers file, and no docker socket |
+| Who the privileged work runs as | root, for two build commands, dropped to the checkout's owner | the whole session, as the checkout's owner — i.e. the operator, i.e. the `docker` group, i.e. root | `clawcius-ops`, refused at start if it is root-equivalent |
+| Is the sudoers file a boundary | it was four rules for the waker | **no** — `docker run -v /:/host` went round it | **yes, mostly** — see § Sudoers for the one gap, which is unit-install plus restart |
+| Is the audit tamper-proof | n/a | **no** — the session could become root and rewrite it | **hard, not impossible** — same one gap, and it is two obvious lines in the log |
+| Can the session read the operator's credentials | yes | yes — `.env`, `~/.claude`, `~/.ssh` | **no**, and the daemon refuses to start it if it can |
 
 Everything below is what is still true.
 
@@ -301,25 +326,138 @@ override that per-name with `hostAgent.envPassthrough`, which is the point: it
 makes "yes, I mean it" a diff somebody reviewed.
 
 `clawcius-ops.service` has no `EnvironmentFile` at all and must never gain one.
-The session authenticates with the owner's own Claude Code OAuth credentials
-under `/home/npurcell`.
+The session authenticates with the **agent account's own** Claude Code OAuth
+credentials under `/var/lib/clawcius-agent` — a second login, established once
+by hand ([`MIGRATION.md` § 4](../MIGRATION.md)), deliberately not the
+operator's.
 
-### The session runs as the checkout's owner, never as root
+### The service account (2026-08-11)
 
-Discovered by `stat`ing the checkout, never hardcoded, exactly as the build step
-it replaces did — this daemon is not entitled to an opinion about who owns a
-directory it was pointed at. The drop is `setuid(2)` performed by libuv in the
-forked child before `execve`, so there is no `sudo`, no `su` and no setuid
-binary involved, and `NoNewPrivileges` has no bearing on it.
+> **The session runs as `clawcius-ops`, an unprivileged system account that is
+> not in the `docker` group — and the daemon refuses to start it if that ever
+> stops being true.**
 
-**If the owner cannot be determined, the task is refused.** Running a session
-with a shell as root is a much larger version of the 2026-08-09 failure that
-motivated the original drop: not two commands leaving root-owned files, but
-every command it chooses to run.
+This is the change that makes everything else on this page mean something, so
+it is worth being blunt about what it replaced.
 
-The upside is that the original failure becomes structurally impossible for
-anything the session does without `sudo`. It cannot leave a root-owned
-`node_modules/` behind by accident, because it is not root.
+Until 2026-08-11 the session was dropped to *"whoever owns the checkout"*,
+discovered by `stat`, with a comment explaining that this daemon "is not
+entitled to an opinion about who owns a directory it was pointed at". That
+reasoning is right for a **build step** and exactly backwards for an
+**identity**. On this host the checkout is owned by `npurcell`, and SETUP.md
+adds `npurcell` to the `docker` group with the comment *"docker group is
+effectively root on the host"*. So:
+
+- **the sudoers file was not a boundary.** `docker run -v /:/host alpine chroot
+  /host sh` is a root shell in one command, with no `sudo`, no rule and no
+  audit entry in the path;
+- **the audit was not tamper-proof.** `journal.jsonl` is 0750 and root-owned,
+  and was one `docker run -v` away from being rewritten by the session it was
+  recording;
+- **"it holds no Discord token" was not true in any useful sense.** The session
+  could `cat /home/npurcell/clawcius/.env`. Asserting the token is not in its
+  *environment* bought nothing.
+
+#### What is asserted, and where
+
+`ops/src/agent-user.ts` refuses to start a session as an account that:
+
+- **does not exist.** There is no fallback to the checkout's owner and no
+  fallback to root. A missing account means every task is refused with the
+  `useradd` line in the message;
+- **has uid 0**, however it is spelled;
+- **is in any root-equivalent group**: `docker`, `podman`, `lxd`, `sudo`,
+  `wheel`, `root`, `disk`, `shadow`, or `adm`. Each has its own recorded reason
+  in that file. `hostAgent.forbiddenGroups` can add to that list and there is
+  deliberately no key that removes from it;
+- **can read a configured secret.** `hostAgent.secretPaths` plus every
+  instance's `envFile`, which is folded in automatically because those hold
+  `DISCORD_TOKEN`. Judged from mode bits, walking the ancestor directories for
+  the traverse bit before checking read on the target — `~/.ssh/id_ed25519` is
+  0600 inside a 0700 directory, and a check that only looked at the file would
+  be right by accident.
+
+Three layers, and the order matters:
+
+1. **at boot**, for the banner and `ops-status.json`. Visibility only;
+2. **before every task**, in the executor, which refuses with the fix;
+3. **immediately before `spawn`**, in `host-agent.ts`, in the same seat as
+   `assertNoSecrets`. This one exists so no code path added later can reach a
+   session start without it.
+
+**It is checked per task rather than once at boot, and that is the important
+design decision.** The membership this is guarding against —
+`usermod -aG docker clawcius-ops`, typed to make something work — is added to a
+**running** host. A boot-time check on a unit that stays up for weeks would
+never see it.
+
+**It does not `exit(1)`.** This unit is `Restart=always` with
+`StartLimitIntervalSec=0`; refusing to boot would be a five-second restart loop
+with every armed rollback deadline unhonoured, which is the shape of #7. The
+daemon comes up, holds its deadlines, answers check-ins, performs rollbacks —
+and refuses every task, loudly. That is exactly what `hostAgent.enabled: false`
+already does, and this codebase already argues it is strictly better than
+stopping the unit.
+
+#### How the drop is performed
+
+`setuid(2)`/`setgid(2)` by libuv in the forked child before `execve` — not
+`sudo -u`, not `su`. It *drops* privilege rather than gaining it, so
+`NoNewPrivileges` has no bearing on it (NNP still has to stay `false` for the
+sake of the `sudo` the session itself runs; different argument, same file).
+
+**And the supplementary groups are set too**, which they were not before.
+`spawn`'s `uid`/`gid` options do not call `setgroups(2)`, so the child inherits
+the parent's groups — and the parent is root. `build.ts` recorded that as an
+honest limitation and left it, which was defensible while the session was the
+checkout's owner and stopped being defensible the moment the whole argument
+became "this account is in no root-equivalent group": a process running as
+`clawcius-ops` while carrying gid 0 is not that. `withSupplementaryGroups` in
+`host-agent.ts` sets this process's own group list to the account's for the
+duration of the synchronous `spawn` call and restores it in a `finally`. The
+window is one synchronous block, so no other JavaScript in this process can
+observe it — which stops being true the day somebody puts an `await` inside it.
+
+#### Filesystem: a shared group, not shared ownership
+
+The agent has to write the checkout (`git pull`, `npm ci`, `dist/`) and must not
+read the operator's secrets. Those are only compatible through a group:
+`clawcius-dev`, with both accounts in it, the checkout group-writable, and
+**setgid on every directory** so files created later inherit the group instead
+of the creator's. `.env*`, `~/.claude` and `~/.ssh` stay `npurcell`-owned and
+`go-rwx`.
+
+Two things that will cost an evening if they are skipped, both in
+[`MIGRATION.md` § 2](../MIGRATION.md):
+
+- `/home/npurcell` must be `o+x` or the checkout inside it is unreachable
+  whatever its own mode says;
+- **git refuses a checkout owned by another user** — `fatal: detected dubious
+  ownership in repository` — until
+  `sudo -u clawcius-ops git config --global --add safe.directory <path>`.
+
+If the group is not set up, the executor **warns** rather than refusing: the
+symptom (every build failing with `EACCES`) is loud on its own, and a `chmod`
+nobody noticed should not take the whole ops mechanism offline.
+
+#### Private repositories: a deploy key, never a token
+
+`hostAgent.gitSshKey` is a **path**. There is deliberately no configuration key
+anywhere in `ops/` that accepts a token: a PAT would have to reach the session
+through its environment, where `assertNoSecrets` refuses `*_TOKEN` outright,
+and a PAT in a session with a shell can push, open pull requests and read every
+private repository the operator has. A read-only deploy key owned by the agent
+account is scoped to one repository and revoked on its own. The executor turns
+the path into `GIT_SSH_COMMAND=ssh -i … -o IdentitiesOnly=yes -o
+StrictHostKeyChecking=yes -o BatchMode=yes` and warns at boot if the key is
+missing, owned by somebody else, or group-readable.
+
+#### What it still cannot do about the original 2026-08-09 failure
+
+Nothing changed there and it is worth saying: a session that is not root cannot
+leave a root-owned `node_modules/` behind by accident. The **new** failure in
+that family is the mirror image — an agent that cannot write the tree at all —
+and that is what the shared group and the boot warning are for.
 
 ### What still holds, unchanged
 
@@ -365,19 +503,30 @@ repo path, any spool, or `stateDir`.
 
 Honest list, and it is longer than it was.
 
-- **The host agent can do anything on this host.** That is the feature. It is
-  bounded by the rate limit, the timeout, the budget, the lock and the rollback
-  — not prevented. There is no allowlist in front of prose and there cannot be.
+- **The host agent can do a great deal on this host.** That is the feature. It
+  is bounded by the account's permissions, the sudoers file, the rate limit, the
+  timeout, the budget, the lock and the rollback. There is still no allowlist in
+  front of prose and there cannot be — what changed on 2026-08-11 is that the
+  *other* bounds became real rather than notional.
 - **The rollback is containers only.** `/etc`, the checkout, unit files,
   packages: not covered. VPS snapshots and git are the recovery path, and a
   person is the one who invokes them.
-- **The audit is not tamper-proof.** The session runs as `npurcell`, and
-  `npurcell` is in the `docker` group, which SETUP.md itself describes as
-  "effectively root on the host". Anything that can become root can rewrite
-  `journal.jsonl`. The sudoers file is scoped so that the *easy* path is the
-  audited one — no `sudo sh`, no `sudo tee`, no `sudo cp` — but this is a record
-  against carelessness and confusion, not against a determined adversary with a
-  docker socket.
+- **The audit is much harder to tamper with than it was, and still not
+  tamper-proof.** Until 2026-08-11 this entry read: *"the session runs as
+  `npurcell`, and `npurcell` is in the `docker` group … anything that can become
+  root can rewrite `journal.jsonl`"*. That is no longer the case: the agent
+  account is in no root-equivalent group, has no docker socket, and no sudoers
+  rule reaches `/var/lib/clawcius-ops`, which is 0750 and root-owned. The
+  remaining path is the one named in § Sudoers — overwrite a unit file, reload,
+  restart a named unit — which is root in two commands that are themselves in
+  the journal, fsynced before they ran. It is a record against carelessness and
+  confusion, and now also against a casual adversary; it is not a record against
+  one who is willing to be obvious.
+- **A single account holds both the deploy capability and the debugging
+  capability.** The agent can install `clawcius.service` *and* restart it, which
+  is the escalation above. Splitting those across two accounts with a human
+  between them is possible and has not been done, because the operator's whole
+  complaint was about being the human between things.
 - **`mayRequest` bounds what an instance may ASK for, not what the agent may
   DO.** A task scoped to `hamachi` is still carried out by a session with a
   shell, and nothing but the task text and the standing prompt points it at
@@ -476,30 +625,74 @@ There is deliberately no `unfreeze` task-that-counts: a task *could* run
 
 ## Sudoers
 
-`ops/clawcius-sudoers` grants `npurcell` passwordless sudo for:
+`ops/clawcius-sudoers` grants **`clawcius-ops`** — not `npurcell` — passwordless
+sudo. It was rewritten on 2026-08-11 and every wildcard in it was removed,
+because for the first time its contents are the actual bound on what the session
+can do rather than a description of the polite route.
 
-| Grant | Why |
-|---|---|
-| `systemctl` restart/start/stop/status/is-active/is-enabled/enable/disable/reset-failed/list-units/show/cat, any unit; `daemon-reload` | The evening that motivated all this was spent standing up **new** units, which by definition are not in any list. Restricting the unit names is exactly what made the old rule useless. |
-| `journalctl` | The specific pain point: the operator was reading unit logs out loud to an agent that could not see them. Read-only. |
-| `mkdir -p`, `chown`, `chmod` under `/var/lib/clawcius*` and `/var/lib/hamachi*` | Making and fixing state directories, which was half the ad-hoc work. Scoped by **path**, because `chown -R npurcell /etc` is the failure worth preventing and it looks perfectly ordinary. |
-| `install -m 0644 -o root -g root … /etc/systemd/system/*`, `rm -f` of units | Installing a unit, with the mode and ownership pinned by the rule rather than chosen by the caller. |
+| Grant | Scope | Why |
+|---|---|---|
+| `systemctl restart` / `start` / `stop` / `enable` / `disable` / `reset-failed` | **Named units only**: `clawcius`, `hamachi`, `clawcius-status`, the two `*-container` units, `clawcius-netguard`, the snapshot service and timers, and `oj` / `oj-container` (which do not exist yet). | The old `restart *` permitted `sshd`, `systemd-journald` and the firewall. Naming them costs one line per new unit, which is the right price for the step that runs new code as root forever. |
+| `systemctl daemon-reload` | Bare, no arguments | Makes an installed unit visible. Changes nothing on its own. |
+| `systemctl status` / `is-active` / `is-enabled` / `is-failed` / `show` / `cat` / `list-units` / `list-timers` | **Any unit** | Reading state cannot break anything, and an agent debugging `clawcius.service` needs to look at what it depends on. |
+| `journalctl` | Any | The original pain point: the operator was reading unit logs out loud to an agent that could not see them. |
+| `docker ps` / `images` / `inspect` / `logs` / `stats --no-stream` / `version` / `info` | Read-only; `logs` restricted to the three agent containers | This section did not exist before — the previous grantee reached docker through group membership, so a rule "would add nothing except the false impression that docker access is being controlled here". |
+| `docker restart` / `stop` / `start` | `clawcius-agent`, `hamachi-agent`, `oj-agent` | "The agent container is wedged" is a real task. |
+| `mkdir -p`, `chown`, `chmod` | **Exact paths** under `/var/lib/{clawcius,hamachi,oj}/run` | Repair, mostly: the executor creates and chowns every spool at boot. |
+| `install -m 0644 -o root -g root … /etc/systemd/system/{clawcius,hamachi,oj}*.{service,timer}`, `rm -f` of the same | Namespaced destinations | Installing this project's units, with the mode and ownership pinned by the rule. |
 
-Deliberately **not** granted: `docker` (npurcell already has it via group
-membership, so a rule would only create the false impression it is being
-controlled), `apt`/`npm`/`pip` as root, `systemctl edit` (opens `$EDITOR` as
-root), `visudo`/`usermod`/`passwd`/`su`, and any blanket interpreter — no
-`sudo sh`, `sudo bash`, `sudo python3`, `sudo env`, `sudo tee`, `sudo cp`,
-`sudo dd` or `sudo find`. Those are the one-line escalations, and each is also a
-one-line way to rewrite the audit log.
+**`clawcius-ops.service` is deliberately not on the restartable list.** It is
+the process that starts the session; restarting it kills the task mid-flight,
+loses the record and silently restarts a recovery window. Until 2026-08-11 that
+was prevented by a sentence in the standing prompt; it is now prevented by a
+missing line as well, and the prompt still explains *why* so the refusal is
+understood rather than routed around. **`docker.service` is off the list too** —
+restarting it takes both agents down at once.
 
-Two honest caveats, both in the file itself: it **has not been checked with
-`visudo -c`** (the machine it was written on has no sudo — do that before
-installing it, from a second shell that already has root), and sudo's `*`
-matches `/` without canonicalising, so `chown … /var/lib/clawcius/../../etc`
-matches. On a host where npurcell is already in the docker group that changes
-nothing about what is reachable, which is why it is documented rather than
-papered over with a glob that looks airtight and is not.
+Deliberately **not** granted: `docker run` / `create` / `exec` / `cp` / `build`
+/ `commit` (the first is `-v /:/host`, i.e. root; the second is root inside a
+container that bind-mounts a spool, i.e. forged provenance; the third is `sudo
+cp` wearing a container), `apt`/`npm`/`pip` as root, `systemctl edit` (opens
+`$EDITOR` as root), `visudo`/`usermod`/`gpasswd`/`passwd`/`su` — `usermod -aG
+docker clawcius-ops` is now specifically the thing this account must not be able
+to do to itself — `setfacl`/`chattr`/`mount` (each a way past the mode bits the
+secret check reads), and any blanket interpreter: no `sudo sh`, `bash`,
+`python3`, `env`, `tee`, `cp`, `dd`, `mv`, `ln` or `find`.
+
+**No rule may ever name a path inside the checkout.** The agent can write
+`/home/npurcell/clawcius` (that is what the shared group is for), so
+`sudo /home/npurcell/clawcius/docker/run-container.sh` would be "run this file I
+can edit, as root" — i.e. `sudo ALL`. That is why there is no rule for
+`run-container.sh` or `snapshot.sh` even though the agent obviously needs
+containers recreated: **the executor runs those two itself, as root, with an
+argv it builds.**
+
+### Two things about sudo's matching that shaped the file
+
+- **`*` matches `/` and spaces.** sudo joins the arguments into one string and
+  `fnmatch`es it without `FNM_PATHNAME`. So the old `chown … /var/lib/clawcius*`
+  matched `/var/lib/clawcius/../../etc`, and the old `restart *` matched any
+  unit at all. That was documented and shrugged off on the grounds that the
+  docker group made it moot. It is not moot any more, so the paths are
+  enumerated.
+- **Unit names need their suffix.** `systemctl restart clawcius` and
+  `… clawcius.service` are the same to systemd and different strings to sudo,
+  and only the second is granted. A refusal on a unit you are sure is listed is
+  almost always this. Both spellings are not listed, deliberately: the value of
+  the file is that it can be read in one sitting.
+
+### What it still does not buy, stated plainly
+
+**Installing a unit file plus restarting a named unit is root, in two audited
+steps.** Overwrite `clawcius.service`, `daemon-reload`, restart. There is no way
+to remove that without also removing the ability to deploy this project's own
+units, which is the capability the whole mechanism exists to provide. What it
+costs the adversary is that both steps are in the journal, in full, fsynced
+before they ran, and they look like exactly what they are.
+
+It also **has still not been checked with `visudo -c`** — the machine it was
+written on has no sudo. Do that before installing, from a second shell that
+already holds root. [`MIGRATION.md` § 3](../MIGRATION.md) has the sequence.
 
 ## `pull` refused a dirty tree. Now the briefing names the files instead.
 
@@ -794,7 +987,19 @@ properties rather than tidiness:
   it names a subdirectory of an already-authorised repo, not a second way to
   nominate a directory for a root process to run `npm` in;
 - `snapshotVerify.instances` must name real instances, and `probe` may not be
-  empty — an empty probe would report every restore as healthy.
+  empty — an empty probe would report every restore as healthy;
+- `hostAgent.user` must be a plain account name, and `hostAgent.secretPaths`
+  and `hostAgent.gitSshKey` must be absolute — a relative "secret path" would
+  resolve against whatever working directory systemd happened to give the unit,
+  and a check silently pointing at the wrong file reads as a pass.
+
+The keys added on 2026-08-11 are asymmetric on purpose:
+`hostAgent.forbiddenGroups` and `hostAgent.secretPaths` can only make the
+identity checks **stricter**. There is no key that takes `docker` off the
+refusal list and there must never be one — a key that can widen a session with
+sudo is a key somebody widens at 3am. `hostAgent.passwdPath` and
+`hostAgent.groupPath` exist so the self-test can drive the real resolution path
+against fixture files; on a real host there is no reason to touch them.
 
 ## Layout
 
@@ -806,8 +1011,16 @@ ops/
   src/
     index.ts             daemon entry, single-instance lock, signals
     config.ts            typed YAML loader, defaults, containment assertions
-    build.ts             who owns the checkout (the session runs as them), and
-                         what state its tree is in (for the briefing)
+    agent-user.ts        WHO THE SESSION IS. Resolves the named service account
+                         out of /etc/passwd + /etc/group and refuses to run as
+                         one that is missing, is uid 0, is in a root-equivalent
+                         group, or can read a configured secret. Read this
+                         second, after host-agent.ts.
+    build.ts             what state the checkout's tree is in (for the
+                         briefing). It used to answer "who owns the checkout,
+                         because that is who the session runs as"; that
+                         question moved to agent-user.ts on 2026-08-11 and the
+                         reversal is explained there.
     request.ts           parsing and validating hostile spool content
     spool.ts             one directory-as-a-queue per instance; the caps, and
                          the stamp that says whose it was
@@ -860,12 +1073,16 @@ with permission errors against paths whose `ls -l` says they are fine. **The
 `pull` verb could never have worked as shipped**, and it would have been
 diagnosed as a git problem.
 
-Re-audited on 2026-08-10 with the host agent in mind, and the case against it is
-now much stronger. The session's `HOME` is `/home/npurcell` and that is where
-Claude Code keeps the OAuth credentials it authenticates with: under
-`ProtectHome=read-only` it cannot write its session state, and under `=yes` or
-`=tmpfs` it cannot find its credentials at all. The symptom would be every task
-failing to authenticate on a host where `claude` works perfectly from a shell. There is a near miss next to it: `ExecStart` is
+Re-audited on 2026-08-10 with the host agent in mind, when the session's `HOME`
+was `/home/npurcell` and that was where Claude Code kept the OAuth credentials
+it authenticated with. **That particular argument expired on 2026-08-11**: HOME
+is now `/var/lib/clawcius-agent`, which `ProtectHome` does not touch, and it
+would be easy to conclude from that alone that `read-only` is safe to add now.
+It is not — the checkout is still under `/home` and still has to be written, so
+the original 2026-08-09 argument above is the live one. The unit file records
+that its *justification* changed while its *verdict* did not, because losing
+that distinction is exactly how a directive that is fatal for reason B gets
+added because reason A was fixed. There is a near miss next to it: `ExecStart` is
 `/home/npurcell/.local/share/node/bin/node`, so `ProtectHome=yes` or `=tmpfs`
 would have hidden the interpreter and the unit would not have started at all —
 which would have been the *better* failure, caught on the first restart instead
@@ -896,10 +1113,29 @@ real task before lowering it. The containers a task starts do *not* count
 against this; docker puts them in their own slice.
 
 `StateDirectory` gained `clawcius-host-agent`, a **sibling** of the executor's
-state rather than a child. The session runs as `npurcell` and needs to write its
-working directory; putting it inside a 0750 root-owned directory would mean
-either the session cannot traverse to it or the journal and the breaker stop
-being 0750.
+state rather than a child. The session needs to write its working directory;
+putting it inside a 0750 root-owned directory would mean either the session
+cannot traverse to it or the journal and the breaker stop being 0750. Since
+2026-08-11 the executor chowns it to `hostAgent.user` rather than to the
+checkout's owner.
+
+There is a name collision here worth knowing about before it bites somebody:
+the executor's `StateDirectory` is `/var/lib/clawcius-ops` **and the service
+account is also called `clawcius-ops`**. Those must not be the same tree — the
+state directory holds the journal, the breaker and the armed deadlines, and an
+account whose `$HOME` is there owns the breaker that quarantines it.
+`MIGRATION.md § 1` therefore creates the account with
+`--home-dir /var/lib/clawcius-agent`. The executor warns at boot if it ever
+finds otherwise.
+
+`RestrictSUIDSGID=true` was re-checked on 2026-08-11 and nearly broke: the
+shared-group scheme puts the **setgid bit on every directory in the checkout**,
+and `chmod g+s` on a directory is precisely what that filter blocks. It survives
+because those chmods are run by the operator from their own shell during the
+migration, not by a task, and therefore not inside this unit's cgroup. A future
+task that needs to create a setgid directory will fail here with an `EPERM` on
+`chmod` that looks nothing like a systemd setting; the answer is that the
+operator runs that one command.
 
 Checked and deliberately still absent, each with the reason recorded in the
 unit itself:
@@ -907,12 +1143,14 @@ unit itself:
 | Directive | Verdict |
 |---|---|
 | `MemoryDenyWriteExecute` | Never. Any Node process dies at startup. |
-| `NoNewPrivileges` | Stays `false`, and since 2026-08-10 that is **mandatory** rather than cautious. `sudo` is a setuid binary and NNP makes the setuid bit a no-op, so under it every sudo call the host agent makes fails — with a message about the effective uid that reads like a broken sudoers file rather than a unit setting. Note the asymmetry that used to be the whole entry: *dropping* privilege via `setuid(2)` is unaffected by NNP, so the session's own privilege drop would work fine. It is the sudo inside the session that would not. |
+| `NoNewPrivileges` | Stays `false`, and since 2026-08-10 that is **mandatory** rather than cautious. `sudo` is a setuid binary and NNP makes the setuid bit a no-op, so under it every sudo call the host agent makes fails — with a message about the effective uid that reads like a broken sudoers file rather than a unit setting. Note the asymmetry that used to be the whole entry: *dropping* privilege via `setuid(2)` is unaffected by NNP, so the session's own privilege drop would work fine. It is the sudo inside the session that would not. Re-checked 2026-08-11 and now *more* load-bearing: sudo is the session's only privileged path, where before it also had the docker group. |
 | `SystemCallFilter` | No. `@system-service` would probably cover docker, systemctl, git, npm and node — including `@setuid` for the drop — and "would probably cover" is the phrase that preceded the SIGTRAP loop. It now also has to cover *whatever a task chooses to run*, which is not a set anybody can enumerate. A filter one syscall short kills a task *halfway through*. |
 | `IPAddressDeny` | No, and not close. `git pull` reaches GitHub and `npm ci` reaches the registry; denial surfaces as timeouts, not refusals. |
 | `PrivateTmp` | No. npm stages tarballs through `TMPDIR`, and a private `/tmp` also hides it from the operator debugging this at 3am. |
 | `ProtectSystem` | `strict` breaks the docker socket (a read-only `/run` denies the write permission a unix socket connect needs). `full` is likely fine and likewise untested. |
-| `RestrictSUIDSGID` | Kept. It restricts *creating* setuid files; it does not touch `setuid(2)` and does not stop *executing* an existing setuid binary — checked deliberately, because if it did it would break `sudo` and therefore the host agent, exactly as NNP would. |
+| `RestrictSUIDSGID` | Kept. It restricts *creating* setuid files; it does not touch `setuid(2)` and does not stop *executing* an existing setuid binary — checked deliberately, because if it did it would break `sudo` and therefore the host agent, exactly as NNP would. Re-checked 2026-08-11: it **does** block `chmod g+s` on a directory, which the shared-group scheme needs. Survives only because those chmods are the operator's, run outside this cgroup. |
+| `SupplementaryGroups=` | Not added, and it would do nothing: it applies to the unit's own `User=`, which is root. The session's supplementary groups are set around the `spawn` in `src/host-agent.ts`, because they have to be the *agent's* and systemd has no directive for "the groups of a process this unit forks with a different uid". |
+| `User=` the agent instead of root | Rejected. The executor itself needs the docker socket for snapshots, rollbacks and the health sample, and giving the agent account that means putting it in the `docker` group — which is precisely what this whole rework forbids. The split is the design: a small readable root supervisor, and an unprivileged session that is neither. |
 
 `clawcius-snapshot-verify.service` carried no hardening block at all, which is
 the only reason it had nothing fatal in it. It now carries the same reasoning
@@ -979,6 +1217,47 @@ The tests added for the host agent on 2026-08-10:
   `checkout -f` — asserted against `dist/`, which is the part a refactor cannot
   quietly undo.
 
+The tests added for the service account on 2026-08-11 — all of which run with
+no root, no docker, no systemd and no `clawcius-ops` account on the machine,
+because `/etc/passwd` and `/etc/group` are text files and the fixture writes
+text files:
+
+- the named account is resolved with **both** its primary group (by gid) and
+  its supplementary ones (by member list) — a check that read only the member
+  lists would miss an account whose *primary* group is `docker`, which is
+  exactly how somebody would set this up without thinking about it, and there
+  is a separate test for that case;
+- a **missing** account refuses the task, with the `useradd` line in the
+  message, and **no session is spawned** — there is no fallback to the
+  checkout's owner and that is asserted rather than assumed;
+- an account **in the docker group** refuses the task, names the group, prints
+  the `gpasswd -d`, spawns nothing, is reported as `identity.ok: false` in
+  `ops-status.json`, and **`assertAgentIdentity` throws on its own** —
+  independently of the executor, so a future code path that reaches `spawn`
+  without going through `#doTask` still cannot start;
+- every group in the built-in list is refused, not just `docker`, and
+  `hostAgent.forbiddenGroups` only ever adds to it;
+- an account with **uid 0** is refused however it is spelled (the fixture calls
+  it `toor`);
+- an **unreadable `/etc/group` is a refusal, not a pass** — the assertion the
+  rest of the design rests on must not fail open;
+- a **secret the account can read** refuses the task, names the file, prints
+  the `chmod` — and tightening the mode lets the same task through with **no
+  restart**, which is the per-task evaluation being tested rather than
+  described;
+- the readability check **walks the ancestor directories** for the traverse bit
+  before checking read on the target (the `~/.ssh` shape: 0600 files inside a
+  0700 directory), and a path that does not exist is reported with the reason
+  rather than as "safe";
+- a checkout the account cannot write is a **warning**, not a refusal: the
+  session still starts, and the warning — with the `chgrp` in it — is in the
+  durable record;
+- the environment carries the **service account's** `HOME`, not the operator's,
+  which is the line that decides whose Claude Code login the session uses;
+- the standing prompt tells the session which account it holds, that it is not
+  in the docker group, and that `clawcius-ops.service` is not on the
+  restartable list.
+
 The per-instance-spool tests from earlier the same day are unchanged in intent
 and were rewritten onto `task`: two spools drained concurrently with each
 request attributed to its own directory, a request claiming
@@ -1004,8 +1283,18 @@ use it.
 - **No task has ever been run for real.** No `claude` session has been started
   by this daemon on the host, no snapshot has been committed or restored, no
   container has been recreated, no unit has been restarted.
+- **Nothing in `MIGRATION.md` has been executed.** No `useradd`, no `groupadd`,
+  no `chgrp`/`chmod`/`find` on the checkout, no `claude auth` as another
+  account, no `ssh-keygen` deploy key, no `git pull` as `clawcius-ops` in a tree
+  owned by `npurcell`. The document says so at the top.
+- **The privilege drop itself is not exercised.** The self-test's fixture
+  account carries the test process's own uid — it has to, because dropping to
+  another uid needs root — so what is tested is the resolution, the refusals and
+  the environment, not `setuid(2)` or `withSupplementaryGroups`. Check
+  `ps -o user= -p <pid>` on a live session and `id` inside a task's own report.
 - **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
-  a shell that already has root.
+  a shell that already has root. The rewrite is larger than the file it
+  replaced, so this matters more than it did.
 - **No unit in `systemd/` has been loaded since the audit below** — which is
   exactly the condition that produced the two units that shipped unable to run
   at all.

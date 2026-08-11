@@ -1,132 +1,526 @@
-# Passwordless sudo for npurcell, for the host agent.
+# Passwordless sudo for the Clawcius host agent's own service account.
 #
-# ── What this is for, and what changed on 2026-08-10 ──────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# WHAT CHANGED ON 2026-08-11, AND WHY THIS FILE IS NOW WORTH READING
+# ══════════════════════════════════════════════════════════════════════════
 #
-# This file used to grant four things: start, stop and restart of one named
-# unit, plus daemon-reload. That was enough for the waker and it was nowhere
-# near enough for the host agent, which is a Claude Code session that runs on
-# this box as npurcell and is expected to do the work the operator was doing by
-# hand — install a unit, make a state directory, fix an ownership mistake, and
-# above all read a journal so that nobody has to paste one into a chat window.
+# Until 2026-08-11 this file granted its rules to `npurcell` — the operator —
+# and the version of it written on 2026-08-10 said so plainly in a paragraph
+# headed "be clear about what this does and does not buy":
 #
-# ── Be clear about what this does and does not buy ────────────────────────
+#     It does NOT contain the host agent. It cannot. npurcell is in the
+#     `docker` group on this host — SETUP.md says so in the line that adds it,
+#     "docker group is effectively root on the host" — and `docker run -v
+#     /:/host` is root with no sudo involved at all.
 #
-# It does NOT contain the host agent. It cannot. npurcell is in the `docker`
-# group on this host — SETUP.md says so in the line that adds it, "docker group
-# is effectively root on the host" — and `docker run -v /:/host` is root with
-# no sudo involved at all. Anybody reading this file hoping it is a boundary
-# should stop here and read ops/README.md § The trust model instead.
+# That was honest and it was also fatal to the whole exercise. A carefully
+# scoped command alias granted to a member of the docker group is not a rule;
+# it is a description of the polite route. Every wildcard below was therefore
+# free — `systemctl restart *` could take out sshd, but so could
+# `docker run -v /:/host` — and nobody had to think about it.
 #
-# What the scoping does buy is real, and it is worth the effort:
+# The host agent now runs as its own unprivileged system account, by default
+# `clawcius-ops`, which is deliberately NOT in `docker`, `sudo`, `wheel`,
+# `adm`, `disk` or any other root-equivalent group. `ops/src/agent-user.ts`
+# REFUSES TO START A SESSION as an account that is, checked against the live
+# /etc/group before every single task rather than once at boot — because the
+# `usermod -aG docker clawcius-ops` this is guarding against is something
+# somebody types on a running host to make a task work.
 #
-#   1. **The easy path is the audited path.** Every command the session runs is
-#      written into /var/lib/clawcius-ops/journal.jsonl in full before its
-#      result is known. Granting `ALL` here would make "get a root shell" a
-#      single command; granting these makes the obvious way to do each job the
-#      way that reads clearly in the log.
-#   2. **No blanket interpreter.** There is deliberately no `sudo sh`, `sudo
-#      bash`, `sudo python3`, `sudo env`, `sudo tee`, `sudo cp`, `sudo dd`,
-#      `sudo vi` or `sudo find` here. Those are the classic one-line escalations
-#      and each one would also be a one-line way to rewrite the audit log that
-#      is standing where the verb allowlist used to.
-#   3. **It is a diff.** Widening it is a change somebody reviews, which is the
-#      whole point of it being in the repository rather than typed into
-#      visudo at 3am.
+# So for the first time the contents of this file are the actual bound on what
+# the session can do, and every wildcard in it had to go.
 #
-# ── Why each grant is here ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# WHAT THIS FILE IS, AND — STILL — WHAT IT IS NOT
+# ══════════════════════════════════════════════════════════════════════════
 #
-# systemctl (restart/start/stop/status/is-active/is-enabled/enable/disable/
-#   daemon-reload/reset-failed), unrestricted as to unit name.
-#   Restricting the unit names is what the old file did and it is exactly what
-#   made this useless: the operator's evening was spent standing up NEW units,
-#   which by definition are not in any list. Note the widening this represents:
-#   `docker.service` used to be deliberately excluded, because restarting it
-#   takes every container on the host down at once. It is reachable now. That is
-#   part of the trade and it is not hidden.
-#   `edit` and `set-property` are NOT granted: `systemctl edit` opens $EDITOR as
-#   root, which is a root shell with extra steps.
+# It IS:
 #
-# journalctl — the thing that started all this. The operator was reading unit
-#   logs out loud to an agent that could not see them. Read-only.
+#   1. **The bound on the easy path, and the easy path is the audited one.**
+#      Every command the session runs is written into
+#      /var/lib/clawcius-ops/journal.jsonl, in full, before its result is
+#      known. Granting `ALL` would make "get a root shell" one command;
+#      granting these makes the obvious way to do each job the way that reads
+#      clearly in the log.
+#   2. **A blast-radius limit inside this project's own namespace.** No sshd,
+#      no systemd-journald, no nftables/ufw, no docker.service, no `docker
+#      run`, no apt. A task that goes wrong in the way tasks go wrong — a typo,
+#      a confused model, a badly worded request — cannot take the host's
+#      network or its login off the air.
+#   3. **A diff.** Widening it is a change somebody reviews, which is the whole
+#      point of it living in the repository rather than being typed into visudo
+#      at 3am.
 #
-# mkdir/chown/chmod/install, scoped BY PATH to the directories this system
-#   actually owns: /var/lib/clawcius*, /var/lib/hamachi*, /etc/systemd/system.
-#   The paths are the scope here rather than the verbs, because `chown -R
-#   npurcell /etc` is the failure worth preventing and it is a perfectly
-#   ordinary-looking command.
-#   Note the deliberate absence of /home/npurcell: the session already owns that
-#   tree and needs no privilege for it, and a `sudo chown` inside it is how the
-#   2026-08-09 root-owned-node_modules incident got "fixed" twice.
+# It is NOT a boundary against a determined adversary, and here is the precise
+# reason, stated rather than left to be discovered:
 #
-# ── What is NOT here, and why ─────────────────────────────────────────────
+#   **Installing a unit file plus restarting a named unit is root, in two
+#   audited steps.** CLAWCIUS_UNITS below lets the agent `install` a file into
+#   /etc/systemd/system, and CLAWCIUS_UNITS_RW lets it restart
+#   clawcius.service. Overwrite clawcius.service with one whose ExecStart is
+#   anything, reload, restart: that is root. There is no way to remove that
+#   without also removing the ability to deploy this project's own units, which
+#   is the capability the whole ops mechanism exists to provide.
 #
-# * docker — not granted, and not an oversight. npurcell reaches docker through
-#   group membership, so a sudoers rule would add nothing except the false
-#   impression that docker access is being controlled here.
-# * apt / npm / pip as root — no. Installing packages system-wide is a decision
-#   with a blast radius beyond this host's lifetime, and it is one of the very
-#   few things worth waiting for a human on. If a task genuinely needs a system
-#   package, it should say so in its report and stop.
-# * /var/lib/clawcius-ops — no path rule reaches it. It holds journal.jsonl, the
-#   circuit breaker and the armed deadlines, and nothing here should make it
-#   convenient to write. (The docker group defeats this. It is still not made
-#   easy.)
-# * visudo, usermod, useradd, passwd, su — no. Granting the ability to grant is
-#   the end of the exercise.
+#   What it costs the adversary is that both steps are in the journal, in full,
+#   fsynced before they ran, and they look like exactly what they are. That is
+#   the trade, and it is the same trade the audit log makes everywhere else in
+#   this design.
 #
-# Install:  sudo install -m 0440 -o root -g root \
-#             /home/npurcell/clawcius/ops/clawcius-sudoers \
-#             /etc/sudoers.d/clawcius
+# One more, and it is new since the account changed: **any sudo rule naming a
+# path inside the checkout would be equivalent to `sudo ALL`.** The agent can
+# write /home/npurcell/clawcius (that is the point of the shared group in
+# MIGRATION.md § 2), so `sudo /home/npurcell/clawcius/docker/run-container.sh`
+# would be "run this file I can edit, as root". That is why there is no rule
+# for run-container.sh or snapshot.sh here even though the agent obviously
+# needs containers recreated: **the executor runs those two scripts itself, as
+# root, with an argv it builds** — see ops/src/executor.ts. Never add a sudo
+# rule pointing into a tree this account can write.
 #
-# Check it parses BEFORE you rely on it — a syntax error in one file in
-# /etc/sudoers.d breaks sudo for everybody:
-#           sudo visudo -c -f /etc/sudoers.d/clawcius
+# ══════════════════════════════════════════════════════════════════════════
+# INSTALLING IT
+# ══════════════════════════════════════════════════════════════════════════
 #
-# NOT YET VERIFIED WITH visudo -c. It was written on a machine without sudo
-# installed and has never been parsed by the real binary. Run the check above
-# before installing it, and do it from a second shell that already has root, in
-# case it is wrong.
+#   sudo install -m 0440 -o root -g root \
+#     /home/npurcell/clawcius/ops/clawcius-sudoers /etc/sudoers.d/clawcius
 #
-# One more honest limitation, since it is the sort of thing this repository
-# writes down rather than discovers: sudo's `*` matches `/` and sudo does not
-# canonicalise paths, so `chown npurcell:npurcell /var/lib/clawcius/../../etc`
-# matches the /var/lib/clawcius* rule. On a host where npurcell is already in
-# the docker group that changes nothing about what is reachable, which is why
-# it is documented rather than papered over with a cleverer glob — a glob that
-# looks airtight and is not would be worse than one that is honestly leaky.
+# CHECK IT PARSES BEFORE YOU RELY ON IT. A syntax error in one file under
+# /etc/sudoers.d breaks sudo for everybody, including the shell you would use
+# to fix it:
+#
+#   sudo visudo -c -f /etc/sudoers.d/clawcius
+#
+# Do that from a SECOND shell that already holds root. See MIGRATION.md § 3.
+#
+# NOT YET VERIFIED WITH visudo -c. Unchanged from the previous version and
+# still true: this was written on a machine with no sudo installed and has
+# never been parsed by the real binary.
+#
+# ══════════════════════════════════════════════════════════════════════════
+# TWO THINGS ABOUT SUDO'S MATCHING THAT DECIDE THE SHAPE OF THIS FILE
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 1. **Unit names must be written in full, with the suffix.** `systemctl
+#    restart clawcius` and `systemctl restart clawcius.service` do the same
+#    thing to systemd and are different strings to sudo, and only the second
+#    one is listed below. If a command here is refused with "a password is
+#    required", the shorthand is the first thing to check. Both spellings are
+#    NOT listed, deliberately: the value of this file is that it can be read in
+#    one sitting, and doubling it to absorb an abbreviation would cost more
+#    than the refusal does.
+#
+# 2. **`*` matches everything, including `/` and spaces.** sudo joins the
+#    arguments into one string and fnmatch()es it without FNM_PATHNAME. So the
+#    old `chown … /var/lib/clawcius*` rule matched
+#    `/var/lib/clawcius/../../etc`, and the old `systemctl restart *` matched
+#    literally any unit. That was documented and shrugged off in the previous
+#    version, on the grounds that the docker group made it moot. It is not moot
+#    any more, so the paths below are ENUMERATED rather than globbed. Where a
+#    `*` survives it is either in a read-only command or in a position where
+#    what it matches cannot escape a fixed prefix AND a fixed suffix.
+#
+# ══════════════════════════════════════════════════════════════════════════
+# ADDING SOMETHING
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A new unit, a new container or a new state directory means one more line
+# here, a `visudo -c`, and a re-install. That cost is deliberate. The 2026-08-10
+# version removed the unit list precisely because "the evening was spent
+# standing up NEW units, which by definition are not in any list" — and that
+# argument is still right about *installing* a unit (which is granted) and
+# wrong about *starting* one (which is running new code as root, forever, and
+# is the single step most worth a human's attention).
 
-Cmnd_Alias CLAWCIUS_SYSTEMCTL = /usr/bin/systemctl restart *, \
-                                /usr/bin/systemctl start *, \
-                                /usr/bin/systemctl stop *, \
-                                /usr/bin/systemctl status *, \
-                                /usr/bin/systemctl is-active *, \
-                                /usr/bin/systemctl is-enabled *, \
-                                /usr/bin/systemctl is-failed *, \
-                                /usr/bin/systemctl enable *, \
-                                /usr/bin/systemctl disable *, \
-                                /usr/bin/systemctl reset-failed *, \
-                                /usr/bin/systemctl daemon-reload, \
-                                /usr/bin/systemctl list-units *, \
-                                /usr/bin/systemctl show *, \
-                                /usr/bin/systemctl cat *
+# ── Who ───────────────────────────────────────────────────────────────────
+# Must match `hostAgent.user` in ops-config.yaml. If the two ever disagree the
+# symptom is every privileged command in a task failing with a password prompt
+# that nothing can answer, which reads like a broken sudoers file rather than
+# like a mismatched name.
+User_Alias CLAWCIUS_AGENT = clawcius-ops
 
-Cmnd_Alias CLAWCIUS_LOGS = /usr/bin/journalctl *
+# ── Environment ───────────────────────────────────────────────────────────
+#
+# `env_reset` is sudo's default and is restated because the next line depends
+# on it. The `env_delete` additions are not decoration:
+#
+# `sudo journalctl` will page its output, and a pager is a shell. `less`
+# reaches a root shell with `!sh` in one keystroke, and `journalctl` honours
+# $SYSTEMD_PAGER and $PAGER to decide which pager to run. In practice the
+# session is not a tty and journalctl does not page — but "in practice" and "is
+# not a tty" are exactly the phrases that precede an incident in this
+# repository, and deleting the variables costs nothing.
+Defaults:CLAWCIUS_AGENT env_reset
+Defaults:CLAWCIUS_AGENT env_delete += "PAGER SYSTEMD_PAGER SYSTEMD_LESS LESS LESSOPEN LESSCLOSE LESSSECURE EDITOR VISUAL SUDO_EDITOR"
+# There is no terminal. Without this, a rule that ever needed a password would
+# hang until the task timeout instead of failing in a second with a readable
+# message. Every rule here is NOPASSWD, so this is belt and braces.
+Defaults:CLAWCIUS_AGENT !requiretty
+# CONSIDERED AND REJECTED: `log_input, log_output, iolog_dir=…`. sudo's I/O
+# logging would give a second, independent record of the privileged subset that
+# this account cannot rewrite — genuinely attractive, since the executor's own
+# journal is the only record today. It is not enabled because `sudo journalctl
+# -u clawcius -n 5000` would then be written to disk twice, in full, on a host
+# whose known gaps already include ~2 GB snapshot images, and a full disk turns
+# every one of this daemon's recovery paths into a failure at once. sudo's
+# ordinary syslog line (who ran what, as whom) is on by default and is the
+# cheap 90% of the value. Revisit if the journal is ever suspected of being
+# tampered with.
 
-Cmnd_Alias CLAWCIUS_STATE = /usr/bin/mkdir -p /var/lib/clawcius*, \
-                            /usr/bin/mkdir -p /var/lib/hamachi*, \
-                            /usr/bin/chown [a-z]*\:[a-z]* /var/lib/clawcius*, \
-                            /usr/bin/chown [a-z]*\:[a-z]* /var/lib/hamachi*, \
-                            /usr/bin/chmod [0-7][0-7][0-7][0-7] /var/lib/clawcius*, \
-                            /usr/bin/chmod [0-7][0-7][0-7][0-7] /var/lib/hamachi*, \
-                            /usr/bin/chmod [0-7][0-7][0-7] /var/lib/clawcius*, \
-                            /usr/bin/chmod [0-7][0-7][0-7] /var/lib/hamachi*
+# ══════════════════════════════════════════════════════════════════════════
+# systemd — units this project owns, by name
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The mutating verbs. Every unit in `systemd/` is here, plus the two OJ units
+# that do not exist yet (naming a unit that is not installed grants nothing and
+# saves an edit on the day it is).
+#
+# ── clawcius-ops.service is DELIBERATELY ABSENT ───────────────────────────
+#
+# It is the process that starts the host agent. Restarting it sends SIGTERM to
+# the session's parent mid-task: the task dies, systemd brings the daemon back
+# with an empty queue, the operation is simply gone — no failure, no journal
+# entry saying it did not finish — and the audit ends mid-sentence with nothing
+# saying why. Worse, the armed rollback deadlines are re-read from disk on
+# boot, so a restart during a task's deadline window is a recovery window
+# silently restarted.
+#
+# Until 2026-08-11 this was prevented by a sentence in the standing prompt
+# ("You cannot restart clawcius-ops.service. Ask the operator."). An
+# instruction can be talked out of; a missing sudoers line cannot. It is now
+# both: the prompt still explains WHY, so the refusal the session hits is
+# understood rather than routed around.
+#
+# Reading its status and its journal IS granted, below, because a session
+# debugging its own supervisor is useful and cannot break it.
+#
+# ── docker.service is DELIBERATELY ABSENT ─────────────────────────────────
+#
+# The 2026-08-10 version noted that removing the unit list had made
+# docker.service reachable, and called that "part of the trade". Restarting
+# docker takes every container on this host down at once — both agents, mid
+# conversation — and there is no task for which that is the smallest change
+# that fixes the thing. It is back out of reach.
+#
+# sshd/ssh, systemd-journald, nftables, ufw, systemd-resolved and the rest of
+# the base system are absent for the obvious reason: a confused task that stops
+# one of them ends the operator's ability to reach the box, and no ops task has
+# ever needed to.
+Cmnd_Alias CLAWCIUS_UNIT_RESTART = \
+    /usr/bin/systemctl restart clawcius.service, \
+    /usr/bin/systemctl restart hamachi.service, \
+    /usr/bin/systemctl restart clawcius-status.service, \
+    /usr/bin/systemctl restart clawcius-container.service, \
+    /usr/bin/systemctl restart hamachi-container.service, \
+    /usr/bin/systemctl restart clawcius-netguard.service, \
+    /usr/bin/systemctl restart clawcius-snapshot.service, \
+    /usr/bin/systemctl restart clawcius-snapshot.timer, \
+    /usr/bin/systemctl restart clawcius-snapshot-verify.service, \
+    /usr/bin/systemctl restart clawcius-snapshot-verify.timer, \
+    /usr/bin/systemctl restart oj.service, \
+    /usr/bin/systemctl restart oj-container.service
 
-# Installing and removing unit files. `install` rather than `cp` because it
-# takes the mode and ownership as arguments, so the rule can pin them: a unit
-# file arrives 0644 root:root or it does not arrive.
-Cmnd_Alias CLAWCIUS_UNITS = /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/*, \
-                            /usr/bin/rm -f /etc/systemd/system/*.service, \
-                            /usr/bin/rm -f /etc/systemd/system/*.timer
+Cmnd_Alias CLAWCIUS_UNIT_START = \
+    /usr/bin/systemctl start clawcius.service, \
+    /usr/bin/systemctl start hamachi.service, \
+    /usr/bin/systemctl start clawcius-status.service, \
+    /usr/bin/systemctl start clawcius-container.service, \
+    /usr/bin/systemctl start hamachi-container.service, \
+    /usr/bin/systemctl start clawcius-netguard.service, \
+    /usr/bin/systemctl start clawcius-snapshot.service, \
+    /usr/bin/systemctl start clawcius-snapshot.timer, \
+    /usr/bin/systemctl start clawcius-snapshot-verify.service, \
+    /usr/bin/systemctl start clawcius-snapshot-verify.timer, \
+    /usr/bin/systemctl start oj.service, \
+    /usr/bin/systemctl start oj-container.service
 
-npurcell ALL=(root) NOPASSWD: CLAWCIUS_SYSTEMCTL, CLAWCIUS_LOGS, \
-                              CLAWCIUS_STATE, CLAWCIUS_UNITS
+Cmnd_Alias CLAWCIUS_UNIT_STOP = \
+    /usr/bin/systemctl stop clawcius.service, \
+    /usr/bin/systemctl stop hamachi.service, \
+    /usr/bin/systemctl stop clawcius-status.service, \
+    /usr/bin/systemctl stop clawcius-container.service, \
+    /usr/bin/systemctl stop hamachi-container.service, \
+    /usr/bin/systemctl stop clawcius-netguard.service, \
+    /usr/bin/systemctl stop clawcius-snapshot.service, \
+    /usr/bin/systemctl stop clawcius-snapshot.timer, \
+    /usr/bin/systemctl stop clawcius-snapshot-verify.service, \
+    /usr/bin/systemctl stop clawcius-snapshot-verify.timer, \
+    /usr/bin/systemctl stop oj.service, \
+    /usr/bin/systemctl stop oj-container.service
+
+# enable/disable change what happens at the NEXT boot, which is a different and
+# slower-acting kind of damage than a restart — a task that disables
+# clawcius.service leaves everything working until a reboot nobody connects to
+# it. Same list, deliberately, so there is one set of units to reason about.
+# reset-failed is here rather than with the read-only verbs because it clears
+# state systemd is using to hold a unit down.
+Cmnd_Alias CLAWCIUS_UNIT_ENABLE = \
+    /usr/bin/systemctl enable clawcius.service, \
+    /usr/bin/systemctl enable hamachi.service, \
+    /usr/bin/systemctl enable clawcius-status.service, \
+    /usr/bin/systemctl enable clawcius-container.service, \
+    /usr/bin/systemctl enable hamachi-container.service, \
+    /usr/bin/systemctl enable clawcius-netguard.service, \
+    /usr/bin/systemctl enable clawcius-snapshot.timer, \
+    /usr/bin/systemctl enable clawcius-snapshot-verify.timer, \
+    /usr/bin/systemctl enable oj.service, \
+    /usr/bin/systemctl enable oj-container.service, \
+    /usr/bin/systemctl disable clawcius.service, \
+    /usr/bin/systemctl disable hamachi.service, \
+    /usr/bin/systemctl disable clawcius-status.service, \
+    /usr/bin/systemctl disable clawcius-container.service, \
+    /usr/bin/systemctl disable hamachi-container.service, \
+    /usr/bin/systemctl disable clawcius-netguard.service, \
+    /usr/bin/systemctl disable clawcius-snapshot.timer, \
+    /usr/bin/systemctl disable clawcius-snapshot-verify.timer, \
+    /usr/bin/systemctl disable oj.service, \
+    /usr/bin/systemctl disable oj-container.service, \
+    /usr/bin/systemctl reset-failed clawcius.service, \
+    /usr/bin/systemctl reset-failed hamachi.service, \
+    /usr/bin/systemctl reset-failed clawcius-status.service, \
+    /usr/bin/systemctl reset-failed clawcius-container.service, \
+    /usr/bin/systemctl reset-failed hamachi-container.service, \
+    /usr/bin/systemctl reset-failed clawcius-netguard.service, \
+    /usr/bin/systemctl reset-failed clawcius-snapshot.service, \
+    /usr/bin/systemctl reset-failed clawcius-snapshot-verify.service, \
+    /usr/bin/systemctl reset-failed oj.service, \
+    /usr/bin/systemctl reset-failed oj-container.service
+
+# daemon-reload takes no unit and changes nothing by itself; it is what makes
+# an installed unit file visible. Bare, with no arguments, so it cannot absorb
+# one.
+Cmnd_Alias CLAWCIUS_DAEMON_RELOAD = /usr/bin/systemctl daemon-reload
+
+# ── Read-only systemctl, any unit, on purpose ─────────────────────────────
+#
+# Answering "what is the state of this box" cannot break it, and the whole
+# reason this service exists is that the operator was reading unit states out
+# loud to an agent that could not see them. Restricting these to the project's
+# own units would mean an agent debugging "clawcius.service will not start"
+# could not look at the unit it depends on.
+#
+# The one honest caveat: `systemctl show` prints a unit's inline `Environment=`
+# values. None of this project's units carry a secret inline — they use
+# EnvironmentFile, and `show` prints only the PATH of those — but a third-party
+# unit on this host that inlined a credential would be readable here. Noted
+# rather than papered over; unit files under /etc/systemd/system are
+# world-readable anyway, so this grants nothing `cat` does not.
+Cmnd_Alias CLAWCIUS_UNIT_READ = \
+    /usr/bin/systemctl status *, \
+    /usr/bin/systemctl is-active *, \
+    /usr/bin/systemctl is-enabled *, \
+    /usr/bin/systemctl is-failed *, \
+    /usr/bin/systemctl show *, \
+    /usr/bin/systemctl cat *, \
+    /usr/bin/systemctl list-units *, \
+    /usr/bin/systemctl list-timers *, \
+    /usr/bin/systemctl list-unit-files *, \
+    /usr/bin/systemctl --failed, \
+    /usr/bin/systemctl
+
+# `systemctl edit` and `set-property` are NOT here and never should be: `edit`
+# opens $EDITOR as root, which is a root shell with extra steps, and the
+# env_delete line above exists partly so that a future mistake in this file
+# does not immediately become one.
+
+# ══════════════════════════════════════════════════════════════════════════
+# journalctl — the thing that started all of this
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The specific pain point: the operator was reading `journalctl -u …` output
+# out loud to an agent that could not see it. Read-only, any unit, for the same
+# reason as the read-only systemctl verbs.
+#
+# `--file`/`--directory` are not excluded and cannot usefully be: they only
+# read journal files, which is what this grant is for. The pager escape is
+# handled by the env_delete line above.
+Cmnd_Alias CLAWCIUS_LOGS = /usr/bin/journalctl, /usr/bin/journalctl *
+
+# ══════════════════════════════════════════════════════════════════════════
+# docker — named containers, read-mostly, and NOT `docker run`
+# ══════════════════════════════════════════════════════════════════════════
+#
+# This section did not exist before 2026-08-11. It could not: the previous
+# grantee reached docker through group membership, so a sudoers rule "would add
+# nothing except the false impression that docker access is being controlled
+# here". The agent account is not in the docker group, so these rules are now
+# the entire docker capability the session has, and every line is a decision.
+#
+# NOT GRANTED, and each for its own reason:
+#
+#   * `docker run` / `docker create` — this is THE hole. `docker run -v /:/host
+#     alpine chroot /host sh` is root, immediately, with no audit inside it.
+#     Nothing the host agent legitimately does needs it: the two containers on
+#     this host are created by docker/run-container.sh, which the EXECUTOR runs
+#     as root with an argv it builds itself.
+#   * `docker exec` — `docker exec -u root clawcius-agent …` is root inside a
+#     container that bind-mounts /var/lib/clawcius/run. That directory is the
+#     ops spool, and writing a request into another instance's spool is forging
+#     provenance, which is the one property per-instance spools exist to make
+#     unforgeable.
+#   * `docker cp` — copies as root, to and from arbitrary host paths. It is
+#     `sudo cp` wearing a container.
+#   * `docker build` / `load` / `import` / `commit` / `save` — a build runs a
+#     Dockerfile as root, and the rest move image layers around. The snapshot
+#     path (`docker commit`) belongs to the executor, which takes one before
+#     every task without being asked.
+#   * `docker system prune`, `volume rm`, `network rm` — destructive, and the
+#     rollback is container-scoped, so a pruned image is a rollback target that
+#     no longer exists.
+#
+# The read-only verbs take a `*` because their arguments are flags and format
+# strings, and because there is nothing on the far side of them to protect: the
+# information is the point of the grant.
+Cmnd_Alias CLAWCIUS_DOCKER_READ = \
+    /usr/bin/docker ps, \
+    /usr/bin/docker ps *, \
+    /usr/bin/docker images, \
+    /usr/bin/docker images *, \
+    /usr/bin/docker version, \
+    /usr/bin/docker info, \
+    /usr/bin/docker stats --no-stream, \
+    /usr/bin/docker stats --no-stream *, \
+    /usr/bin/docker inspect *, \
+    /usr/bin/docker container inspect *, \
+    /usr/bin/docker image inspect *, \
+    /usr/bin/docker logs clawcius-agent, \
+    /usr/bin/docker logs hamachi-agent, \
+    /usr/bin/docker logs oj-agent, \
+    /usr/bin/docker logs * clawcius-agent, \
+    /usr/bin/docker logs * hamachi-agent, \
+    /usr/bin/docker logs * oj-agent
+
+# Restarting a container kills whatever turn it was in the middle of, which is
+# why the executor waits for an idle turn before anything destructive. The
+# session gets these because "the agent container is wedged" is a real thing a
+# task is asked to fix, and because the deadline machinery notices a container
+# name in the audit and arms a check-in for it.
+#
+# There is no `docker rm`. Removing an agent container discards its writable
+# layer, and the way to get one back is the executor's rollback path, not a
+# task's.
+Cmnd_Alias CLAWCIUS_DOCKER_LIFECYCLE = \
+    /usr/bin/docker restart clawcius-agent, \
+    /usr/bin/docker restart hamachi-agent, \
+    /usr/bin/docker restart oj-agent, \
+    /usr/bin/docker stop clawcius-agent, \
+    /usr/bin/docker stop hamachi-agent, \
+    /usr/bin/docker stop oj-agent, \
+    /usr/bin/docker start clawcius-agent, \
+    /usr/bin/docker start hamachi-agent, \
+    /usr/bin/docker start oj-agent
+
+# ══════════════════════════════════════════════════════════════════════════
+# State directories — enumerated, because `*` matches `..`
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The 2026-08-10 version scoped these by path glob (`/var/lib/clawcius*`) and
+# documented, honestly, that `chown … /var/lib/clawcius/../../etc` matches —
+# concluding that "on a host where npurcell is already in the docker group that
+# changes nothing about what is reachable". That conclusion was correct and its
+# premise is gone, so the glob had to go with it. These are exact paths.
+#
+# Most of this is repair work rather than routine: the executor creates and
+# chowns every spool and the host agent's working directory at boot
+# (`ensureSpoolDir` / `ensureDirOwnedBy`), precisely so that an agent whose
+# requests silently vanish is not a state anybody has to discover. These rules
+# are for the case where that went wrong, and for standing up a new instance.
+#
+# Note the absence of /home/npurcell: the agent shares that tree through a
+# group, not through sudo, and a `sudo chown` inside it is how the 2026-08-09
+# root-owned-node_modules incident got "fixed" twice. Note also the absence of
+# /var/lib/clawcius-ops: it holds journal.jsonl, the circuit breaker and the
+# armed deadlines. No rule here reaches it, and for the first time that is a
+# statement about what the session can do rather than a statement about what it
+# would have to bother doing.
+Cmnd_Alias CLAWCIUS_STATE_MKDIR = \
+    /usr/bin/mkdir -p /var/lib/clawcius, \
+    /usr/bin/mkdir -p /var/lib/clawcius/run, \
+    /usr/bin/mkdir -p /var/lib/clawcius/run/ops, \
+    /usr/bin/mkdir -p /var/lib/clawcius/run/wake, \
+    /usr/bin/mkdir -p /var/lib/hamachi, \
+    /usr/bin/mkdir -p /var/lib/hamachi/run, \
+    /usr/bin/mkdir -p /var/lib/hamachi/run/ops, \
+    /usr/bin/mkdir -p /var/lib/hamachi/run/wake, \
+    /usr/bin/mkdir -p /var/lib/oj, \
+    /usr/bin/mkdir -p /var/lib/oj/run, \
+    /usr/bin/mkdir -p /var/lib/oj/run/ops, \
+    /usr/bin/mkdir -p /var/lib/oj/run/wake
+
+# The uid:gid pairs are spelled out rather than matched with a character class,
+# because `[a-z]*\:[a-z]*` accepts `root:root` and the whole question this rule
+# answers is "who ends up owning the spool". npurcell is the answer for the
+# instance state directories, because that is the uid the containers run as
+# (the Dockerfile builds the agent user with AGENT_UID=1000 to match).
+Cmnd_Alias CLAWCIUS_STATE_CHOWN = \
+    /usr/bin/chown npurcell\:npurcell /var/lib/clawcius/run/ops, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/clawcius/run/wake, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/hamachi/run/ops, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/hamachi/run/wake, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/oj/run/ops, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/oj/run/wake, \
+    /usr/bin/chmod 0770 /var/lib/clawcius/run/ops, \
+    /usr/bin/chmod 0770 /var/lib/clawcius/run/wake, \
+    /usr/bin/chmod 0770 /var/lib/hamachi/run/ops, \
+    /usr/bin/chmod 0770 /var/lib/hamachi/run/wake, \
+    /usr/bin/chmod 0770 /var/lib/oj/run/ops, \
+    /usr/bin/chmod 0770 /var/lib/oj/run/wake
+
+# ══════════════════════════════════════════════════════════════════════════
+# Unit files
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `install` rather than `cp` because it takes the mode and ownership as
+# arguments, so the rule can pin them: a unit file arrives 0644 root:root or it
+# does not arrive.
+#
+# The destination is namespaced. The previous version's `/etc/systemd/system/*`
+# would have accepted `sshd.service.d/override.conf` — `*` matches `/` — and
+# the whole base system with it. These accept only names beginning with this
+# project's prefixes, and the trailing `*` cannot climb out of the directory it
+# is anchored in because there is no `..` that produces a path still ending in
+# a project-prefixed unit name... which is a sentence worth distrusting, so:
+# the honest version is that this is a much narrower `*` than the old one and
+# it is still a `*`. Combined with `systemctl daemon-reload` and a restart of a
+# named unit, it is root — see the note at the top. It is granted anyway
+# because installing this project's units is the capability the ops mechanism
+# was built to provide, and it is in the audit.
+Cmnd_Alias CLAWCIUS_UNITS = \
+    /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/clawcius*.service, \
+    /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/clawcius*.timer, \
+    /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/hamachi*.service, \
+    /usr/bin/install -m 0644 -o root -g root * /etc/systemd/system/oj*.service, \
+    /usr/bin/rm -f /etc/systemd/system/clawcius*.service, \
+    /usr/bin/rm -f /etc/systemd/system/clawcius*.timer, \
+    /usr/bin/rm -f /etc/systemd/system/hamachi*.service, \
+    /usr/bin/rm -f /etc/systemd/system/oj*.service
+
+# ══════════════════════════════════════════════════════════════════════════
+# What is deliberately NOT here
+# ══════════════════════════════════════════════════════════════════════════
+#
+# * Any blanket interpreter: no `sudo sh`, `bash`, `python3`, `perl`, `env`,
+#   `tee`, `cp`, `dd`, `mv`, `ln`, `vi`, `find`, `awk`, `xargs`. Those are the
+#   classic one-line escalations, and each would also be a one-line way to
+#   rewrite the audit log that stands where the verb allowlist used to.
+# * apt / npm / pip as root. Installing packages system-wide has a blast radius
+#   beyond this host's lifetime and is one of the very few things worth waiting
+#   for a human on. A task that needs a system package should say so in its
+#   report and stop.
+# * visudo, usermod, useradd, gpasswd, groupadd, passwd, chsh, su. Granting the
+#   ability to grant is the end of the exercise — and `usermod -aG docker
+#   clawcius-ops` is now, specifically and by name, the thing this account must
+#   not be able to do to itself.
+# * setfacl / chattr. Both are ways to reach the operator's files past the mode
+#   bits that ops/src/agent-user.ts checks.
+# * mount / umount. A bind mount of /home somewhere the mode-bit check does not
+#   look would defeat the secret-readability assertion silently.
+# * /var/lib/clawcius-ops, in any rule, by any path.
+# * docker.service, sshd, systemd-journald, the firewall, and everything else
+#   in the base system. See the systemd section.
+
+CLAWCIUS_AGENT ALL=(root) NOPASSWD: CLAWCIUS_UNIT_RESTART, CLAWCIUS_UNIT_START, \
+                                    CLAWCIUS_UNIT_STOP, CLAWCIUS_UNIT_ENABLE, \
+                                    CLAWCIUS_DAEMON_RELOAD, CLAWCIUS_UNIT_READ, \
+                                    CLAWCIUS_LOGS, CLAWCIUS_DOCKER_READ, \
+                                    CLAWCIUS_DOCKER_LIFECYCLE, CLAWCIUS_STATE_MKDIR, \
+                                    CLAWCIUS_STATE_CHOWN, CLAWCIUS_UNITS

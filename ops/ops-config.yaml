@@ -7,10 +7,13 @@
 # protected by a list.
 #
 # The closed verb list is gone. A request is now free text — a `task` — handed
-# to a headless Claude Code session running ON THE HOST as the checkout's owner,
-# with Bash and with sudo. There is no allowlist in front of prose. What
-# replaced the list is: a snapshot before every task, a rollback after a failed
-# one, and a complete audit of every command in journal.jsonl.
+# to a headless Claude Code session running ON THE HOST as an unprivileged
+# service account of its own (hostAgent.user, since 2026-08-11 — it used to be
+# the checkout's owner, who is in the docker group), with Bash and with sudo.
+# There is no allowlist in front of prose. What replaced the list is: a snapshot
+# before every task, a rollback after a failed one, a complete audit of every
+# command in journal.jsonl, and — since 2026-08-11 — an account that cannot
+# become root.
 #
 # Read ops/README.md § The trust model before changing anything here. What this
 # file still holds:
@@ -126,8 +129,13 @@ units:
 # every task: path, expected branch, actual branch, HEAD, and the exact list of
 # uncommitted filenames.
 #
-# The FIRST entry is special in one way that is not obvious: its `path` is what
-# the executor stats to decide who the session runs as. It never runs as root.
+# The first entry used to be special: its `path` was what the executor stat'ed
+# to decide who the session ran as. IT IS NOT ANY MORE — since 2026-08-11 the
+# identity comes from `hostAgent.user` below, because discovering it from the
+# filesystem is precisely how the session ended up running as the operator, who
+# is in the docker group. These entries are now purely a briefing, and the agent
+# account reaches them through a shared group (MIGRATION.md § 2) rather than by
+# being their owner.
 #
 # A DIRTY TREE IS NOW A WARNING, NOT A GATE, and that is a real reduction in
 # strength which is written down rather than glossed. On 2026-08-09 a plain
@@ -179,18 +187,27 @@ repos:
     buildDirs: ['.', 'status', 'ops']
     #
     # ── Who the build runs as ───────────────────────────────────────────
-    # Not configured here, and deliberately not configurable. clawcius-ops
-    # runs as root; this checkout is owned by npurcell; clawcius.service,
+    # `hostAgent.user` below, and nothing else. clawcius-ops.service runs as
+    # root; this checkout is owned by npurcell; clawcius.service,
     # hamachi.service and clawcius-status.service all run as npurcell. A build
     # run as root leaves root-owned node_modules/ and dist/ behind and every
     # one of those units then fails to start with an EACCES naming a file
     # nobody edited — which happened twice on the night of 2026-08-09, the
     # second time ten minutes after a `chown -R` had fixed the first.
     #
-    # So the owner is discovered by stat()ing this path and the build drops to
-    # that uid/gid. There is no username key to get wrong, and if the owner
-    # cannot be determined or the drop cannot be performed the build is
-    # REFUSED rather than run as root.
+    # Until 2026-08-11 the answer was "whoever owns this path, discovered by
+    # stat". That kept the files correctly owned and made the SESSION the
+    # operator, who is in the docker group — so it fixed the small failure and
+    # created a much larger one. The session now runs as the service account,
+    # and the checkout is shared with it through a group with setgid
+    # directories (MIGRATION.md § 2), which keeps both properties: nothing in
+    # the tree ends up root-owned, and nothing in the tree is owned by an
+    # account that can become root.
+    #
+    # The new failure mode to watch for is the mirror image of the old one:
+    # if the shared group is not set up, the agent cannot write the tree at
+    # all and every build dies with an EACCES. The executor warns about that
+    # at boot and before every task, with the `chgrp` to run.
 
 # ── Instances whose containers may be recreated ───────────────────────────
 # Everything needed to rebuild an instance is spelled out rather than derived.
@@ -353,18 +370,87 @@ snapshotKeep: 24
 
 # ── The host agent ────────────────────────────────────────────────────────
 # The headless Claude Code session that carries out a task. Read
-# ops/src/host-agent.ts before changing any of this; the security decisions —
-# which tools are denied, what the standing prompt says, that the session runs
-# as the checkout's owner and never as root, that its environment is built from
-# an allowlist and asserted free of DISCORD_TOKEN before it spawns — are all in
-# code on purpose. A YAML key that can widen a session with sudo is a YAML key
-# somebody widens at 3am.
+# ops/src/host-agent.ts and ops/src/agent-user.ts before changing any of this;
+# the security decisions — which tools are denied, what the standing prompt
+# says, that the session runs as an unprivileged account and never as root,
+# that the account may not be in the docker group, that its environment is
+# built from an allowlist and asserted free of DISCORD_TOKEN before it spawns —
+# are all in code on purpose. A YAML key that can widen a session with sudo is
+# a YAML key somebody widens at 3am.
 hostAgent:
   # false refuses every task with a stated reason while leaving deadlines,
   # check-ins and rollbacks working. That is the setting to put the host in
   # while somebody works out what the last task did — strictly better than
   # stopping the unit, which would drop every armed deadline.
   enabled: true
+
+  # ── The service account (2026-08-11) ────────────────────────────────────
+  #
+  # Until 2026-08-11 there was no such key: the session was dropped to whoever
+  # owned the checkout, discovered by stat. On this host that is npurcell —
+  # the operator — and npurcell is in the `docker` group, which SETUP.md calls
+  # "effectively root on the host". `docker run -v /:/host` is root in one
+  # command with no sudo in the path, so the sudoers file was not a boundary,
+  # the root-owned journal was one command from being rewritten, and the
+  # session could read every credential the operator has.
+  #
+  # It now runs as this account, which must exist and must NOT be in docker,
+  # sudo, wheel, adm, disk, shadow, root, lxd or podman. The executor checks
+  # that against the live /etc/group BEFORE EVERY TASK — not once at boot,
+  # because the `usermod -aG docker clawcius-ops` this is guarding against is
+  # something somebody types on a running host to make a task work — and
+  # refuses the task, loudly, with the `gpasswd -d` to run. It does not fall
+  # back to the checkout's owner and it does not fall back to root.
+  #
+  # Create it with MIGRATION.md § 1. Until you do, every task is refused; the
+  # daemon still boots and still holds its rollback deadlines.
+  user: clawcius-ops
+
+  # Where the user and group databases live. There is no reason to change
+  # these on a real host; they exist so the self-test can drive the real
+  # resolution path against fixture files with no root and no such account.
+  #
+  # Both are read AS FILES. A host using nsswitch with LDAP or SSSD would not
+  # have its group memberships here and the docker-group assertion would
+  # silently pass — that limit is written down in ops/src/agent-user.ts rather
+  # than worked around by shelling out to `getent` from a root daemon.
+  # passwdPath: /etc/passwd
+  # groupPath: /etc/group
+
+  # EXTRA groups to refuse to run as a member of, unioned with the built-in
+  # list. This key can only make the check stricter; there is deliberately no
+  # key that takes `docker` off it.
+  forbiddenGroups: []
+
+  # Files and directories the agent account must NOT be able to read, checked
+  # from mode bits before every task. A readable one REFUSES the task.
+  #
+  # Every instance's `envFile` above is added automatically and does not need
+  # listing — those hold DISCORD_TOKEN, and host-agent.ts refusing to put that
+  # token in the session's ENVIRONMENT is worth nothing if the session can
+  # `cat` the file it lives in.
+  #
+  # What is listed here is the rest of the operator's credential surface. The
+  # check cannot see POSIX ACLs or a friendlier bind mount of the same inode:
+  # it catches a `.env` left 0644 and a home directory that was 0755 all
+  # along, which is what it is for.
+  secretPaths:
+    - /home/npurcell/.claude
+    - /home/npurcell/.ssh
+    - /home/npurcell/clawcius/.env
+    - /home/npurcell/clawcius/.env.hamachi
+
+  # A read-only deploy key, owned by the agent account, for pulls from private
+  # repositories (OJ). Becomes GIT_SSH_COMMAND for the session.
+  #
+  # A PATH, never a token, and there is deliberately no key here that takes
+  # one: a PAT would have to live in the session's environment, where
+  # assertNoSecrets refuses it, and sharing the operator's GitHub credential
+  # with a session that has a shell is exactly what the separate account
+  # exists to prevent. A deploy key is scoped to one repository and can be
+  # revoked on its own. Empty means "no private repositories"; see
+  # MIGRATION.md § 5.
+  gitSshKey: ""
 
   # Absolute. Never looked up on PATH: this daemon is root and a PATH lookup is
   # one writable directory away from being somebody else's choice of binary.
@@ -376,7 +462,8 @@ hostAgent:
   # would let any agent hand standing instructions to a process with sudo,
   # through a route nobody would think to audit. The loader refuses a workDir
   # inside any spool, inside stateDir, or inside a checkout. The executor
-  # creates it at boot and chowns it to the checkout's owner.
+  # creates it at boot and chowns it to `user:` above (it used to chown it to
+  # the checkout's owner, which since 2026-08-11 is a different account).
   workDir: /var/lib/clawcius-host-agent
 
   # Wall-clock ceiling. On expiry the whole process group is killed — the

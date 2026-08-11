@@ -21,8 +21,9 @@ import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } f
 import { join } from 'node:path';
 import { loadOpsConfig } from './config.js';
 import { Executor } from './executor.js';
-import { OpsSpool, ensureOwnedDir } from './spool.js';
-import { resolveOwner } from './build.js';
+import { OpsSpool, ensureDirOwnedBy } from './spool.js';
+import { agentProblems, agentWarnings, describeAgentUser } from './agent-user.js';
+import { identityOptionsFor } from './host-agent.js';
 
 const config = loadOpsConfig();
 
@@ -109,37 +110,62 @@ const releaseLock = takeLock(config.stateDir);
 const executor = new Executor(config);
 
 /**
- * The host agent's working directory, created and handed to the checkout owner.
+ * Who the host agent is, checked at boot so the answer is in the banner.
  *
- * Created here rather than lazily at the first task, because a task that fails
- * because a directory does not exist fails several seconds into a `claude`
- * spawn with a message about a bad cwd, at the moment somebody was waiting on
- * it. Doing it at boot means the failure — if there is one — is in the boot
- * banner where it belongs.
+ * The boot check is for VISIBILITY. It is not the enforcement point and must
+ * not be mistaken for one: `#doTask` re-resolves the account before every task
+ * and `runHostAgent` asserts on it again immediately before the spawn, because
+ * the failure this whole mechanism exists to catch — somebody typing `usermod
+ * -aG docker clawcius-ops` to make something work — happens to a host that is
+ * already running, and a check evaluated once at boot on a unit that stays up
+ * for weeks would never see it.
  *
- * Root-owned would be useless: the session runs as the checkout's owner, so it
- * is chowned to match, exactly as the spools are, with the ownership discovered
- * by stat rather than configured.
+ * Note what does NOT happen here: `process.exit(1)`. This unit is
+ * `Restart=always` with `StartLimitIntervalSec=0` and `StartLimitBurst=0` — it
+ * holds the rollback deadlines and must never stay dead — so refusing the boot
+ * would not produce one loud failure, it would produce a root daemon in a
+ * five-second restart loop with every armed deadline unhonoured. That is the
+ * shape of #7 and this repository has agreed twice not to ship it again. The
+ * daemon comes up, holds its deadlines, answers check-ins, performs rollbacks,
+ * and refuses every task with the reason and the fix — which is exactly the
+ * behaviour `hostAgent.enabled: false` already has, and which this codebase
+ * already argues is strictly better than stopping the unit.
  */
-const ownerOfCheckout = config.repos[0]?.path ?? '';
+const identity = executor.resolveAgentIdentity();
 if (config.hostAgent.enabled) {
-  if (!ownerOfCheckout) {
+  if (!identity.ok) {
     process.stderr.write(
-      '[ops] hostAgent.enabled is true but no repos: are configured, so there is no ' +
-        'checkout to take an owner from. Every task will be refused rather than run a ' +
-        'session with a shell as root.\n',
+      `[ops] ══ HOST AGENT HAS NO IDENTITY ══\n[ops] ${identity.reason.replace(/\n/g, '\n[ops] ')}\n` +
+        '[ops] Every task will be REFUSED until this is fixed. Deadlines, check-ins and\n' +
+        '[ops] rollbacks are unaffected and this daemon is staying up. See MIGRATION.md.\n',
     );
   } else {
-    ensureOwnedDir(
+    const problems = agentProblems(identity.user, identityOptionsFor(config));
+    if (problems.length > 0) {
+      process.stderr.write(
+        `[ops] ══ HOST AGENT ACCOUNT IS NOT CONTAINED ══ ${describeAgentUser(identity.user)}\n` +
+          problems.map((problem) => `[ops] ${problem.replace(/\n/g, '\n[ops] ')}`).join('\n') +
+          '\n[ops] Every task will be REFUSED until this is fixed. Nothing else is affected.\n',
+      );
+    }
+    for (const warning of agentWarnings(identity.user, identityOptionsFor(config))) {
+      process.stderr.write(`[ops] host agent warning: ${warning.replace(/\n/g, '\n[ops] ')}\n`);
+    }
+
+    // The session's working directory, created and handed to the AGENT
+    // account — not, since 2026-08-11, to the checkout's owner. Created here
+    // rather than lazily at the first task, because a task that fails because
+    // a directory does not exist fails several seconds into a `claude` spawn
+    // with a message about a bad cwd, at the moment somebody was waiting on it.
+    ensureDirOwnedBy(
       config.hostAgent.workDir,
-      ownerOfCheckout,
+      { uid: identity.user.uid, gid: identity.user.gid },
       (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
       0o750,
+      `so the host agent (${identity.user.user}) can write its own working directory`,
     );
   }
 }
-
-const owner = ownerOfCheckout ? resolveOwner(ownerOfCheckout) : null;
 
 executor.journal.write({
   kind: 'boot',
@@ -158,7 +184,14 @@ executor.journal.write({
       config.hostAgent.enabled
         ? `${config.hostAgent.claudePath}, up to ${config.hostAgent.timeoutMinutes}m and ` +
           `$${config.hostAgent.maxCostUsd} per task, cwd ${config.hostAgent.workDir}, as ` +
-          `${owner?.ok ? `${owner.owner.user} (uid ${owner.owner.uid})` : 'NOBODY — tasks will be refused'}`
+          (identity.ok
+            ? `${describeAgentUser(identity.user)}` +
+              (agentProblems(identity.user, identityOptionsFor(config)).length > 0
+                ? ' — REFUSED: that account is not contained; see the banner above and ' +
+                  'MIGRATION.md. Tasks will be refused; deadlines and rollbacks continue'
+                : '')
+            : `NOBODY (${config.hostAgent.user}: ${identity.reason.split('\n')[0]}) — tasks ` +
+              'will be refused')
         : 'DISABLED — tasks refused, deadlines and rollbacks still honoured'
     }. ` +
     (config.dryRun

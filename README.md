@@ -78,8 +78,15 @@ the agent's hands. **For that one component the sandbox is no longer a security
 boundary.** What replaces it is a snapshot before every task, an automatic
 rollback if the task fails or a service stops being healthy, a complete audit of
 every command it runs, and a deadline the agent must answer or be reverted.
+Since 2026-08-11 it also runs as an unprivileged system account of its own
+(`clawcius-ops`) rather than as the operator — who is in the `docker` group,
+which is root, which made every other control in `ops/` decoration. The daemon
+refuses to start a session as an account that is missing, is uid 0, is in a
+root-equivalent group, or can read the operator's secrets.
 See [`ops/README.md`](ops/README.md) — the trust model section is the honest
-account. It ships in dry-run, and in dry-run the session has no shell at all.
+account — and [`MIGRATION.md`](MIGRATION.md), which is how the host gets from
+one to the other and has not been run yet. It ships in dry-run, and in dry-run
+the session has no shell at all.
 
 ## Configuration
 
@@ -88,7 +95,8 @@ account. It ships in dry-run, and in dry-run the session has no shell at all.
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
 | `squid/squid.conf` | The egress allowlist — the only copy | yes |
 | `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do | yes |
-| `ops/clawcius-sudoers` | What the host agent may do with sudo, and why | yes |
+| `ops/clawcius-sudoers` | What the host agent may do with sudo, by exact command and exact unit name, and why | yes |
+| `MIGRATION.md` | Creating the host agent's service account, the shared group, the deploy key — with a rollback path. **Not yet executed.** | yes |
 | `status/status-config.yaml` | Transcript roots, port, liveness thresholds | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 

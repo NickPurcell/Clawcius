@@ -164,25 +164,59 @@ export function ensureOwnedDir(
   log: (line: string) => void,
   mode: number,
 ): void {
+  let want: { uid: number; gid: number };
+  try {
+    const reference = statSync(ownerOf);
+    want = { uid: reference.uid, gid: reference.gid };
+  } catch (error) {
+    log(`cannot stat ${ownerOf} to find out who should own ${dir}: ${String(error)}`);
+    return;
+  }
+  ensureDirOwnedBy(dir, want, log, mode, `to match ${ownerOf}`);
+}
+
+/**
+ * The same thing, told the ownership rather than shown a reference path.
+ *
+ * Added 2026-08-11 for the host agent's working directory, whose owner is no
+ * longer discoverable by `stat`ing anything. It used to be chowned to match the
+ * checkout, because the session ran as the checkout's owner; the session now
+ * runs as a named service account that owns nothing on this host to point at,
+ * so the uid comes from `resolveAgentUser` instead.
+ *
+ * That is a real reversal of the rule written all over this file — "the owner
+ * is discovered, never configured, because this daemon is not entitled to an
+ * opinion about who owns a directory it was pointed at" — and the reversal is
+ * the point of the whole rework. For a SPOOL the rule still holds: the right
+ * owner there is whatever uid the container runs as, which is a fact about the
+ * host that config can only get wrong. For the session's IDENTITY it was
+ * exactly backwards: discovering it from the filesystem is how the session
+ * ended up running as the operator, who is in the docker group.
+ */
+export function ensureDirOwnedBy(
+  dir: string,
+  want: { uid: number; gid: number },
+  log: (line: string) => void,
+  mode: number,
+  why = '',
+): void {
   let created = false;
   try {
-    // 0770 rather than 0750: the container writes here. Group ownership is
-    // what makes that work without the directory being world-writable.
+    // 0770 rather than 0750 for spools: the container writes there. Group
+    // ownership is what makes that work without the directory being
+    // world-writable.
     created = mkdirSync(dir, { recursive: true, mode }) !== undefined;
   } catch (error) {
     log(`cannot create ${dir}: ${String(error)} — requests filed there will never arrive`);
     return;
   }
 
-  let want: { uid: number; gid: number };
   let have: { uid: number; gid: number };
   try {
-    const reference = statSync(ownerOf);
-    want = { uid: reference.uid, gid: reference.gid };
     const current = statSync(dir);
     have = { uid: current.uid, gid: current.gid };
   } catch (error) {
-    log(`cannot compare ${dir} against ${ownerOf}: ${String(error)} — leaving it alone`);
+    log(`cannot stat ${dir}: ${String(error)} — leaving it alone`);
     return;
   }
 
@@ -194,17 +228,17 @@ export function ensureOwnedDir(
   try {
     chownSync(dir, want.uid, want.gid);
     log(
-      `chowned ${dir} to ${want.uid}:${want.gid} to match ${ownerOf} — it was ` +
-        `${have.uid}:${have.gid}, which the container's uid cannot write`,
+      `chowned ${dir} to ${want.uid}:${want.gid} ${why} — it was ` +
+        `${have.uid}:${have.gid}, which the process that has to write it cannot`,
     );
   } catch (error) {
     // Loud, and with the command in it, because the alternative symptom is an
-    // agent whose requests vanish.
+    // agent whose requests vanish, or a session that cannot start.
     log(
-      `WARNING: ${dir} is owned ${have.uid}:${have.gid} but ${ownerOf} is owned ` +
-        `${want.uid}:${want.gid}, and chown failed (${String(error)}). The container ` +
-        `probably cannot write its own spool. Fix on the host with: ` +
-        `chown ${want.uid}:${want.gid} ${dir} && chmod 0770 ${dir}`,
+      `WARNING: ${dir} is owned ${have.uid}:${have.gid} but should be ` +
+        `${want.uid}:${want.gid} ${why}, and chown failed (${String(error)}). Fix on the ` +
+        `host with: chown ${want.uid}:${want.gid} ${dir} && chmod ` +
+        `${(mode & 0o7777).toString(8).padStart(4, '0')} ${dir}`,
     );
   }
 }

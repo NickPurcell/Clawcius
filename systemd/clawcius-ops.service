@@ -35,10 +35,10 @@ Type=simple
 # It used to say "narrow because ops-config.yaml lists every unit, repo and
 # instance it may touch by exact name". Since 2026-08-10 that is false. The verb
 # list was replaced by a `task` verb carrying free text, handed to a headless
-# Claude Code session running on this host as npurcell, with Bash and with
-# passwordless sudo (ops/clawcius-sudoers). What bounds it now is a snapshot
-# before every task, an automatic rollback after a failed one, and a complete
-# audit of every command in /var/lib/clawcius-ops/journal.jsonl.
+# Claude Code session running on this host with Bash and with passwordless sudo
+# (ops/clawcius-sudoers). What bounds it is a snapshot before every task, an
+# automatic rollback after a failed one, and a complete audit of every command
+# in /var/lib/clawcius-ops/journal.jsonl.
 #
 # The operator accepted that trade explicitly, twice, in writing. Anybody
 # hardening this unit needs to understand it before deciding what to add: the
@@ -46,11 +46,34 @@ Type=simple
 # with a shell does something nobody expected", and no directive in this file
 # addresses that.
 #
+# ── THE SESSION IS NOT THIS UNIT'S USER, AND SINCE 2026-08-11 IT IS NOT ───
+# ── THE OPERATOR EITHER ───────────────────────────────────────────────────
+#
+# This unit is root because it holds the docker socket and starts the session.
+# The SESSION is dropped, in the forked child before execve, to the
+# unprivileged system account named by hostAgent.user in ops-config.yaml —
+# `clawcius-ops` by default.
+#
+# Until 2026-08-11 it was dropped instead to "whoever owns the checkout", which
+# on this host is npurcell, who is in the `docker` group, which SETUP.md itself
+# calls "effectively root on the host". So the session was root-equivalent by a
+# route with no sudo, no sudoers rule and no audit entry in it, and every
+# hardening decision in this file was being made about the wrong process.
+#
+# ops/src/agent-user.ts now REFUSES to start a session as an account that does
+# not exist, has uid 0, is in any root-equivalent group, or can read any
+# configured secret — re-checked against the live /etc/group before every task.
+# If you are reading this because tasks are being refused, read the boot banner
+# in `journalctl -u clawcius-ops`: it names the account, the group and the
+# `gpasswd -d` to run.
+#
 # What this unit still does NOT have, and must not gain: DISCORD_TOKEN,
 # GITHUB_TOKEN, any Anthropic API key in an EnvironmentFile. The host agent
-# authenticates through the owner's own Claude Code OAuth credentials under
-# /home/npurcell, and ops/src/host-agent.ts REFUSES TO SPAWN if the environment
-# it built contains anything that looks like a credential. Adding an
+# authenticates through the SERVICE ACCOUNT's own Claude Code OAuth credentials
+# under its own home (/var/lib/clawcius-ops), which is a second login that has
+# to be established once by hand — see MIGRATION.md § 4 — and NOT through the
+# operator's. ops/src/host-agent.ts REFUSES TO SPAWN if the environment it
+# built contains anything that looks like a credential. Adding an
 # EnvironmentFile here would be handing a shell session the ability to speak as
 # the bot, which is the one thing the report-back-through-the-spool design
 # exists to prevent.
@@ -74,11 +97,26 @@ RestartSec=5
 # primary record of what this machine has been told to do.
 #
 # clawcius-host-agent is the session's working directory and is a SIBLING, not a
-# child, on purpose. The session runs as npurcell and needs to write its cwd;
-# putting it inside a 0750 root-owned directory would mean either the session
-# cannot traverse to it or clawcius-ops stops being 0750. systemd creates it
-# root-owned and the executor chowns it to the checkout's owner at boot, the
-# same way it does the spools, with the ownership discovered by stat.
+# child, on purpose. The session runs as the unprivileged service account and
+# needs to write its cwd; putting it inside a 0750 root-owned directory would
+# mean either the session cannot traverse to it or clawcius-ops stops being
+# 0750. systemd creates it root-owned and the executor chowns it — since
+# 2026-08-11 to hostAgent.user rather than to the checkout's owner, which is now
+# a different account. If that chown fails the boot log says so with the exact
+# command; the symptom otherwise is `claude` failing to start with an ENOENT on
+# the BINARY, which reads as "claude is not installed".
+#
+# Note the name collision, because it will confuse somebody: the service
+# account's HOME is /var/lib/clawcius-ops and this unit's StateDirectory is
+# also called clawcius-ops (/var/lib/clawcius-ops). They are THE SAME PATH, and
+# that is wrong — the state directory holds the journal, the breaker and the
+# armed deadlines and is 0750 root-owned, and the agent account must not own or
+# write it. MIGRATION.md § 1 therefore creates the account with
+# `--home-dir /var/lib/clawcius-agent`, NOT /var/lib/clawcius-ops. Do not let
+# `useradd --system --create-home clawcius-ops` pick the default home; on
+# Debian that is /home/clawcius-ops, which is harmless, but a hand-written
+# `--home-dir /var/lib/clawcius-ops` would hand the breaker to the account it
+# is meant to bound.
 #
 # It is deliberately NOT the checkout. Claude Code auto-discovers CLAUDE.md and
 # project settings from its working directory, and the checkout is a tree the
@@ -134,6 +172,42 @@ StateDirectoryMode=0750
 # shell is a list somebody maintains until the first task it breaks, and then
 # widens to `/`.
 
+# ── Re-audited 2026-08-11, against the new identity ───────────────────────
+#
+# The session stopped being npurcell and became an unprivileged service
+# account. That changes what several directives here are protecting, so every
+# one of them was re-read rather than assumed. The conclusions, in full:
+#
+#   User=root                 UNCHANGED. This unit holds the docker socket and
+#                             performs the drop; it is the session that is not
+#                             root, and it never was this unit.
+#   NoNewPrivileges=false     UNCHANGED, and now more load-bearing: sudo is the
+#                             session's ONLY privileged path, where before it
+#                             also had the docker group.
+#   ProtectHome (absent)      UNCHANGED VERDICT, DIFFERENT REASON. HOME moved
+#                             out of /home; the checkout did not. See below.
+#   RestrictSUIDSGID=true     KEPT, with a new caveat about setgid directories
+#                             in the checkout. See below.
+#   StateDirectory            UNCHANGED, but the chown target changed from the
+#                             checkout's owner to hostAgent.user, and there is
+#                             a name collision worth knowing about. See above.
+#   SupplementaryGroups=      NOT ADDED, and it would do nothing here: it
+#                             applies to the unit's own User=, which is root.
+#                             The session's supplementary groups are set in
+#                             ops/src/host-agent.ts around the spawn, because
+#                             they have to be the AGENT's and systemd has no
+#                             directive for "the groups of a process this unit
+#                             forks with a different uid".
+#   User= the agent instead   REJECTED. Running this whole unit as
+#                             clawcius-ops would mean the executor could not
+#                             use the docker socket (snapshots, rollbacks, the
+#                             health sample) except by putting the agent
+#                             account in the docker group — which is precisely
+#                             what the whole 2026-08-11 rework exists to
+#                             forbid. The split is the design: a root
+#                             supervisor that is small and readable, and an
+#                             unprivileged session that is neither.
+#
 # ── Hardening ─────────────────────────────────────────────────────────────
 # Deliberately light, and the reason is worth writing down rather than
 # rediscovering. This unit exists to run systemctl and docker; the usual
@@ -159,23 +233,33 @@ StateDirectoryMode=0750
 # reason for the rest of this block.
 
 # NoNewPrivileges — false, and as of 2026-08-10 this is MANDATORY rather than
-# merely cautious. Do not flip it.
+# merely cautious. Do not flip it. Re-checked 2026-08-11 against the new
+# identity and the argument is unchanged in every particular.
 #
 # NNP forbids *gaining* privilege at execve, which makes the setuid bit a no-op.
-# `sudo` is a setuid binary. The host agent session runs as npurcell and does
-# its privileged work through the rules in ops/clawcius-sudoers — so under
-# NNP=true every one of those sudo calls fails, and fails with a message about
-# being unable to set the effective uid that reads like a broken sudoers file
-# rather than like a unit setting. The single most useful capability this
-# service has would stop working, and the diagnosis would go looking in the
-# wrong file.
+# `sudo` is a setuid binary. The host agent session runs as the unprivileged
+# service account (hostAgent.user) and does its privileged work through the
+# rules in ops/clawcius-sudoers — so under NNP=true every one of those sudo
+# calls fails, and fails with a message about being unable to set the effective
+# uid that reads like a broken sudoers file rather than like a unit setting. The
+# single most useful capability this service has would stop working, and the
+# diagnosis would go looking in the wrong file.
+#
+# That got MORE important on 2026-08-11, not less. The old grantee reached
+# docker through group membership and could have done much of this work without
+# sudo at all; the new one cannot do any of it that way, by design, so sudo is
+# now the only privileged path there is and NNP would remove all of it.
 #
 # Note the asymmetry, because it is the thing that used to be written here and
 # is still true: DROPPING privilege is unaffected by NNP. The session is dropped
-# to the checkout's owner by libuv calling setgid(2)/setuid(2) in the forked
+# to the service account by libuv calling setgid(2)/setuid(2) in the forked
 # child from the uid/gid spawn options, before execve, with no setuid binary
-# involved. That half would work fine under NNP. It is the sudo the session
-# itself runs that would not.
+# involved — and, since 2026-08-11, with the parent's supplementary groups set
+# to the account's own for the duration of the spawn (ops/src/host-agent.ts,
+# `withSupplementaryGroups`), because otherwise the child inherits root's group
+# list and "this account is in no root-equivalent group" would be false of the
+# running process. All of that half works fine under NNP. It is the sudo the
+# session itself runs that would not.
 #
 # The old reasons also still hold: docker/run-container.sh runs `docker run`
 # with --cap-drop sets and a gVisor runtime, and this unit's children include
@@ -189,9 +273,24 @@ NoNewPrivileges=false
 # — checked deliberately on 2026-08-10, because if it did it would break sudo
 # and therefore the host agent, in the same way NNP would. It does not.
 #
-# What it costs: a task that legitimately needs to install a setuid binary will
-# fail here, loudly. That is the correct outcome for a root daemon's cgroup and
-# it has never come up.
+# ── RE-CHECKED 2026-08-11, AND THIS ONE NEARLY BROKE ──────────────────────
+#
+# The shared-group scheme in MIGRATION.md § 2 puts the SETGID bit on every
+# directory in the checkout, so that files the agent creates inherit the shared
+# group and stay readable and writable by the operator. `chmod g+s` on a
+# DIRECTORY is exactly the operation this directive's seccomp filter blocks.
+#
+# It does not break, for one reason: those chmods are run BY THE OPERATOR, from
+# their own shell, during the migration — not by a task, and therefore not
+# inside this unit's cgroup. If a future task ever needs to create a setgid
+# directory (a new instance's state tree, say) it will fail here with an EPERM
+# on chmod that looks nothing like a systemd setting, and the answer is that
+# the operator runs that one command. That is an acceptable, and now written
+# down, cost.
+#
+# What it otherwise costs: a task that legitimately needs to install a setuid
+# binary fails here, loudly. That is the correct outcome for a root daemon's
+# cgroup and it has never come up.
 RestrictSUIDSGID=true
 
 # A no-op on this unit, kept because it costs nothing and stops being a no-op
@@ -199,15 +298,32 @@ RestrictSUIDSGID=true
 # effect on objects owned by root.
 RemoveIPC=true
 
-# ── NOT ProtectHome. Fatal before; now fatal twice over. ─────────────────
+# ── NOT ProtectHome. Fatal before; still fatal, for a different reason. ──
 #
-# Re-audited 2026-08-10 with the host agent in mind, and the case against it is
-# now much stronger than the one written below. The session's HOME is
-# /home/npurcell and that is where Claude Code keeps the OAuth credentials it
-# authenticates with; under ProtectHome=read-only it cannot write its session
-# state, and under =yes or =tmpfs it cannot find its credentials at all. The
-# symptom would be every task failing to authenticate, on a host where `claude`
-# works perfectly from a shell. The original argument follows.
+# Re-audited 2026-08-11, after the session stopped running as npurcell.
+#
+# The 2026-08-10 case against it was that the session's HOME was /home/npurcell
+# and that is where Claude Code keeps its OAuth credentials. THAT ARGUMENT NO
+# LONGER APPLIES: HOME is now /var/lib/clawcius-agent, which ProtectHome does
+# not touch. It would have been easy to conclude from that alone that
+# ProtectHome=read-only is now safe to add. It is not, and the reason is the
+# original one from 2026-08-09, which never went away:
+#
+#   THE CHECKOUT IS /home/npurcell/clawcius. `git pull` writes .git/, `npm ci`
+#   writes node_modules/, `npm run build` writes dist/. Under
+#   ProtectHome=read-only all three get EROFS on a filesystem that is
+#   demonstrably read-write from a shell.
+#
+# And a near miss that also survives: ExecStart is
+# /home/npurcell/.local/share/node/bin/node, so =yes or =tmpfs hides the
+# interpreter and the unit does not start at all. Perversely the better failure
+# — noticed on the first restart rather than the first build.
+#
+# So: still absent, and this block now records that its *justification* changed
+# on 2026-08-11 while its *verdict* did not. That distinction is exactly the
+# kind of thing that gets lost, and losing it is how a directive that is fatal
+# for reason B gets added because reason A was fixed. The original argument
+# follows.
 #
 #
 # This unit carried ProtectHome=read-only. It reads like obvious hygiene: a

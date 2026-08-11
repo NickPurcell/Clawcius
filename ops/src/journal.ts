@@ -164,6 +164,19 @@ export type OpsStatusSnapshot = {
     claudePath: string;
     timeoutMinutes: number;
     maxCostUsd: number;
+    /** The service account the session runs as (`hostAgent.user`). */
+    user: string;
+    /**
+     * Whether that account currently passes the checks in agent-user.ts, and
+     * a one-line summary either way.
+     *
+     * Published because "enabled: true" on its own became misleading on
+     * 2026-08-11: the daemon can be enabled, healthy and holding deadlines
+     * while refusing every task because somebody added the agent account to
+     * the docker group. A status page that could not show the difference
+     * would be showing reassurance.
+     */
+    identity: { ok: boolean; detail: string };
   };
   /** Bash invocations audited since this process started. */
   auditedCommands: number;

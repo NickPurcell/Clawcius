@@ -57,6 +57,31 @@
  *      `rm -rf /etc`. The host filesystem's rollback is the provider's snapshot
  *      and git, and that is a human's job, not this file's.
  *
+ * ── It runs as its own user, and that is what makes the rest real ────────
+ *
+ * Added 2026-08-11, and it is the most important paragraph in this header.
+ *
+ * The first version of this file dropped the session to "the checkout's
+ * owner", discovered by `stat`. On this host that is `npurcell` — the operator
+ * — and `npurcell` is in the `docker` group, which SETUP.md itself calls
+ * "effectively root on the host". `docker run -v /:/host` is root in one
+ * command with no sudo, no sudoers rule and no audit entry in the path. So:
+ *
+ *   - the carefully-scoped aliases in ops/clawcius-sudoers were not a boundary,
+ *     they were a description of the polite route;
+ *   - the journal in /var/lib/clawcius-ops, 0750 and root-owned, was one
+ *     `docker run -v` away from being rewritten by the session it recorded;
+ *   - the session could read every credential the operator has — .env,
+ *     ~/.claude, ~/.ssh — because it *was* the operator.
+ *
+ * The session now runs as a named, unprivileged service account
+ * (`hostAgent.user`, default `clawcius-ops`) with no docker group, and
+ * `ops/src/agent-user.ts` REFUSES TO START IT if that account does not exist,
+ * has uid 0, is in any root-equivalent group, or can read any configured
+ * secret. That refusal is checked immediately before the spawn, below, in the
+ * same seat as `assertNoSecrets` and for the same reason: a property somebody
+ * has to remember is not a property.
+ *
  * ── The security model, now that the sandbox is not ──────────────────────
  *
  * ┌────────────────────────────────────────────────────────────────────────┐
@@ -150,7 +175,11 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import type { OpsConfig } from './config.js';
-import type { BuildOwner } from './build.js';
+import {
+  assertAgentIdentity,
+  type AgentUser,
+  type IdentityOptions,
+} from './agent-user.js';
 
 /**
  * One thing the session did, on its way to being written into the journal.
@@ -215,8 +244,8 @@ export type HostAgentOutcome = {
  * An allowlist. Nothing gets in because it happened to be exported when
  * somebody started the daemon by hand during an incident. `HOME`, `USER` and
  * `LOGNAME` are NOT taken from the executor's environment — the executor is
- * root and the session is not — they are derived from the checkout's owner in
- * `hostAgentEnv` below.
+ * root and the session is not — they are derived from the resolved service
+ * account in `hostAgentEnv` below.
  */
 const ENV_ALLOWLIST = [
   'LANG',
@@ -329,16 +358,56 @@ export function assertNoSecrets(
 }
 
 /**
+ * Everything `agent-user.ts` needs to judge the account, assembled from config.
+ *
+ * The interesting line is the one that folds every instance's `envFile` into
+ * `secretPaths` without being asked. Those files hold `DISCORD_TOKEN`. This
+ * module already refuses to put that token in the session's ENVIRONMENT and
+ * says so loudly; a session that can `cat /home/npurcell/clawcius/.env` has
+ * defeated that assertion completely without ever setting a variable. Making
+ * the operator remember to list it would be making the loudest claim in this
+ * file depend on somebody's memory.
+ *
+ * The checkouts go in as `writablePaths` — warnings, not refusals — because the
+ * failure they catch is the mirror image of the 2026-08-09 one: not "the build
+ * left root-owned files", but "the agent cannot write the tree at all", which
+ * surfaces as an EACCES naming a file nobody edited, several minutes into a
+ * task.
+ */
+export function identityOptionsFor(config: OpsConfig): IdentityOptions {
+  const secrets = new Set<string>(config.hostAgent.secretPaths);
+  for (const instance of config.instances) secrets.add(instance.envFile);
+  return {
+    forbiddenGroups: config.hostAgent.forbiddenGroups,
+    secretPaths: [...secrets],
+    writablePaths: config.repos.map((repo) => repo.path),
+    stateDir: config.stateDir,
+    gitSshKey: config.hostAgent.gitSshKey,
+  };
+}
+
+/**
  * The session's environment, built from nothing.
  *
- * `HOME` is the checkout owner's home, and that is load-bearing twice over: it
- * is where Claude Code finds the OAuth credentials it authenticates with, and
- * it is why the systemd unit must not carry `ProtectHome` in any form. It is
- * also, honestly, the weak point — a session with the owner's HOME can read
- * anything else in it. Real isolation would mean a separate OS user or a
- * container, and this is a host agent precisely because it must not be in one.
+ * `HOME` is the SERVICE ACCOUNT's home — `/var/lib/clawcius-ops` on this host,
+ * not `/home/npurcell` — and that is load-bearing three times over since
+ * 2026-08-11:
+ *
+ *   - it is where Claude Code finds the OAuth credentials it authenticates
+ *     with, which now means the agent's own login rather than the operator's.
+ *     `claude auth` has to be run once as this account (MIGRATION.md § 4) and
+ *     until it is, every task fails to authenticate on a host where `claude`
+ *     works perfectly from the operator's shell;
+ *   - it is why the systemd unit must not carry `ProtectHome` in any form: the
+ *     checkout under /home still has to be writable even though HOME is not
+ *     there any more;
+ *   - it is what makes "the session cannot read the operator's secrets" true
+ *     rather than aspirational. The previous version pointed HOME at
+ *     /home/npurcell and admitted, in this comment, that a session with the
+ *     owner's HOME can read anything in it. That sentence is what this rework
+ *     deleted.
  */
-export function hostAgentEnv(config: OpsConfig, owner: BuildOwner): Record<string, string> {
+export function hostAgentEnv(config: OpsConfig, agent: AgentUser): Record<string, string> {
   const env: Record<string, string> = {};
 
   for (const name of [...ENV_ALLOWLIST, ...PROXY_VARS, ...CLAUDE_CONFIG_VARS]) {
@@ -367,13 +436,29 @@ export function hostAgentEnv(config: OpsConfig, owner: BuildOwner): Record<strin
     '/sbin',
     '/bin',
   ].join(':');
-  env['HOME'] = owner.home;
-  env['USER'] = owner.user;
-  env['LOGNAME'] = owner.user;
+  env['HOME'] = agent.home;
+  env['USER'] = agent.user;
+  env['LOGNAME'] = agent.user;
   env['SHELL'] = '/bin/bash';
   // Anything git does must fail rather than prompt: there is no terminal, and a
   // credential prompt hangs until the timeout instead of failing usefully.
   env['GIT_TERMINAL_PROMPT'] = '0';
+  // A read-only deploy key owned by the agent account, for pulls from private
+  // repositories (OJ). A PATH, never a token: a token would have to live in
+  // this environment, where `assertNoSecrets` refuses it, and sharing the
+  // operator's PAT with a session that has a shell is the precise thing the
+  // separate account exists to stop. `IdentitiesOnly` so ssh does not offer
+  // every key in the agent's agent/keyring and get rate-limited by GitHub
+  // before it reaches the right one; `StrictHostKeyChecking=yes` because there
+  // is no human to answer the first-connection prompt and accepting an unknown
+  // host key unattended is how a MITM becomes permanent. The known_hosts entry
+  // is part of the migration, deliberately, so that failure is a one-off with
+  // a clear message rather than a silent acceptance.
+  if (config.hostAgent.gitSshKey) {
+    env['GIT_SSH_COMMAND'] =
+      `ssh -i ${config.hostAgent.gitSshKey} -o IdentitiesOnly=yes ` +
+      '-o StrictHostKeyChecking=yes -o BatchMode=yes';
+  }
   // Visible in `ps` and in the transcript directory. Somebody looking at a
   // strange process on this box should be able to tell what started it.
   env['CLAWCIUS_HOST_AGENT'] = '1';
@@ -483,7 +568,8 @@ export function hostAgentTools(dryRun: boolean): string[] {
 
 export type HostAgentRequest = {
   config: OpsConfig;
-  owner: BuildOwner;
+  /** The resolved service account. Already checked; re-checked before the spawn. */
+  agent: AgentUser;
   /** The free text from the spool. Untrusted; it is the task, and it is all of it. */
   task: string;
   /** Which instance filed it. From the spool directory, never from the file. */
@@ -506,9 +592,28 @@ export type HostAgentRequest = {
 export function standingPrompt(config: OpsConfig, dryRun: boolean): string {
   const containers = config.instances.map((i) => `${i.name} (container ${i.container})`);
   return [
-    'You are the Clawcius host agent. You run ON THE HOST, not in a container, as the user',
-    'who owns the checkout, with passwordless sudo for a scoped set of commands. You were',
+    `You are the Clawcius host agent. You run ON THE HOST, not in a container, as the`,
+    `unprivileged service account "${config.hostAgent.user}" — NOT as the operator, and not`,
+    'as root — with passwordless sudo for a short, explicit list of commands. You were',
     'started by clawcius-ops.service to carry out one task and then exit.',
+    '',
+    '## What your account can and cannot do',
+    '',
+    `You are ${config.hostAgent.user}. You are deliberately NOT in the docker group, NOT in`,
+    'sudo/wheel, and you cannot read the operator\'s credentials (.env files, ~/.claude,',
+    '~/.ssh). The executor refuses to start you if any of that stops being true, so if you',
+    'find you CAN do one of those things, say so in your report — it is a misconfiguration',
+    'and it is a serious one.',
+    '',
+    'Your sudo grants are enumerated in ops/clawcius-sudoers by exact command and exact unit',
+    'name. There is no `sudo sh`, no `sudo tee`, no `sudo cp`, no `docker run`, no package',
+    'manager. When something is refused, that is the design and not a bug: read the file,',
+    'say in your report what you needed and why, and stop. Do NOT go looking for a way',
+    'around it — a route around the sudoers file is a route around the audit, and finding',
+    'one is a finding to report, not a tool to use.',
+    '',
+    'You share the checkout with the operator through a group. Files you create there are',
+    'group-writable by design (setgid directories). Do not chown or chmod anything in it.',
     '',
     '## What you must never read',
     '',
@@ -540,14 +645,20 @@ export function standingPrompt(config: OpsConfig, dryRun: boolean): string {
     '  because the checkout was pulled and the service restarted without `npm run build`.',
     '  After any pull, run `npm ci && npm run build` in each package you touched, and',
     '  restart only after the build succeeds.',
-    '- **Never run npm as root.** You are already the checkout\'s owner; keep it that way.',
-    '  A root-owned `node_modules/` or `dist/` makes every unit that runs as a person fail',
-    '  to start with an EACCES naming a file nobody edited. That happened twice in one night.',
+    '- **Never run npm, git or a build under sudo.** You are not root and the sudoers file',
+    '  does not let you become root for these; that is the point. A root-owned `node_modules/`',
+    '  or `dist/` makes every unit that runs as a person fail to start with an EACCES naming a',
+    '  file nobody edited — that happened twice on the night of 2026-08-09. If a build fails',
+    '  with a permission error, the fix is the shared group on the checkout, not sudo. Report',
+    '  it and stop.',
     '- **Never force past a dirty tree.** No `git reset --hard`, `checkout -f`, `stash` or',
     '  `clean`. On 2026-08-09 the local edits blocking a pull turned out to be real fixes',
     '  made by hand during an incident. Name the files and stop.',
     '- **You cannot restart clawcius-ops.service.** It is the process that started you;',
-    '  restarting it kills you mid-task and loses the record. Ask the operator.',
+    '  restarting it kills you mid-task and loses the record. Since 2026-08-11 this is also',
+    '  enforced: the sudoers file grants restart/start/stop for a named list of units and',
+    '  clawcius-ops.service is not on it. You can still read its status and its journal. If',
+    '  it genuinely needs restarting, say so in your report and let the operator do it.',
     dryRun
       ? [
           '',
@@ -668,42 +779,61 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
     ...(config.hostAgent.model ? ['--model', config.hostAgent.model] : []),
   ];
 
-  const env = hostAgentEnv(config, request.owner);
+  // ── The gate. Throws; nothing below it runs if the account is wrong ─────
+  //
+  // The executor checked this before it got here and produced a friendlier
+  // refusal for the agent that filed the task. This call is the one that
+  // matters: it exists so there is no code path in ops/ — including one added
+  // next year by somebody who has not read agent-user.ts — that reaches
+  // `spawn` without the docker-group check having been evaluated against the
+  // live /etc/group. Same seat as `assertNoSecrets`, same argument.
+  assertAgentIdentity(request.agent, identityOptionsFor(config));
+
+  const env = hostAgentEnv(config, request.agent);
 
   request.onLog(
     `host agent: session ${sessionId} for ${request.requester}, ` +
-      `${dryRun ? 'DRY RUN (execution denied)' : 'LIVE'}, as ${request.owner.user} ` +
-      `(uid ${request.owner.uid}), cwd ${config.hostAgent.workDir}, ` +
+      `${dryRun ? 'DRY RUN (execution denied)' : 'LIVE'}, as ${request.agent.user} ` +
+      `(uid ${request.agent.uid}, gid ${request.agent.gid}, groups ` +
+      `${request.agent.groups.join('/') || 'none'}), cwd ${config.hostAgent.workDir}, ` +
       `env: ${Object.keys(env).sort().join(' ')}`,
   );
 
   return new Promise<HostAgentOutcome>((resolve) => {
     let child: ReturnType<typeof spawn>;
+    const dropping = request.agent.uid !== process.getuid?.();
     try {
-      child = spawn(config.hostAgent.claudePath, args, {
-        // A directory of our own, NOT the checkout. Claude Code auto-discovers
-        // CLAUDE.md and project settings from the working directory, and the
-        // checkout is a tree the agents push to — so pointing this at the
-        // checkout would hand a session with sudo a set of instructions any
-        // agent can edit and get merged. The agent can still `cd` there in a
-        // Bash command, which is a deliberate act it takes and the audit
-        // records, rather than context it silently absorbs.
-        cwd: config.hostAgent.workDir,
-        env,
-        // The drop to the checkout's owner, by the same mechanism and for the
-        // same reason as the build used to use: setuid(2) from an already-root
-        // process, performed by libuv before execve, so NoNewPrivileges has no
-        // bearing on it. Everything the session writes without sudo is owned by
-        // the user every unit here runs as, which makes the root-owned
-        // node_modules failure structurally impossible for it.
-        ...(request.owner.uid === process.getuid?.()
-          ? {}
-          : { uid: request.owner.uid, gid: request.owner.gid }),
-        stdio: ['ignore', 'pipe', 'pipe'],
-        // Its own process group, so a timeout can take out the commands it
-        // started as well as the session itself.
-        detached: true,
-      });
+      child = withSupplementaryGroups(dropping ? request.agent : null, request.onLog, () =>
+        spawn(config.hostAgent.claudePath, args, {
+          // A directory of our own, NOT the checkout. Claude Code auto-discovers
+          // CLAUDE.md and project settings from the working directory, and the
+          // checkout is a tree the agents push to — so pointing this at the
+          // checkout would hand a session with sudo a set of instructions any
+          // agent can edit and get merged. The agent can still `cd` there in a
+          // Bash command, which is a deliberate act it takes and the audit
+          // records, rather than context it silently absorbs.
+          cwd: config.hostAgent.workDir,
+          env,
+          // The drop to the service account: `setuid(2)` performed by libuv in
+          // the forked child before `execve`, which is a DIFFERENT operation
+          // from anything `sudo` or `su` does. It drops privilege rather than
+          // gaining it, so `NoNewPrivileges` has no bearing on it — see the
+          // unit file, where NNP has to stay false anyway for the sudo the
+          // session itself runs.
+          //
+          // Deliberately not `sudo -u clawcius-ops claude …`: sudo is a setuid
+          // binary, NNP would make it a no-op, it would need its own sudoers
+          // rule (a rule that says "become the agent user and run anything",
+          // which is a strange thing to write in a file whose whole purpose is
+          // enumerating what may be run), and the resulting process tree would
+          // have a sudo between this daemon and the session for no benefit.
+          ...(dropping ? { uid: request.agent.uid, gid: request.agent.gid } : {}),
+          stdio: ['ignore', 'pipe', 'pipe'],
+          // Its own process group, so a timeout can take out the commands it
+          // started as well as the session itself.
+          detached: true,
+        }),
+      );
     } catch (error) {
       resolve({
         ok: false,
@@ -1062,6 +1192,105 @@ function summariseToolInput(input: Record<string, unknown>): string {
     if (typeof value === 'string' && value) parts.push(`${key}=${value.slice(0, 300)}`);
   }
   return parts.join(' ') || '(no notable arguments)';
+}
+
+/**
+ * Run `fn` with the parent's supplementary groups set to the agent's, then put
+ * them back.
+ *
+ * ── The hole this closes, and why it needed closing on 2026-08-11 ────────
+ *
+ * `spawn`'s `uid`/`gid` options make libuv call `setgid(2)` and `setuid(2)` in
+ * the forked child. It does NOT call `setgroups(2)` or `initgroups(3)`. So the
+ * child's SUPPLEMENTARY groups are inherited from the parent — and the parent
+ * is root.
+ *
+ * build.ts wrote that down as an honest limitation and left it, on the grounds
+ * that what mattered was the ownership of the files the build produced. That
+ * was defensible while the session ran as the checkout's owner. It stopped
+ * being defensible the moment the entire containment argument became "this
+ * account is not in any root-equivalent group": a process running as
+ * `clawcius-ops` while still carrying root's group list is not the thing
+ * agent-user.ts just spent two hundred lines asserting about. In particular it
+ * would carry gid 0, and "not in the root group" is one of the things that file
+ * refuses to start without.
+ *
+ * The fix is not clever, and the alternatives are worse: `setpriv
+ * --clear-groups` is another binary to depend on and one that has never been
+ * run on this host, and `sudo -u` is a setuid binary in a unit that has to
+ * think about `NoNewPrivileges`. What happens instead is that this process — as
+ * root, which is the only thing allowed to — sets ITS OWN supplementary groups
+ * to the agent's for exactly the duration of the `spawn` call, and restores
+ * them in a `finally`.
+ *
+ * That is safe for one specific reason and it is worth stating, because it
+ * looks alarming: `fn` here is a single synchronous `spawn()`, and Node is
+ * single-threaded with a run-to-completion event loop. No other JavaScript in
+ * this process can observe the window. If anybody ever puts an `await` inside
+ * this callback, that stops being true and this comment is the warning.
+ *
+ * Failure to restore would leave the root daemon carrying the agent's groups,
+ * which is a downgrade rather than an escalation, and is in practice impossible
+ * (root may always `setgroups`). It is shouted about anyway.
+ */
+function withSupplementaryGroups<T>(
+  agent: AgentUser | null,
+  log: (line: string) => void,
+  fn: () => T,
+): T {
+  const getgroups = process.getgroups;
+  const setgroups = process.setgroups;
+  const canSet =
+    agent !== null &&
+    process.getuid?.() === 0 &&
+    typeof getgroups === 'function' &&
+    typeof setgroups === 'function';
+
+  if (!canSet || agent === null || !getgroups || !setgroups) {
+    if (agent !== null) {
+      // Not root, or a platform without setgroups. Nothing to do and nothing
+      // to hide: the caller is either the self-test (running as itself, not
+      // dropping at all) or a host where this daemon is not root, in which
+      // case it cannot drop to anybody either and `resolveAgentUser` has
+      // already refused.
+      log(
+        `host agent: not adjusting supplementary groups (uid ${String(process.getuid?.())}); ` +
+          'the child inherits this process\'s group list',
+      );
+    }
+    return fn();
+  }
+
+  const saved = getgroups();
+  try {
+    setgroups(agent.gids);
+  } catch (error) {
+    // Not fatal. The uid/gid drop below still happens and is the property that
+    // matters most; this is the belt to its braces. Loud, because a session
+    // that is `clawcius-ops` with root's group list is not what the README
+    // says it is, and somebody should know.
+    log(
+      `host agent: WARNING — could not set supplementary groups to ` +
+        `${agent.gids.join(',')} (${String(error)}). The session will run as ` +
+        `${agent.user} but with this process's supplementary groups, which are root's. ` +
+        'Everything ops/README.md says about group membership is weaker than it claims ' +
+        'until this is fixed.',
+    );
+    return fn();
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      setgroups(saved);
+    } catch (error) {
+      process.stderr.write(
+        `[ops] ══ COULD NOT RESTORE SUPPLEMENTARY GROUPS ══ ${String(error)}. This process ` +
+          `is still carrying ${agent.user}'s group list. Restart clawcius-ops.\n`,
+      );
+    }
+  }
 }
 
 /**

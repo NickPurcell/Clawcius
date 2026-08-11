@@ -87,9 +87,22 @@ import { StateStore, type PendingCheckin } from './state.js';
 import { readIdle } from './idle.js';
 import { Runner, render, summarise, type CommandResult } from './runner.js';
 import { describeRequest, isDestructive, parseRequest, type OpsRequest } from './request.js';
-import { readDirty, resolveOwner } from './build.js';
-import { runHostAgent, type AuditEvent, type HostAgentOutcome } from './host-agent.js';
-import { ensureOwnedDir, type RawRequest } from './spool.js';
+import { readDirty } from './build.js';
+import {
+  identityOptionsFor,
+  runHostAgent,
+  type AuditEvent,
+  type HostAgentOutcome,
+} from './host-agent.js';
+import {
+  agentProblems,
+  agentWarnings,
+  describeAgentUser,
+  resolveAgentUser,
+  type AgentUser,
+  type AgentUserResult,
+} from './agent-user.js';
+import { ensureDirOwnedBy, type RawRequest } from './spool.js';
 
 /**
  * The executor's own unit.
@@ -220,6 +233,15 @@ export class Executor {
         claudePath: this.#config.hostAgent.claudePath,
         timeoutMinutes: this.#config.hostAgent.timeoutMinutes,
         maxCostUsd: this.#config.hostAgent.maxCostUsd,
+        // Added 2026-08-11 and additive, like everything else in this object.
+        // The status page's honest sentence about this daemon used to be "it
+        // runs a shell as npurcell"; it can now say which account, and — the
+        // part worth publishing — whether that account is currently in a state
+        // this daemon will run a session as. A page that says "host agent:
+        // enabled" while every task is being refused for a docker-group
+        // membership would be reassurance rather than status.
+        user: this.#config.hostAgent.user,
+        identity: this.#identityStatus(),
       },
       auditedCommands: this.#auditedCommands,
       lastTask: this.#lastTask,
@@ -578,6 +600,43 @@ export class Executor {
     return this.#config.instances.find((instance) => instance.name === name) ?? null;
   }
 
+  /**
+   * The service account the host agent runs as, resolved fresh.
+   *
+   * Public so `index.ts` can print it in the boot banner and so the self-test
+   * can assert on the refusals without starting a task. Deliberately NOT
+   * memoised: see #doTask for why a cached answer would miss the exact change
+   * this check exists to catch.
+   */
+  resolveAgentIdentity(): AgentUserResult {
+    return this.#resolveAgent();
+  }
+
+  /** One line about the agent account, for `ops-status.json`. Never a decision. */
+  #identityStatus(): { ok: boolean; detail: string } {
+    if (!this.#config.hostAgent.enabled) {
+      return { ok: false, detail: 'hostAgent.enabled is false; tasks are refused' };
+    }
+    const agent = this.#resolveAgent();
+    if (!agent.ok) return { ok: false, detail: agent.reason.split('\n')[0] ?? agent.reason };
+    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
+    if (problems.length > 0) {
+      return {
+        ok: false,
+        detail: `${describeAgentUser(agent.user)} — ${problems.length} refusal(s): ` +
+          `${problems.map((problem) => problem.split('\n')[0]).join(' | ')}`,
+      };
+    }
+    return { ok: true, detail: describeAgentUser(agent.user) };
+  }
+
+  #resolveAgent(): AgentUserResult {
+    return resolveAgentUser(this.#config.hostAgent.user, {
+      passwdPath: this.#config.hostAgent.passwdPath,
+      groupPath: this.#config.hostAgent.groupPath,
+    });
+  }
+
   // ── task ────────────────────────────────────────────────────────────────
 
   /**
@@ -646,38 +705,56 @@ export class Executor {
       return;
     }
 
-    // The session runs as whoever owns the checkout — never as root. Same rule
-    // as the build step it replaces, discovered by `stat` rather than
-    // configured, because this daemon is not entitled to an opinion about who
-    // owns a directory it was pointed at. A session running as root would put
-    // root-owned files into a checkout every unit here runs as a person, which
-    // is the EACCES-naming-a-file-nobody-edited failure of 2026-08-09, twice in
-    // one night.
-    const buildRepo = this.#config.repos[0];
-    if (!buildRepo) {
+    // ── Who is this session, and is that account still contained? ────────
+    //
+    // Re-resolved from /etc/passwd and /etc/group here, for every task, rather
+    // than cached from boot. That is the whole reason the check lives at task
+    // time: the membership it exists to catch — `usermod -aG docker
+    // clawcius-ops`, typed to make something work — is added to a RUNNING host,
+    // and a boot-time check on a unit that stays up for weeks would not see it
+    // until the next restart. Costs two small file reads per task.
+    const agent = this.#resolveAgent();
+    if (!agent.ok) {
+      this.#fail(job, `${agent.reason}\n\nThe host agent was not started.`);
+      return;
+    }
+    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
+    if (problems.length > 0) {
       this.#fail(
         job,
-        'no repos: are configured, so there is no checkout to take an owner from and the ' +
-          'host agent cannot be run as anybody in particular. Refusing rather than running ' +
-          'a session with a shell as root.',
+        `refusing to run a task as ${describeAgentUser(agent.user)}:\n\n` +
+          problems.map((problem) => `  * ${problem}`).join('\n\n') +
+          '\n\nSince 2026-08-11 the containment story for this service is that the session ' +
+          'runs as an unprivileged account of its own. The sudoers scoping, the root-owned ' +
+          'journal and the claim that it holds no credential are all downstream of that one ' +
+          'fact and none of them survive without it. Nothing was run; the executor is still ' +
+          'holding its deadlines and will still perform rollbacks and check-ins.',
       );
       return;
     }
-    const owner = resolveOwner(buildRepo.path);
-    if (!owner.ok) {
-      this.#fail(job, `${owner.reason} The host agent is not started.`);
-      return;
+    for (const warning of agentWarnings(agent.user, identityOptionsFor(this.#config))) {
+      this.#journal.write({
+        kind: 'request',
+        what: describeRequest(request),
+        requester: job.requester,
+        detail: `host agent identity warning: ${warning}`,
+      });
     }
 
     // Idempotent, and here as well as at boot on purpose. `execFile`/`spawn`
     // report a missing cwd as ENOENT on the BINARY, which reads as "claude is
     // not installed" and sends whoever is debugging it to the wrong place
     // entirely. Costs a stat; saves an evening.
-    ensureOwnedDir(
+    //
+    // Owned by the agent account rather than by the checkout's owner, which is
+    // the change of 2026-08-11: the session writes here and it is no longer the
+    // same user as the one that owns /home/npurcell/clawcius.
+    ensureDirOwnedBy(
       this.#config.hostAgent.workDir,
-      buildRepo.path,
+      { uid: agent.user.uid, gid: agent.user.gid },
       (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
       0o750,
+      `so the host agent (${agent.user.user}) can write its own working directory`,
     );
 
     const scope = this.#scopeOf(request);
@@ -722,10 +799,10 @@ export class Executor {
     try {
       outcome = await runHostAgent({
         config: this.#config,
-        owner: owner.owner,
+        agent: agent.user,
         task: request.task,
         requester: job.requester,
-        briefing: await this.#briefing(scope),
+        briefing: await this.#briefing(scope, agent.user),
         onAudit: (event) => {
           if (event.kind === 'bash') commands.push(event.command);
           this.#audit(job, event);
@@ -947,8 +1024,20 @@ export class Executor {
    * with the actual filenames attached is one the session can act on instead of
    * discovering the hard way.
    */
-  async #briefing(scope: InstanceEntry[]): Promise<string> {
+  async #briefing(scope: InstanceEntry[], agent: AgentUser): Promise<string> {
     const lines: string[] = [];
+
+    // Who the session is, stated rather than left to be discovered with `id`.
+    // Not decoration: a session that believes it is the operator will try
+    // things that get refused and then try to work around the refusal, and the
+    // fastest way to stop that is to tell it what account it holds and where
+    // the list of its grants is written down.
+    lines.push(
+      `You are running as ${describeAgentUser(agent)}. Your sudo grants are enumerated in ` +
+        `${this.#config.repos[0]?.path ?? '<checkout>'}/ops/clawcius-sudoers — read it before ` +
+        'assuming something is broken.',
+    );
+    lines.push('');
 
     lines.push('Instances (name, container, state directory, waker status file):');
     for (const instance of this.#config.instances) {

@@ -1,5 +1,5 @@
 /**
- * Who owns the checkout, and what state its tree is in.
+ * What state the checkout's tree is in.
  *
  * ── What this file was, and what is left of it ───────────────────────────
  *
@@ -8,21 +8,37 @@
  * the planner and the runner — the host agent runs npm itself, in a Bash
  * command that gets audited like every other.
  *
- * Two things stayed, and both are load-bearing for what replaced them:
+ * On 2026-08-10 two things survived that cull: `readDirty`, and `resolveOwner`,
+ * which was how the executor decided who the host agent session ran as — the
+ * checkout's owner, discovered by `stat`, on the reasoning that "this daemon is
+ * not entitled to an opinion about who owns a directory it was pointed at".
  *
- *   - `resolveOwner`, which is how the executor decides who the host agent
- *     session runs as. The session is dropped to the checkout's owner for
- *     exactly the reason the build was, and the drop now covers everything the
- *     session does rather than two commands;
- *   - `readDirty`, which feeds the briefing. The prohibition on forcing past a
- *     dirty tree moved from a gate in this file to a standing rule in the host
- *     agent's system prompt, and a rule that arrives with the actual filenames
- *     attached is one the session can act on.
+ * ── `resolveOwner` is gone, 2026-08-11, and that reversal is the point ───
  *
- * The rest of this header is the record of why either of them exists. It is
- * kept in full, because the failures it describes have not stopped being
- * possible — they have stopped being prevented by a check and started being
- * prevented by an instruction, which is a weaker thing and worth knowing.
+ * That reasoning was right for a BUILD STEP and exactly backwards for an
+ * IDENTITY. On this host the checkout is owned by `npurcell`; `npurcell` is in
+ * the `docker` group; SETUP.md's own words for the docker group are
+ * "effectively root on the host". So discovering the session's identity from
+ * the filesystem is precisely how the session ended up running as a
+ * root-equivalent account, and the sudoers scoping, the root-owned journal and
+ * every other control in `ops/` were decoration on top of it.
+ *
+ * The session now runs as a named, unprivileged service account that the
+ * daemon refuses to start without — see `ops/src/agent-user.ts`, which also
+ * holds the passwd parsing that used to live here. What is left in this file is
+ * `readDirty`, which feeds the briefing: the prohibition on forcing past a
+ * dirty tree moved from a gate here to a standing rule in the host agent's
+ * system prompt, and a rule that arrives with the actual filenames attached is
+ * one the session can act on.
+ *
+ * The rest of this header is the record of why any of it exists. It is kept in
+ * full, because the failures it describes have not stopped being possible —
+ * they have stopped being prevented by a check and started being prevented by
+ * an instruction, which is a weaker thing and worth knowing. The root-owned
+ * `node_modules` failure in particular has a NEW shape now and it is in the
+ * same family: the session is no longer the checkout's owner, so the way it
+ * breaks a build is by not being able to write the tree at all. That is what
+ * the shared group in MIGRATION.md § 2 is for, and `agentWarnings` checks it.
  *
  * ── Why the build mattered ───────────────────────────────────────────────
  *
@@ -58,7 +74,7 @@
  * chown a directory and read a journal, which is what the operator actually
  * needed.
  *
- * ── Why the session drops privileges ─────────────────────────────────────
+ * ── Why the session drops privileges at all ──────────────────────────────
  *
  * `clawcius-ops.service` is `User=root`. The checkout is `/home/npurcell/clawcius`
  * and `clawcius.service`, `hamachi.service` and `clawcius-status.service` all
@@ -73,156 +89,38 @@
  * *succeeds*: the exit code is 0, `dist/` is complete and correct, and the
  * damage is in the file metadata rather than in anything the build reports.
  *
- * So the owner is discovered by `stat`ing the checkout — never hardcoded,
- * because the executor is not entitled to an opinion about who owns a directory
- * it was pointed at — and the host agent session runs as that uid/gid. If the
- * owner cannot be determined, or the drop cannot be performed, THE TASK IS
+ * So the session is dropped, and if the drop cannot be performed THE TASK IS
  * REFUSED. Running a session with a shell as root is a much larger version of
  * the failure this was written for: not two commands producing root-owned
  * files, but every command it chooses to run.
- *
- * The upside of dropping the whole session rather than two commands is that the
- * original failure becomes structurally impossible for anything the agent does
- * without `sudo`. It cannot leave a root-owned `node_modules/` behind by
- * accident, because it is not root.
  *
  * ── Why the drop is setuid(2) and not sudo or su ─────────────────────────
  *
  * `sudo` and `su` are setuid binaries, and a setuid bit is exactly what
  * `NoNewPrivileges=true` turns into a no-op. Under NNP the kernel refuses to
- * grant the privilege transition at `execve`, so `sudo -u npurcell npm ci`
+ * grant the privilege transition at `execve`, so `sudo -u clawcius-ops npm ci`
  * fails with a message about being unable to set the effective uid — and it
  * fails whether or not the caller is already root, which makes it look like a
  * permissions bug rather than a unit setting.
  *
  * A `setuid(2)` performed by an already-root process is a different operation:
  * it *drops* privilege, it happens before `execve`, and `NoNewPrivileges` has
- * no bearing on it. So the drop is done with the `uid`/`gid` spawn options,
- * which is what `Runner` passes to `execFile`, and this file needs no setuid
- * helper, no sudoers rule and no shell. The unit does not have to weaken
- * `NoNewPrivileges` to make the build work; see `systemd/clawcius-ops.service`
- * for what it does have to do instead, which is stop making /home read-only.
+ * no bearing on it. So the drop is done with the `uid`/`gid` spawn options and
+ * needs no setuid helper, no sudoers rule and no shell. The unit does not have
+ * to weaken `NoNewPrivileges` for the drop's sake; it has to leave it false for
+ * the sake of the `sudo` the SESSION runs, which is a different argument and is
+ * written out in `systemd/clawcius-ops.service`.
  *
- * Honest limitation, in the same spirit as the rest of this codebase: the
- * spawn options set the gid and the uid but do not call `setgroups(2)`, so the
- * build inherits root's supplementary group list (in practice just `root`).
- * Files it creates are owned `npurcell:npurcell` — which is the property that
- * matters here — but the process is not as thoroughly unprivileged as a real
- * login would be. Fixing that properly means `setpriv --clear-groups`, which
- * is another binary to depend on and another thing that has never been run on
- * this host; noted rather than half-done.
+ * The honest limitation that used to be recorded here — that the spawn options
+ * do not call `setgroups(2)`, so the child inherits root's supplementary group
+ * list — was fixed on 2026-08-11 in `host-agent.ts`, because it stopped being
+ * cosmetic the moment the containment argument became "this account is in no
+ * root-equivalent group". See `withSupplementaryGroups` there.
  */
 
-import { readFileSync, statSync } from 'node:fs';
 import type { OpsConfig, RepoEntry } from './config.js';
 import type { Runner } from './runner.js';
 import { summarise } from './runner.js';
-
-/** Where the owning user's name and home directory are looked up. */
-const PASSWD_PATH = '/etc/passwd';
-
-export type BuildOwner = {
-  uid: number;
-  gid: number;
-  /** Login name, for the log. Never interpolated into a command. */
-  user: string;
-  /** The owner's home, which becomes HOME and the npm cache root. */
-  home: string;
-};
-
-export type OwnerResult =
-  | { ok: true; owner: BuildOwner; drop: boolean }
-  | { ok: false; reason: string };
-
-/**
- * Who owns the checkout, and can this process become them?
- *
- * `drop` is false when the executor is already running as the owner — which is
- * the case in the self-test, and would be the case on a host where someone
- * decided the executor should not be root. Nothing is dropped in that case
- * because there is nothing to drop; the build simply runs as the process
- * already is, which by definition produces correctly-owned files.
- *
- * Everything else is a refusal. In particular: a non-root executor that is not
- * the owner cannot become the owner, and saying so is the whole point — the
- * alternative is a build that succeeds and leaves a service that will not
- * start.
- */
-export function resolveOwner(dir: string, passwdPath: string = PASSWD_PATH): OwnerResult {
-  let uid: number;
-  let gid: number;
-  try {
-    const stat = statSync(dir);
-    uid = stat.uid;
-    gid = stat.gid;
-  } catch (error) {
-    return {
-      ok: false,
-      reason:
-        `cannot stat ${dir} to find out who owns it: ${String(error)}. Refusing to build — ` +
-        'a build run as the wrong user leaves root-owned node_modules/ and dist/ behind, ' +
-        'and every service that runs as a person then fails to start with an EACCES ' +
-        'naming a file nobody edited.',
-    };
-  }
-
-  const passwd = lookupPasswd(uid, passwdPath);
-  if (!passwd) {
-    return {
-      ok: false,
-      reason:
-        `${dir} is owned by uid ${uid}, which has no entry in ${passwdPath}. Refusing to ` +
-        'build: without a passwd entry there is no home directory to point HOME and the ' +
-        'npm cache at, and npm would fall back to the running user\'s — which is root\'s.',
-    };
-  }
-
-  const me = typeof process.getuid === 'function' ? process.getuid() : -1;
-  if (me === uid) {
-    return { ok: true, drop: false, owner: { uid, gid, user: passwd.user, home: passwd.home } };
-  }
-  if (me !== 0) {
-    return {
-      ok: false,
-      reason:
-        `${dir} is owned by ${passwd.user} (uid ${uid}) but this process runs as uid ${me}, ` +
-        'which cannot become another user. Refusing to build rather than building as the ' +
-        'wrong user.',
-    };
-  }
-
-  return { ok: true, drop: true, owner: { uid, gid, user: passwd.user, home: passwd.home } };
-}
-
-/**
- * getpwuid, by hand.
- *
- * Node exposes `os.userInfo()` for the *current* user and nothing at all for an
- * arbitrary uid, so the file gets parsed. Fields are name:passwd:uid:gid:gecos:home:shell
- * and a line with fewer than seven of them is not a passwd line and is skipped
- * rather than guessed at. Hosts using nsswitch with a non-file backend will not
- * be found here, which surfaces as the loud refusal above rather than as a
- * build that runs as somebody unexpected.
- */
-function lookupPasswd(uid: number, passwdPath: string): { user: string; home: string } | null {
-  let text: string;
-  try {
-    text = readFileSync(passwdPath, 'utf8');
-  } catch {
-    return null;
-  }
-  for (const line of text.split('\n')) {
-    if (!line || line.startsWith('#')) continue;
-    const fields = line.split(':');
-    if (fields.length < 7) continue;
-    if (Number(fields[2]) !== uid) continue;
-    const user = fields[0] ?? '';
-    const home = fields[5] ?? '';
-    if (!user || !home) continue;
-    return { user, home };
-  }
-  return null;
-}
 
 export type DirtyResult =
   | { ok: true; files: string[] }

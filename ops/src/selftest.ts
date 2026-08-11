@@ -82,13 +82,26 @@ import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
 import { Executor, compareHealth } from './executor.js';
 import { verifyInstance } from './verify.js';
-import { resolveOwner } from './build.js';
+import {
+  agentProblems,
+  agentWarnings,
+  assertAgentIdentity,
+  canReadPath,
+  forbiddenGroupsFor,
+  parseGroups,
+  parsePasswd,
+  resolveAgentUser,
+  ROOT_EQUIVALENT_GROUPS,
+  type AgentUser,
+} from './agent-user.js';
 import {
   assertNoSecrets,
   hostAgentEnv,
   hostAgentSettings,
   hostAgentTools,
+  identityOptionsFor,
   judge,
+  standingPrompt,
   DRY_RUN_TOOL_DENY,
 } from './host-agent.js';
 
@@ -128,10 +141,41 @@ function makeHost(options: {
   hostAgent?: boolean;
   snapshotKeep?: number;
   envPassthrough?: string[];
+  /**
+   * `hostAgent.user`. Defaults to `clawcius-ops`, which the fixture passwd
+   * file below defines. Point it at a name that is NOT in that file to
+   * exercise the missing-account refusal.
+   */
+  agentUser?: string;
+  /**
+   * Supplementary groups the fixture agent account is a member of.
+   *
+   * This is how the docker-group refusal is tested without a docker daemon, a
+   * root shell or a real `usermod`: `/etc/group` is a text file, so the check
+   * is a text-file check, so the test writes the text file. Fixture the data,
+   * not the code.
+   */
+  agentGroups?: string[];
+  /**
+   * Mode for the instances' `envFile`, which the identity check treats as a
+   * secret automatically.
+   *
+   * Defaults to 0o000, and that needs explaining because it looks absurd. The
+   * fixture's "service account" has the uid of the process running the test —
+   * it has to, because dropping to a different uid needs root and this suite
+   * runs as nobody in particular. So every file in the temp directory is owned
+   * by the agent account, and the only way to express "this account cannot
+   * read the operator's secret" is to take away the owner read bit. On the
+   * real host the separation is by uid and `.env` is an ordinary 0600 file.
+   * A test below flips this to 0o644 to prove the refusal fires.
+   */
+  envFileMode?: number;
 }): {
   root: string;
   config: OpsConfig;
   callsDir: string;
+  /** The fixture service account, resolved through the real code path. */
+  agent: AgentUser;
   calls: () => string[][];
   setStatus: (instance: string, body: unknown) => void;
   /** That instance's ops spool, which is where its container would write. */
@@ -249,7 +293,7 @@ function makeHost(options: {
    *
    * `cwd=` and `uid=` go into the call file because *where* something ran and
    * *as whom* are the two properties that are not visible in an argv, and both
-   * still matter: the host agent session is dropped to the checkout's owner.
+   * still matter: the host agent session is dropped to its own service account.
    */
   const npm = join(bin, 'npm');
   writeFileSync(
@@ -383,6 +427,63 @@ emit({
 
   const statusFile = (instance: string) => join(root, `${instance}-waker-status.json`);
 
+  // ── The user and group databases, as files ──────────────────────────────
+  //
+  // `agent-user.ts` resolves the service account by parsing /etc/passwd and
+  // /etc/group, so pointing it at fixture copies exercises the real resolution
+  // path — including the docker-group refusal — with no root, no `usermod` and
+  // no `clawcius-ops` account on the machine running the suite.
+  //
+  // The fixture account carries THIS PROCESS's uid and gid, because a drop to
+  // any other uid requires root and would turn every task test into a spawn
+  // failure. The consequence is that the fixture cannot demonstrate the drop
+  // itself; that is stated in ops/README.md § Not tested, alongside everything
+  // else here that needs a real host.
+  const agentUser = options.agentUser ?? 'clawcius-ops';
+  const agentUid = process.getuid?.() ?? 1000;
+  const agentGid = process.getgid?.() ?? 1000;
+  const agentHome = join(root, 'agent-home');
+  mkdirSync(agentHome, { recursive: true });
+  const passwdPath = join(root, 'passwd');
+  const groupPath = join(root, 'group');
+  writeFileSync(
+    passwdPath,
+    [
+      'root:x:0:0:root:/root:/bin/bash',
+      'npurcell:x:1000:1000:the operator:/home/npurcell:/bin/bash',
+      `clawcius-ops:x:${agentUid}:${agentGid}:Clawcius host agent:${agentHome}:/usr/sbin/nologin`,
+      '',
+    ].join('\n'),
+  );
+  // Built as a table so a membership the test asks for lands in the EXISTING
+  // group line rather than in a second one with the same name. A fixture where
+  // `docker` appears twice would still satisfy the assertion below while being
+  // a shape /etc/group never has, and a fixture that cannot be wrong in the
+  // same way the real file is wrong is not testing much.
+  const wanted = new Set(options.agentGroups ?? []);
+  const groupTable: Array<{ name: string; gid: number; members: string[] }> = [
+    { name: 'root', gid: 0, members: [] },
+    // The operator is in docker on the real host, and that single fact is what
+    // this whole rework is about. Present in the fixture so that "the agent is
+    // not in docker" is not passing merely because the group does not exist.
+    { name: 'docker', gid: 998, members: ['npurcell'] },
+    { name: 'sudo', gid: 27, members: ['npurcell'] },
+    { name: 'adm', gid: 4, members: ['npurcell'] },
+    { name: 'clawcius-ops', gid: agentGid, members: [] },
+    { name: 'clawcius-dev', gid: 1500, members: ['npurcell'] },
+  ];
+  for (const name of wanted) {
+    const existing = groupTable.find((group) => group.name === name);
+    if (existing) existing.members.push(agentUser);
+    else groupTable.push({ name, gid: 9000 + groupTable.length, members: [agentUser] });
+  }
+  writeFileSync(
+    groupPath,
+    `${groupTable
+      .map((group) => `${group.name}:x:${group.gid}:${group.members.join(',')}`)
+      .join('\n')}\n`,
+  );
+
   const configPath = join(root, 'ops-config.yaml');
   writeFileSync(
     configPath,
@@ -399,6 +500,9 @@ emit({
       `snapshotKeep: ${options.snapshotKeep ?? 24}`,
       'hostAgent:',
       `  enabled: ${options.hostAgent === false ? 'false' : 'true'}`,
+      `  user: ${agentUser}`,
+      `  passwdPath: ${passwdPath}`,
+      `  groupPath: ${groupPath}`,
       `  claudePath: ${claude}`,
       `  workDir: ${join(root, 'host-agent')}`,
       '  timeoutMinutes: 1',
@@ -458,13 +562,36 @@ emit({
     ].join('\n'),
   );
 
+  // The instances' envFile, which `identityOptionsFor` folds into the secret
+  // list without being asked, because on the real host it is the file holding
+  // DISCORD_TOKEN. See `envFileMode` above for why the default is 0o000.
   writeFileSync(join(root, 'env'), 'X=1\n');
+  chmodSync(join(root, 'env'), options.envFileMode ?? 0o000);
 
   const config = loadOpsConfig(configPath);
+
+  const resolved = resolveAgentUser(config.hostAgent.user, {
+    passwdPath: config.hostAgent.passwdPath,
+    groupPath: config.hostAgent.groupPath,
+  });
 
   return {
     root,
     config,
+    // Resolved through the real code path rather than assembled by hand, so a
+    // change to the parser shows up here rather than being papered over by a
+    // fixture that knows the answer.
+    agent: resolved.ok
+      ? resolved.user
+      : {
+          user: config.hostAgent.user,
+          uid: agentUid,
+          gid: agentGid,
+          home: agentHome,
+          shell: '/usr/sbin/nologin',
+          groups: [],
+          gids: [agentGid],
+        },
     callsDir,
     calls: () => {
       if (!existsSync(callsDir)) return [];
@@ -1960,30 +2087,31 @@ test('the host agent is refused a Discord token, and refuses to start if it has 
 
 test('the host agent environment is built from nothing and carries no token', () => {
   const host = makeHost({ dryRun: true, suffix: 'env' });
-  const owner = resolveOwner(join(host.root, 'repo'));
-  assert.equal(owner.ok, true);
-  if (!owner.ok) return;
+  const agent = host.agent;
 
   const previous = process.env['DISCORD_TOKEN'];
   const noise = process.env['SOMETHING_UNRELATED'];
   process.env['SOMETHING_UNRELATED'] = 'should not be inherited';
   try {
-    const env = hostAgentEnv(host.config, owner.owner);
+    const env = hostAgentEnv(host.config, agent);
     assert.equal(env['SOMETHING_UNRELATED'], undefined, 'an allowlist, not a filter');
     assert.equal(env['DISCORD_TOKEN'], undefined);
-    // HOME is the checkout owner's, not root's: it is where Claude Code finds
-    // the OAuth credentials it authenticates with, and it is why the unit must
-    // never carry ProtectHome in any form.
-    assert.equal(env['HOME'], owner.owner.home);
-    assert.equal(env['USER'], owner.owner.user);
+    // HOME is the SERVICE ACCOUNT's, not root's and — since 2026-08-11 — not
+    // the operator's either. It is where Claude Code finds the OAuth
+    // credentials it authenticates with, so this is the line that decides
+    // whose login the session is using.
+    assert.equal(env['HOME'], agent.home);
+    assert.equal(env['USER'], agent.user);
+    assert.equal(env['LOGNAME'], agent.user);
+    assert.ok(!env['HOME']?.startsWith('/home/npurcell'), 'not the operator\'s home');
     assert.ok((env['PATH'] ?? '').includes('/usr/bin'));
 
     // And a token in the executor's own environment does not reach it — it
     // stops the session starting at all.
     process.env['DISCORD_TOKEN'] = 'a-very-real-looking-token-value';
-    assert.doesNotThrow(() => hostAgentEnv(host.config, owner.owner));
+    assert.doesNotThrow(() => hostAgentEnv(host.config, agent));
     assert.throws(
-      () => assertNoSecrets({ ...hostAgentEnv(host.config, owner.owner), DISCORD_TOKEN: 'x' }),
+      () => assertNoSecrets({ ...hostAgentEnv(host.config, agent), DISCORD_TOKEN: 'x' }),
       /looks like a credential/,
     );
   } finally {
@@ -1992,6 +2120,311 @@ test('the host agent environment is built from nothing and carries no token', ()
     if (noise === undefined) delete process.env['SOMETHING_UNRELATED'];
     else process.env['SOMETHING_UNRELATED'] = noise;
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// The service account — 2026-08-11
+//
+// Everything below runs with no root, no docker, no systemd and no
+// `clawcius-ops` account on the machine: /etc/passwd and /etc/group are text
+// files, so the checks that read them are tested against text files. That is
+// the point of `hostAgent.passwdPath` and `hostAgent.groupPath` existing.
+// ══════════════════════════════════════════════════════════════════════════
+
+test('the named service account is resolved, with its primary and supplementary groups', () => {
+  const host = makeHost({ dryRun: true, suffix: 'agent-resolve', agentGroups: ['clawcius-dev'] });
+  const resolved = resolveAgentUser(host.config.hostAgent.user, {
+    passwdPath: host.config.hostAgent.passwdPath,
+    groupPath: host.config.hostAgent.groupPath,
+  });
+  assert.equal(resolved.ok, true);
+  if (!resolved.ok) return;
+
+  assert.equal(resolved.user.user, 'clawcius-ops');
+  assert.ok(resolved.user.home.endsWith('agent-home'));
+  assert.equal(resolved.user.shell, '/usr/sbin/nologin');
+  // The primary group comes from the gid, the supplementary ones from the
+  // member lists, and BOTH have to be looked at. A check that only read the
+  // member lists would miss an account whose PRIMARY group is docker, which is
+  // exactly how somebody would set this up without thinking about it.
+  assert.ok(resolved.user.groups.includes('clawcius-ops'), 'primary group by gid');
+  assert.ok(resolved.user.groups.includes('clawcius-dev'), 'supplementary group by membership');
+  // The full gid list is what gets handed to setgroups(2) before the spawn.
+  assert.deepEqual(resolved.user.gids, [resolved.user.gid, 1500]);
+  assert.equal(forbiddenGroupsFor(resolved.user).length, 0, 'the shared group is not forbidden');
+});
+
+test('a primary group that is docker is caught, not just a supplementary one', () => {
+  // Assembled by hand rather than through makeHost, because the fixture ties
+  // the agent's primary gid to the test process's. The parser is what is under
+  // test here and it is fed a group file where docker IS the primary group.
+  const groups = parseGroups('docker:x:998:\nclawcius-dev:x:1500:clawcius-ops\n');
+  const passwd = parsePasswd(
+    'clawcius-ops:x:900:998:agent:/var/lib/clawcius-ops:/usr/sbin/nologin\n',
+  );
+  const entry = passwd[0];
+  assert.ok(entry);
+  const primary = groups.find((group) => group.gid === entry.gid);
+  assert.equal(primary?.name, 'docker');
+
+  const user: AgentUser = {
+    user: entry.user,
+    uid: entry.uid,
+    gid: entry.gid,
+    home: entry.home,
+    shell: entry.shell,
+    groups: ['docker', 'clawcius-dev'],
+    gids: [998, 1500],
+  };
+  assert.deepEqual(forbiddenGroupsFor(user), ['docker']);
+});
+
+test('a missing service account refuses the task and never falls back', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'agent-missing', agentUser: 'nosuchagent' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
+  const executor = new Executor(host.config);
+  const identity = executor.resolveAgentIdentity();
+  assert.equal(identity.ok, false);
+
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+  });
+  await settle(executor, 40_000);
+
+  const failed = journalEntries(host.config).filter((entry) => entry['kind'] === 'failed');
+  assert.equal(failed.length, 1, 'the task fails, it does not run as somebody else');
+  const detail = String(failed[0]?.['detail'] ?? '');
+  assert.match(detail, /there is no user "nosuchagent"/);
+  // The refusal has to carry the fix. A daemon that says "no" without saying
+  // "run this" is a daemon somebody works around by hand.
+  assert.match(detail, /useradd --system/);
+  // And nothing was started. This is the assertion that matters: the old
+  // behaviour was to stat the checkout and become its owner, which on this
+  // host is the operator.
+  assert.equal(host.claudeCall(), null, 'no session was spawned');
+});
+
+test('an agent account in the docker group refuses the task, with the gpasswd to run', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'agent-docker', agentGroups: ['docker'] });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
+  const executor = new Executor(host.config);
+  const identity = executor.resolveAgentIdentity();
+  assert.equal(identity.ok, true, 'the account exists; it is its membership that is wrong');
+  if (!identity.ok) return;
+  assert.deepEqual(forbiddenGroupsFor(identity.user), ['docker']);
+
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+  });
+  await settle(executor, 40_000);
+
+  const failed = journalEntries(host.config).filter((entry) => entry['kind'] === 'failed');
+  assert.equal(failed.length, 1);
+  const detail = String(failed[0]?.['detail'] ?? '');
+  assert.match(detail, /is in the "docker" group/);
+  assert.match(detail, /docker run -v \/:\/host/);
+  assert.match(detail, /sudo gpasswd -d clawcius-ops docker/);
+  assert.equal(host.claudeCall(), null, 'no session was spawned');
+
+  // The status file has to say so too. "hostAgent enabled: true" while every
+  // task is being refused would be reassurance rather than status.
+  const status = executor.snapshot();
+  assert.equal(status.hostAgent.identity.ok, false);
+  assert.match(status.hostAgent.identity.detail, /docker/);
+
+  // And the innermost gate throws on its own, independently of the executor —
+  // so a future code path that reaches the spawn without going through
+  // #doTask still cannot start a session as a docker-group account.
+  assert.throws(
+    () => assertAgentIdentity(identity.user, identityOptionsFor(host.config)),
+    /refusing to start the host agent[\s\S]*docker/,
+  );
+});
+
+test('every root-equivalent group is refused, not just docker', () => {
+  // A check that knows one name is a check that fails on the second one — the
+  // same argument assertNoSecrets makes about credential-shaped variables.
+  for (const group of Object.keys(ROOT_EQUIVALENT_GROUPS)) {
+    const user: AgentUser = {
+      user: 'clawcius-ops',
+      uid: 900,
+      gid: 900,
+      home: '/var/lib/clawcius-ops',
+      shell: '/usr/sbin/nologin',
+      groups: ['clawcius-ops', group],
+      gids: [900, 9000],
+    };
+    assert.deepEqual(forbiddenGroupsFor(user), [group], group);
+    assert.throws(
+      () => assertAgentIdentity(user, { forbiddenGroups: [], secretPaths: [] }),
+      new RegExp(`is in the "${group}" group`),
+      group,
+    );
+  }
+
+  // hostAgent.forbiddenGroups only ever ADDS. There is deliberately no key
+  // that takes `docker` off the list.
+  const ordinary: AgentUser = {
+    user: 'clawcius-ops',
+    uid: 900,
+    gid: 900,
+    home: '/var/lib/clawcius-ops',
+    shell: '/usr/sbin/nologin',
+    groups: ['clawcius-ops', 'clawcius-dev'],
+    gids: [900, 1500],
+  };
+  assert.equal(forbiddenGroupsFor(ordinary).length, 0);
+  assert.deepEqual(forbiddenGroupsFor(ordinary, ['clawcius-dev']), ['clawcius-dev']);
+});
+
+test('an account with uid 0 is refused however it is spelled', () => {
+  const root = makeHost({ dryRun: true, suffix: 'agent-root' });
+  writeFileSync(
+    join(root.root, 'passwd'),
+    'toor:x:0:0:another root:/root:/bin/bash\n',
+  );
+  const resolved = resolveAgentUser('toor', {
+    passwdPath: join(root.root, 'passwd'),
+    groupPath: join(root.root, 'group'),
+  });
+  assert.equal(resolved.ok, false);
+  if (resolved.ok) return;
+  assert.match(resolved.reason, /has uid 0/);
+});
+
+test('an unreadable group file is a refusal, never a pass', () => {
+  const host = makeHost({ dryRun: true, suffix: 'agent-nogroup' });
+  const resolved = resolveAgentUser(host.config.hostAgent.user, {
+    passwdPath: host.config.hostAgent.passwdPath,
+    groupPath: join(host.root, 'group-that-does-not-exist'),
+  });
+  // The docker-group assertion is the one the rest of the design rests on, so
+  // a check that cannot be evaluated must not read as a pass.
+  assert.equal(resolved.ok, false);
+  if (resolved.ok) return;
+  assert.match(resolved.reason, /must not fail\s+open/);
+});
+
+test('a secret the agent account can read refuses the task', async () => {
+  // The envFile holds DISCORD_TOKEN on the real host, and it is folded into
+  // the secret list automatically — asserting that the token is not in the
+  // session's ENVIRONMENT means nothing if the session can `cat` the file.
+  const host = makeHost({ dryRun: false, suffix: 'agent-secret', envFileMode: 0o644 });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+  });
+  await settle(executor, 40_000);
+
+  const failed = journalEntries(host.config).filter((entry) => entry['kind'] === 'failed');
+  assert.equal(failed.length, 1);
+  const detail = String(failed[0]?.['detail'] ?? '');
+  assert.match(detail, /can read .*env/);
+  assert.match(detail, /chmod go-rwx/);
+  assert.equal(host.claudeCall(), null, 'no session was spawned');
+
+  // Tightening it lets the same task through, without a restart. The check is
+  // evaluated per task on purpose.
+  chmodSync(join(host.root, 'env'), 0o000);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'b.json',
+    body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+  });
+  await settle(executor, 40_000);
+  assert.notEqual(host.claudeCall(), null, 'the session starts once the secret is protected');
+});
+
+test('the readability check walks the directory it is in, not just the file', () => {
+  const host = makeHost({ dryRun: true, suffix: 'agent-read' });
+  const agent = host.agent;
+
+  const dir = join(host.root, 'sealed');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, 'secret');
+  writeFileSync(file, 'DISCORD_TOKEN=x\n');
+  chmodSync(file, 0o644);
+  assert.equal(canReadPath(file, agent).readable, true, '0644 in a traversable directory');
+
+  // ~/.ssh is the shape that matters: 0600 keys inside a 0700 directory. A
+  // check that only looked at the file would be right by accident here and
+  // wrong about every 0644 file under a 0700 home.
+  chmodSync(dir, 0o000);
+  const verdict = canReadPath(file, agent);
+  assert.equal(verdict.readable, false);
+  assert.match(verdict.why, /not traversable/);
+  chmodSync(dir, 0o700);
+  assert.equal(canReadPath(file, agent).readable, true);
+
+  // A path that does not exist is not readable — and it is reported with the
+  // reason, so a typo in hostAgent.secretPaths does not read as "safe".
+  const missing = canReadPath(join(dir, 'nope'), agent);
+  assert.equal(missing.readable, false);
+  assert.match(missing.why, /could not be stat'ed/);
+});
+
+test('a checkout the agent cannot write is a warning, not a refusal', async () => {
+  const host = makeHost({ dryRun: false, suffix: 'agent-warn' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+
+  // Take the write bit off the checkout. On the real host this is what a
+  // missing shared group looks like: the agent user is not npurcell, the tree
+  // is not group-writable, and every `npm ci` dies with an EACCES naming a
+  // file nobody edited.
+  chmodSync(join(host.root, 'repo'), 0o500);
+  try {
+    const warnings = agentWarnings(host.agent, identityOptionsFor(host.config));
+    assert.ok(
+      warnings.some((warning) => /cannot write/.test(warning) && /chgrp -R clawcius-dev/.test(warning)),
+      'the warning names the fix',
+    );
+    // Warnings do not stop a task. A refusal here would mean a chmod nobody
+    // noticed takes the whole ops mechanism offline, and the failure it is
+    // warning about is loud on its own — the build fails, in the audit.
+    assert.equal(agentProblems(host.agent, identityOptionsFor(host.config)).length, 0);
+
+    const executor = new Executor(host.config);
+    executor.intake({
+      requester: 'clawcius',
+      name: 'a.json',
+      body: '{"verb":"task","instance":"clawcius","task":"do something"}',
+    });
+    await settle(executor, 40_000);
+    assert.notEqual(host.claudeCall(), null, 'a warning does not stop the session');
+    assert.ok(
+      journalEntries(host.config).some((entry) =>
+        /host agent identity warning/.test(String(entry['detail'] ?? '')),
+      ),
+      'and it is in the durable record',
+    );
+  } finally {
+    chmodSync(join(host.root, 'repo'), 0o700);
+  }
+});
+
+test('the standing prompt tells the session which account it holds', () => {
+  const host = makeHost({ dryRun: false, suffix: 'agent-prompt' });
+  const prompt = standingPrompt(host.config, false);
+  assert.match(prompt, /unprivileged service account "clawcius-ops"/);
+  assert.match(prompt, /NOT in the docker group/);
+  // The self-restart rule is now enforced by the sudoers file as well as
+  // stated here, and the prompt says so rather than leaving the session to
+  // discover it as an unexplained refusal.
+  assert.match(prompt, /clawcius-ops\.service is not on it/);
 });
 
 test('a clean exit with is_error is a failure, not a success', () => {
