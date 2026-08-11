@@ -206,7 +206,11 @@ function describeEntry(stat: Stats): string {
  *      bought us the case where a previous root `mkdir` had left a bad owner;
  *      it cost us the case where the adversary chooses the target. That is a
  *      bad trade at any price. So the existing-and-wrongly-owned case is now a
- *      loud WARNING with the exact `chown` to run, and nothing else.
+ *      loud WARNING with the exact `chown` to run, and nothing else. That
+ *      warning is also emitted by `OpsSpool.#ready()` on every sweep of an
+ *      existing spool, which is the route the daemon actually takes — this
+ *      function only sees a missing directory in production, so a promise kept
+ *      only here would be a promise never kept at all.
  *
  *   2. **Never follow a symlink, and never trust a path after checking it.**
  *      Every level is `lstat`ed, refused if it is not a real directory, and
@@ -351,18 +355,62 @@ export function ensureSpoolDir(
       // Reported, NOT repaired. See the header: the executor does not chown
       // directories it did not just create, because their parent belongs to
       // the party this daemon is defending against.
-      log(
-        `WARNING: ${dir} is owned ${stat.uid}:${stat.gid} but ${ownerOf} is owned ` +
-          `${want.uid}:${want.gid}, so the container probably cannot write its own spool ` +
-          'and its requests will never arrive. NOT chowning it: this process is root and ' +
-          'the directory above it is writable by the container, so repairing a path we ' +
-          'did not create is how a symlink becomes an arbitrary root chown. Fix it on the ' +
-          `host as ${want.uid}: chown ${want.uid}:${want.gid} ${dir} && chmod 0770 ${dir}`,
-      );
+      log(wrongOwnerLine(dir, ownerOf, want, stat));
     }
   }
 
   return true;
+}
+
+/**
+ * The one place the "your spool is owned by the wrong uid" message is written.
+ *
+ * Shared, because it is emitted from two places that reach the same state by
+ * different routes: `ensureSpoolDir` walking down to a leaf that already
+ * exists, and `OpsSpool.#ready()` finding a spool that was there before the
+ * daemon started. Before 2026-08-11 only the first existed, and the daemon
+ * never took that route — see `#ready()` — so the promise was written down and
+ * never kept.
+ */
+function wrongOwnerLine(
+  dir: string,
+  ownerOf: string,
+  want: { uid: number; gid: number },
+  have: { uid: number; gid: number },
+): string {
+  return (
+    `WARNING: ${dir} is owned ${have.uid}:${have.gid} but ${ownerOf} is owned ` +
+    `${want.uid}:${want.gid}, so the container probably cannot write its own spool ` +
+    'and its requests will never arrive. NOT chowning it: this process is root and ' +
+    'the directory above it is writable by the container, so repairing a path we ' +
+    'did not create is how a symlink becomes an arbitrary root chown. Fix it on the ' +
+    `host as ${want.uid}: chown ${want.uid}:${want.gid} ${dir} && chmod 0770 ${dir}`
+  );
+}
+
+/**
+ * Does an existing spool's ownership match the instance's state directory?
+ *
+ * Returns the warning to log, or `null` when there is nothing to say —
+ * including when `ownerOf` is missing or is not a directory, because those
+ * are `ensureSpoolDir`'s cases and have their own messages.
+ *
+ * `stat` is passed in rather than taken here: the caller has already `lstat`ed
+ * the spool and refused it unless it is a real directory, and re-`lstat`ing by
+ * name would be a second, different answer to the same question.
+ */
+function ownershipWarning(dir: string, ownerOf: string, stat: Stats): string | null {
+  let reference: Stats | null;
+  try {
+    reference = lstatOrNull(ownerOf);
+  } catch {
+    // EACCES, ELOOP, ENOTDIR on the state directory is a different problem
+    // with its own report; it is not evidence about the spool's owner.
+    return null;
+  }
+  if (reference === null || !reference.isDirectory()) return null;
+  if (stat.uid === reference.uid && stat.gid === reference.gid) return null;
+  return wrongOwnerLine(dir, ownerOf, { uid: reference.uid, gid: reference.gid }, stat);
 }
 
 /**
@@ -586,17 +634,43 @@ export class OpsSpool {
         : this.#createUnowned();
       if (!created) return false;
       try {
-        const now = lstatOrNull(this.#dir);
-        if (now === null || !now.isDirectory()) return false;
+        stat = lstatOrNull(this.#dir);
       } catch {
         return false;
       }
+      if (stat === null || !stat.isDirectory()) return false;
       // A newly created directory is a different inode, so any watcher we hold
       // is watching something that no longer exists.
       this.#attachWatch();
     }
 
-    this.#complaint = '';
+    // ── The spool is a real directory. Can the container write it? ──────────
+    //
+    // Added 2026-08-11, second review of PR #8. `ensureSpoolDir` documented —
+    // and implemented — a loud warning for an existing, wrongly-owned spool,
+    // and the daemon could not reach it: this method only called that function
+    // when the directory was MISSING, and an existing one fell straight
+    // through to `return true`. So the realistic state — `run-container.sh`'s
+    // `mkdir -p "$OPS_DIR"` running as root because the executor invoked
+    // `--recreate`, or an in-place upgrade from the build whose repair did not
+    // work, or a manual root `mkdir` — produced a root-owned spool that was
+    // swept happily forever while the container (uid 1000) got EACCES on every
+    // `mv`, its requests vanished, and NOTHING was logged. That is the exact
+    // silent-failure shape this whole change exists to abolish.
+    //
+    // Still not repaired, for the reason in the header: the parent belongs to
+    // the party we are defending against. Reported, once, with the command to
+    // run — and swept anyway, because sweeping a real directory is safe and
+    // the operator may have fixed the mode without the owner.
+    const warning = this.#ownerOf === '' ? null : ownershipWarning(this.#dir, this.#ownerOf, stat);
+    if (warning === null) {
+      this.#complaint = '';
+    } else {
+      // Through #complain, so a spool that stays wrong does not print the same
+      // line every five seconds until somebody deals with it.
+      this.#complain(warning);
+    }
+
     if (this.#running && this.#watcher === null) this.#attachWatch();
     return true;
   }

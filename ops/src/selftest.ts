@@ -38,6 +38,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  chownSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -49,6 +50,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -776,7 +778,7 @@ test('a symlink where the spool should be is refused, not chowned and not swept'
   assert.equal(existsSync(loot), true, 'and nothing behind it may be unlinked');
 });
 
-test('a file or a FIFO in the spool is never followed or read through', () => {
+test('a file or a symlink where the spool should be is never followed or read through', () => {
   const root = mkdtempSync(join(tmpdir(), 'ops-spool-notdir-'));
   const stateDir = join(root, 'state');
   mkdirSync(join(stateDir, 'run'), { recursive: true });
@@ -817,6 +819,74 @@ test('a file or a FIFO in the spool is never followed or read through', () => {
   assert.equal(readFileSync(secret, 'utf8'), 'not for the journal', 'the target is untouched');
 });
 
+test('a FIFO named like a request cannot park the sweep, and with it every deadline', () => {
+  // Added 2026-08-11, second review of PR #8: the test above is named for a
+  // FIFO and never made one, so the `O_NONBLOCK` that the whole no-hang claim
+  // rests on was unexercised. Deleting the flag left the suite green.
+  //
+  // The threat is small to write and large to suffer. The agent owns the spool
+  // directory, so it can `mkfifo 1.json`. A synchronous `open(O_RDONLY)` on a
+  // FIFO with no writer blocks until one appears — forever, if the agent never
+  // opens the other end. `O_NOFOLLOW` does not help (a FIFO is not a symlink)
+  // and the `fstat().isFile()` guard runs only after `open` has returned, so
+  // `O_NONBLOCK` is the only thing between here and a wedged daemon — and this
+  // daemon is the one holding every armed rollback deadline, so a hang here is
+  // an outage that cannot be rolled back.
+  //
+  // Which is also why this runs in a CHILD process. A hang cannot be asserted
+  // about from inside the thread that is hung: `openSync` is synchronous, no
+  // timer would ever run, and the test would take the whole suite down with it
+  // instead of failing. The child gets a deadline; missing it is the failure.
+  const dir = mkdtempSync(join(tmpdir(), 'ops-spool-fifo-'));
+  const fifo = join(dir, '1.json');
+  execFileSync('mkfifo', [fifo]);
+  assert.equal(lstatSync(fifo).isFIFO(), true, 'the fixture must really be a FIFO');
+
+  // Sorted after the FIFO, so it is only reached if the FIFO did not stop the
+  // sweep. A sweep that hangs never gets here even if the process is killed.
+  fileRequest(dir, '2', '{"verb":"snapshot","instance":"clawcius"}');
+
+  // Beside the spool, not in it: everything in the spool is evidence.
+  const script = join(mkdtempSync(join(tmpdir(), 'ops-spool-fifo-runner-')), 'drain.mjs');
+  writeFileSync(
+    script,
+    [
+      `import { OpsSpool } from ${JSON.stringify(new URL('./spool.js', import.meta.url).href)};`,
+      'const seen = [];',
+      'const logs = [];',
+      'const spool = new OpsSpool({',
+      '  dir: process.argv[2], instance: "clawcius", maxBytes: 4096, maxPerSweep: 10,',
+      '  maxFiles: 50, pollSeconds: 3600,',
+      '  log: (line) => logs.push(line), onRequest: (raw) => seen.push(raw.name),',
+      '});',
+      'spool.drain();',
+      'process.stdout.write(JSON.stringify({ seen, logs }));',
+    ].join('\n'),
+  );
+
+  let output: string;
+  try {
+    output = execFileSync(process.execPath, [script, dir], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      // The child is blocked inside a syscall if this regresses; do not
+      // negotiate with it.
+      killSignal: 'SIGKILL',
+    });
+  } catch (error) {
+    assert.fail(
+      'the sweep did not finish with a FIFO in the spool — the request files are opened ' +
+        'O_RDONLY | O_NOFOLLOW | O_NONBLOCK, and without O_NONBLOCK this open blocks until ' +
+        `a writer appears, hanging the daemon that holds every rollback deadline: ${String(error)}`,
+    );
+  }
+
+  const result = JSON.parse(output) as { seen: string[]; logs: string[] };
+  assert.deepEqual(result.seen, ['2.json'], 'a FIFO is not a request, and it did not stop the one behind it');
+  assert.match(result.logs.join('\n'), /1\.json: not a regular file/);
+  assert.equal(existsSync(fifo), false, 'and it is discarded rather than left to be met again');
+});
+
 test('a fresh host gets a spool the container can actually write, ancestors included', () => {
   const root = mkdtempSync(join(tmpdir(), 'ops-spool-fresh-'));
   // The state directory exists — systemd's StateDirectory= or the instance
@@ -844,6 +914,91 @@ test('a fresh host gets a spool the container can actually write, ancestors incl
     // vanish, which is the failure this function exists to prevent.
     assert.equal(stat.mode & 0o777, 0o770, `${dir} must be group-writable`);
   }
+});
+
+test('an already-existing spool with the wrong owner is swept, but never silently', () => {
+  // Added 2026-08-11, second review of PR #8. The warning below existed and
+  // the daemon could not reach it: `#ready()` only called `ensureSpoolDir` when
+  // the directory was MISSING, so a spool that already existed with the wrong
+  // owner was watched, swept and never mentioned. The container gets EACCES on
+  // every `mv`, its requests never arrive, and the journal says nothing —
+  // which is the failure mode this whole PR is about.
+  //
+  // It is a state the host reaches without an adversary: `run-container.sh`'s
+  // `mkdir -p "$OPS_DIR"` assumes it runs as `npurcell`, and the executor
+  // invokes that script itself, as root, on a `--recreate`.
+  //
+  // Arranging a wrongly-owned directory without root is the awkward part. A
+  // test that is not root cannot chown anything to anyone, so the mismatch is
+  // made from whichever side this process can reach: as root, by chowning the
+  // spool away; otherwise by pointing `ownerOf` at a directory this user does
+  // not own. Either way the property under test is the same one — the spool's
+  // uid/gid differ from the state directory's, and the daemon must say so.
+  const root = mkdtempSync(join(tmpdir(), 'ops-spool-badowner-'));
+  const stateDir = join(root, 'state');
+  const spool = join(stateDir, 'run', 'ops');
+  mkdirSync(spool, { recursive: true, mode: 0o770 });
+
+  let ownerOf = stateDir;
+  if ((process.getuid?.() ?? 0) === 0) {
+    chownSync(spool, 65534, 65534);
+  } else {
+    // Owned by root on every host there is, and this process is not root.
+    ownerOf = '/';
+    assert.notEqual(lstatSync(ownerOf).uid, lstatSync(spool).uid, 'the fixture needs a mismatch');
+  }
+  const want = lstatSync(ownerOf);
+
+  const logs: string[] = [];
+  const seen: string[] = [];
+  const spoolObj = new OpsSpool({
+    dir: spool,
+    instance: 'clawcius',
+    ownerOf,
+    maxBytes: 4096,
+    maxPerSweep: 3,
+    maxFiles: 5,
+    pollSeconds: 3600,
+    log: (line) => logs.push(line),
+    onRequest: (raw) => seen.push(raw.name),
+  });
+
+  // Everything the daemon would do in three sweeps, then the assertions —
+  // with `stop()` guaranteed, because `start()` attaches an fs.watch and a
+  // failed assertion between the two would leave the test runner holding an
+  // open handle and hanging forever instead of reporting.
+  try {
+    spoolObj.start();
+    // Still swept — a real directory is safe to read, and the operator may
+    // have fixed the mode without the owner. Refusing here would turn a
+    // warning into an outage.
+    fileRequest(spool, '1', '{"verb":"snapshot","instance":"clawcius"}');
+    spoolObj.drain();
+    // And the complaint is made once, not once per five-second sweep, or the
+    // incident buries itself in its own alarm.
+    spoolObj.drain();
+    spoolObj.drain();
+  } finally {
+    spoolObj.stop();
+  }
+
+  const warning = logs.filter((line) => /WARNING/.test(line));
+  assert.equal(warning.length, 1, 'a locked-out agent must produce a journal line, not silence');
+  assert.match(String(warning[0]), /probably cannot write its own spool/);
+  // The exact command to run, because "ownership is wrong" without it is a
+  // puzzle at 3am.
+  assert.equal(
+    String(warning[0]).includes(`chown ${want.uid}:${want.gid} ${spool} && chmod 0770 ${spool}`),
+    true,
+    'the warning has to carry the exact command',
+  );
+
+  // Not repaired: the directory above it is writable by the container, and
+  // chowning a path we did not create is how a symlink becomes a root chown.
+  const after = lstatSync(spool);
+  assert.equal(after.uid !== want.uid || after.gid !== want.gid, true, 'reported, not repaired');
+
+  assert.deepEqual(seen, ['1.json'], 'a warning is not a refusal; the requests still arrive here');
 });
 
 test('with no state directory to copy ownership from, nothing is created as root', async () => {
@@ -2436,7 +2591,7 @@ test('mayRequest.units and mayRequest.repos are enforced, and say which list ref
   executor.stop();
 });
 
-test('an empty mayRequest list denies every unit and every repo, and says so', () => {
+test('an empty mayRequest list denies every unit and every repo, and says so', async () => {
   // Present-and-empty is not absent. `units: []` is a legitimate way to say
   // "this instance may never restart anything", and the loader has to keep the
   // two distinguishable or the meaning inverts.
@@ -2446,6 +2601,42 @@ test('an empty mayRequest list denies every unit and every repo, and says so', (
   assert.deepEqual(host.config.instances[1]?.mayRequest?.units, []);
   assert.deepEqual(host.config.instances[1]?.mayRequest?.repos, []);
   assert.equal(host.config.instances[1]?.mayRequest?.verbs, null, 'absent stays unrestricted');
+
+  // And then the half that was missing until 2026-08-11: the loader parsing
+  // `[]` as `[]` proves nothing about the runtime, where an empty list is one
+  // `length === 0` away from being read as "no restriction". Empty means deny
+  // everything, including the instance's own unit and the repo any other
+  // instance may pull.
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'hamachi',
+    name: 'a.json',
+    body: '{"verb":"restart","unit":"hamachi.service"}',
+  });
+  await settle(executor);
+  executor.intake({ requester: 'hamachi', name: 'b.json', body: '{"verb":"pull","repo":"tools"}' });
+  await settle(executor);
+  // The unrestricted neighbour still gets through, so this is a rule about
+  // hamachi and not a broken fixture.
+  executor.intake({
+    requester: 'clawcius',
+    name: 'c.json',
+    body: '{"verb":"restart","unit":"clawcius.service"}',
+  });
+  await settle(executor);
+  executor.stop();
+
+  const entries = journalEntries(host.config);
+  const rejected = entries.filter((entry) => entry['kind'] === 'rejected');
+  assert.equal(rejected.length, 2, 'an empty list denies, it does not permit');
+  assert.match(String(rejected[0]?.['detail']), /may not name unit "hamachi\.service"/);
+  assert.match(String(rejected[1]?.['detail']), /may not name repo "tools"/);
+  assert.deepEqual(
+    entries
+      .filter((entry) => entry['kind'] === 'started')
+      .map((entry) => `${String(entry['requester'])}: ${String(entry['what'])}`),
+    ['clawcius: restart clawcius.service'],
+  );
 });
 
 test('an out-of-scope request does not consume the hourly budget', async () => {

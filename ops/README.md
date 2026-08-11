@@ -306,7 +306,18 @@ whose parent directory is owned by the adversary:
 - an **existing** directory with the wrong owner is a loud warning with the
   exact `chown` to run, and nothing else. The old "repair" bought the case
   where a previous root `mkdir` left a bad owner; it cost the case where the
-  adversary picks the target;
+  adversary picks the target. That warning is emitted **on every sweep**, from
+  the sweeper itself, and not only by `ensureSpoolDir` — because the second
+  review of PR #8 pointed out that the daemon only ever called `ensureSpoolDir`
+  when the spool was *missing*, so a spool that was already there with the
+  wrong owner was swept happily and forever while the container got `EACCES` on
+  every `mv` and nothing was logged at all. That state is reachable without an
+  adversary: `run-container.sh`'s `mkdir -p "$OPS_DIR"` assumes it runs as
+  `npurcell`, and the executor invokes that script itself, as root, on a
+  `--recreate`. A warning that the running configuration cannot reach is not a
+  warning. It is repeated at most once per state change rather than every five
+  seconds, and it does not stop the sweep: a real directory is safe to read,
+  and refusing here would turn a diagnostic into an outage;
 - if the state directory does not exist yet, **nothing is created at all**.
   There is no correct owner to copy, and a root-owned tree is worse than an
   absent one — the absent one is fixed by the instance unit starting, and this
@@ -877,7 +888,7 @@ Hamachi bug without first being able to represent two agents:
   `opsSpoolDir`;
 - the post-rebuild wake tells the instance to check in via *its own* spool.
 
-The nine added on 2026-08-11 are the review findings on PR #8, one test each,
+The eleven added on 2026-08-11 are the review findings on PR #8, one test each,
 and they are written as **absences** for the same reason as the batch above —
 every failure here is silent, and three of them are silent *and* privileged:
 
@@ -892,6 +903,19 @@ every failure here is silent, and three of them are silent *and* privileged:
   are each asserted, because each was separately wrong;
 - a *missing* state directory creates nothing at all, and the spool appears by
   itself on a later sweep once the instance unit has made one — no restart;
+- an already-existing spool whose owner does not match the state directory
+  produces the WARNING **from the sweeper**, carrying the exact `chown` — once,
+  not once per sweep — while the directory is left exactly as it was found and
+  requests filed in it still arrive. Without root a test cannot chown anything,
+  so the mismatch is arranged from whichever side it can reach; the property
+  asserted is the same either way;
+- a **FIFO** named like a request (`mkfifo 1.json`, which the agent owns the
+  directory to do) is discarded, and the request behind it is still delivered.
+  It runs in a child process with a deadline, because the regression it guards
+  against is a *hang*: without `O_NONBLOCK` the sweep blocks in `open(2)` until
+  a writer appears, and a test that hangs cannot report from inside the thread
+  that is hung. `O_NOFOLLOW` does not catch this — a FIFO is not a symlink —
+  and `fstat().isFile()` runs only after `open` has returned;
 - an explicitly written `opsSpoolDir` is never replaced by the legacy
   `spoolDir`, **including when its value is the default spelled out by hand**,
   which is the case that used to slip through; the agreeing and absent cases
@@ -901,7 +925,11 @@ every failure here is silent, and three of them are silent *and* privileged:
 - `mayRequest.units` and `mayRequest.repos` are enforced, asserted against
   names that are in the *global* allowlist — so the refusal can only have come
   from the per-instance rule — while the unrestricted instance still gets
-  through, and present-and-empty stays distinguishable from absent;
+  through. Present-and-empty stays distinguishable from absent in the loader
+  *and* is now filed against the executor: `units: []` refuses the instance's
+  own unit and `repos: []` refuses a repo anyone else may pull, because a
+  loader assertion says nothing about the `length === 0` reading of the same
+  list at runtime;
 - a deadline rollback that has to **queue behind a busy operation** still
   quarantines the build it rolled back, is still attributed to `(executor)`,
   and still counts towards the breaker. The idle path did all of that already;
