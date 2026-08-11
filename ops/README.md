@@ -622,6 +622,23 @@ After a task that touched an instance, the executor:
 3. on silence, rolls back to the snapshot taken immediately **before** the task,
    and reports.
 
+**The automatic rollback waits at most a minute for an idle turn, and then goes
+ahead anyway.** A requested rollback waits `idle.maxWaitMinutes` and, if the
+instance never reports idle, abandons itself rather than killing a live turn —
+somebody asked for it, and somebody can be told no. A rollback after a missed
+check-in is not a request, it is a recovery, and until 2026-08-11 (review of
+PR #9) it took the requested path: an instance whose rebuild had wedged it
+never reported idle, so the wait ran for the full half hour and then abandoned
+the rollback — leaving the instance on the build that broke it, and, because
+that return happened before the quarantine, leaving the breaker unaware that a
+recovery had failed. A wedged container is exactly when the rollback matters
+most. The minute is kept because a missed check-in can also mean an agent that
+is alive and simply did not file one, and a lost turn is worth avoiding when it
+is cheap; it is capped by `idle.maxWaitMinutes`, so `0` still means "never
+wait". Going ahead is journalled, in those words. `#restoreAll` — the rollback
+after a *failed task* — skips the wait entirely, for the same reason and with
+one fewer doubt.
+
 "Touched" is answered from the audit: the task named it, or its container name,
 image or one of the deploy scripts appears in a command the session ran. That is
 a substring match over shell text and is deliberately over-broad — a false
@@ -1406,6 +1423,21 @@ silent and privileged:
   against is a *hang*: without `O_NONBLOCK` the sweep blocks in `open(2)` until
   a writer appears, and a test that hangs cannot report from inside the thread
   that is hung.
+
+The two added for the second review of PR #9 are both about the automatic
+rollback, which is the least-exercised path in the daemon and the one that runs
+when everything else has already gone wrong:
+
+- a deadline rollback that has to **queue behind a busy operation** still
+  quarantines the build it rolled back, is still attributed to `(executor)`,
+  and still counts towards the breaker. There is one way into `#doRollback` and
+  the origin travels on the job, so the idle path and the queued path cannot
+  drift apart again;
+- an instance that **never reports idle again** — a status file that keeps
+  saying a turn is in flight, which is what a wedged rebuild looks like — is
+  rolled back anyway, within the bounded wait, and quarantined. The same test
+  asserts that a *requested* rollback still gives up rather than interrupting a
+  live turn, because that difference is the whole decision.
 
 ### Verified by hand, against the real CLI
 

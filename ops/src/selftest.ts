@@ -2100,6 +2100,97 @@ test('a deadline rollback that queues behind a busy operation still quarantines'
   executor.stop();
 });
 
+test('a wedged instance is rolled back anyway, not left broken out of politeness', async () => {
+  // Round 2 of the review of PR #9. `#doRollback` is shared by the requested
+  // path and the automatic one, and it waited `idle.maxWaitMinutes` for an
+  // idle turn on both — then returned WITHOUT restoring, and before the
+  // quarantine, if the wait ran out.
+  //
+  // Which is precisely backwards for a recovery. The instance is here because
+  // it did not check in, and the likeliest reason for that is that the rebuild
+  // wedged it — so its waker status never goes idle, the rollback is abandoned
+  // half an hour later, the instance stays on the build that broke it, and the
+  // breaker is never told a recovery failed. `#restoreAll` already reached the
+  // opposite conclusion for a failed task, in as many words.
+  //
+  // The fixture is that state: a status file that says a turn is in flight and
+  // never stops saying it.
+  const host = makeHost({ dryRun: false, suffix: 'deadlinewedged' });
+  const config: OpsConfig = {
+    ...host.config,
+    deadline: { minutes: 1 / 60, autoRollback: true },
+    // Half a second of politeness, and a maxWaitMinutes an abandoning
+    // implementation would burn before giving up. If the wait is unbounded and
+    // ends in abandonment, nothing below happens at all.
+    idle: { ...host.config.idle, maxWaitMinutes: 1 / 120, pollSeconds: 1 },
+  };
+
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  host.setPlan(['true']);
+  const executor = new Executor(config);
+
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"recreate the container"}',
+  });
+  await settle(executor, 40_000);
+  const pending = executor.state.pendingFor('clawcius');
+  assert.ok(pending, 'the task must have armed a deadline');
+  const build = pending?.build ?? '';
+
+  // And now it wedges: a live turn that never ends, refreshed so it never even
+  // reads as stale. Nothing will ever report idle again.
+  const wedge = setInterval(() => host.setStatus('clawcius', { at: Date.now(), liveCount: 1 }), 200);
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await settle(executor, 40_000);
+  } finally {
+    clearInterval(wedge);
+    executor.stop();
+  }
+
+  const entries = journalEntries(config);
+  assert.ok(
+    entries.some(
+      (entry) => entry['kind'] === 'idle-wait' && /PROCEEDING ANYWAY/.test(String(entry['detail'])),
+    ),
+    'the wait is bounded and says out loud that it went ahead',
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry['kind'] === 'finished' && /rollback clawcius to snap-/.test(String(entry['what'])),
+    ),
+    'the snapshot is restored even though the instance never reported idle',
+  );
+  // And the half that the early return also cost: the breaker learns about it.
+  assert.ok(
+    executor.state.isQuarantined('clawcius', build),
+    'the build that wedged it is quarantined, not left free to be deployed again',
+  );
+
+  // The requested path is unchanged: a rollback somebody asked for still gives
+  // up rather than interrupting a live turn. That is the whole reason this is
+  // an origin-dependent decision and not a global one.
+  const requested = new Executor(config);
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 1 });
+  requested.intake({
+    requester: 'clawcius',
+    name: 'b.json',
+    body: '{"verb":"rollback","instance":"clawcius"}',
+  });
+  await settle(requested, 40_000);
+  requested.stop();
+
+  const abandoned = journalEntries(config).filter(
+    (entry) => entry['kind'] === 'failed' && /ABANDONED, not deferred/.test(String(entry['detail'])),
+  );
+  assert.equal(abandoned.length, 1, 'a requested rollback still waits and then says no');
+});
+
 test('consecutive failed recoveries freeze the executor, and a freeze refuses destructive verbs', async () => {
   const host = makeHost({ dryRun: true, suffix: 'freeze' });
   host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });

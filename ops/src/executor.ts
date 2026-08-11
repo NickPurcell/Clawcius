@@ -137,6 +137,23 @@ const SELF_REQUESTER = '(executor)';
 const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
 
 /**
+ * How long a RECOVERY waits for an idle turn before going ahead regardless.
+ *
+ * Not `idle.maxWaitMinutes`, and deliberately not configurable. That setting
+ * answers "how long may a requested operation hold the lock being polite",
+ * whose right answer is minutes-to-half-an-hour. This answers a different
+ * question — "how long do we leave an instance on a build that took it down,
+ * on the chance that it is only busy" — and the right answer to that is short
+ * whatever the other one is set to. A minute is long enough for an agent that
+ * is alive and mid-turn to finish something small, and short enough that an
+ * incident is not still waiting on politeness when somebody looks.
+ *
+ * Capped by `idle.maxWaitMinutes` at the call site, so an operator who wrote 0
+ * ("never wait") still gets 0.
+ */
+const RECOVERY_IDLE_WAIT_MINUTES = 1;
+
+/**
  * One unit of work: a validated request, and who filed it.
  *
  * `requester` is carried explicitly through every handler rather than kept in
@@ -1383,7 +1400,46 @@ export class Executor {
       }
     }
 
-    const idle = await this.#waitForIdle(job, instance, describeRequest(request));
+    // ── Waiting for idle: right for a request, wrong for a recovery ───────
+    //
+    // Decided deliberately on 2026-08-11, after review of PR #9 asked which
+    // of the two this path is. It is both, and it was treating both as a
+    // request.
+    //
+    // A requested rollback is somebody's plan: they can be told no, and the
+    // full `idle.maxWaitMinutes` wait followed by abandoning is right.
+    //
+    // A deadline rollback is not a plan, it is a recovery. The instance was
+    // rebuilt and did not check in. The most likely reason it did not is that
+    // the rebuild wedged or crash-looped it — in which case its waker status
+    // file goes stale, `readIdle` correctly reports not-idle, and the old code
+    // sat in this wait for the full thirty minutes and then ABANDONED the
+    // rollback. The instance stays on the build that broke it, and because
+    // that return is before the quarantine below, the breaker never learns
+    // that a recovery failed either. A container that is wedged is exactly
+    // when this rollback matters most, so waiting for it to look healthy
+    // before repairing it is backwards. `#restoreAll` reached the same
+    // conclusion for a failed task and skips the wait outright.
+    //
+    // Not skipped outright here, because the two cases are not identical: a
+    // missed check-in can also mean an agent that is perfectly alive and
+    // simply did not file `checkin` — and interrupting a live turn costs
+    // somebody a conversation. So the wait is kept and bounded to a minute,
+    // and running out of it PROCEEDS rather than abandons. Polite if it can
+    // be, decisive if it cannot.
+    const idle = await this.#waitForIdle(
+      job,
+      instance,
+      describeRequest(request),
+      origin === 'deadline'
+        ? {
+            // Never longer than the operator asked for; `idle.maxWaitMinutes:
+            // 0` still means "do not wait".
+            maxMinutes: Math.min(RECOVERY_IDLE_WAIT_MINUTES, this.#config.idle.maxWaitMinutes),
+            abandonOnTimeout: false,
+          }
+        : {},
+    );
     if (!idle) return;
 
     const retag = await this.#runner.run([
@@ -1598,9 +1654,28 @@ export class Executor {
    * polite wait, and it does not queue itself for later — both of those are
    * ways of turning "we decided not to interrupt anyone" into "we interrupted
    * someone, eventually". The agent can ask again.
+   *
+   * That is the rule for REQUESTED work. Recovery is the other case and it
+   * takes `options`: see `RECOVERY_IDLE_WAIT_MINUTES`, and `#doRollback`,
+   * where the difference is argued.
    */
-  async #waitForIdle(job: Job, instance: InstanceEntry, what: string): Promise<boolean> {
-    const deadline = Date.now() + this.#config.idle.maxWaitMinutes * 60_000;
+  async #waitForIdle(
+    job: Job,
+    instance: InstanceEntry,
+    what: string,
+    options: {
+      /** Ceiling on the wait. Defaults to `idle.maxWaitMinutes`. */
+      maxMinutes?: number;
+      /**
+       * What running out of time means. `true` (the default) abandons the
+       * operation; `false` proceeds anyway, having asked politely.
+       */
+      abandonOnTimeout?: boolean;
+    } = {},
+  ): Promise<boolean> {
+    const maxMinutes = options.maxMinutes ?? this.#config.idle.maxWaitMinutes;
+    const abandonOnTimeout = options.abandonOnTimeout ?? true;
+    const deadline = Date.now() + maxMinutes * 60_000;
     let waited = 0;
     let lastReason = '';
 
@@ -1631,6 +1706,22 @@ export class Executor {
       }
 
       if (Date.now() >= deadline) {
+        if (!abandonOnTimeout) {
+          this.#journal.write({
+            kind: 'idle-wait',
+            what,
+            instance: instance.name,
+            requester: job.requester,
+            detail:
+              `waited ${maxMinutes} minute(s) for ${instance.name} to be idle ` +
+              `(${verdict.reason}) and PROCEEDING ANYWAY. This is a recovery, not a ` +
+              'request: the instance missed its check-in, the most likely reason it is ' +
+              'not reporting idle is that it is wedged, and a rollback abandoned for ' +
+              'politeness leaves it broken on the build that broke it. A live turn lost ' +
+              'here is the cost of the deploy having failed.',
+          });
+          return true;
+        }
         this.#journal.write({
           kind: 'failed',
           what,
@@ -1638,7 +1729,7 @@ export class Executor {
           requester: job.requester,
           ok: false,
           detail:
-            `gave up after ${this.#config.idle.maxWaitMinutes} minutes waiting for ` +
+            `gave up after ${maxMinutes} minutes waiting for ` +
             `${instance.name} to be idle (${verdict.reason}). ABANDONED, not deferred — ` +
             'recreating the container over a live turn would kill it mid-conversation, and ' +
             'a request that quietly waits forever is worse than one that says no.',
