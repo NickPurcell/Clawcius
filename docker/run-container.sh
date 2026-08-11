@@ -116,10 +116,15 @@ mkdir -p "$WAKE_DIR"
 # the container runs as, by construction. Exactly how $WAKE_DIR itself has
 # always worked; no chown needed, and none here either.
 #
-# The executor also repairs this at startup — it stats the instance's state
-# directory and chowns the spool to match, so a host where nothing has ever
-# been started still works — but this is the path that makes it right the first
-# time. See ensureSpoolDir() in ops/src/spool.ts.
+# The executor creates it too, if it is missing when the executor starts, so a
+# host where nothing has ever been started still works — but this is the path
+# that makes it right the first time, and since 2026-08-11 it is the only path
+# that can FIX an existing one. The executor deliberately does not chown a
+# directory it did not just create, and refuses outright if this path is a
+# symlink: $OPS_DIR lives inside the read-write bind mount below, so the
+# container owns its parent, and a root process repairing a path the sandbox
+# controls the name of is how `ln -s /etc "$OPS_DIR"` turns into a root chown
+# of /etc. See ensureSpoolDir() in ops/src/spool.ts for the whole account.
 mkdir -p "$OPS_DIR"
 # Created rather than asserted. This used to hard-fail, which was right when
 # the path was a constant: /var/lib/clawcius comes from the unit's

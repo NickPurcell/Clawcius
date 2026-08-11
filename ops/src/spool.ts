@@ -54,16 +54,22 @@
  */
 
 import {
-  chownSync,
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fchownSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
-  statSync,
   unlinkSync,
   watch,
   type FSWatcher,
+  type Stats,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 export type RawRequest = {
   /** Spool file name. Logged; never used to build a path beyond `join`. */
@@ -101,8 +107,34 @@ export type SpoolHandler = (raw: RawRequest) => void;
  */
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$/;
 
+/** `lstat`, with "it is not there" as a value rather than an exception. */
+function lstatOrNull(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    // ENOTDIR (an ancestor is a file), EACCES, ELOOP — all of them mean "this
+    // path is not what we think it is", which is the caller's refusal case and
+    // not something to paper over with a null.
+    throw error;
+  }
+}
+
+/** What is actually sitting at a path, for a log line a human can act on. */
+function describeEntry(stat: Stats): string {
+  if (stat.isSymbolicLink()) return 'a symlink';
+  if (stat.isFile()) return 'a regular file';
+  if (stat.isDirectory()) return 'a directory';
+  if (stat.isSocket()) return 'a socket';
+  if (stat.isFIFO()) return 'a FIFO';
+  return 'neither a directory nor a regular file';
+}
+
 /**
  * Make sure a spool exists and that the container's uid can write it.
+ *
+ * Returns whether the directory is safe to sweep. `false` means the executor
+ * should not read, write, unlink or chown anything at that path.
  *
  * ── The ownership problem, and why it is solved by stat ──────────────────
  *
@@ -129,7 +161,91 @@ const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$/;
  * because this daemon is not entitled to an opinion about who owns a directory
  * it was pointed at.
  *
- * Failures here are logged, never fatal. A spool that cannot be chowned is a
+ * ── Rewritten 2026-08-11: it created a root chown of any path on the host ──
+ *
+ * The first version of this function was four lines of `mkdirSync(recursive)`,
+ * `statSync`, `chownSync` and it was a privilege escalation out of the sandbox,
+ * in the change written to let agents file requests safely. Review of PR #8
+ * found it; the mechanism is worth writing down in full, because every step of
+ * it looked reasonable in isolation.
+ *
+ * The spool is `<stateDir>/run/ops`, and `<stateDir>/run` is bind-mounted
+ * READ-WRITE into the container, owned by the uid the agent runs as. So the
+ * agent owns the parent of the spool and may do anything it likes to the entry
+ * called `ops`, including:
+ *
+ *     rm -rf run/ops && ln -s /root/.ssh run/ops
+ *
+ * On the next executor start — restarts are routine: a pull, a redeploy, a
+ * reboot — the old code did this, as root:
+ *
+ *     mkdirSync(dir, {recursive:true})  // returns undefined on an existing
+ *                                       // symlink-to-dir, no throw
+ *     statSync(dir)                     // FOLLOWS the link: sees /root/.ssh
+ *     chownSync(dir, 1000, 1000)        // FOLLOWS the link: chowns /root/.ssh
+ *
+ * That is an arbitrary-path root chown, chosen by the least trusted process on
+ * the machine (CWE-59). `/etc`, `/root/.ssh`, the checkout root, or — most
+ * pointedly — `/var/lib/clawcius-ops`, the executor's own state directory,
+ * whose unreachability is the entire argument for why the circuit breaker
+ * cannot be edited by the party it is quarantining.
+ *
+ * ── The decision: refuse and report; never repair what we did not create ──
+ *
+ * The obvious patch is `lstat` + `lchown`, and that is necessary but it is not
+ * the whole answer, so it is not what this does. The question the review asked
+ * is the right one: should a root process chown a path whose parent directory
+ * is owned by the adversary, at all?
+ *
+ * It should not. Two rules, and they are deliberate:
+ *
+ *   1. **Only chown what this call just created.** A directory that already
+ *      exists with the wrong owner is not a thing to fix silently — it is
+ *      evidence. Either an operator made it by hand, or something else did,
+ *      and both are worth a human reading a line. The old code's "repair"
+ *      bought us the case where a previous root `mkdir` had left a bad owner;
+ *      it cost us the case where the adversary chooses the target. That is a
+ *      bad trade at any price. So the existing-and-wrongly-owned case is now a
+ *      loud WARNING with the exact `chown` to run, and nothing else.
+ *
+ *   2. **Never follow a symlink, and never trust a path after checking it.**
+ *      Every level is `lstat`ed, refused if it is not a real directory, and
+ *      the chown/chmod goes through a file descriptor opened `O_NOFOLLOW |
+ *      O_DIRECTORY` whose `fstat` is compared with the `lstat` by device and
+ *      inode. The window between "checked" and "used" is where these bugs
+ *      live, and the fd is what closes it: whatever is chowned is the object
+ *      we looked at, or nothing is.
+ *
+ * A symlink where the spool should be is therefore not repaired, not deleted
+ * (deleting it as root is another primitive, and the agent owns the parent
+ * anyway) and not swept. It is reported and left exactly where it is, and the
+ * instance's requests stop arriving until someone looks — which is the correct
+ * outcome, because the only party who can put a symlink there is the one whose
+ * requests those would be.
+ *
+ * ── Also 2026-08-11: the fresh-host repair did not work ──────────────────
+ *
+ * The same review found the repair ineffective in the one case it was written
+ * for. `mkdirSync(recursive)` as root created any missing ancestors root-owned
+ * too, and only the leaf was ever chowned — so a host where `<stateDir>` did
+ * not exist got `<stateDir>`, `run` and `run/ops` all owned by root, and
+ * because `want` was read from the freshly-created `<stateDir>` the comparison
+ * was vacuously satisfied and even the leaf chown was skipped. The container
+ * could not write its own spool: the exact silent failure this whole change
+ * exists to abolish, reintroduced by the code meant to prevent it.
+ *
+ * So: `want` is read from `ownerOf` BEFORE anything is created, each level is
+ * created one at a time and chowned as it is created, and the mode is applied
+ * with `fchmod` rather than left to `mkdir`'s mode argument — which is masked
+ * by the process umask, and 0770 & ~022 is 0750, which uid 1000 cannot write.
+ *
+ * And if `ownerOf` itself does not exist, nothing is created at all. There is
+ * no correct owner to discover, and a root-owned tree is worse than an absent
+ * one: the absent one is fixed by the instance unit starting (it creates the
+ * state directory as `npurcell`, and this function is retried on every sweep),
+ * whereas the root-owned one silently swallows every request forever.
+ *
+ * Failures here are logged, never fatal. A spool that cannot be created is a
  * spool one agent cannot use; a daemon that refuses to boot over it is every
  * agent's rollback deadline unhonoured.
  */
@@ -137,49 +253,190 @@ export function ensureSpoolDir(
   dir: string,
   ownerOf: string,
   log: (line: string) => void,
-): void {
-  let created = false;
-  try {
-    // 0770 rather than 0750: the container writes here. Group ownership is
-    // what makes that work without the directory being world-writable.
-    created = mkdirSync(dir, { recursive: true, mode: 0o770 }) !== undefined;
-  } catch (error) {
-    log(`cannot create ${dir}: ${String(error)} — requests filed there will never arrive`);
-    return;
-  }
-
+): boolean {
+  // ── 1. What we would apply, discovered before anything is created ───────
   let want: { uid: number; gid: number };
-  let have: { uid: number; gid: number };
   try {
-    const reference = statSync(ownerOf);
+    const reference = lstatOrNull(ownerOf);
+    if (reference === null) {
+      log(
+        `${ownerOf} does not exist yet, so there is no owner to copy — NOT creating ${dir} ` +
+          'as root. The instance unit creates the state directory as its User=, and this ' +
+          'is retried on every sweep, so a first boot in the wrong order fixes itself. A ' +
+          'root-owned spool would not: the container would get EACCES forever and the ' +
+          'executor would see a quiet directory.',
+      );
+      return false;
+    }
+    if (!reference.isDirectory()) {
+      log(`${ownerOf} is ${describeEntry(reference)}, not a directory — leaving ${dir} alone`);
+      return false;
+    }
     want = { uid: reference.uid, gid: reference.gid };
-    const current = statSync(dir);
-    have = { uid: current.uid, gid: current.gid };
   } catch (error) {
-    log(`cannot compare ${dir} against ${ownerOf}: ${String(error)} — leaving it alone`);
-    return;
+    log(`cannot inspect ${ownerOf}: ${String(error)} — leaving ${dir} alone`);
+    return false;
   }
 
-  if (want.uid === have.uid && want.gid === have.gid) {
-    if (created) log(`created ${dir}, already owned ${have.uid}:${have.gid}`);
-    return;
+  // ── 2. Only paths under `ownerOf` are ours to create ────────────────────
+  //
+  // An operator may point `opsSpoolDir` anywhere; creating arbitrary ancestors
+  // as root outside the instance's own state directory is not this daemon's
+  // business. If such a spool already exists as a real directory we will use
+  // it; if it does not, we say so and stop.
+  const rel = relative(ownerOf, dir);
+  const inside = rel !== '' && !rel.startsWith('..') && !rel.startsWith(sep) && rel !== '.';
+
+  if (!inside) {
+    const stat = (() => {
+      try {
+        return lstatOrNull(dir);
+      } catch (error) {
+        log(`cannot inspect ${dir}: ${String(error)}`);
+        return undefined;
+      }
+    })();
+    if (stat === undefined) return false;
+    if (stat === null) {
+      log(
+        `${dir} is outside ${ownerOf} and does not exist. NOT creating it as root — a spool ` +
+          'outside the instance\'s state directory is not one this daemon can reason about ' +
+          `the ownership of. Create it on the host, owned ${want.uid}:${want.gid}, mode 0770.`,
+      );
+      return false;
+    }
+    if (!stat.isDirectory()) {
+      log(`REFUSING to use ${dir}: it is ${describeEntry(stat)}, not a directory.`);
+      return false;
+    }
+    return true;
+  }
+
+  // ── 3. Walk down from `ownerOf`, one level at a time ────────────────────
+  const segments = rel.split(sep).filter((segment) => segment.length > 0);
+  let cursor = ownerOf;
+
+  for (let index = 0; index < segments.length; index += 1) {
+    cursor = join(cursor, segments[index] as string);
+    const leaf = index === segments.length - 1;
+
+    let stat: Stats | null;
+    try {
+      stat = lstatOrNull(cursor);
+    } catch (error) {
+      log(`cannot inspect ${cursor}: ${String(error)} — ${dir} left alone`);
+      return false;
+    }
+
+    if (stat === null) {
+      if (!createOwned(cursor, want, log)) return false;
+      continue;
+    }
+
+    if (!stat.isDirectory()) {
+      // The whole point. A symlink here is not a directory that needs fixing,
+      // it is a directory that has been replaced, and the only writer who can
+      // do that inside the bind mount is the agent this spool belongs to.
+      log(
+        `REFUSING to use ${dir}: ${cursor} is ${describeEntry(stat)}, not a directory. ` +
+          'Nothing here has been created, chowned, read or removed — following it would ' +
+          `hand whatever it points at to uid ${want.uid}, as root. ${dir} lives inside a ` +
+          'bind mount the container writes, so this is what tampering looks like. ' +
+          `Investigate, then remove it by hand as the owner of ${ownerOf}.`,
+      );
+      return false;
+    }
+
+    if (leaf && (stat.uid !== want.uid || stat.gid !== want.gid)) {
+      // Reported, NOT repaired. See the header: the executor does not chown
+      // directories it did not just create, because their parent belongs to
+      // the party this daemon is defending against.
+      log(
+        `WARNING: ${dir} is owned ${stat.uid}:${stat.gid} but ${ownerOf} is owned ` +
+          `${want.uid}:${want.gid}, so the container probably cannot write its own spool ` +
+          'and its requests will never arrive. NOT chowning it: this process is root and ' +
+          'the directory above it is writable by the container, so repairing a path we ' +
+          'did not create is how a symlink becomes an arbitrary root chown. Fix it on the ' +
+          `host as ${want.uid}: chown ${want.uid}:${want.gid} ${dir} && chmod 0770 ${dir}`,
+      );
+    }
+  }
+
+  return true;
+}
+
+/**
+ * `mkdir` one level, then chown and chmod it through an O_NOFOLLOW fd.
+ *
+ * The fd is the point. Between `mkdirSync` returning and anything else
+ * touching the path, the owner of the parent directory — the agent — can
+ * replace what we just made with a symlink. Opening `O_NOFOLLOW | O_DIRECTORY`
+ * refuses a link outright, and comparing the fd's `fstat` with a fresh `lstat`
+ * of the path refuses the swap-for-another-directory case: from there on we
+ * are operating on the object we checked, not on the name we checked it by.
+ *
+ * `fchmod` rather than `mkdir`'s mode, because that argument is masked by the
+ * umask: the daemon runs with 022, so 0770 arrives as 0750 and the container's
+ * group loses write — which is the same invisible EACCES the ownership rules
+ * above exist to prevent.
+ */
+function createOwned(
+  path: string,
+  want: { uid: number; gid: number },
+  log: (line: string) => void,
+): boolean {
+  try {
+    mkdirSync(path, { mode: 0o770 });
+  } catch (error) {
+    log(`cannot create ${path}: ${String(error)} — requests filed there will never arrive`);
+    return false;
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    log(
+      `created ${path} but could not open it without following symlinks (${String(error)}). ` +
+        'Something replaced it between the mkdir and the open, which is not something that ' +
+        'happens by accident. Nothing was chowned.',
+    );
+    return false;
   }
 
   try {
-    chownSync(dir, want.uid, want.gid);
-    log(
-      `chowned ${dir} to ${want.uid}:${want.gid} to match ${ownerOf} — it was ` +
-        `${have.uid}:${have.gid}, which the container's uid cannot write`,
-    );
+    const opened = fstatSync(fd);
+    const onDisk = lstatSync(path);
+    if (opened.dev !== onDisk.dev || opened.ino !== onDisk.ino || !opened.isDirectory()) {
+      log(
+        `created ${path} but the directory now at that path is not the one that was ` +
+          'created. Refusing to chown it; nothing was changed.',
+      );
+      return false;
+    }
+    fchmodSync(fd, 0o770);
+    fchownSync(fd, want.uid, want.gid);
+    log(`created ${path}, owned ${want.uid}:${want.gid}, mode 0770`);
+    return true;
   } catch (error) {
-    // Loud, and with the command in it, because the alternative symptom is an
-    // agent whose requests vanish.
+    // Not fatal, and loud: the usual cause is running the executor as
+    // something other than root, where chown of a directory to another uid is
+    // simply not permitted. Say what to run rather than what failed.
     log(
-      `WARNING: ${dir} is owned ${have.uid}:${have.gid} but ${ownerOf} is owned ` +
-        `${want.uid}:${want.gid}, and chown failed (${String(error)}). The container ` +
-        `probably cannot write its own spool. Fix on the host with: ` +
-        `chown ${want.uid}:${want.gid} ${dir} && chmod 0770 ${dir}`,
+      `created ${path} but could not set it to ${want.uid}:${want.gid} mode 0770 ` +
+        `(${String(error)}). The container may not be able to write its spool. On the ` +
+        `host: chown ${want.uid}:${want.gid} ${path} && chmod 0770 ${path}`,
     );
+    return true;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* nothing useful to do about a failed close */
+    }
   }
 }
 
@@ -196,6 +453,17 @@ export class OpsSpool {
   #watcher: FSWatcher | null = null;
   #sweeper: NodeJS.Timeout | null = null;
   #draining = false;
+  #running = false;
+  /**
+   * The last complaint logged about the directory itself.
+   *
+   * The safety check below runs on every sweep — every five seconds, forever —
+   * and a spool that has been replaced with a symlink stays replaced until a
+   * human deals with it. Logging that once per sweep would bury the incident
+   * in its own alarm. Repeats of the identical line are suppressed, and the
+   * next state change (including a return to normal) always prints.
+   */
+  #complaint = '';
 
   constructor(options: {
     dir: string;
@@ -238,17 +506,11 @@ export class OpsSpool {
   }
 
   start(): void {
-    if (this.#ownerOf) {
-      ensureSpoolDir(this.#dir, this.#ownerOf, this.#log);
-    } else {
-      mkdirSync(this.#dir, { recursive: true, mode: 0o770 });
-    }
-
-    try {
-      this.#watcher = watch(this.#dir, () => this.drain());
-    } catch (error) {
-      this.#log(`cannot watch ${this.#dir}: ${String(error)} — polling only`);
-    }
+    this.#running = true;
+    // The watcher is attached by #ready() once the directory is known to be a
+    // real one, and re-attached if it is ever replaced. Watching first would
+    // mean an fs.watch on whatever a symlink points at.
+    this.#ready();
 
     // The sweep is not a fallback here, it is the primary mechanism. gVisor's
     // gofer does not reliably deliver inotify for writes made inside the
@@ -262,10 +524,109 @@ export class OpsSpool {
   }
 
   stop(): void {
+    this.#running = false;
     this.#watcher?.close();
     this.#watcher = null;
     if (this.#sweeper) clearInterval(this.#sweeper);
     this.#sweeper = null;
+  }
+
+  /**
+   * Is the spool a real directory that this process may sweep?
+   *
+   * Checked on EVERY sweep rather than once at start, and that is the fix for
+   * the second half of the 2026-08-11 finding. `ensureSpoolDir` runs at start;
+   * the agent owns `<stateDir>/run` for the whole life of the process and can
+   * swap `ops` for a symlink at any moment after it. A check that only ran at
+   * boot would leave `drain()` — which `readdir`s and, critically, `unlink`s as
+   * root — pointed wherever the link went, deleting files anywhere on the host
+   * that happened to end in `.json`.
+   *
+   * A missing directory is not a refusal: it is retried through
+   * `ensureSpoolDir`, which is what makes the first-boot ordering
+   * (`clawcius-ops.service` is deliberately not ordered after the instance
+   * units) recover by itself once the state directory appears.
+   *
+   * What this is NOT is atomic, and that is worth stating rather than
+   * implying. Node has no `unlinkat`, so the sweep below re-resolves the
+   * directory by name for every file it removes; an attacker swapping the
+   * directory for a symlink in the window between this check and one of those
+   * `unlink`s could still get a file removed elsewhere. Closing that properly
+   * needs a directory descriptor and `*at()` syscalls this runtime does not
+   * expose. What the check does buy is that the ordinary, persistent case —
+   * plant a link, wait for a restart — is refused outright and reported,
+   * rather than being followed with root's privileges and no log line. The
+   * residual race is in ops/README.md under "what this does not protect
+   * against", where it belongs.
+   */
+  #ready(): boolean {
+    let stat: Stats | null;
+    try {
+      stat = lstatOrNull(this.#dir);
+    } catch (error) {
+      this.#complain(`cannot inspect ${this.#dir}: ${String(error)}`);
+      return false;
+    }
+
+    if (stat !== null && !stat.isDirectory()) {
+      this.#complain(
+        `REFUSING to sweep ${this.#dir}: it is ${describeEntry(stat)}, not a directory. ` +
+          'Not following it, not reading through it and not deleting anything behind it — ' +
+          'this path is inside a bind mount the container writes, and a root sweep of a ' +
+          'symlink would readdir and unlink wherever it pointed. No requests from ' +
+          `${this.#instance} will be seen until a human removes it.`,
+      );
+      return false;
+    }
+
+    if (stat === null) {
+      // Gone, or never there. Recreate it the careful way, then re-check.
+      const created = this.#ownerOf
+        ? ensureSpoolDir(this.#dir, this.#ownerOf, (line) => this.#complain(line))
+        : this.#createUnowned();
+      if (!created) return false;
+      try {
+        const now = lstatOrNull(this.#dir);
+        if (now === null || !now.isDirectory()) return false;
+      } catch {
+        return false;
+      }
+      // A newly created directory is a different inode, so any watcher we hold
+      // is watching something that no longer exists.
+      this.#attachWatch();
+    }
+
+    this.#complaint = '';
+    if (this.#running && this.#watcher === null) this.#attachWatch();
+    return true;
+  }
+
+  /** The no-`ownerOf` path, used by the self-test and by nothing on the host. */
+  #createUnowned(): boolean {
+    try {
+      mkdirSync(this.#dir, { recursive: true, mode: 0o770 });
+      return true;
+    } catch (error) {
+      this.#complain(`cannot create ${this.#dir}: ${String(error)}`);
+      return false;
+    }
+  }
+
+  #attachWatch(): void {
+    if (!this.#running) return;
+    this.#watcher?.close();
+    this.#watcher = null;
+    try {
+      this.#watcher = watch(this.#dir, () => this.drain());
+    } catch (error) {
+      this.#log(`cannot watch ${this.#dir}: ${String(error)} — polling only`);
+    }
+  }
+
+  #complain(line: string): void {
+    if (line === this.#complaint) return;
+    this.#complaint = line;
+    this.#log(line);
   }
 
   /**
@@ -282,11 +643,14 @@ export class OpsSpool {
     this.#draining = true;
 
     try {
+      // Before anything is read, and before anything is unlinked. See #ready.
+      if (!this.#ready()) return;
+
       let names: string[];
       try {
         names = readdirSync(this.#dir);
       } catch (error) {
-        this.#log(`cannot read ${this.#dir}: ${String(error)}`);
+        this.#complain(`cannot read ${this.#dir}: ${String(error)}`);
         return;
       }
 
@@ -339,8 +703,36 @@ export class OpsSpool {
         }
 
         let body: string;
+        // Opened O_NOFOLLOW, and every decision made against the FD rather
+        // than the name, since 2026-08-11.
+        //
+        // These files are written by the container. `req.json` can be a
+        // symlink to anything root can read — `/root/.ssh/id_rsa`, whose
+        // contents would then go through the parser and into the journal as a
+        // "malformed request" — or a FIFO, which would block the sweep, and
+        // with it the daemon that holds every rollback deadline, forever.
+        // O_NONBLOCK is what makes the FIFO case an error instead of a hang.
+        //
+        // And the size check is made with `fstat` on the open descriptor, not
+        // `stat` on the path, because the two are not the same check: between
+        // a `stat` that says 40 bytes and an `open` a moment later, the writer
+        // owns the directory and can put something else there. What is read is
+        // now the object that was measured, or nothing is.
+        let fd: number;
         try {
-          const stat = statSync(path);
+          fd = openSync(
+            path,
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+          );
+        } catch (error) {
+          this.#log(`${name}: could not open it as a plain file (${String(error)}), discarded`);
+          this.#discard(path);
+          processed += 1;
+          continue;
+        }
+
+        try {
+          const stat = fstatSync(fd);
           if (!stat.isFile()) {
             this.#log(`${name}: not a regular file, discarded unread`);
             this.#discard(path);
@@ -348,7 +740,7 @@ export class OpsSpool {
             continue;
           }
           if (stat.size > this.#maxBytes) {
-            // Never opened. The point of checking size first is that the
+            // Never read. The point of checking size first is that the
             // oversized case costs a stat, not a read.
             this.#log(
               `${name}: ${stat.size} bytes exceeds the ${this.#maxBytes}-byte cap, ` +
@@ -358,12 +750,18 @@ export class OpsSpool {
             processed += 1;
             continue;
           }
-          body = readFileSync(path, 'utf8');
+          body = readFileSync(fd, 'utf8');
         } catch (error) {
           this.#log(`${name}: could not read (${String(error)})`);
           this.#discard(path);
           processed += 1;
           continue;
+        } finally {
+          try {
+            closeSync(fd);
+          } catch {
+            /* nothing useful to do about a failed close */
+          }
         }
 
         // Removed before it is acted on. A request that throws must not come

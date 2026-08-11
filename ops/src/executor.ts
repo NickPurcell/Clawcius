@@ -93,6 +93,35 @@ type Job = {
   /** The instance whose spool this arrived in, or SELF_REQUESTER. */
   requester: string;
   receivedAt: number;
+  /**
+   * Set only on the rollback the executor files itself when a check-in
+   * deadline passes. Its presence is what makes the job an origin-`deadline`
+   * rollback, and it carries the record of what is being rolled back FROM.
+   *
+   * ── Why this field exists, 2026-08-11 ─────────────────────────────────
+   *
+   * It used to be a parameter passed straight into `#doRollback`, which
+   * worked only on the path where the executor happened to be idle when the
+   * deadline fired. If it was busy, the job went on the queue and the context
+   * went nowhere: `#pump` later shifted it and `#dispatch` called
+   * `#doRollback(job, 'requested')`, hard-coded, so the quarantine, the
+   * consecutive-failure count and the freeze — the entire safety accounting,
+   * all gated on `origin === 'deadline'` — were skipped. The container was
+   * restored and the build that had just failed to come back was left free to
+   * be deployed again, defeating the breaker whose only job is to stop that
+   * loop.
+   *
+   * That is not a rare corner. `#waitForIdle` parks an operation for up to
+   * thirty minutes, and the incidents where a deadline expires are exactly
+   * the incidents where something else is already stuck holding the lock.
+   *
+   * Found in review of PR #8, where it was pre-existing rather than
+   * introduced — but in the dispatch path this change was already rewriting,
+   * so it is fixed here rather than filed. Carrying it on the Job means there
+   * is now ONE way a rollback reaches `#doRollback`, and the origin is a
+   * property of the job rather than of which branch created it.
+   */
+  deadline?: PendingCheckin;
 };
 
 export class Executor {
@@ -468,7 +497,14 @@ export class Executor {
         await this.#doRedeploy(job);
         return;
       case 'rollback':
-        await this.#doRollback(job, 'requested');
+        // The origin comes off the job, never off which branch queued it.
+        // See the `deadline` field on Job for the incident this shape exists
+        // to make unrepresentable.
+        await this.#doRollback(
+          job,
+          job.deadline ? 'deadline' : 'requested',
+          job.deadline,
+        );
         return;
       case 'wake':
         this.#doWake(job);
@@ -1305,6 +1341,11 @@ export class Executor {
       request,
       requester: SELF_REQUESTER,
       receivedAt: Date.now(),
+      // The context travels WITH the job: the build to quarantine, the tag to
+      // restore, and — by its presence — the fact that this is a deadline
+      // rollback and not a requested one. Until 2026-08-11 this was a
+      // parameter on a direct call, and the queued case lost all of it.
+      deadline: pending,
     };
 
     // Straight onto the queue, ahead of nothing and behind whatever is
@@ -1320,39 +1361,18 @@ export class Executor {
         what: describeRequest(request),
         instance: pending.instance,
         requester: SELF_REQUESTER,
-        detail: `automatic rollback waiting behind "${this.#busy}"`,
+        detail:
+          `automatic rollback waiting behind "${this.#busy}". It keeps its deadline ` +
+          'origin while it waits, so the build being rolled back is still quarantined ' +
+          'when it runs.',
       });
-      return;
     }
 
-    // Bypass #pump's normal path so the rollback carries its `pending` context
-    // (the build to quarantine, the tag to restore).
-    this.#queue.pop();
-    this.#busy = describeRequest(request);
-    this.#journal.write({
-      kind: 'started',
-      what: this.#busy,
-      instance: pending.instance,
-      requester: SELF_REQUESTER,
-      dryRun: this.#config.dryRun,
-      detail: 'automatic rollback after a missed check-in',
-    });
-    try {
-      await this.#doRollback(job, 'deadline', pending);
-    } catch (error) {
-      this.#journal.write({
-        kind: 'failed',
-        what: this.#busy,
-        instance: pending.instance,
-        requester: SELF_REQUESTER,
-        ok: false,
-        detail: `automatic rollback threw: ${String(error)}`,
-      });
-    } finally {
-      this.#busy = null;
-      this.#journal.publishStatus();
-    }
-    void this.#pump();
+    // And then through the ordinary lock, like everything else. There is no
+    // second path any more: the branch that used to run the rollback inline
+    // was the only one that passed the origin through, which is exactly why
+    // the queued one silently stopped quarantining.
+    await this.#pump();
   }
 
   // ── Docker/git introspection (read-only, always executed) ───────────────
