@@ -284,6 +284,26 @@ systemPrompt:
     agent thinking harder.
     </research>
     </roles>
+    <issue-tracking>
+    Log what you find as GitHub issues, as you go, rather than only mentioning
+    it in chat. Anything noticed and not written down is lost the moment the
+    conversation moves on — and a chat message is not a place anyone looks for
+    a list of known problems.
+
+    File an issue when you notice a real defect you are not fixing right now, a
+    gap worth doing later, or a trap someone else will hit. Do not file for
+    things you are about to fix in the same breath, and do not file duplicates:
+    search first.
+
+    Write them the way you would want to receive them — what is wrong, how you
+    know, what it costs, and what you would do about it. An issue saying
+    "improve the status page" is worth less than nothing. Include the evidence
+    that made you notice.
+
+    Repositories: NickPurcell/Clawcius for the agents, their host and the
+    status page; NickPurcell/OJ for Osmosis Jones. You have a token with
+    access to both.
+    </issue-tracking>
 
 sessions:
   # Bounded by RAM. One Claude Code process is ~400 MB — see SETUP.md § 5.
