@@ -56,6 +56,33 @@ RestartSec=5
 StateDirectory=clawcius-ops
 StateDirectoryMode=0750
 
+# ── The spools are NOT named here, and that was checked ───────────────────
+#
+# On 2026-08-10 the ops spool became one directory per instance
+# (/var/lib/clawcius/run/ops and /var/lib/hamachi/run/ops rather than the
+# single shared one), which is the kind of change that quietly needs a unit
+# edit. This file was re-read line by line looking for anywhere the old path
+# was named or implied. There is nowhere:
+#
+#   - no ReadWritePaths, so no list to extend;
+#   - no ProtectSystem (=strict breaks the docker socket; see below), so the
+#     filesystem is not read-only to begin with;
+#   - no ProtectHome (it was removed after it made `pull` impossible), so no
+#     second exception to keep in step;
+#   - StateDirectory= names clawcius-ops, which is the executor's own state and
+#     has nothing to do with the spools.
+#
+# So this unit needs no change, and the reason is written down rather than
+# assumed — two units in this repository shipped with hardening that made them
+# unable to run at all (MemoryDenyWriteExecute in #7, ProtectHome here), both
+# times because a directive was reasoned about and never loaded.
+#
+# IF ANYONE ADDS ReadWritePaths= LATER: it must list every instance's
+# opsSpoolDir, not just the first. The executor creates and chowns each spool
+# at startup, and under a path allowlist that misses one, the failure is an
+# agent whose requests are never seen — which looks exactly like an agent that
+# is not filing any.
+
 # ── Hardening ─────────────────────────────────────────────────────────────
 # Deliberately light, and the reason is worth writing down rather than
 # rediscovering. This unit exists to run systemctl and docker; the usual

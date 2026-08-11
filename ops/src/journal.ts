@@ -58,8 +58,25 @@ export type JournalEntry = {
   what: string;
   /** Prose. Always says *why*, because that is what you want at 3am. */
   detail: string;
-  /** Present when the entry is about a specific instance. */
+  /** Present when the entry is about a specific instance — the TARGET. */
   instance?: string;
+  /**
+   * Who asked. The instance whose spool the request arrived in, or
+   * `(executor)` for the daemon's own actions.
+   *
+   * Distinct from `instance`, and the distinction is the point. Before
+   * 2026-08-10 there was one shared spool and this field could not have
+   * existed: every entry named the target and nothing named the requester, so
+   * "Hamachi asked to redeploy Hamachi" and "Hamachi asked to redeploy
+   * Clawcius" produced byte-identical journal lines. The second is an agent
+   * reaching across at its neighbour and it should never have been possible to
+   * confuse the two after the fact.
+   *
+   * It is set from the spool directory, never from the request body, so it is
+   * as trustworthy as the bind mount — which is the most trustworthy thing in
+   * this pipeline.
+   */
+  requester?: string;
   /** Present when the entry concerns a command; the argv, rendered. */
   command?: string;
   ok?: boolean;
@@ -77,6 +94,13 @@ export type OpsStatusSnapshot = {
   frozen: boolean;
   frozenReason: string;
   dryRun: boolean;
+  /**
+   * The spools being watched, one per instance, and whether each is
+   * restricted. Published so the status page can show at a glance that every
+   * agent has a reachable queue — the failure this replaced was one agent
+   * silently having none.
+   */
+  spools: Array<{ instance: string; dir: string; restricted: boolean }>;
   /** Instances with an armed check-in deadline, and when it expires. */
   pendingCheckins: Array<{ instance: string; deadlineAt: number; reason: string }>;
   quarantined: Array<{ instance: string; build: string; at: number }>;
@@ -144,8 +168,15 @@ export class Journal {
     // The same line to stdout, so `journalctl -u clawcius-ops` is readable
     // without a JSON reader. Prefixed with the kind because the interesting
     // greps are `rejected` and `deadline-missed`.
+    //
+    // The requester goes in the prose line too, not only in the jsonl. The
+    // journalctl output is what an operator actually reads during an incident,
+    // and `redeploy hamachi` on its own does not say whether Hamachi asked for
+    // its own rebuild or Clawcius asked for someone else's. `grep 'from
+    // clawcius'` is now a question with an answer.
     const flag = full.dryRun ? ' [dry-run]' : '';
-    process.stdout.write(`[ops] ${full.kind}${flag}: ${full.what} — ${full.detail}\n`);
+    const from = full.requester ? ` (from ${full.requester})` : '';
+    process.stdout.write(`[ops] ${full.kind}${flag}: ${full.what}${from} — ${full.detail}\n`);
 
     this.#recent.push(full);
     if (this.#recent.length > STATUS_EVENTS) this.#recent.splice(0, this.#recent.length - STATUS_EVENTS);

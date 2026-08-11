@@ -51,6 +51,20 @@ CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
 WORKSPACES=$CLAWCIUS_STATE/workspaces
 # The agent drops wake-request JSON here; the waker watches it.
 WAKE_DIR=$CLAWCIUS_STATE/run
+# And privileged-operation requests here; clawcius-ops watches it.
+#
+# One per instance, and it MUST be under $WAKE_DIR, because $WAKE_DIR is the
+# only part of the state directory that gets bind-mounted below. That was the
+# bug: ops/ops-config.yaml carried a single shared spool at
+# /var/lib/clawcius/run/ops, which is inside instance 1's mount and inside
+# nothing at all for instance 2. From inside the Hamachi container that path
+# simply did not exist, so Hamachi could not file a request — silently, since
+# the agent's failed `mv` goes to a shell nobody reads and the executor just
+# sees an empty directory.
+#
+# This must stay in step with `instances[].opsSpoolDir` in ops-config.yaml,
+# whose default is exactly <stateDir>/run/ops for this reason.
+OPS_DIR=$WAKE_DIR/ops
 SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 GWS_CLI=/home/npurcell/clawcius/gws-cli
@@ -91,6 +105,27 @@ AGENT_HOME=$CLAWCIUS_STATE/agent-home
 AGENT_CLAUDE=/home/agent/.claude-agent
 
 mkdir -p "$WAKE_DIR"
+# Created here rather than by the executor, and the reason is ownership.
+#
+# clawcius-ops runs as root. `mkdir` from root produces a root-owned directory,
+# and the whole point of a spool is that an unprivileged process inside a
+# gVisor container writes into it — a root-owned 0770 spool is not a spool, it
+# is an EACCES the agent reports to nobody. This script runs as npurcell (the
+# container units are User=npurcell) and the Dockerfile builds the agent user
+# with AGENT_UID=1000 to match, so a plain `mkdir -p` here lands with the uid
+# the container runs as, by construction. Exactly how $WAKE_DIR itself has
+# always worked; no chown needed, and none here either.
+#
+# The executor creates it too, if it is missing when the executor starts, so a
+# host where nothing has ever been started still works — but this is the path
+# that makes it right the first time, and since 2026-08-11 it is the only path
+# that can FIX an existing one. The executor deliberately does not chown a
+# directory it did not just create, and refuses outright if this path is a
+# symlink: $OPS_DIR lives inside the read-write bind mount below, so the
+# container owns its parent, and a root process repairing a path the sandbox
+# controls the name of is how `ln -s /etc "$OPS_DIR"` turns into a root chown
+# of /etc. See ensureSpoolDir() in ops/src/spool.ts for the whole account.
+mkdir -p "$OPS_DIR"
 # Created rather than asserted. This used to hard-fail, which was right when
 # the path was a constant: /var/lib/clawcius comes from the unit's
 # StateDirectory, so its absence meant something was wrong. Now that it is
@@ -210,6 +245,14 @@ AGENT_TZ="${AGENT_TZ:-America/Los_Angeles}"
 # --cap-drop=ALL: root execs in here run apt, and dpkg needs CHOWN,
 # SETUID/SETGID, DAC_OVERRIDE and FOWNER — dropping those breaks the
 # persistent-sandbox package story the snapshot timer exists to protect.
+
+# Note on the mounts below: $OPS_DIR gets no -v of its own. It is a child of
+# $WAKE_DIR and rides along inside that one mount, which is deliberate rather
+# than incidental — a spool that lives under the per-instance mount is
+# reachable from this container and from no other, and that is what makes the
+# executor's "which agent filed this request" answer unforgeable. A spool
+# outside it would need its own mount and would be reachable by whoever was
+# given one, which is the arrangement that broke.
 
 GWS_MOUNT=()
 if [ -f "$GWS_KEY" ]; then

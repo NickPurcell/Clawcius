@@ -25,8 +25,9 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, isAbsolute } from 'node:path';
+import { resolve, isAbsolute, join } from 'node:path';
 import { parse } from 'yaml';
+import { VERBS } from './request.js';
 
 /**
  * A systemd unit this executor may act on.
@@ -80,6 +81,47 @@ export type RepoEntry = {
 };
 
 /**
+ * What one instance is allowed to ask for, when the operator narrows it.
+ *
+ * Added 2026-08-10, alongside per-instance spools, and off by default — every
+ * field null means "no restriction", which is exactly the behaviour every
+ * instance had before this existed. An upgrade changes nothing until somebody
+ * writes a `mayRequest:` block.
+ *
+ * The mechanism only became *possible* with per-instance spools. With one
+ * shared directory the executor had no idea who had written a file, so there
+ * was nothing to restrict: "Hamachi may not redeploy Clawcius" is not a rule
+ * you can enforce against an anonymous request. Now the directory a request
+ * arrived in names the requester, and this is the allowlist that names what
+ * that requester may do with it.
+ *
+ * Semantics, deliberately boring:
+ *
+ *   - a field left out entirely means "this kind is not restricted";
+ *   - a field present means "exactly these, by exact string equality";
+ *   - a field present and empty (`instances: []`) means "none of this kind" —
+ *     it is a legitimate way to say an instance may never touch a container,
+ *     and it is not confused with absent because the loader distinguishes a
+ *     missing key from an empty list.
+ *
+ * Every name written here is checked against the real allowlists at boot. A
+ * typo in `mayRequest.units` would otherwise be a silent, total denial of a
+ * verb the operator believed they had granted — and a restriction that fails
+ * closed by accident is indistinguishable, from the agent's side, from an
+ * executor that is broken.
+ */
+export type RequestScope = {
+  /** Verbs this instance may use at all. */
+  verbs: string[] | null;
+  /** Instances it may name in `redeploy` / `snapshot` / `rollback` / `checkin`. */
+  instances: string[] | null;
+  /** Units it may `restart`. */
+  units: string[] | null;
+  /** Repos it may `pull`. */
+  repos: string[] | null;
+};
+
+/**
  * An agent instance whose container this executor may recreate.
  *
  * Everything needed to rebuild it is here rather than being derived, because
@@ -112,6 +154,44 @@ export type InstanceEntry = {
    * agent can also read, and it only ever writes a wake request there.
    */
   wakeSpoolDir: string;
+  /**
+   * This instance's ops spool — the directory ITS container writes requests
+   * into. Defaults to `<stateDir>/run/ops`.
+   *
+   * ── Why this is per-instance, since 2026-08-10 ──────────────────────────
+   *
+   * It used to be one top-level `spoolDir`, `/var/lib/clawcius/run/ops`, for
+   * the whole executor. That was wrong in a way nobody noticed for a week,
+   * because it was only wrong for one of the two agents.
+   *
+   * `docker/run-container.sh` gives each instance its OWN state directory and
+   * bind-mounts only that:
+   *
+   *     CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
+   *     WAKE_DIR=$CLAWCIUS_STATE/run
+   *     -v "$WAKE_DIR:$WAKE_DIR:rw"
+   *
+   * For Clawcius that is `/var/lib/clawcius/run`, so the shared spool happened
+   * to fall inside the mount and worked. For Hamachi, whose unit sets
+   * `CLAWCIUS_STATE_DIR=/var/lib/hamachi`, the mount is `/var/lib/hamachi/run`
+   * and `/var/lib/clawcius/run/ops` **does not exist inside the container at
+   * all** — verified from inside it on 2026-08-10. Hamachi could not file a
+   * single request. The agent the operator talks to most was the one agent
+   * locked out of the mechanism built for both of them, and the failure was
+   * silent from every angle: the executor saw an empty spool (which is what a
+   * quiet night looks like), and the agent's `mv` failed into a shell nobody
+   * was reading.
+   *
+   * The default follows the mount rather than the other way round, so a new
+   * instance is reachable by construction: put the spool where the container's
+   * bind mount already is, and there is no second thing to remember.
+   */
+  opsSpoolDir: string;
+  /**
+   * Optional narrowing of what this instance may ask for. Null means
+   * unrestricted, which is the default and the pre-2026-08-10 behaviour.
+   */
+  mayRequest: RequestScope | null;
   /**
    * Discord channel the post-rebuild wake is addressed to. The agent has to be
    * woken *somewhere*, and a wake with no channel cannot be delivered.
@@ -230,13 +310,12 @@ export type OpsConfig = {
    * week of it and know precisely what you are turning on.
    */
   dryRun: boolean;
-  /** Directory the agents drop request JSON into. Bind-mounted, hostile. */
-  spoolDir: string;
   /**
    * Executor state: journal, breaker, pending check-ins, status JSON.
    *
-   * MUST NOT be inside `spoolDir` or any container mount. The breaker lives
-   * here, and a breaker the quarantined party can edit is not a breaker.
+   * MUST NOT be inside any instance's `opsSpoolDir` or any container mount.
+   * The breaker lives here, and a breaker the quarantined party can edit is
+   * not a breaker.
    */
   stateDir: string;
   /** Sweep interval for the spool, alongside fs.watch. */
@@ -269,11 +348,33 @@ export type OpsConfig = {
   deadline: DeadlineConfig;
   breaker: BreakerConfig;
   snapshotVerify: SnapshotVerifyConfig;
+  /**
+   * Prose warnings the loader produced but did not fail on.
+   *
+   * Currently just the deprecated top-level `spoolDir` key. They are returned
+   * rather than printed so the daemon can put them in the *journal* at boot —
+   * a warning that only ever reaches stdout is a warning nobody reads after
+   * the fact, and the whole reason this key is tolerated rather than rejected
+   * is that the operator needs a durable record saying it was tolerated.
+   */
+  deprecations: string[];
 };
+
+/**
+ * Where an instance's spool goes when config does not say.
+ *
+ * `<stateDir>/run/ops`, because `<stateDir>/run` is the directory
+ * `docker/run-container.sh` already bind-mounts read-write into that
+ * instance's container. Deriving it from the mount is the point: it is the
+ * one rule that makes a newly added instance able to file a request without
+ * anybody remembering a second setting. See `InstanceEntry.opsSpoolDir`.
+ */
+export function defaultOpsSpoolDir(instanceStateDir: string): string {
+  return join(instanceStateDir, 'run', 'ops');
+}
 
 const DEFAULTS: OpsConfig = {
   dryRun: true,
-  spoolDir: '/var/lib/clawcius/run/ops',
   stateDir: '/var/lib/clawcius-ops',
   pollSeconds: 5,
   runContainerScript: '/home/npurcell/clawcius/docker/run-container.sh',
@@ -313,6 +414,7 @@ const DEFAULTS: OpsConfig = {
     startTimeoutSeconds: 60,
     probe: ['/bin/sh', '-c', 'test -x /usr/local/bin/claude'],
   },
+  deprecations: [],
 };
 
 export class OpsConfigError extends Error {
@@ -379,6 +481,21 @@ function strList(raw: unknown, path: string, fallback: string[]): string[] {
 }
 
 /**
+ * A list of strings where "absent" and "empty" must stay distinguishable.
+ *
+ * `strList` cannot express this: it folds a missing key into its fallback, so
+ * `[]` and "not written down" arrive identical. For `mayRequest` that
+ * difference is the whole meaning — absent is "unrestricted", empty is "none
+ * at all" — and collapsing the two would turn a config that grants everything
+ * into one that grants nothing, or the reverse, depending on which way the
+ * fallback pointed.
+ */
+function strListOrNull(raw: unknown, path: string): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  return strList(raw, path, []);
+}
+
+/**
  * An absolute path from config, resolved once.
  *
  * Relative paths are rejected rather than resolved against cwd. This process
@@ -440,6 +557,157 @@ function checkName(value: string, path: string): string {
  */
 export function isInside(child: string, parent: string): boolean {
   return child === parent || child.startsWith(`${parent}/`);
+}
+
+/**
+ * The old top-level `spoolDir:` key, mapped onto the instance that owns it.
+ *
+ * ── Why this is an alias and not an error ────────────────────────────────
+ *
+ * The choice was between refusing to boot with a message telling the operator
+ * exactly what to write, and accepting the old key as a deprecated alias. This
+ * is the alias, and the reason is the shape of the failure rather than a
+ * preference for leniency.
+ *
+ * `clawcius-ops.service` is `Restart=always` with `StartLimitIntervalSec=0`
+ * and `StartLimitBurst=0` — never give up — because it holds the rollback
+ * deadlines and a dead executor is how a broken rebuild becomes a permanent
+ * outage. A config the loader rejects therefore does not produce one loud
+ * failure: it produces a root daemon in a five-second restart loop, with every
+ * armed deadline unhonoured for as long as it lasts. That is precisely the
+ * shape of #7 (`MemoryDenyWriteExecute` in clawcius-status.service, SIGTRAP,
+ * restart loop) and it is the shape this repository has already agreed not to
+ * ship again.
+ *
+ * The executor is also *running right now*, in dry-run, with the old key on
+ * disk. `pull` updates the checkout — including `ops-config.yaml` — without
+ * restarting this daemon, so the new file lands under a process that will not
+ * read it until a person restarts it. Making that restart the moment it dies
+ * is a bad trade for a cosmetic key rename.
+ *
+ * What is NOT tolerated is ambiguity. The old key is accepted only when
+ * exactly one configured instance can be shown to own that directory — that
+ * is, it lies inside that instance's `stateDir`. If no instance owns it, or
+ * two do, the boot fails with the exact lines to write, because an
+ * unattributable spool is the precise thing this change exists to abolish:
+ * provenance is the feature, and guessing at it would be worse than the shared
+ * spool was.
+ *
+ * Mutates the matched entry's `opsSpoolDir`, so the instance carries on
+ * watching the same directory it was watching before the upgrade. Returns the
+ * deprecation notice for the boot journal.
+ *
+ * ── `explicit` — added 2026-08-11, because "written down" is not "default" ──
+ *
+ * `explicit` is the set of instance names whose `opsSpoolDir` was actually
+ * present in the YAML. It has to be passed in, because by the time this runs
+ * the value has already been resolved through `absPath(..., default)` and an
+ * explicitly written default is byte-identical to an absent key.
+ *
+ * Review of PR #8 found what that cost. The disagreement check used to read
+ * `opsSpoolDir !== <the derived default> && opsSpoolDir !== legacy`, so an
+ * operator who wrote the default out by hand — `opsSpoolDir:
+ * /var/lib/clawcius/run/ops`, which is a perfectly ordinary thing to do while
+ * moving off the old key — and left a stale top-level `spoolDir` pointing
+ * somewhere else in the same stateDir got neither the failure nor their own
+ * value: the first conjunct was false, the throw was skipped, and the line
+ * below silently overwrote what they had written with the legacy path.
+ *
+ * The consequence is precisely the failure this release exists to end, with an
+ * extra step. `docker/run-container.sh` hard-codes the container's spool to
+ * `<stateDir>/run/ops` and that path is not in the config, so the executor
+ * would end up watching the old directory while the container wrote the new
+ * one, and every request would vanish silently in both directions. No
+ * containment check catches it — both paths are legal, they simply are not the
+ * same path.
+ *
+ * So the rule is now the one the README always claimed: an explicit
+ * `opsSpoolDir` that disagrees with the legacy key fails the boot, whatever its
+ * value happens to be, and an explicit one is never overwritten.
+ */
+function migrateLegacySpoolDir(
+  root: Record<string, unknown>,
+  instances: InstanceEntry[],
+  explicit: ReadonlySet<string>,
+): string[] {
+  const raw = root['spoolDir'];
+  if (raw === undefined || raw === null) return [];
+
+  const legacy = absPath(raw, 'spoolDir', '');
+
+  const owners = instances.filter(
+    (instance) =>
+      isInside(legacy, instance.stateDir) || legacy === instance.opsSpoolDir,
+  );
+
+  const remedy = instances
+    .map(
+      (instance) =>
+        `      - name: ${instance.name}\n        opsSpoolDir: ${instance.opsSpoolDir}`,
+    )
+    .join('\n');
+
+  if (owners.length === 0) {
+    throw new Error(
+      `ops-config.yaml: the top-level "spoolDir" key (${legacy}) is deprecated, and this ` +
+        'one cannot be attributed to any configured instance — it is not inside any ' +
+        "instance's stateDir. Since 2026-08-10 each instance has its own spool and the " +
+        'directory a request arrives in is what identifies the requester, so a spool ' +
+        'belonging to nobody has no meaning. Delete the key and, if the default is not ' +
+        'what you want, set opsSpoolDir per instance:\n' +
+        `${remedy}\n` +
+        '(The default is <stateDir>/run/ops, which is inside the bind mount ' +
+        'docker/run-container.sh already gives each container.)',
+    );
+  }
+
+  if (owners.length > 1) {
+    throw new Error(
+      `ops-config.yaml: the deprecated top-level "spoolDir" (${legacy}) is inside the ` +
+        `stateDir of more than one instance (${owners.map((o) => o.name).join(', ')}). ` +
+        'It cannot be attributed, and attributing it by guessing would defeat the reason ' +
+        'spools are per-instance now. Delete the key and set opsSpoolDir explicitly:\n' +
+        `${remedy}`,
+    );
+  }
+
+  const owner = owners[0]!;
+  const wouldBe = defaultOpsSpoolDir(owner.stateDir);
+
+  if (explicit.has(owner.name)) {
+    // The operator wrote both keys. If they disagree, that is two answers to
+    // one question and the one case where silence is indefensible: whichever
+    // the loader picked, the other would look like it had been honoured.
+    //
+    // Tested against "was it written" and not against "is it the default",
+    // because those are different questions and only the first one is about
+    // the operator's intent. See the header.
+    if (owner.opsSpoolDir !== legacy) {
+      throw new Error(
+        `ops-config.yaml: the deprecated top-level "spoolDir" (${legacy}) and ` +
+          `instances[${owner.name}].opsSpoolDir (${owner.opsSpoolDir}) name different ` +
+          'directories. Delete the top-level key; the per-instance one is the only one ' +
+          'that can say whose spool it is. (This fails even when the per-instance value ' +
+          'is the default written out by hand: an explicit key means the operator meant ' +
+          'it, and quietly replacing it is how the executor ends up watching a directory ' +
+          'no container writes.)',
+      );
+    }
+    // Written twice, identically. Nothing to migrate; the deprecation notice
+    // below still goes into the journal.
+  } else {
+    owner.opsSpoolDir = legacy;
+  }
+
+  return [
+    `the top-level "spoolDir" key is DEPRECATED. ${legacy} has been attributed to ` +
+      `instance "${owner.name}", which is the only instance whose stateDir contains it, ` +
+      'so that instance keeps watching exactly the directory it watched before this ' +
+      'upgrade and no behaviour changed for it. Every other instance now has its own ' +
+      'spool. Replace the key with:\n' +
+      `    instances:\n      - name: ${owner.name}\n        opsSpoolDir: ${legacy}\n` +
+      `  or delete it entirely to take the default (${wouldBe}).`,
+  ];
 }
 
 export function loadOpsConfig(configPath?: string): OpsConfig {
@@ -514,6 +782,17 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     };
   });
 
+  /**
+   * Instances whose `opsSpoolDir` was actually written in the file.
+   *
+   * Kept beside the entries rather than on them: the resolved value cannot
+   * answer "was this written down", because an explicitly written default is
+   * identical to an absent key, and `migrateLegacySpoolDir` has to be able to
+   * tell those apart. Same distinction `strListOrNull` exists to preserve for
+   * `mayRequest`, for the same reason — absence means something.
+   */
+  const explicitOpsSpoolDir = new Set<string>();
+
   const instances: InstanceEntry[] = list(root['instances'], 'instances').map((raw, index) => {
     const at = `instances[${index}]`;
     const entry = section(raw, at);
@@ -538,23 +817,92 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
           'build by that checkout\'s HEAD, so it has to be one this executor knows about.',
       );
     }
+    const stateDir = requiredAbsPath(entry['stateDir'], `${at}.stateDir`);
+
+    // The spool defaults from the state directory rather than being required,
+    // because the default is the only value that is right by construction:
+    // `<stateDir>/run` is what run-container.sh bind-mounts. An operator who
+    // writes it out by hand can still get it wrong — and the containment
+    // checks below are what catch that — but nobody has to write it out at
+    // all for a new instance to be able to talk to this daemon.
+    const opsSpoolDir = absPath(
+      entry['opsSpoolDir'],
+      `${at}.opsSpoolDir`,
+      defaultOpsSpoolDir(stateDir),
+    );
+    if (entry['opsSpoolDir'] !== undefined && entry['opsSpoolDir'] !== null) {
+      explicitOpsSpoolDir.add(name);
+    }
+
+    // Absent is unrestricted. That is the pre-2026-08-10 behaviour and it is
+    // what an upgrade gets, deliberately: this change ships a *mechanism*, and
+    // a mechanism that silently starts refusing requests on a running
+    // privileged daemon is not a mechanism, it is an outage with a changelog.
+    const scopeRaw = entry['mayRequest'];
+    let mayRequest: RequestScope | null = null;
+    if (scopeRaw !== undefined && scopeRaw !== null) {
+      const scope = section(scopeRaw, `${at}.mayRequest`);
+      mayRequest = {
+        verbs: strListOrNull(scope['verbs'], `${at}.mayRequest.verbs`),
+        instances: strListOrNull(scope['instances'], `${at}.mayRequest.instances`),
+        units: strListOrNull(scope['units'], `${at}.mayRequest.units`),
+        repos: strListOrNull(scope['repos'], `${at}.mayRequest.repos`),
+      };
+
+      // Checked against the real allowlists, now for verbs/units/repos and
+      // below in the cross-field pass for instances (which are still being
+      // built at this point). A name that matches nothing would be a silent
+      // total denial — the operator writes `mayRequest.units:
+      // [clawcius.serivce]`, believes they granted a restart, and every
+      // restart is refused with a message that reads like a config problem
+      // somewhere else entirely.
+      for (const verb of mayRequest.verbs ?? []) {
+        if (!(VERBS as readonly string[]).includes(verb)) {
+          throw new OpsConfigError(
+            `${at}.mayRequest.verbs`,
+            `("${verb}") is not a verb. Known verbs: ${VERBS.join(', ')}`,
+          );
+        }
+      }
+      for (const unit of mayRequest.units ?? []) {
+        if (!units.some((candidate) => candidate.name === unit)) {
+          throw new OpsConfigError(
+            `${at}.mayRequest.units`,
+            `("${unit}") names no entry under units:. A restriction that names nothing ` +
+              'refuses everything, and does it in a way that reads like a bug elsewhere.',
+          );
+        }
+      }
+      for (const repo of mayRequest.repos ?? []) {
+        if (!repos.some((candidate) => candidate.name === repo)) {
+          throw new OpsConfigError(
+            `${at}.mayRequest.repos`,
+            `("${repo}") names no entry under repos:`,
+          );
+        }
+      }
+    }
+
     return {
       name,
       container,
       image,
-      stateDir: requiredAbsPath(entry['stateDir'], `${at}.stateDir`),
+      stateDir,
       envFile: requiredAbsPath(entry['envFile'], `${at}.envFile`),
       memory: str(entry['memory'], `${at}.memory`, '2g'),
       wakerStatusFile: requiredAbsPath(entry['wakerStatusFile'], `${at}.wakerStatusFile`),
       wakeSpoolDir: requiredAbsPath(entry['wakeSpoolDir'], `${at}.wakeSpoolDir`),
       wakeChannelId,
       buildRepo,
+      opsSpoolDir,
+      mayRequest,
     };
   });
 
+  const deprecations = migrateLegacySpoolDir(root, instances, explicitOpsSpoolDir);
+
   const config: OpsConfig = {
     dryRun: bool(root['dryRun'], 'dryRun', DEFAULTS.dryRun),
-    spoolDir: absPath(root['spoolDir'], 'spoolDir', DEFAULTS.spoolDir),
     stateDir: absPath(root['stateDir'], 'stateDir', DEFAULTS.stateDir),
     pollSeconds: num(root['pollSeconds'], 'pollSeconds', DEFAULTS.pollSeconds, 1, 3600),
     runContainerScript: absPath(
@@ -654,6 +1002,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       ),
       probe: strList(verify['probe'], 'snapshotVerify.probe', DEFAULTS.snapshotVerify.probe),
     },
+    deprecations,
   };
 
   // ── Cross-field checks ──────────────────────────────────────────────────
@@ -683,18 +1032,39 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     }
   }
 
-  // The state directory holds the circuit breaker. If the agent can write it,
-  // the agent can un-quarantine the build that just took it down — which turns
-  // the breaker into a suggestion, and the loop it exists to break back on.
-  if (isInside(config.stateDir, config.spoolDir)) {
-    throw new Error(
-      `ops-config.yaml: stateDir (${config.stateDir}) is inside spoolDir ` +
-        `(${config.spoolDir}). The spool is written by the agents; the breaker and ` +
-        'the journal must not be.',
-    );
-  }
+  // ── Containment, now across every spool ─────────────────────────────────
+  //
+  // These used to be written against the one shared `spoolDir`. Every one of
+  // them has to hold for EACH instance's spool now, and the ones that are new
+  // exist because per-instance spools introduce failure modes a single spool
+  // could not have: two instances sharing a directory (provenance gone), one
+  // instance's spool containing another's (provenance forged), and a spool
+  // that swallows a wake spool (the executor eating the waker's queue).
+  //
+  // Written as an explicit loop over pairs rather than anything clever,
+  // because the reader of this function at 3am is trying to answer "can the
+  // agent reach the breaker" and every abstraction between them and the answer
+  // costs more than it saves.
 
   for (const instance of instances) {
+    // The state directory holds the circuit breaker. If the agent can write
+    // it, the agent can un-quarantine the build that just took it down — which
+    // turns the breaker into a suggestion, and turns the loop it exists to
+    // break back on.
+    if (isInside(config.stateDir, instance.opsSpoolDir)) {
+      throw new Error(
+        `ops-config.yaml: stateDir (${config.stateDir}) is inside ` +
+          `instances[${instance.name}].opsSpoolDir (${instance.opsSpoolDir}). That spool ` +
+          'is written by that agent; the breaker and the journal must not be.',
+      );
+    }
+    if (isInside(config.stateDir, instance.wakeSpoolDir)) {
+      throw new Error(
+        `ops-config.yaml: stateDir is inside instances[${instance.name}].wakeSpoolDir, ` +
+          'which the container can write.',
+      );
+    }
+
     // Same argument, at the sharpest point. A waker status file the container
     // can write is a container that can declare itself idle and be recreated
     // mid-turn — or, worse, declare itself idle to get a rollback moving.
@@ -706,17 +1076,103 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
           'container would interrupt a live turn.',
       );
     }
-    if (isInside(instance.wakerStatusFile, config.spoolDir)) {
-      throw new Error(
-        `ops-config.yaml: instances[${instance.name}].wakerStatusFile is inside the ` +
-          'ops spoolDir, which the agents write. Same problem.',
-      );
+
+    for (const other of instances) {
+      // Any spool, not just its own. Instance A writing instance B's status
+      // file is the same hole with an extra step, and on this host the two
+      // state directories are siblings under /var/lib, so a fat-fingered path
+      // lands in the neighbour rather than nowhere.
+      if (isInside(instance.wakerStatusFile, other.opsSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}].wakerStatusFile is inside ` +
+            `instances[${other.name}].opsSpoolDir, which that agent writes. Same problem.`,
+        );
+      }
+
+      if (instance === other) continue;
+
+      // The same argument as the two checks above, for the pairing they both
+      // missed. Added 2026-08-11, after review of PR #8 pointed out that the
+      // coverage was asymmetric: a status file was checked against its OWN
+      // wake spool and against ANY ops spool, but never against another
+      // instance's wake spool — which is bind-mounted read-write into that
+      // other container exactly like the ops spool is.
+      //
+      // So instance A's status file sitting under B's wake spool meant B's
+      // agent could create or overwrite it and declare A idle whenever it
+      // liked: A gets recreated mid-turn, or a rollback of A proceeds over a
+      // live conversation. The check that would have caught it was three lines
+      // away and written for precisely this, which is the usual shape of a
+      // coverage gap — the loop's own comment says "a fat-fingered path lands
+      // in the neighbour" and then only looked in half the neighbourhood.
+      if (isInside(instance.wakerStatusFile, other.wakeSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}].wakerStatusFile is inside ` +
+            `instances[${other.name}].wakeSpoolDir (${other.wakeSpoolDir}), which is ` +
+            `bind-mounted read-write into ${other.name}'s container. ${other.name} could ` +
+            `then declare ${instance.name} idle, and the executor believes that file when ` +
+            'it decides whether destroying a container would interrupt a live turn.',
+        );
+      }
+
+      // Two instances, one spool: the exact thing this release exists to end.
+      // The directory a request arrives in is now the only evidence of who
+      // filed it, so a shared spool does not merely blur provenance, it
+      // fabricates it — every request from either agent would be attributed,
+      // confidently and wrongly, to whichever entry the loop happened to see
+      // first.
+      if (instance.opsSpoolDir === other.opsSpoolDir) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}] and instances[${other.name}] ` +
+            `share opsSpoolDir (${instance.opsSpoolDir}). The spool a request arrives ` +
+            'in is what identifies the requester, so sharing one does not blur ' +
+            'provenance — it invents it. Give each instance its own.',
+        );
+      }
+      if (isInside(instance.opsSpoolDir, other.opsSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}].opsSpoolDir ` +
+            `(${instance.opsSpoolDir}) is inside instances[${other.name}].opsSpoolDir ` +
+            `(${other.opsSpoolDir}). ${other.name} could then write requests that arrive ` +
+            `attributed to ${instance.name}, which is forgery with extra steps.`,
+        );
+      }
     }
-    if (isInside(config.stateDir, instance.wakeSpoolDir)) {
-      throw new Error(
-        `ops-config.yaml: stateDir is inside instances[${instance.name}].wakeSpoolDir, ` +
-          'which the container can write.',
-      );
+
+    for (const other of instances) {
+      // A spool that contains a wake spool means the executor sweeps the
+      // waker's queue: wake files are a different schema, so every one of them
+      // would be consumed, rejected as malformed and DELETED — the ops spool
+      // unlinks before it parses. The agent would lose wakes it never knew it
+      // had. The reverse nesting hands the waker the ops requests.
+      if (isInside(other.wakeSpoolDir, instance.opsSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${other.name}].wakeSpoolDir ` +
+            `(${other.wakeSpoolDir}) is inside instances[${instance.name}].opsSpoolDir ` +
+            `(${instance.opsSpoolDir}). The ops spool unlinks every file it sweeps ` +
+            'before parsing it, so this would silently eat wakes.',
+        );
+      }
+      if (isInside(instance.opsSpoolDir, other.wakeSpoolDir)) {
+        throw new Error(
+          `ops-config.yaml: instances[${instance.name}].opsSpoolDir ` +
+            `(${instance.opsSpoolDir}) is inside instances[${other.name}].wakeSpoolDir ` +
+            `(${other.wakeSpoolDir}). The waker sweeps that directory and would consume ` +
+            'ops requests as malformed wakes.',
+        );
+      }
+    }
+
+    // Checked here rather than in the instance loop above because the instance
+    // list does not exist yet while it is being built.
+    for (const target of instance.mayRequest?.instances ?? []) {
+      if (!instances.some((candidate) => candidate.name === target)) {
+        throw new OpsConfigError(
+          `instances[${instance.name}].mayRequest.instances`,
+          `("${target}") names no entry under instances:. A restriction that names ` +
+            'nothing refuses everything.',
+        );
+      }
     }
   }
 

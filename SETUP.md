@@ -406,7 +406,7 @@ sudo chown -R npurcell:npurcell /home/npurcell/clawcius   # if a root build got 
 cd /home/npurcell/clawcius/ops
 npm install
 npm run build
-npm run selftest              # 64 tests, no docker required
+npm run selftest              # 82 tests, no docker required
 
 sudo cp ../systemd/clawcius-ops.service \
         ../systemd/clawcius-snapshot-verify.service \
@@ -416,32 +416,58 @@ sudo systemctl enable --now clawcius-ops.service
 sudo systemctl enable --now clawcius-snapshot-verify.timer
 ```
 
-Then create the spool directory so the containers can write into it. It lives
-inside each instance's `run/` mount, which `docker/run-container.sh` already
-bind-mounts read-write:
+**One spool per instance, since 2026-08-10.** Each lives inside that
+instance's own `run/` mount — the only part of its state directory that
+`docker/run-container.sh` bind-mounts — because that is what makes it reachable
+from that container and from no other. There used to be a single shared one at
+`/var/lib/clawcius/run/ops`, and it was reachable from Clawcius's container and
+simply absent from Hamachi's, which meant the agent the operator talks to most
+could not file a request at all. `ops/README.md` has the whole account.
+
+`docker/run-container.sh` creates them now, next to `run/wake`, running as
+`npurcell` so the ownership matches the container's uid without a `chown`. The
+executor also creates and chowns them at startup, so a fresh host works before
+any container has been started. Neither needs a manual step, but if you want to
+do it by hand ahead of time:
 
 ```sh
 sudo install -d -m 0770 -o npurcell -g npurcell /var/lib/clawcius/run/ops
+sudo install -d -m 0770 -o npurcell -g npurcell /var/lib/hamachi/run/ops
 ```
 
-Check it is watching, and that the first thing it says is that it is not really
-doing anything:
+Check it is watching **both**, and that the first thing it says is that it is
+not really doing anything:
 
 ```sh
 journalctl -u clawcius-ops -n 30
 # [ops] boot: clawcius-ops — … DRY RUN — every decision is made and logged, nothing is executed.
-# [ops] watching /var/lib/clawcius/run/ops (sweep 5s)
+# [ops] watching /var/lib/clawcius/run/ops for clawcius (sweep 5s)
+# [ops] watching /var/lib/hamachi/run/ops  for hamachi  (sweep 5s)
 ```
 
-Then file a request from inside a container and watch it land:
+If the log carries a `config deprecation` line, `ops-config.yaml` still has the
+old top-level `spoolDir:`. It has been accepted and attributed to the instance
+that owns it — nothing has changed for that instance — and the line names the
+replacement. Delete the key.
+
+Then file a request from inside each container and watch it land. Do both:
+the second one is the case that was broken, and it is the one worth proving.
 
 ```sh
-docker exec clawcius-agent sh -c '
-  OPS=/var/lib/clawcius/run/ops; S=$(date +%s)
-  printf "%s" "{\"verb\":\"restart\",\"unit\":\"clawcius.service\",\"reason\":\"smoke test\"}" \
-    > $OPS/$S.tmp && mv $OPS/$S.tmp $OPS/$S.json'
-journalctl -u clawcius-ops -n 10
+for c in clawcius hamachi; do
+  docker exec "$c-agent" sh -c "
+    OPS=/var/lib/$c/run/ops; S=\$(date +%s)
+    printf '%s' '{\"verb\":\"restart\",\"unit\":\"clawcius.service\",\"reason\":\"smoke test\"}' \
+      > \$OPS/\$S.tmp && mv \$OPS/\$S.tmp \$OPS/\$S.json"
+done
+journalctl -u clawcius-ops -n 20
+# [ops] request: restart clawcius.service (from clawcius) — filed by clawcius as …
+# [ops] request: restart clawcius.service (from hamachi)  — filed by hamachi as …
 ```
+
+The `(from …)` is the point of the change: with one shared spool those two
+lines were identical, and the executor had no way to tell which agent had
+asked.
 
 ### The status file each waker publishes
 
