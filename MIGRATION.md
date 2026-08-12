@@ -253,13 +253,18 @@ rewrite is that this file describes reality.
 
 ```sh
 # What the account may do, from sudo's own mouth.
-sudo -u clawcius-ops sudo -l
+#
+# NOT `sudo -u clawcius-ops sudo -l`. The inner sudo authenticates the user it
+# is invoked AS, so that prompts for clawcius-ops's password — and a --system
+# account has a locked password, so the prompt can never be satisfied. Ask
+# about the account instead of asking as it:
+sudo -l -U clawcius-ops
 
 # A granted read-only command works, with no password.
 sudo -u clawcius-ops sudo -n /usr/bin/systemctl is-active clawcius.service
 
 # A granted mutating command is listed (do not run it yet).
-sudo -u clawcius-ops sudo -l /usr/bin/systemctl restart clawcius.service
+sudo -l -U clawcius-ops /usr/bin/systemctl restart clawcius.service
 
 # And these must all be REFUSED.
 sudo -u clawcius-ops sudo -n /usr/bin/systemctl restart sshd.service        # no
