@@ -98,6 +98,25 @@ gitPath: /usr/bin/git
 # found" several minutes after npm ci succeeded.
 npmPath: /home/npurcell/.local/share/node/bin/npm
 
+# Where this project's systemd units are installed, by the EXECUTOR, as root.
+#
+# New on 2026-08-12, when unit installation moved out of the sudoers file. The
+# two rules that used to do it (`install -m 0644 -o root -g root * …` and
+# `rm -f …`) were one command to full root: sudo flattens argv and fnmatches it,
+# so the `*` absorbed further `install` flags and `-t /etc/sudoers.d` redirected
+# the write. See ops/src/units.ts.
+#
+# This is NOT a knob for choosing where a task may write. The destination of
+# every install is join(unitDir, <validated unit name>) — nothing a task says
+# reaches this value. The loader refuses a unitDir inside hostAgent.workDir,
+# inside stateDir, inside a checkout or inside an instance's stateDir, because
+# all four are trees the agent account can already write, and a root-owned 0644
+# write into one of those would hand back exactly what was just taken away.
+#
+# Leave it alone unless you are the self-test, which points it at a temp
+# directory so the code that writes to /etc can be exercised at all.
+unitDir: /etc/systemd/system
+
 # ── Units whose health is checked around every task ───────────────────────
 # NOT an allowlist any more. The host agent runs systemctl itself and this list
 # does not constrain it. What it does is decide what gets `systemctl is-active`

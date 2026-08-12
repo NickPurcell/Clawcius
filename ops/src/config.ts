@@ -523,6 +523,24 @@ export type OpsConfig = {
    */
   npmPath: string;
   /**
+   * Where this project's systemd unit files are installed. `/etc/systemd/system`.
+   *
+   * A setting since 2026-08-12 because unit installation moved out of sudo and
+   * into the executor (ops/src/units.ts), and the self-test has to be able to
+   * point it at a temporary directory — the alternative is a suite that cannot
+   * exercise the code that writes to /etc at all, which is the code most worth
+   * exercising.
+   *
+   * It is NOT a knob for choosing where a task may write. The destination of
+   * every install is `join(unitDir, <validated unit name>)`; nothing a task says
+   * reaches this value, and the loader refuses a unitDir inside a checkout,
+   * inside the host agent's working directory, inside stateDir or inside any
+   * instance's state directory — all of which are trees the agent account can
+   * write, and any of which would turn "the executor installs units as root"
+   * back into "the agent chooses the bytes AND the path".
+   */
+  unitDir: string;
+  /**
    * Snapshots retained per instance, passed to `docker/snapshot.sh` as KEEP.
    *
    * Raised from that script's default of 8 because the executor now takes one
@@ -577,6 +595,7 @@ const DEFAULTS: OpsConfig = {
   dockerPath: '/usr/bin/docker',
   gitPath: '/usr/bin/git',
   npmPath: '/home/npurcell/.local/share/node/bin/npm',
+  unitDir: '/etc/systemd/system',
   snapshotKeep: 24,
   units: [],
   repos: [],
@@ -1185,6 +1204,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     dockerPath: absPath(root['dockerPath'], 'dockerPath', DEFAULTS.dockerPath),
     gitPath: absPath(root['gitPath'], 'gitPath', DEFAULTS.gitPath),
     npmPath: absPath(root['npmPath'], 'npmPath', DEFAULTS.npmPath),
+    unitDir: absPath(root['unitDir'], 'unitDir', DEFAULTS.unitDir),
     snapshotKeep: num(root['snapshotKeep'], 'snapshotKeep', DEFAULTS.snapshotKeep, 1, 500),
     units,
     repos,
@@ -1542,6 +1562,33 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
           `checkout repos[${repo.name}].path (${repo.path}). Claude Code reads CLAUDE.md and ` +
           'project settings from its working directory, so this would let anything merged ' +
           'into that repository supply standing instructions to a session with sudo.',
+      );
+    }
+  }
+
+  // ── Where units are installed ───────────────────────────────────────────
+  //
+  // Added 2026-08-12 with ops/src/units.ts, which took unit installation out of
+  // the sudoers file and gave it to the executor. The whole value of that move
+  // is that the DESTINATION is computed by root and cannot be influenced by the
+  // task: `join(unitDir, <validated name>)`. That argument collapses the moment
+  // unitDir is somewhere the agent account can already write — it would be
+  // handing the session a root-owned 0644 write into a tree it controls, which
+  // is a strictly worse version of the rule that was just deleted. So a unitDir
+  // inside any of these is refused at boot rather than discovered later.
+  for (const [label, dir] of [
+    ['hostAgent.workDir', config.hostAgent.workDir],
+    ['stateDir', config.stateDir],
+    ...config.repos.map((repo) => [`repos[${repo.name}].path`, repo.path] as const),
+    ...config.instances.map((instance) => [`instances[${instance.name}].stateDir`, instance.stateDir] as const),
+  ] as ReadonlyArray<readonly [string, string]>) {
+    if (isInside(config.unitDir, dir)) {
+      throw new Error(
+        `ops-config.yaml: unitDir (${config.unitDir}) is inside ${label} (${dir}). Unit files ` +
+          'are written there by the executor as root, mode 0644, and the point of doing that ' +
+          'in code rather than through a sudo rule is that the destination is not something a ' +
+          'task can choose. A unitDir inside a tree the agent account can already write gives ' +
+          'that back, with root ownership attached.',
       );
     }
   }

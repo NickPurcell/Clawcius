@@ -224,6 +224,22 @@ and will not start a session that can read one.
 named one by one, `docker run` is not granted at all, and `clawcius-ops.service`
 is deliberately absent from the restartable list.
 
+> **Changed again on 2026-08-12, after an adversarial audit of that file.**
+> Three grants were deleted outright and one was narrowed:
+>
+> - `install` and `rm -f` against `/etc/systemd/system`. The `*` between the
+>   pinned flags and the destination absorbed further `install` flags, which GNU
+>   install applies last-wins, so `-t /etc/sudoers.d` redirected the write:
+>   full root, one command. Unit installs are now done by the executor
+>   (`ops/src/units.ts`) and need no sudo rule at all.
+> - `journalctl`. It also permitted `--vacuum-time`/`--rotate`, i.e. destroying
+>   the journal. **This one needs an action from you — see § 3a below.**
+> - `docker inspect *` → enumerated `--format` invocations. The wildcard printed
+>   `Config.Env`, which is the other agents' API keys.
+>
+> If you are re-installing the file over a version from 2026-08-11, nothing else
+> about the procedure changes.
+
 **Check it parses before you install it, from a second shell that already holds
 root.** A syntax error in one file under `/etc/sudoers.d` breaks `sudo` for
 everybody, including the shell you would use to fix it.
@@ -290,6 +306,49 @@ is.
 `systemctl restart clawcius.service` are the same thing to systemd and
 different strings to sudo, and only the second is granted. A refusal on a unit
 you are certain is in the list is almost always this.
+
+---
+
+## 3a. The `systemd-journal` group — NEW on 2026-08-12
+
+Reading `journalctl -u <unit>` was the pain point this whole service exists to
+remove, and as of 2026-08-12 it is **not** a sudo grant. The old rule was
+`journalctl *`, described in the file as "read-only, any unit". It was not:
+`--vacuum-time=1s`, `--vacuum-size=1`, `--rotate`, `--flush` and
+`--relinquish-var` all mutate or destroy the host's log history, as root, in one
+command — and journalctl's own option parsing permutes, so no `*` anywhere in a
+sudoers pattern could have excluded them.
+
+The replacement is the group systemd provides for exactly this:
+
+```sh
+sudo usermod -aG systemd-journal clawcius-ops
+sudo systemctl restart clawcius-ops     # memberships are read at process start
+```
+
+### Verify
+
+```sh
+# Reading works, with NO sudo:
+sudo -u clawcius-ops journalctl -u clawcius.service -n 5 --no-pager
+
+# Writing does not, with or without:
+sudo -u clawcius-ops journalctl --vacuum-time=1s          # refused
+sudo -u clawcius-ops sudo -n /usr/bin/journalctl -n 1     # refused: no such rule
+```
+
+### If you skip this step
+
+Nothing breaks and nothing is unsafe — the agent simply cannot read the journal,
+which is the single most useful thing it does. It will show up as a warning on
+**every** task, in the journal and in `ops-status.json`, naming the one command
+above; `ops/src/agent-user.ts` emits it. It is a warning rather than a refusal on
+purpose: a missing `usermod` must not take the ops mechanism offline, because the
+way that gets fixed at 3am is by putting the `journalctl *` rule back.
+
+**Do not use `adm` instead.** It also reads `/var/log/auth.log`, which is where
+sudo records what this account did, and it stays on the refused-groups list —
+the executor will refuse to start a session as a member of it.
 
 ---
 

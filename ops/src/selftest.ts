@@ -109,6 +109,14 @@ import {
   standingPrompt,
   DRY_RUN_TOOL_DENY,
 } from './host-agent.js';
+import {
+  drainUnitRequests,
+  installUnit,
+  parseUnitRequest,
+  removeUnit,
+  validateUnitName,
+  MAX_UNIT_BYTES,
+} from './units.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -219,6 +227,11 @@ function makeHost(options: {
   }
   mkdirSync(join(root, 'repo'), { recursive: true });
   mkdirSync(join(root, 'tools'), { recursive: true });
+  // Stands in for /etc/systemd/system. The suite cannot write the real one and
+  // must not want to; what it needs to prove is that the executor computes the
+  // destination itself and that nothing a task says can move it, and a temp
+  // directory proves that exactly as well as /etc would.
+  mkdirSync(join(root, 'units-installed'), { recursive: true });
   // The build steps run with cwd set to these, and execFile fails to spawn at
   // all if the cwd does not exist — which would look like a missing binary
   // rather than a missing directory.
@@ -503,6 +516,7 @@ emit({
       `dockerPath: ${docker}`,
       `gitPath: ${git}`,
       `npmPath: ${npm}`,
+      `unitDir: ${join(root, 'units-installed')}`,
       `snapshotKeep: ${options.snapshotKeep ?? 24}`,
       'hostAgent:',
       `  enabled: ${options.hostAgent === false ? 'false' : 'true'}`,
@@ -1904,6 +1918,426 @@ test('a live task snapshots first, runs the session, and reports back', async ()
 
   const finished = journalEntries(host.config).filter((entry) => entry['kind'] === 'finished');
   assert.ok(finished.some((entry) => /host agent session/.test(String(entry['detail']))));
+
+  executor.stop();
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Unit install/remove — what replaced the `install`/`rm` sudo rules
+// ══════════════════════════════════════════════════════════════════════════
+//
+// These are the tests that would have failed against the sudoers rules deleted
+// on 2026-08-12, if a sudoers rule were a thing one could write a test for. It
+// is not, and that is half the argument for moving the capability into code: a
+// `Cmnd_Alias` is asserted about by reading it carefully and being right, and
+// the six-lens audit that produced this change found four separate places where
+// somebody had read one carefully and been wrong.
+//
+// The name validation is the load-bearing part. Every exploit in that audit
+// came down to a string reaching a program that re-parsed it — as flags, as a
+// second file, as a path with a `..` in it — so the assertions below are mostly
+// "this string is refused, and nothing was written".
+
+/** A minimal but real unit file, so the content check has something to accept. */
+const UNIT_BODY = '[Unit]\nDescription=selftest\n\n[Service]\nExecStart=/bin/true\n';
+
+/** A staging + destination pair in a temp directory, with nothing else around. */
+function unitFixture(suffix: string): {
+  staging: string;
+  unitDir: string;
+  stage: (name: string, body?: string) => string;
+} {
+  const root = mkdtempSync(join(tmpdir(), `ops-units-${suffix}-`));
+  const staging = join(root, 'staging');
+  const unitDir = join(root, 'installed');
+  mkdirSync(staging, { recursive: true });
+  mkdirSync(unitDir, { recursive: true });
+  return {
+    staging,
+    unitDir,
+    stage: (name, body = UNIT_BODY) => {
+      const path = join(staging, name);
+      writeFileSync(path, body);
+      return path;
+    },
+  };
+}
+
+test('a unit name with a separator, a "..", a space or the wrong suffix is refused', () => {
+  // The four the task brief names, plus the ones the deleted sudo rules
+  // actually accepted. Each is checked through `validateUnitName` AND through
+  // `installUnit`, because a validator nobody calls is a comment.
+  const fixture = unitFixture('names');
+  const hostile: Array<[string, RegExp]> = [
+    // A separator: the destination is built by the executor and a name is a
+    // NAME. `/etc/systemd/system/clawcius*.service` accepted the whole left
+    // half of this string as part of its wildcard.
+    ['clawcius/../ssh.service', /path separator/],
+    ['/etc/sudoers.d/clawcius', /path separator/],
+    ['clawcius\\ssh.service', /path separator/],
+    // Traversal, without a separator in the first position.
+    ['clawcius..service', /"\.\."/],
+    // Whitespace. This is the whole `fnmatch` defect in one assertion: sudo
+    // joined argv with spaces before matching, so a wildcard that matched a
+    // space matched any number of extra arguments — `-t /etc/sudoers.d`, say.
+    ['clawcius x.service', /whitespace/],
+    ['clawcius\t.service', /whitespace/],
+    // The whole flag-smuggling exploit as a single "name". It trips the
+    // separator check first, which is why the expectation says so: the checks
+    // run in a fixed order and the first one to fire is the one that explains
+    // itself.
+    ['-m 4755 /bin/bash clawcius.service', /path separator/],
+    // The suffix. Drop-ins are how `sshd.service.d/override.conf` would get in.
+    ['clawcius.conf', /not a unit name/],
+    ['clawcius.service.d', /not a unit name/],
+    ['clawcius.socket', /not a unit name/],
+    ['clawcius.mount', /not a unit name/],
+    ['clawcius.timer.bak', /not a unit name/],
+    ['clawcius', /not a unit name/],
+    ['', /empty/],
+    // Case: systemd is case-sensitive and two spellings of one unit is a way to
+    // install a second copy of something under a name a human skims past.
+    ['Clawcius.service', /not a unit name/],
+    // A leading hyphen is an argument to anything that later handles this name.
+    ['-rf.service', /starts with "-"/],
+    // Not this project's. /etc/systemd/system OVERRIDES /lib/systemd/system, so
+    // without the prefix check this is how sshd gets replaced — which is what
+    // the `..` climb-out bought, and what the file claimed was out of reach.
+    ['ssh.service', /not one of this project's units/],
+    ['sshd.service', /not one of this project's units/],
+    ['docker.service', /not one of this project's units/],
+    ['clawciusfoo.service', /not one of this project's units/],
+    // The executor's own unit. Rewriting it is root at the next boot with
+    // nothing watching, and `clawcius*` matched it.
+    ['clawcius-ops.service', /is this executor's own unit/],
+  ];
+
+  for (const [name, expected] of hostile) {
+    const verdict = validateUnitName(name);
+    assert.equal(verdict.ok, false, `${JSON.stringify(name)} must not validate`);
+    if (!verdict.ok) {
+      assert.match(verdict.reason, expected, `the refusal for ${JSON.stringify(name)} says why`);
+    }
+
+    const result = installUnit({
+      unit: name,
+      unitDir: fixture.unitDir,
+      stagingDir: fixture.staging,
+      dryRun: false,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /^REFUSED: /);
+  }
+
+  // And nothing was created, anywhere, by any of them.
+  assert.deepEqual(readdirSync(fixture.unitDir), []);
+
+  // Non-strings are refused rather than coerced. `{"unit": 42}` is a rejection.
+  for (const value of [42, null, undefined, ['clawcius.service'], { name: 'x' }]) {
+    const verdict = validateUnitName(value);
+    assert.equal(verdict.ok, false);
+  }
+
+  // The names that MUST work, or the capability is gone rather than fixed.
+  for (const name of [
+    'clawcius.service',
+    'clawcius-status.service',
+    'clawcius-snapshot.timer',
+    'hamachi.service',
+    'hamachi-container.service',
+    'oj.service',
+  ]) {
+    const verdict = validateUnitName(name);
+    assert.equal(verdict.ok, true, `${name} must still be installable`);
+  }
+});
+
+test('an install lands at the path the executor computed, 0644, and nowhere else', () => {
+  const fixture = unitFixture('install');
+  fixture.stage('clawcius-selftest.service');
+
+  const result = installUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.path, join(fixture.unitDir, 'clawcius-selftest.service'));
+  assert.equal(readFileSync(result.path, 'utf8'), UNIT_BODY);
+  // The claim the old sudoers comment made and could not keep. It is kept here
+  // by `fchmod` on the descriptor that was written, not by a pattern asking an
+  // `install` invocation to behave — `install -m 0644 -m 0777` really does
+  // produce 0777, which is why the rule pinned nothing.
+  assert.equal(statSync(result.path).mode & 0o7777, 0o644);
+  // Exactly one file, and no leftover temp: an interrupted install must not
+  // leave `.clawcius-selftest.service.tmp` for systemd to find.
+  assert.deepEqual(readdirSync(fixture.unitDir), ['clawcius-selftest.service']);
+
+  // Reinstalling replaces it in place, atomically.
+  fixture.stage('clawcius-selftest.service', `${UNIT_BODY}# second\n`);
+  const again = installUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(again.ok, true, again.detail);
+  assert.match(readFileSync(result.path, 'utf8'), /# second/);
+  assert.deepEqual(readdirSync(fixture.unitDir), ['clawcius-selftest.service']);
+
+  const removed = removeUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(removed.ok, true, removed.detail);
+  assert.deepEqual(readdirSync(fixture.unitDir), []);
+
+  // Removing what is not there says so instead of succeeding quietly.
+  const missing = removeUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.detail, /not installed/);
+});
+
+test('a staged symlink is refused rather than published into /etc/systemd/system', () => {
+  // CWE-59, and the exact exploit the deleted rule permitted with no symlink at
+  // all: `install … /root/.ssh/id_ed25519 /etc/systemd/system/clawcius-leak.service`
+  // copied any root-only file somewhere world-readable. The staging directory
+  // belongs to the agent account, so the same thing is available here by
+  // pointing a staged name at a file the ROOT executor can read.
+  const fixture = unitFixture('symlink');
+  const secret = join(fixture.staging, '..', 'pretend-id_ed25519');
+  writeFileSync(secret, 'PRIVATE KEY MATERIAL\n');
+  symlinkSync(secret, join(fixture.staging, 'clawcius-leak.service'));
+
+  const result = installUnit({
+    unit: 'clawcius-leak.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /could not open .* as a plain file/);
+  assert.deepEqual(readdirSync(fixture.unitDir), [], 'nothing was published');
+
+  // Same refusal for a directory, and for a staging directory that has itself
+  // been replaced by a symlink — the check is on the object, never on the name.
+  mkdirSync(join(fixture.staging, 'clawcius-dir.service'));
+  const asDir = installUnit({
+    unit: 'clawcius-dir.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(asDir.ok, false);
+
+  const swapped = join(fixture.staging, '..', 'staging-link');
+  symlinkSync(fixture.staging, swapped);
+  const throughLink = installUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: swapped,
+    dryRun: false,
+  });
+  assert.equal(throughLink.ok, false);
+  assert.match(throughLink.detail, /symlink/);
+
+  // And a symlink where the INSTALLED unit belongs is refused rather than
+  // silently replaced: something else put it there.
+  fixture.stage('clawcius-planted.service');
+  symlinkSync('/etc/passwd', join(fixture.unitDir, 'clawcius-planted.service'));
+  const overPlanted = installUnit({
+    unit: 'clawcius-planted.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(overPlanted.ok, false);
+  assert.match(overPlanted.detail, /not a regular file/);
+  assert.equal(lstatSync(join(fixture.unitDir, 'clawcius-planted.service')).isSymbolicLink(), true);
+  const removePlanted = removeUnit({
+    unit: 'clawcius-planted.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: false,
+  });
+  assert.equal(removePlanted.ok, false);
+  assert.match(removePlanted.detail, /Refusing to unlink/);
+});
+
+test('an empty, oversized or non-unit staged file is not installed', () => {
+  const fixture = unitFixture('content');
+
+  fixture.stage('clawcius-empty.service', '');
+  assert.match(
+    installUnit({ unit: 'clawcius-empty.service', unitDir: fixture.unitDir, stagingDir: fixture.staging, dryRun: false }).detail,
+    /is empty/,
+  );
+
+  fixture.stage('clawcius-big.service', 'x'.repeat(MAX_UNIT_BYTES + 1));
+  assert.match(
+    installUnit({ unit: 'clawcius-big.service', unitDir: fixture.unitDir, stagingDir: fixture.staging, dryRun: false }).detail,
+    /over the .* ceiling. It was not read/,
+  );
+
+  // Not a unit file at all. This is what a session that has been talked into
+  // "just put this file somewhere root-owned" produces.
+  fixture.stage('clawcius-notaunit.service', 'clawcius-ops ALL=(ALL) NOPASSWD: ALL\n');
+  assert.match(
+    installUnit({ unit: 'clawcius-notaunit.service', unitDir: fixture.unitDir, stagingDir: fixture.staging, dryRun: false }).detail,
+    /no \[Section\] header/,
+  );
+
+  assert.deepEqual(readdirSync(fixture.unitDir), []);
+});
+
+test('a dry run stages nothing into the unit directory', () => {
+  const fixture = unitFixture('dryrun');
+  fixture.stage('clawcius-selftest.service');
+  const result = installUnit({
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+    dryRun: true,
+  });
+  // Reported as ok AND as skipped, the same shape `Runner` uses: a dry run that
+  // reported failure would train whoever reads a week of it to ignore failures.
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.match(result.detail, /DRY RUN/);
+  assert.deepEqual(readdirSync(fixture.unitDir), []);
+});
+
+test('a unit request carries a name and nothing else — no path, no mode, no owner', () => {
+  // The shape of the request is the other half of the fix. The deleted sudo
+  // rule let the caller supply the source, the destination, the mode and the
+  // owner; this one has two fields and neither is a path.
+  const good = parseUnitRequest('{"op":"install","unit":"clawcius-x.service"}');
+  assert.equal(good.ok, true);
+
+  for (const body of [
+    '{"op":"install","unit":"clawcius-x.service","mode":"4755"}',
+    '{"op":"install","unit":"clawcius-x.service","dest":"/etc/sudoers.d/clawcius"}',
+    '{"op":"install","unit":"clawcius-x.service","owner":"root"}',
+    '{"op":"install","unit":"clawcius-x.service","source":"/root/.ssh/id_ed25519"}',
+  ]) {
+    const parsed = parseUnitRequest(body);
+    assert.equal(parsed.ok, false);
+    if (!parsed.ok) assert.match(parsed.reason, /unknown field/);
+  }
+
+  for (const body of [
+    'not json at all',
+    '[]',
+    '"clawcius-x.service"',
+    '{"op":"chmod","unit":"clawcius-x.service"}',
+    '{"op":"install"}',
+    '{"unit":"clawcius-x.service"}',
+  ]) {
+    assert.equal(parseUnitRequest(body).ok, false, body);
+  }
+});
+
+test('the desk serves a request, answers it, and never serves it twice', () => {
+  const fixture = unitFixture('desk');
+  const requests = join(fixture.staging, '..', 'requests');
+  const results = join(fixture.staging, '..', 'results');
+  mkdirSync(requests);
+  mkdirSync(results);
+  fixture.stage('clawcius-desk.service');
+
+  const logs: string[] = [];
+  const drain = (max = 8) =>
+    drainUnitRequests({
+      requestDir: requests,
+      resultDir: results,
+      stagingDir: fixture.staging,
+      unitDir: fixture.unitDir,
+      dryRun: false,
+      max,
+      onLog: (line) => logs.push(line),
+    });
+
+  writeFileSync(join(requests, '1.json'), '{"op":"install","unit":"clawcius-desk.service"}');
+  const served = drain();
+  assert.equal(served.length, 1);
+  assert.equal(served[0]?.ok, true, served[0]?.detail);
+  assert.equal(existsSync(join(fixture.unitDir, 'clawcius-desk.service')), true);
+
+  // The answer is where the session can read it, and the request is gone. Gone
+  // BEFORE it was acted on, like an ops request: a removal that throws must not
+  // come back on the next drain.
+  const answer = JSON.parse(readFileSync(join(results, '1.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(answer['ok'], true);
+  assert.equal(answer['path'], join(fixture.unitDir, 'clawcius-desk.service'));
+  assert.deepEqual(readdirSync(requests), []);
+  assert.deepEqual(drain(), [], 'a served request does not come back');
+
+  // A refusal is served and answered too, rather than being dropped silently —
+  // a session that gets no answer retries, and a run of refusals is what
+  // somebody probing the name validation looks like from outside.
+  writeFileSync(join(requests, '2.json'), '{"op":"remove","unit":"/etc/sudoers.d/clawcius"}');
+  const refused = drain();
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0]?.ok, false);
+  assert.match(String(refused[0]?.detail), /path separator/);
+
+  // Implausible names, oversized files and non-files are discarded unread, and
+  // the ceiling bounds a session that loops.
+  writeFileSync(join(requests, 'no-suffix'), '{"op":"install","unit":"clawcius-desk.service"}');
+  writeFileSync(join(requests, '3.json'), 'x'.repeat(9000));
+  assert.deepEqual(drain(), []);
+  assert.deepEqual(readdirSync(requests), []);
+
+  for (let n = 0; n < 5; n += 1) {
+    writeFileSync(join(requests, `4${n}.json`), '{"op":"install","unit":"clawcius-desk.service"}');
+  }
+  assert.equal(drain(2).length, 2, 'the ceiling stops after two');
+  assert.equal(readdirSync(requests).length, 3, 'the rest are left where they are');
+});
+
+test('a task can install a unit without sudo, and it lands in the journal as its own kind', async () => {
+  // End to end, through the real executor: the fake session writes the unit and
+  // files the request with the shell, exactly as the briefing tells it to, and
+  // the executor — which is the only thing here that could be root — does the
+  // write. No `install` command appears anywhere, because there is no longer a
+  // sudo rule for one.
+  const host = makeHost({ dryRun: false, suffix: 'unitdesk' });
+  host.setStatus('clawcius', { at: Date.now(), liveCount: 0 });
+  const staging = join(host.root, 'host-agent', 'units');
+  const requests = join(host.root, 'host-agent', 'unit-requests');
+  host.setPlan([
+    `printf '[Unit]\\nDescription=x\\n' > ${join(staging, 'clawcius-e2e.service')}`,
+    `printf '{"op":"install","unit":"clawcius-e2e.service"}' > ${join(requests, 'a.json.tmp')}` +
+      ` && mv ${join(requests, 'a.json.tmp')} ${join(requests, 'a.json')}`,
+    'sleep 2',
+  ]);
+
+  const executor = new Executor(host.config);
+  executor.intake({
+    requester: 'clawcius',
+    name: 'a.json',
+    body: '{"verb":"task","instance":"clawcius","task":"install the new unit"}',
+  });
+  await settle(executor, 60_000);
+
+  const installed = join(host.root, 'units-installed', 'clawcius-e2e.service');
+  assert.equal(existsSync(installed), true, 'the executor installed it');
+  assert.equal(statSync(installed).mode & 0o7777, 0o644);
+
+  const entries = journalEntries(host.config);
+  const unitEntry = entries.find((entry) => entry['kind'] === 'unit');
+  assert.ok(unitEntry, 'the install is its own journal kind, not an audited sudo command');
+  assert.equal(unitEntry?.['what'], 'install clawcius-e2e.service');
+  assert.equal(unitEntry?.['command'], installed, 'the destination is recorded');
+  assert.equal(unitEntry?.['requester'], 'clawcius', 'and who asked for the task that did it');
 
   executor.stop();
 });
