@@ -269,15 +269,43 @@ account that cannot become root.
 **The trust model has now changed three times in two days, so here is the
 honest state of it in one place:**
 
-| | 2026-08-09 | 2026-08-10 | 2026-08-11 |
-|---|---|---|---|
-| What bounds the privileged work | a closed list of seven verbs with argument allowlists | nothing in front of prose; a snapshot, a rollback and an audit behind it | the same, **plus** an unprivileged account, an enumerated sudoers file, and no docker socket |
-| Who the privileged work runs as | root, for two build commands, dropped to the checkout's owner | the whole session, as the checkout's owner — i.e. the operator, i.e. the `docker` group, i.e. root | `clawcius-ops`, refused at start if it is root-equivalent |
-| Is the sudoers file a boundary | it was four rules for the waker | **no** — `docker run -v /:/host` went round it | **yes, mostly** — see § Sudoers for the one gap, which is unit-install plus restart |
-| Is the audit tamper-proof | n/a | **no** — the session could become root and rewrite it | **hard, not impossible** — same one gap, and it is two obvious lines in the log |
-| Can the session read the operator's credentials | yes | yes — `.env`, `~/.claude`, `~/.ssh` | **no**, and the daemon refuses to start it if it can |
+| | 2026-08-09 | 2026-08-10 | 2026-08-11 | 2026-08-12 |
+|---|---|---|---|---|
+| What bounds the privileged work | a closed list of seven verbs with argument allowlists | nothing in front of prose; a snapshot, a rollback and an audit behind it | the same, **plus** an unprivileged account, an enumerated sudoers file, and no docker socket | the same, with the sudoers file's four holes closed and its false comments corrected |
+| Who the privileged work runs as | root, for two build commands, dropped to the checkout's owner | the whole session, as the checkout's owner — i.e. the operator, i.e. the `docker` group, i.e. root | `clawcius-ops`, refused at start if it is root-equivalent | unchanged |
+| Is the sudoers file a boundary | it was four rules for the waker | **no** — `docker run -v /:/host` went round it | it *claimed* "yes, mostly, one gap" — and that claim was **wrong**: `sudo install` was one command to full root | **yes** — the one remaining gap is unit-content plus restart, and it is now genuinely the only one |
+| Is the audit tamper-proof | n/a | **no** — the session could become root and rewrite it | **no**, though nobody knew it: `rm -f` reached `journal.jsonl` and `journalctl --vacuum-time` erased the system journal | **hard, not impossible** — the remaining path is install-a-unit-and-restart, which is three obvious lines in the log |
+| Can the session read the operator's credentials | yes | yes — `.env`, `~/.claude`, `~/.ssh` | **no** for `.env`/`~/.claude`/`~/.ssh` — but `sudo install /root/.ssh/id_ed25519 …/clawcius-x.service` copied any root-only file out, and `docker inspect` printed the other agents' API keys | **no**, and both of those are closed |
+
+The 2026-08-11 column is written the way it is on purpose: it is what this
+document *said* on 2026-08-11, next to what was actually true. Three of those
+five rows were wrong, and they were wrong because they described the sudoers
+file's comments rather than its rules. A trust model is not a summary of what a
+config file says about itself.
 
 Everything below is what is still true.
+
+### The 2026-08-12 audit
+
+`ops/clawcius-sudoers` was audited adversarially — six independent lenses, then
+a two-of-three refutation round; nine findings survived. The mechanism behind
+all four of the exploitable ones is one sentence:
+
+> sudo joins the arguments into **one string** and `fnmatch`es it without
+> `FNM_PATHNAME`, so a `*` in an argument position is not "one argument", it is
+> **any number of arguments** — handed to a program that re-parses them as flags.
+
+| Finding | What it actually granted | Fix |
+|---|---|---|
+| `install -m 0644 -o root -g root * /etc/systemd/system/clawcius*.service` | **Full root in one command.** `-t /etc/sudoers.d` redirects the write (GNU install applies flags last-wins), so an attacker-authored `clawcius-ops ALL=(ALL) NOPASSWD: ALL` lands in `/etc/sudoers.d` at 0644 root:root. Also `-m 4755 -t /tmp /bin/bash` for a setuid shell, and an absolute source to copy `/root/.ssh/id_ed25519` anywhere readable. | **Rule deleted.** Unit installs moved into `ops/src/units.ts`. |
+| `rm -f /etc/systemd/system/clawcius*.service` | **Arbitrary root deletion.** Two project-prefixed names with anything between them matched, including `/var/lib/clawcius-ops/journal.jsonl` — the audit log, the breaker, the armed deadlines. | **Rule deleted.** Same replacement. |
+| `..` in either destination | `/etc/systemd/system/clawcius/../ssh.service` matched both rules, so "namespaced" reached sshd and every other unit file. | Subsumed by the deletions; the code-side validator refuses `..` and separators outright. |
+| `journalctl *`, documented "read-only" | `--vacuum-time=1s`, `--rotate`, `--flush`, `--relinquish-var`: erasing the host journal as root, in one command. | **Rule deleted.** Journal reading is `systemd-journal` group membership. |
+| `docker inspect *` in a READ alias | Prints `Config.Env` for the sibling agent containers — the other agents' API keys — plus their mount table. Undisclosed, while the far smaller `systemctl show` leak was documented two sections up. | Enumerated `--format` invocations that cannot print an environment. |
+
+The other four survivors were the file's own comments claiming things that were
+not true. Those are corrected in place, with the date and the reason, which is
+the part of this change most worth reading.
 
 ### The host agent must never ingest untrusted content
 
@@ -533,17 +561,23 @@ Honest list, and it is longer than it was.
 - **The audit is much harder to tamper with than it was, and still not
   tamper-proof.** Until 2026-08-11 this entry read: *"the session runs as
   `npurcell`, and `npurcell` is in the `docker` group … anything that can become
-  root can rewrite `journal.jsonl`"*. That is no longer the case: the agent
-  account is in no root-equivalent group, has no docker socket, and no sudoers
-  rule reaches `/var/lib/clawcius-ops`, which is 0750 and root-owned. The
-  remaining path is the one named in § Sudoers — overwrite a unit file, reload,
-  restart a named unit — which is root in two commands that are themselves in
-  the journal, fsynced before they ran. It is a record against carelessness and
-  confusion, and now also against a casual adversary; it is not a record against
-  one who is willing to be obvious.
+  root can rewrite `journal.jsonl`"*. On 2026-08-11 it was rewritten to say that
+  "no sudoers rule reaches `/var/lib/clawcius-ops`", which was **false** — `rm
+  -f /etc/systemd/system/clawcius*.service` reached it, along with anything else
+  on the disk, and `journalctl --vacuum-time=1s` erased the system journal
+  beside it. Both rules are gone as of 2026-08-12 and the sentence is now true
+  by inspection: no remaining rule names that directory, and no remaining rule
+  takes a `*` in a writing position at all. The remaining path is the one named
+  in § Sudoers — install a unit, reload, restart a named unit — which is root in
+  three steps that are themselves in the journal, fsynced before they ran, the
+  first of them as its own `"kind":"unit"` entry. It is a record against
+  carelessness and confusion, and now also against a casual adversary; it is not
+  a record against one who is willing to be obvious.
 - **A single account holds both the deploy capability and the debugging
-  capability.** The agent can install `clawcius.service` *and* restart it, which
-  is the escalation above. Splitting those across two accounts with a human
+  capability.** The agent can get `clawcius.service` installed *and* restart it,
+  which is the escalation above. The unit's *content* is still written by the
+  session — moving the install into the executor pinned the destination, the
+  mode and the owner, not the bytes. Splitting those across two accounts with a human
   between them is possible and has not been done, because the operator's whole
   complaint was about being the human between things.
 - **`mayRequest` bounds what an instance may ASK for, not what the agent may
@@ -681,11 +715,31 @@ can do rather than a description of the polite route.
 | `systemctl restart` / `start` / `stop` / `enable` / `disable` / `reset-failed` | **Named units only**: `clawcius`, `hamachi`, `clawcius-status`, the two `*-container` units, `clawcius-netguard`, the snapshot service and timers, and `oj` / `oj-container` (which do not exist yet). | The old `restart *` permitted `sshd`, `systemd-journald` and the firewall. Naming them costs one line per new unit, which is the right price for the step that runs new code as root forever. |
 | `systemctl daemon-reload` | Bare, no arguments | Makes an installed unit visible. Changes nothing on its own. |
 | `systemctl status` / `is-active` / `is-enabled` / `is-failed` / `show` / `cat` / `list-units` / `list-timers` | **Any unit** | Reading state cannot break anything, and an agent debugging `clawcius.service` needs to look at what it depends on. |
-| `journalctl` | Any | The original pain point: the operator was reading unit logs out loud to an agent that could not see them. |
-| `docker ps` / `images` / `inspect` / `logs` / `stats --no-stream` / `version` / `info` | Read-only; `logs` restricted to the three agent containers | This section did not exist before — the previous grantee reached docker through group membership, so a rule "would add nothing except the false impression that docker access is being controlled here". |
+| `docker ps` / `images` / `logs` / `stats --no-stream` / `version` / `info` | Read-only; `logs` restricted to the three agent containers | This section did not exist before — the previous grantee reached docker through group membership, so a rule "would add nothing except the false impression that docker access is being controlled here". |
+| `docker inspect --format …` | **Enumerated**: six state formats × the three agent containers, plus `{{.Id}}` for the three images | Narrowed on 2026-08-12. The previous `docker inspect *` printed `Config.Env` — the sibling agents' API keys — from an alias called READ. No `*` on these lines: a trailing one re-admits a second `--format`, and docker takes the last. |
 | `docker restart` / `stop` / `start` | `clawcius-agent`, `hamachi-agent`, `oj-agent` | "The agent container is wedged" is a real task. |
 | `mkdir -p`, `chown`, `chmod` | **Exact paths** under `/var/lib/{clawcius,hamachi,oj}/run` | Repair, mostly: the executor creates and chowns every spool at boot. |
-| `install -m 0644 -o root -g root … /etc/systemd/system/{clawcius,hamachi,oj}*.{service,timer}`, `rm -f` of the same | Namespaced destinations | Installing this project's units, with the mode and ownership pinned by the rule. |
+
+**Removed on 2026-08-12, and not replaced by a narrower rule:**
+
+| Was | Why it is gone | What does the job now |
+|---|---|---|
+| `journalctl` (any argument) | It was not read-only. `--vacuum-time`/`--rotate`/`--flush` destroy the journal, and no sudoers pattern can exclude them — journalctl's getopt permutes, so any surviving `*` re-admits them. | `sudo usermod -aG systemd-journal clawcius-ops`. Plain `journalctl -u <unit>` with no sudo. `agentWarnings` nags on every task until the membership exists. |
+| `install …`, `rm -f …` against `/etc/systemd/system` | One command to full root; see the audit table above. Unfixable in place. | `ops/src/units.ts` — the executor writes the file itself, as root. |
+
+**Installing a unit, since 2026-08-12.** The session writes the content to
+`<hostAgent.workDir>/units/<name>` and drops
+`{"op":"install","unit":"<name>"}` into `<workDir>/unit-requests/`; the executor
+serves it within a second, while the session is still running, and writes the
+answer to `<workDir>/unit-results/`. It validates the NAME against
+`^[a-z0-9][a-z0-9-]*\.(service|timer)$` — with separate refusals for separators,
+`..`, whitespace and control bytes, so the message says which — requires one of
+this project's prefixes, refuses `clawcius-ops.service` outright, reads the
+content through an `O_NOFOLLOW` descriptor so a staged symlink cannot be
+published, and writes to a path **it** computes at mode 0644 root:root set on
+the descriptor. The request has two fields and neither is a path. Every
+operation and every refusal is a `"kind":"unit"` journal entry naming the
+destination.
 
 **`clawcius-ops.service` is deliberately not on the restartable list.** It is
 the process that starts the session; restarting it kills the task mid-flight,
@@ -703,7 +757,12 @@ cp` wearing a container), `apt`/`npm`/`pip` as root, `systemctl edit` (opens
 docker clawcius-ops` is now specifically the thing this account must not be able
 to do to itself — `setfacl`/`chattr`/`mount` (each a way past the mode bits the
 secret check reads), and any blanket interpreter: no `sudo sh`, `bash`,
-`python3`, `env`, `tee`, `cp`, `dd`, `mv`, `ln` or `find`.
+`python3`, `env`, `tee`, `cp`, `dd`, `mv`, `ln` or `find` — and, since
+2026-08-12, `install`, `rm` and `journalctl`, which belonged in that last list
+from the beginning. `install` is `cp` that can also set the mode and the owner;
+`rm` with a wildcard argument spec cannot be made to mean one file; `journalctl`
+can delete the journal. Each was treated as a special case for two days because
+the flags on the rule looked like a constraint.
 
 **No rule may ever name a path inside the checkout.** The agent can write
 `/home/npurcell/clawcius` (that is what the shared group is for), so
@@ -721,6 +780,16 @@ argv it builds.**
   unit at all. That was documented and shrugged off on the grounds that the
   docker group made it moot. It is not moot any more, so the paths are
   enumerated.
+- **A fixed prefix and a fixed suffix are not a constraint.** The 2026-08-11
+  version of the file said a surviving `*` was safe if what it matched "cannot
+  escape a fixed prefix AND a fixed suffix". That bounds the first and last
+  token of the flattened string and nothing in between — not the number of
+  arguments, not whether they are flags. It is the sentence the audit walked
+  through four times. The rule now is narrower: **a `*` may appear only after a
+  pinned, read-only subcommand, where the worst thing it can absorb is more
+  read-only flags for that same subcommand.** When a capability cannot be
+  expressed that way, it belongs in the executor — which is root already and can
+  build an argv — and not in a cleverer pattern.
 - **Unit names need their suffix.** `systemctl restart clawcius` and
   `… clawcius.service` are the same to systemd and different strings to sudo,
   and only the second is granted. A refusal on a unit you are sure is listed is
@@ -1153,6 +1222,11 @@ ops/
                          because that is who the session runs as"; that
                          question moved to agent-user.ts on 2026-08-11 and the
                          reversal is explained there.
+    units.ts             INSTALLING AND REMOVING UNIT FILES, as root, with the
+                         destination/mode/owner built in code. It exists
+                         because the two sudo rules that used to do this were
+                         one command to full root; the header records the
+                         exploits. Read it with clawcius-sudoers open.
     request.ts           parsing and validating hostile spool content
     spool.ts             one directory-as-a-queue per instance; the caps, and
                          the stamp that says whose it was
@@ -1464,8 +1538,18 @@ use it.
   the environment, not `setuid(2)` or `withSupplementaryGroups`. Check
   `ps -o user= -p <pid>` on a live session and `id` inside a task's own report.
 - **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
-  a shell that already has root. The rewrite is larger than the file it
-  replaced, so this matters more than it did.
+  a shell that already has root. Still true on 2026-08-12, and re-checked rather
+  than copied forward: the machine it is edited on has no `sudo` and no `visudo`
+  binary at all. Two things in it are new syntax as of that date and are what to
+  look at if it does not parse — the `{{.State.Status}}` format strings on the
+  `docker inspect` lines, and the escaped colon in `clawcius-agent\:latest`.
+- **No unit has been installed through `ops/src/units.ts` on a real host.** The
+  self-test drives it against a temporary directory (`unitDir`), which proves
+  the validation, the `O_NOFOLLOW` refusals, the computed destination, the mode
+  and the atomic replace — but not the `fchown(0, 0)`, which is skipped when
+  the process is not root, and not that systemd picks the file up. First install
+  on the host: check `ls -l /etc/systemd/system/clawcius-*` for `root root` and
+  `-rw-r--r--`, and `systemctl cat` the unit.
 - **No unit in `systemd/` has been loaded since the audit below** — which is
   exactly the condition that produced the two units that shipped unable to run
   at all.

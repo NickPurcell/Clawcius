@@ -135,6 +135,16 @@ export type AgentUserResult =
  * names. Naming a group that does not exist on this host costs nothing; missing
  * one costs the entire containment story.
  */
+/**
+ * The one group this account is meant to be IN.
+ *
+ * systemd's own group for reading the journal, and nothing else — it is not
+ * `adm`, which also reads /var/log/auth.log where sudo records what this agent
+ * did. See the warning in `agentWarnings` for why journal access moved here from
+ * the sudoers file on 2026-08-12.
+ */
+export const JOURNAL_GROUP = 'systemd-journal';
+
 export const ROOT_EQUIVALENT_GROUPS: Record<string, string> = {
   docker:
     'membership of `docker` is root. `docker run -v /:/host --privileged …` mounts the ' +
@@ -165,12 +175,15 @@ export const ROOT_EQUIVALENT_GROUPS: Record<string, string> = {
     'read access to /etc/shadow, i.e. every password hash on the host, offline.',
   adm:
     'read access to every log on the box. This one is NOT root-equivalent and it is refused ' +
-    'anyway, deliberately: the agent already gets journal access through an explicit ' +
-    '`journalctl` grant in the sudoers file, so this membership adds nothing it was meant to ' +
-    'have and grants ambient authority nobody wrote down. The design claim is "everything ' +
-    'this account may do is in a file somebody reviewed", and a group is not that file. ' +
-    'Also, concretely: it reads /var/log/auth.log, which is where sudo records what the ' +
-    'agent did.',
+    'anyway, for one concrete reason: it reads /var/log/auth.log, which is where sudo records ' +
+    'what this agent did. An account that can read the record of its own privileged commands ' +
+    'is a small step from an account whose record nobody can trust.\n' +
+    'Until 2026-08-12 this entry also said the membership "adds nothing", because journal ' +
+    'access came from a `journalctl` grant in the sudoers file. That grant is gone — it ' +
+    'permitted `--vacuum-time` and `--rotate`, i.e. destroying the journal, while being ' +
+    'documented as read-only — and journal reading is now the `systemd-journal` group, which ' +
+    'is the narrow one: it reads the journal and nothing else. `adm` is still refused; ' +
+    '`systemd-journal` is what the account should have instead.',
 };
 
 /** Names allowed for the agent account. Deliberately narrower than useradd's. */
@@ -535,6 +548,35 @@ export function agentProblems(user: AgentUser, options: IdentityOptions): string
 /** Things that are not a refusal but will cost somebody an evening. */
 export function agentWarnings(user: AgentUser, options: IdentityOptions): string[] {
   const warnings: string[] = [];
+
+  // ── The one membership this account is supposed to HAVE ─────────────────
+  //
+  // Added 2026-08-12, when `journalctl` was removed from ops/clawcius-sudoers.
+  // That grant was `journalctl *`, documented as "read-only, any unit", and `*`
+  // also carries `--vacuum-time=1s`, `--rotate`, `--flush` and
+  // `--relinquish-var` — every one of which mutates or destroys the host
+  // journal, as root, in one command. No sudoers pattern can restrict it:
+  // journalctl's own getopt permutes, so a `*` anywhere in the argument spec
+  // re-admits the destructive flags. So the grant is gone and journal reading is
+  // group membership instead, which is the correct mechanism and needs no sudo
+  // at all.
+  //
+  // A WARNING and not a refusal, deliberately. The failure it describes is "the
+  // agent cannot read the journal", which is annoying and visible; refusing to
+  // run tasks over it would mean a missing `usermod` takes the whole ops
+  // mechanism offline, and the operator would fix that by putting the sudo rule
+  // back. It nags on every task until somebody runs one command.
+  if (!user.groups.includes(JOURNAL_GROUP)) {
+    warnings.push(
+      `${user.user} is not in the \`${JOURNAL_GROUP}\` group, so it cannot read the system ` +
+        'journal. Reading `journalctl -u <unit>` was the pain point this whole service was ' +
+        'built for, and since 2026-08-12 it is NOT granted through sudo — the old ' +
+        '`journalctl *` rule also permitted `--vacuum-time=1s` and `--rotate`, which erase ' +
+        'the audit trail as root while the comment above the rule called it read-only. The ' +
+        'group is the read-only mechanism and it is one command:\n' +
+        `        sudo usermod -aG ${JOURNAL_GROUP} ${user.user} && sudo systemctl restart clawcius-ops`,
+    );
+  }
 
   if (user.shell && !/(nologin|false)$/.test(user.shell)) {
     warnings.push(

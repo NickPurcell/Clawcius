@@ -103,6 +103,13 @@ import {
   type AgentUserResult,
 } from './agent-user.js';
 import { ensureDirOwnedBy, type RawRequest } from './spool.js';
+import {
+  drainUnitRequests,
+  unitRequestDir,
+  unitResultDir,
+  unitStagingDir,
+  type UnitOpResult,
+} from './units.js';
 
 /**
  * The executor's own unit.
@@ -152,6 +159,38 @@ const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
  * ("never wait") still gets 0.
  */
 const RECOVERY_IDLE_WAIT_MINUTES = 1;
+
+/**
+ * How often the executor looks for a unit-install request from the session, and
+ * how many it will carry out for one task.
+ *
+ * ── Why there is a desk here at all, 2026-08-12 ──────────────────────────
+ *
+ * The two sudo rules that let the session run `install` and `rm -f` against
+ * /etc/systemd/system were deleted on 2026-08-12: a `*` in an argument position
+ * is "any number of arguments" to sudo, and GNU install applies flags last-wins,
+ * so `install -m 0644 -o root -g root -t /etc/sudoers.d …` matched the rule and
+ * was one command to full root. The reasoning is in ops/src/units.ts.
+ *
+ * Deleting them removes a capability the ops mechanism exists to provide, so it
+ * had to be replaced rather than dropped. It is replaced the same way
+ * `run-container.sh` and `snapshot.sh` already were: the executor does it
+ * itself, as root, with everything but the unit's NAME constructed in code. The
+ * session stages the content in its own working directory and drops a two-field
+ * request; this daemon validates the name, builds the destination, and writes
+ * the file.
+ *
+ * The poll runs WHILE the session runs, not after it, because installing a unit
+ * is never the last step — `daemon-reload` and a restart follow, and a session
+ * that had to end before its unit appeared could not verify its own work. One
+ * second is imperceptible next to a task and costs a `readdir` of an empty
+ * directory.
+ *
+ * The ceiling bounds a session that has been talked into a loop. Thirty-two is
+ * more units than this project has.
+ */
+const UNIT_DESK_POLL_MS = 1_000;
+const MAX_UNIT_OPS_PER_TASK = 32;
 
 /**
  * One unit of work: a validated request, and who filed it.
@@ -810,6 +849,25 @@ export class Executor {
       `so the host agent (${agent.user.user}) can write its own working directory`,
     );
 
+    // The three directories the unit desk runs on. Created and chowned here for
+    // the same reason the working directory is: a session that finds them
+    // missing would create them itself and the executor would then be reading
+    // and unlinking inside something whose ancestry it never established. See
+    // `ensureDirOwnedBy`, which refuses a symlink rather than repairing it.
+    for (const dir of [
+      unitStagingDir(this.#config.hostAgent.workDir),
+      unitRequestDir(this.#config.hostAgent.workDir),
+      unitResultDir(this.#config.hostAgent.workDir),
+    ]) {
+      ensureDirOwnedBy(
+        dir,
+        { uid: agent.user.uid, gid: agent.user.gid },
+        (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
+        0o750,
+        `so the host agent (${agent.user.user}) can stage and request unit installs`,
+      );
+    }
+
     const scope = this.#scopeOf(request);
     const before = await this.#sampleHealth();
 
@@ -848,6 +906,17 @@ export class Executor {
     // ── Run it ───────────────────────────────────────────────────────────
     const commands: string[] = [];
     const startedAt = Date.now();
+    let unitOps = 0;
+    const serveUnitRequests = (): void => {
+      if (unitOps >= MAX_UNIT_OPS_PER_TASK) return;
+      for (const result of this.#drainUnitRequests(MAX_UNIT_OPS_PER_TASK - unitOps)) {
+        unitOps += 1;
+        this.#journalUnitOp(job, result);
+      }
+    };
+    const desk = setInterval(serveUnitRequests, UNIT_DESK_POLL_MS);
+    desk.unref();
+
     let outcome: HostAgentOutcome;
     try {
       outcome = await runHostAgent({
@@ -868,9 +937,16 @@ export class Executor {
       // the snapshots were taken and are kept, because a snapshot nobody needed
       // costs disk and a snapshot somebody needed and did not have costs an
       // instance.
+      clearInterval(desk);
       this.#fail(job, `the host agent was not started: ${String(error)}`);
       return;
     }
+    // Once more with the session gone. A request filed in the last second of a
+    // task would otherwise be left in the directory and served by the NEXT
+    // task, which is a different session, possibly for a different instance,
+    // and would be attributed to it in the journal.
+    clearInterval(desk);
+    serveUnitRequests();
 
     this.#lastTask = {
       at: startedAt,
@@ -995,6 +1071,54 @@ export class Executor {
         haystack.includes(this.#config.runContainerScript) ||
         haystack.includes(this.#config.snapshotScript)
       );
+    });
+  }
+
+  // ── The unit desk ───────────────────────────────────────────────────────
+
+  /**
+   * Serve whatever unit-install requests the session has filed so far.
+   *
+   * Everything hostile-input-shaped about the request directory is handled in
+   * units.ts, alongside the reasoning; this method exists so the poll and the
+   * post-session sweep share one call and one set of paths, all of them derived
+   * from `hostAgent.workDir` and `unitDir` in config rather than from anything a
+   * task said.
+   */
+  #drainUnitRequests(budget: number): UnitOpResult[] {
+    const workDir = this.#config.hostAgent.workDir;
+    return drainUnitRequests({
+      requestDir: unitRequestDir(workDir),
+      resultDir: unitResultDir(workDir),
+      stagingDir: unitStagingDir(workDir),
+      unitDir: this.#config.unitDir,
+      dryRun: this.#config.dryRun,
+      max: budget,
+      onLog: (line) => process.stdout.write(`[ops units] ${line}\n`),
+    });
+  }
+
+  /**
+   * Record one install or removal, refusals included.
+   *
+   * Its own journal kind, and it carries the destination path in `command` —
+   * which is the field the status page already renders as "what was run". This
+   * is now the only way bytes reach /etc/systemd/system from a task, so
+   * `grep '"kind":"unit"'` has to be the complete answer to what has been
+   * written there. A REFUSAL is journalled just as loudly as a success: a run of
+   * them is what a session probing for a way past the name validation looks like
+   * from outside, and that is worth being able to find later.
+   */
+  #journalUnitOp(job: Job, result: UnitOpResult): void {
+    this.#journal.write({
+      kind: 'unit',
+      what: `${result.op} ${result.unit || '(unnamed)'}`,
+      instance: job.request.instance || undefined,
+      requester: job.requester,
+      ok: result.ok,
+      dryRun: result.skipped,
+      ...(result.path ? { command: result.path } : {}),
+      detail: result.detail,
     });
   }
 
@@ -1149,6 +1273,35 @@ export class Executor {
     lines.push('');
     lines.push(`Executor state directory (do not write here): ${this.#config.stateDir}`);
     lines.push(`Your working directory: ${this.#config.hostAgent.workDir}`);
+
+    // How to install a unit, spelled out with the actual paths, because since
+    // 2026-08-12 there is no `sudo install` and a session that discovers that by
+    // being refused will spend turns looking for another way round rather than
+    // reading the file it was pointed at. See ops/src/units.ts.
+    const staging = unitStagingDir(this.#config.hostAgent.workDir);
+    const requests = unitRequestDir(this.#config.hostAgent.workDir);
+    const results = unitResultDir(this.#config.hostAgent.workDir);
+    lines.push('');
+    lines.push('Installing or removing a systemd unit — you cannot do this with sudo:');
+    lines.push(
+      `  1. write the unit's full content to ${join(staging, '<name>.service')}` +
+        ' (Write, or a plain shell redirect; not a symlink, and not empty);',
+    );
+    lines.push(
+      `  2. file the request:  printf '%s' '{"op":"install","unit":"<name>.service"}' > ` +
+        `${join(requests, '$(date +%s).json.tmp')} && mv that file to the same name without ` +
+        '.tmp;',
+    );
+    lines.push(
+      `  3. within a couple of seconds, read the answer at ${join(results, '<same name>.json')}: ` +
+        'it says ok true/false and why.',
+    );
+    lines.push(
+      `  Then \`sudo systemctl daemon-reload\` and start or restart the unit by exact name. ` +
+        `The executor writes the file itself, as root, to ${this.#config.unitDir}/<name>, mode ` +
+        '0644 root:root. It validates the NAME and builds the path — you cannot choose the ' +
+        'destination, the mode or the owner, and `{"op":"remove", …}` is the other verb.',
+    );
     lines.push(
       'Snapshot script: ' +
         `${this.#config.snapshotScript}; container script: ${this.#config.runContainerScript}.`,

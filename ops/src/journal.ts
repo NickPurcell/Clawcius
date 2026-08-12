@@ -52,6 +52,13 @@ export type JournalKind =
   // longer builds anything itself: journal.jsonl is append-only and years of
   // it exist, so the kind has to stay readable by whatever reads it.
   | 'build'
+  // A unit file was installed or removed by the executor, or refused. Its own
+  // kind since 2026-08-12, when that capability moved out of the sudoers file
+  // and into ops/src/units.ts: `grep '"kind":"unit"' journal.jsonl` is now the
+  // complete answer to "what has been written into /etc/systemd/system by this
+  // machinery", and before that date the answer was spread across `audit`
+  // entries containing a `sudo install` command line.
+  | 'unit'
   | 'finished'
   | 'failed'
   | 'idle-wait'
