@@ -360,6 +360,32 @@ separate login.** The operator's own `claude` login under `/home/npurcell` is
 not used, not readable, and not shared — which is the point, and which also
 means this step cannot be skipped.
 
+First make sure the account can actually reach `claude`. The rest of this
+project refers to `/usr/local/bin/claude`, which is where it lives in the agent
+containers — on a host it is usually a per-user install under `~/.local/bin`,
+which is a directory this account is deliberately unable to read.
+
+```sh
+sudo -u clawcius-ops "$(command -v claude)" --version
+```
+
+If that prints a version, the operator's home is traversable and a symlink
+makes every other reference true:
+
+```sh
+sudo ln -sf "$(command -v claude)" /usr/local/bin/claude
+```
+
+If it says permission denied, do NOT loosen the home directory to fix it —
+"the agent cannot read /home/<operator>" is verified in § 2 and worth keeping.
+Install `claude` system-wide instead, or point `hostAgent.claudePath` at a copy
+the account can execute.
+
+Discovered on 2026-08-12: this guide and `ops-config.yaml` both hardcoded
+`/usr/local/bin/claude`, which was true of the container the guide was written
+in and false of the host it was written for. The same wrong assumption had
+already cost a spawn failure in the sibling OJ project a day earlier.
+
 ```sh
 sudo -u clawcius-ops -H /usr/local/bin/claude
 # then /login inside the session, and follow the flow it prints.
