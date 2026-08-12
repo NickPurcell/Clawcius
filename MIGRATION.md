@@ -428,6 +428,10 @@ wrong place. Check `sudo -u clawcius-ops -H claude -p ok` before anything else.
 
 ## 5. The deploy key, for private repositories
 
+**Skip this step unless the host agent needs to pull a private repository.**
+It is the only optional section here. Clawcius is public and needs nothing;
+this exists solely so the session can pull OJ. Come back when that is true.
+
 Pulling OJ (private) needs a credential. The credential is **a read-only deploy
 key owned by the agent account**, not the operator's PAT and not the operator's
 ssh key.
@@ -475,10 +479,28 @@ sudo -u clawcius-ops -H sh -c \
 #    for the session, and warns at boot if the key is missing, owned by
 #    somebody else, or group/world-accessible.
 
-# 5. The OJ checkout must use ssh, not https.
-sudo -u clawcius-ops git -C /var/lib/oj/checkout remote set-url origin \
-  git@github.com:NickPurcell/oj.git
+# 5. The agent account must be able to write the OJ checkout at all. It is
+#    owned by the operator with no group access, exactly as the Clawcius
+#    checkout was before § 2, so give it the same treatment:
+sudo chgrp -R clawcius-dev /home/npurcell/oj
+sudo chmod -R g+w /home/npurcell/oj
+sudo find /home/npurcell/oj -type d -exec chmod g+s {} +
+
+# 6. The OJ checkout must use ssh, not https.
+sudo -u clawcius-ops git -C /home/npurcell/oj remote set-url origin \
+  git@github.com:NickPurcell/OJ.git
 ```
+
+The checkout is `/home/npurcell/oj`, where the operator cloned it. An earlier
+version of this guide said `/var/lib/oj/checkout`, which has never existed:
+`/var/lib/oj` holds `workers/` and `state.json` and nothing else. The symptom
+was a *permission denied* rather than a *no such file*, because the parent does
+exist and the agent account cannot traverse it — which reads like a permissions
+problem to be fixed and is a path that was never real.
+
+Recorded on 2026-08-12 because it is the third host path in this project
+written from the container the guide was authored in rather than the host it
+was authored for.
 
 **One key per repository.** `IdentitiesOnly=yes` means only the configured key
 is offered, so a second private repository needs a second key and a second
@@ -496,7 +518,7 @@ sudo -u clawcius-ops -H \
 #  provide shell access." — the repository name in that line is the proof it
 #  is the deploy key and not somebody's account key.
 
-sudo -u clawcius-ops git -C /var/lib/oj/checkout fetch --dry-run
+sudo -u clawcius-ops git -C /home/npurcell/oj fetch --dry-run
 ```
 
 ### If you skip this step
