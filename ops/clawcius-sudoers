@@ -315,7 +315,20 @@ Cmnd_Alias CLAWCIUS_UNIT_READ = \
     /usr/bin/systemctl list-timers *, \
     /usr/bin/systemctl list-unit-files *, \
     /usr/bin/systemctl --failed, \
-    /usr/bin/systemctl
+    /usr/bin/systemctl ""
+
+# The `""` on the bare entry above is not decoration. A command listed in
+# sudoers with NO argument spec permits that command with ANY arguments — so
+# a bare `/usr/bin/systemctl` line grants `systemctl restart sshd.service`,
+# `systemctl stop` anything, and every other invocation the careful list above
+# it spells out one unit at a time. `""` means "no arguments", which is what
+# was intended: bare `systemctl` lists units.
+#
+# Found on 2026-08-12 by the operator running the step-3 refusal check:
+# `sudo -u clawcius-ops sudo -n /usr/bin/systemctl restart sshd.service`
+# returned "Unit sshd.service not found" rather than a refusal — sudo had
+# permitted it and systemctl merely had nothing to restart. The enumeration
+# had been decorative from the moment it was written.
 
 # `systemctl edit` and `set-property` are NOT here and never should be: `edit`
 # opens $EDITOR as root, which is a root shell with extra steps, and the
@@ -333,7 +346,7 @@ Cmnd_Alias CLAWCIUS_UNIT_READ = \
 # `--file`/`--directory` are not excluded and cannot usefully be: they only
 # read journal files, which is what this grant is for. The pager escape is
 # handled by the env_delete line above.
-Cmnd_Alias CLAWCIUS_LOGS = /usr/bin/journalctl, /usr/bin/journalctl *
+Cmnd_Alias CLAWCIUS_LOGS = /usr/bin/journalctl "", /usr/bin/journalctl *
 
 # ══════════════════════════════════════════════════════════════════════════
 # docker — named containers, read-mostly, and NOT `docker run`
