@@ -74,7 +74,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -101,13 +101,22 @@ import {
 } from './agent-user.js';
 import {
   assertNoSecrets,
+  credentialComplaint,
+  describeCredentials,
   hostAgentEnv,
   hostAgentSettings,
   hostAgentTools,
   identityOptionsFor,
   judge,
+  parseCredentialReport,
+  privilegeDropLaunch,
+  sessionSpawnOptions,
   standingPrompt,
+  supportsExecve,
+  CREDENTIAL_REPORT_MARKER,
   DRY_RUN_TOOL_DENY,
+  PRIVILEGE_DROP_BOOTSTRAP,
+  PRIVILEGE_DROP_EXIT,
 } from './host-agent.js';
 import {
   drainUnitRequests,
@@ -3388,6 +3397,229 @@ test('the standing prompt tells the session which account it holds', () => {
   // stated here, and the prompt says so rather than leaving the session to
   // discover it as an unexplained refusal.
   assert.match(prompt, /clawcius-ops\.service is not on it/);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// The privilege drop — #21.
+//
+// The session came up as `clawcius-ops` holding only its primary group, while
+// the boot banner and the session log line both named all three. Cause: libuv's
+// `uv__process_child_init` runs `setgroups(0, NULL)` in the forked child
+// whenever the `uid` OR `gid` spawn option is used, a few instructions before
+// it calls setgid/setuid. So no arrangement of the PARENT's group list can ever
+// reach the child, and the old `withSupplementaryGroups` could not have worked.
+//
+// None of that is executable here: this process is not root, so it cannot
+// setgroups to anything and cannot observe a real drop. What IS executable, and
+// is below, is everything the fix is made of —
+//
+//   * that `agent.gids` is numbers and never group names;
+//   * that the spawn options carry no `uid`/`gid` on the bootstrap path, which
+//     is the mistake, expressed as an assertion;
+//   * the bootstrap itself, run end-to-end against the credentials this test
+//     process already holds, proving it verifies against the kernel and then
+//     replaces itself with the target — and that it REFUSES to exec anything
+//     when the numbers do not match.
+//
+// The last of those is the important one. The reason #21 survived a boot
+// banner, a session log line and two reviews is that nothing anywhere compared
+// an observed credential with an intended one, and a check nobody can run
+// without root is a check that rots. This one runs as anybody.
+// ══════════════════════════════════════════════════════════════════════════
+
+/** This test process, dressed as an AgentUser. The bootstrap should accept it. */
+function selfAsAgent(): AgentUser {
+  const gids = process.getgroups?.() ?? [];
+  return {
+    user: 'self',
+    uid: process.getuid?.() ?? 0,
+    gid: process.getgid?.() ?? 0,
+    home: tmpdir(),
+    shell: '/usr/sbin/nologin',
+    groups: ['self'],
+    gids,
+  };
+}
+
+function runBootstrap(intent: unknown): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(
+    process.execPath,
+    ['-e', PRIVILEGE_DROP_BOOTSTRAP, JSON.stringify(intent)],
+    { encoding: 'utf8' },
+  );
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+test('the gid list handed to setgroups is numbers, never group names', () => {
+  // #21's first hypothesis, and the one worth nailing down permanently: a
+  // STRING element would be resolved by process.setgroups() through NSS as a
+  // group NAME. `groups` (names) and `gids` (numbers) are built on adjacent
+  // lines from the same data and the log line prints the former, which is
+  // exactly how you end up believing you passed the latter.
+  const host = makeHost({ dryRun: true, suffix: 'gids-numeric', agentGroups: ['clawcius-dev'] });
+  const resolved = resolveAgentUser(host.config.hostAgent.user, {
+    passwdPath: host.config.hostAgent.passwdPath,
+    groupPath: host.config.hostAgent.groupPath,
+  });
+  assert.equal(resolved.ok, true);
+  if (!resolved.ok) return;
+
+  assert.ok(resolved.user.gids.length >= 2, 'primary plus at least one supplementary');
+  for (const gid of resolved.user.gids) {
+    assert.equal(typeof gid, 'number', `gid ${String(gid)} is a ${typeof gid}, not a number`);
+    assert.ok(Number.isInteger(gid), `gid ${String(gid)} is not a whole number`);
+  }
+  assert.equal(resolved.user.gids[0], resolved.user.gid, 'primary gid first');
+  assert.equal(
+    resolved.user.gids.length,
+    resolved.user.groups.length,
+    'one gid per group name — if these ever diverge the log line stops describing the drop',
+  );
+
+  // A malformed /etc/group line cannot smuggle a NaN in either: the parser
+  // drops the line rather than keeping a group with a broken gid.
+  const junk = parseGroups('fine:x:1500:clawcius-ops\nbroken:x:notanumber:clawcius-ops\n');
+  assert.deepEqual(junk.map((group) => group.name), ['fine']);
+});
+
+test('the session is never spawned with the uid/gid options — that is what clears the groups', () => {
+  const agent = selfAsAgent();
+  const base = { cwd: tmpdir(), env: { PATH: '/usr/bin' }, agent };
+
+  // The fix, stated as an assertion. libuv calls setgroups(0, NULL) in the
+  // child if EITHER of these keys is present, so their absence is not a detail
+  // of the bootstrap — it IS the bootstrap working.
+  const dropped = sessionSpawnOptions({ ...base, dropping: true, viaBootstrap: true });
+  assert.equal('uid' in dropped, false, 'no uid option on the bootstrap path');
+  assert.equal('gid' in dropped, false, 'no gid option on the bootstrap path');
+  assert.equal(dropped.detached, true);
+  assert.deepEqual(dropped.stdio, ['ignore', 'pipe', 'pipe']);
+
+  // Not dropping at all (the self-test's own case) is likewise clean.
+  const same = sessionSpawnOptions({ ...base, dropping: false, viaBootstrap: false });
+  assert.equal('uid' in same, false);
+
+  // The documented fallback for a node without process.execve does use them,
+  // and the comment in host-agent.ts says what it costs: a session with an
+  // empty supplementary list, which is less capable rather than less contained.
+  const fallback = sessionSpawnOptions({ ...base, dropping: true, viaBootstrap: false });
+  assert.equal(fallback.uid, agent.uid);
+  assert.equal(fallback.gid, agent.gid);
+
+  // And the launcher hands `spawn` this node plus the bootstrap, with the whole
+  // intent in one JSON argument — no shell, so nothing to quote wrong even
+  // when the task prompt is full of quotes and newlines.
+  const argv = ['-p', 'a "quoted" prompt\nwith a newline and $HOME', '--verbose'];
+  const launch = privilegeDropLaunch(agent, '/usr/local/bin/claude', argv);
+  assert.equal(launch.command, process.execPath);
+  assert.equal(launch.argv[0], '-e');
+  assert.equal(launch.argv[1], PRIVILEGE_DROP_BOOTSTRAP);
+  const payload = JSON.parse(launch.argv[2] ?? '{}') as Record<string, unknown>;
+  assert.equal(payload['uid'], agent.uid);
+  assert.equal(payload['gid'], agent.gid);
+  assert.deepEqual(payload['gids'], agent.gids);
+  assert.equal(payload['command'], '/usr/local/bin/claude');
+  assert.deepEqual(payload['argv'], argv);
+});
+
+test('the privilege-drop bootstrap verifies against the kernel and then execs', () => {
+  // Runnable without root because the bootstrap is idempotent: handed the
+  // credentials this process already holds, it makes no syscall, reads them
+  // back from the kernel anyway, and execs. That short-circuit is the only
+  // reason this code is testable at all, and untestable is how the last
+  // version of it shipped broken.
+  assert.equal(supportsExecve(), true, 'node >= 22.15 — the fallback path is not what ships');
+  const me = selfAsAgent();
+  const launch = privilegeDropLaunch(me, '/bin/sh', ['-c', 'echo I-AM-THE-SESSION']);
+  const run = spawnSync(launch.command, launch.argv, { encoding: 'utf8' });
+
+  assert.equal(run.status, 0, run.stderr);
+  // execve REPLACED the bootstrap: this is the target's stdout on the same pid,
+  // which is what keeps child.pid, killTree and the detached process group
+  // meaning what they meant before.
+  assert.match(run.stdout, /I-AM-THE-SESSION/);
+
+  const line = run.stderr.split('\n').find((l) => l.includes(CREDENTIAL_REPORT_MARKER));
+  assert.ok(line, `no credential report in stderr: ${run.stderr}`);
+  const report = parseCredentialReport(line);
+  assert.ok(report, 'the credential report parses');
+  assert.equal(report.uid, me.uid);
+  assert.equal(report.gid, me.gid);
+  // Observed, not intended. This is the line whose absence is the whole bug.
+  assert.equal(credentialComplaint(me, report), null);
+  assert.match(describeCredentials(me, report), /read back from the kernel/);
+});
+
+test('the bootstrap refuses to exec anything when the credentials would be wrong', () => {
+  const me = selfAsAgent();
+  const base = {
+    uid: me.uid,
+    gid: me.gid,
+    gids: me.gids,
+    command: '/bin/sh',
+    // If any of these cases reaches execve the test fails loudly rather than
+    // silently: NOTHING is allowed to run when the drop did not take.
+    argv: ['-c', 'echo THIS-MUST-NEVER-RUN'],
+  };
+
+  const cases: Array<[string, unknown, RegExp]> = [
+    // #21's first hypothesis. A string here would be resolved as a group NAME.
+    ['a group name instead of a gid', { ...base, gids: ['clawcius-dev'] }, /not a number/],
+    ['a uid this process cannot take', { ...base, uid: me.uid + 1 }, /not root/],
+    ['a group list this process does not hold', { ...base, gids: [...me.gids, 4242] }, /not root/],
+    ['uid 0', { ...base, uid: 0 }, /refusing to "drop" to uid 0/],
+    ['a claudePath that is not executable', { ...base, command: '/etc/hostname' }, /not executable/],
+  ];
+
+  for (const [what, intent, expected] of cases) {
+    const run = runBootstrap(intent);
+    assert.equal(run.status, PRIVILEGE_DROP_EXIT, `${what}: expected a refusal, got ${run.stderr}`);
+    assert.match(run.stderr, expected, what);
+    assert.doesNotMatch(run.stdout, /THIS-MUST-NEVER-RUN/, `${what}: the session must not start`);
+    assert.doesNotMatch(run.stderr, new RegExp(CREDENTIAL_REPORT_MARKER.trim()), `${what}: no report`);
+  }
+});
+
+test('credentialComplaint names the difference between what was asked for and what happened', () => {
+  const agent: AgentUser = {
+    user: 'clawcius-ops',
+    uid: 997,
+    gid: 988,
+    home: '/var/lib/clawcius-agent',
+    shell: '/usr/sbin/nologin',
+    groups: ['clawcius-ops', 'clawcius-dev', 'systemd-journal'],
+    gids: [988, 1500, 999],
+  };
+
+  assert.equal(credentialComplaint(agent, { uid: 997, gid: 988, groups: [988, 999, 1500] }), null);
+
+  // The exact shape of #21: the session reported `groups=988(clawcius-ops)`.
+  const observed = credentialComplaint(agent, { uid: 997, gid: 988, groups: [988] });
+  assert.ok(observed);
+  assert.match(observed, /groups are \[988\], expected \[988,999,1500\]/);
+  assert.match(observed, /missing 999,1500/);
+
+  // And the shape the OLD comment feared — the child still carrying root's list.
+  const roots = credentialComplaint(agent, { uid: 997, gid: 988, groups: [0, 988] });
+  assert.ok(roots);
+  assert.match(roots, /unexpected 0/);
+
+  const wrongUser = credentialComplaint(agent, { uid: 1000, gid: 1000, groups: [988, 999, 1500] });
+  assert.ok(wrongUser);
+  assert.match(wrongUser, /uid is 1000, expected 997/);
+  assert.match(wrongUser, /gid is 1000, expected 988/);
+
+  // Report parsing fails closed: anything that is not a credential line is not
+  // mistaken for one, so "no report" can never look like "a clean report".
+  assert.equal(parseCredentialReport('claude: some ordinary stderr'), null);
+  assert.equal(parseCredentialReport(`${CREDENTIAL_REPORT_MARKER}not json`), null);
+  assert.equal(parseCredentialReport(`${CREDENTIAL_REPORT_MARKER}{"uid":"997"}`), null);
+  assert.equal(parseCredentialReport(`${CREDENTIAL_REPORT_MARKER}{"uid":1,"gid":2}`), null);
+  assert.deepEqual(parseCredentialReport(`${CREDENTIAL_REPORT_MARKER}{"uid":1,"gid":2,"groups":[2]}`), {
+    uid: 1,
+    gid: 2,
+    groups: [2],
+  });
 });
 
 test('a clean exit with is_error is a failure, not a success', () => {

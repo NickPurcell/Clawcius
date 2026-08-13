@@ -105,17 +105,22 @@
  *
  * A `setuid(2)` performed by an already-root process is a different operation:
  * it *drops* privilege, it happens before `execve`, and `NoNewPrivileges` has
- * no bearing on it. So the drop is done with the `uid`/`gid` spawn options and
- * needs no setuid helper, no sudoers rule and no shell. The unit does not have
- * to weaken `NoNewPrivileges` for the drop's sake; it has to leave it false for
- * the sake of the `sudo` the SESSION runs, which is a different argument and is
- * written out in `systemd/clawcius-ops.service`.
+ * no bearing on it. So the drop needs no setuid helper, no sudoers rule and no
+ * shell. The unit does not have to weaken `NoNewPrivileges` for the drop's
+ * sake; it has to leave it false for the sake of the `sudo` the SESSION runs,
+ * which is a different argument and is written out in
+ * `systemd/clawcius-ops.service`.
  *
- * The honest limitation that used to be recorded here — that the spawn options
- * do not call `setgroups(2)`, so the child inherits root's supplementary group
- * list — was fixed on 2026-08-11 in `host-agent.ts`, because it stopped being
- * cosmetic the moment the containment argument became "this account is in no
- * root-equivalent group". See `withSupplementaryGroups` there.
+ * It is NOT done with the `uid`/`gid` spawn options, and the reason is
+ * counter-intuitive enough to be worth repeating here rather than only in
+ * host-agent.ts: libuv calls `setgroups(0, NULL)` in the forked child whenever
+ * either of those options is used, which throws away the supplementary group
+ * list. The honest limitation once recorded in this file — "the child inherits
+ * root's supplementary groups" — was therefore never true; the truth was worse
+ * and quieter, which is that the child had none at all. The drop is performed
+ * by the `PRIVILEGE_DROP_BOOTSTRAP` in host-agent.ts instead, which sets the
+ * groups itself, verifies them against the kernel and refuses to `execve` the
+ * session if they are wrong. See #21.
  */
 
 import type { OpsConfig, RepoEntry } from './config.js';

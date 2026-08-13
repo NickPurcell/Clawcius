@@ -97,10 +97,17 @@ export const GROUP_PATH = '/etc/group';
  * The account the host agent session runs as.
  *
  * `gids` is the FULL list — primary first, then every supplementary group —
- * because it is handed to `setgroups(2)` before the spawn. See the long note in
- * host-agent.ts about why that matters: without it the child inherits *root's*
- * supplementary groups, and a process that is nominally `clawcius-ops` while
- * still carrying gid 0 is not the thing this design is claiming to be.
+ * because it is handed to `setgroups(2)` by the privilege-drop bootstrap in
+ * host-agent.ts, in the child, immediately before it becomes the agent. Without
+ * that call the session holds ONLY its primary group: libuv clears the
+ * supplementary list in any child spawned with the `uid`/`gid` options, which
+ * is #21.
+ *
+ * `gids` and `groups` are two renderings of the same fact and they are built on
+ * adjacent lines below. Keep them that way. #21 cost an afternoon partly
+ * because the log line printed `groups` (names, correct) while the thing that
+ * mattered was `gids` (numbers, never observed). Anything handed to
+ * `setgroups()` must be numbers: a STRING element is resolved as a group NAME.
  */
 export type AgentUser = {
   /** Login name, exactly as written in ops-config.yaml and found in passwd. */
@@ -114,7 +121,10 @@ export type AgentUser = {
   shell: string;
   /** Every group name this user is in, primary first. Sorted after the first. */
   groups: string[];
-  /** Every gid, primary first. Passed to setgroups before the spawn. */
+  /**
+   * Every gid, primary first. Numbers, never names — `process.setgroups()`
+   * treats a string element as a group name to resolve through NSS.
+   */
   gids: number[];
 };
 
