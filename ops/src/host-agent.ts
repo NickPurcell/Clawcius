@@ -841,37 +841,17 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
   return new Promise<HostAgentOutcome>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(launch.command, launch.argv, {
-        // A directory of our own, NOT the checkout. Claude Code auto-discovers
-        // CLAUDE.md and project settings from the working directory, and the
-        // checkout is a tree the agents push to — so pointing this at the
-        // checkout would hand a session with sudo a set of instructions any
-        // agent can edit and get merged. The agent can still `cd` there in a
-        // Bash command, which is a deliberate act it takes and the audit
-        // records, rather than context it silently absorbs.
-        cwd: config.hostAgent.workDir,
-        env,
-        // NOTE THE ABSENCE of `uid`/`gid` on the bootstrap path, and that it is
-        // the entire fix for #21. Passing either one makes libuv run
-        // `setgroups(0, NULL)` in the forked child before it calls
-        // setgid/setuid, which throws away whatever supplementary groups this
-        // process had arranged for it. The drop is done by the bootstrap
-        // instead, in the child, in the right order, and verified there.
-        //
-        // Still deliberately not `sudo -u clawcius-ops claude …`: sudo is a
-        // setuid binary, NNP would make it a no-op, it would need its own
-        // sudoers rule (a rule that says "become the agent user and run
-        // anything", which is a strange thing to write in a file whose whole
-        // purpose is enumerating what may be run), and the resulting process
-        // tree would have a sudo between this daemon and the session.
-        ...(dropping && !viaBootstrap
-          ? { uid: request.agent.uid, gid: request.agent.gid }
-          : {}),
-        stdio: ['ignore', 'pipe', 'pipe'],
-        // Its own process group, so a timeout can take out the commands it
-        // started as well as the session itself.
-        detached: true,
-      });
+      child = spawn(
+        launch.command,
+        launch.argv,
+        sessionSpawnOptions({
+          cwd: config.hostAgent.workDir,
+          env,
+          agent: request.agent,
+          dropping,
+          viaBootstrap,
+        }),
+      );
     } catch (error) {
       resolve({
         ok: false,
@@ -1489,6 +1469,18 @@ export const PRIVILEGE_DROP_BOOTSTRAP = [
     'the 2026-08-13 failure: libuv clears the group list in the child whenever the uid or gid ' +
     "spawn option is used, so the list has to be taken here instead.');",
   '}',
+  '// Checked HERE, after the drop and before the report, because',
+  '// process.execve() failing is a fatal native abort that no try/catch sees —',
+  '// it prints a V8 stack trace and no explanation. And because the question',
+  '// worth asking is whether the AGENT can execute it: claude lives under a',
+  "// home the agent does not own, and root's answer is not the one that counts.",
+  'try {',
+  "  var fs = require('node:fs');",
+  '  fs.accessSync(intent.command, fs.constants.X_OK);',
+  '} catch (e) {',
+  "  shout(intent.command + ' is not executable by uid ' + have.uid + ': ' + String(e) +",
+  "    '. Check hostAgent.claudePath and its mode.');",
+  '}',
   "process.stderr.write('" +
     CREDENTIAL_REPORT_MARKER +
     "' + JSON.stringify({",
@@ -1538,6 +1530,62 @@ export function privilegeDropLaunch(
         argv: [...argv],
       }),
     ],
+  };
+}
+
+/**
+ * The `spawn` options for the session.
+ *
+ * Extracted from `runHostAgent` and exported for ONE reason, and it is a
+ * regression guard rather than tidiness: the self-test asserts that the
+ * bootstrap path carries no `uid` and no `gid` key. Passing either of them is
+ * how #21 happened — libuv responds by running `setgroups(0, NULL)` in the
+ * forked child — and it is the single most natural "simplification" for a
+ * future reader to make, because to the naked eye those two options are exactly
+ * what this function is trying to achieve.
+ */
+export function sessionSpawnOptions(input: {
+  cwd: string;
+  env: Record<string, string>;
+  agent: AgentUser;
+  dropping: boolean;
+  viaBootstrap: boolean;
+}): {
+  cwd: string;
+  env: Record<string, string>;
+  stdio: ['ignore', 'pipe', 'pipe'];
+  detached: true;
+  uid?: number;
+  gid?: number;
+} {
+  return {
+    // A directory of our own, NOT the checkout. Claude Code auto-discovers
+    // CLAUDE.md and project settings from the working directory, and the
+    // checkout is a tree the agents push to — so pointing this at the checkout
+    // would hand a session with sudo a set of instructions any agent can edit
+    // and get merged. The agent can still `cd` there in a Bash command, which
+    // is a deliberate act it takes and the audit records, rather than context
+    // it silently absorbs.
+    cwd: input.cwd,
+    env: input.env,
+    // NOTE THE ABSENCE of `uid`/`gid` whenever the bootstrap is in play, and
+    // that it is the entire fix for #21. The drop is done by the bootstrap
+    // instead — in the child, in the right order, and verified there before it
+    // execs anything.
+    //
+    // Still deliberately not `sudo -u clawcius-ops claude …`: sudo is a setuid
+    // binary, NNP would make it a no-op, it would need its own sudoers rule (a
+    // rule that says "become the agent user and run anything", which is a
+    // strange thing to write in a file whose whole purpose is enumerating what
+    // may be run), and the resulting process tree would have a sudo between
+    // this daemon and the session.
+    ...(input.dropping && !input.viaBootstrap
+      ? { uid: input.agent.uid, gid: input.agent.gid }
+      : {}),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    // Its own process group, so a timeout can take out the commands it started
+    // as well as the session itself.
+    detached: true,
   };
 }
 
