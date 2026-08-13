@@ -100,6 +100,7 @@ import {
   type AgentUser,
 } from './agent-user.js';
 import {
+  assertNoNodeOptions,
   assertNoSecrets,
   credentialComplaint,
   describeCredentials,
@@ -3055,6 +3056,34 @@ test('the host agent is refused a Discord token, and refuses to start if it has 
   assert.doesNotThrow(() => assertNoSecrets({ PATH: '/usr/bin', HOME: '/home/n', HTTPS_PROXY: 'http://p:3128' }));
   // And an operator can say "yes, I mean it" — in a file that gets reviewed.
   assert.doesNotThrow(() => assertNoSecrets({ MY_TOKEN: 'x' }, ['MY_TOKEN']));
+});
+
+test('a NODE_* variable is refused, because the drop now runs node as root first', () => {
+  // Introduced with the #21 fix and worth its own test: the first process in
+  // the session is `node -e <bootstrap>` and it is root until it calls setuid.
+  // NODE_OPTIONS=--require=… would run a file of somebody's choosing as root
+  // before any privilege had been dropped, which is a worse hole than the one
+  // the bootstrap closes.
+  for (const name of ['NODE_OPTIONS', 'NODE_REPL_EXTERNAL_MODULE', 'NODE_EXTRA_CA_CERTS']) {
+    assert.throws(() => assertNoNodeOptions({ [name]: 'x' }), /runs as ROOT until it calls setuid/, name);
+  }
+  assert.doesNotThrow(() => assertNoNodeOptions({ PATH: '/usr/bin', NODEJS_HOME: '/x' }));
+
+  // Unlike the credential check, envPassthrough does NOT exempt it: that key is
+  // exactly the route by which one would arrive.
+  const host = makeHost({
+    dryRun: true,
+    suffix: 'node-options',
+    envPassthrough: ['NODE_OPTIONS'],
+  });
+  const previous = process.env['NODE_OPTIONS'];
+  process.env['NODE_OPTIONS'] = '--require=/tmp/pwn.js';
+  try {
+    assert.throws(() => hostAgentEnv(host.config, host.agent), /NODE_OPTIONS/);
+  } finally {
+    if (previous === undefined) delete process.env['NODE_OPTIONS'];
+    else process.env['NODE_OPTIONS'] = previous;
+  }
 });
 
 test('the host agent environment is built from nothing and carries no token', () => {

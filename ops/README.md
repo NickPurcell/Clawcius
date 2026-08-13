@@ -1583,11 +1583,18 @@ use it.
   no `chgrp`/`chmod`/`find` on the checkout, no `claude auth` as another
   account, no `ssh-keygen` deploy key, no `git pull` as `clawcius-ops` in a tree
   owned by `npurcell`. The document says so at the top.
-- **The privilege drop itself is not exercised.** The self-test's fixture
+- **The privilege drop itself is only half exercised.** The self-test's fixture
   account carries the test process's own uid — it has to, because dropping to
-  another uid needs root — so what is tested is the resolution, the refusals and
-  the environment, not `setuid(2)` or `withSupplementaryGroups`. Check
-  `ps -o user= -p <pid>` on a live session and `id` inside a task's own report.
+  another uid needs root — so the `setgroups`/`setgid`/`setuid` transition is
+  never actually performed here. What *is* executed, since 2026-08-13, is the
+  bootstrap itself: handed the credentials the test process already holds it
+  verifies them against the kernel and execs, and handed anybody else's — a
+  group *name* where a gid belongs, a uid it cannot take, uid 0 — it refuses
+  with a message and execs nothing. That plus an assertion that the spawn
+  options carry no `uid`/`gid` key is as close as an unprivileged suite can get
+  to #21. Check `id` inside a task's own report for the rest, and read the
+  `host agent: privilege drop —` line in the journal, which is the observed
+  credential rather than the intended one.
 - **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
   a shell that already has root. Still true on 2026-08-12, and re-checked rather
   than copied forward: the machine it is edited on has no `sudo` and no `visudo`

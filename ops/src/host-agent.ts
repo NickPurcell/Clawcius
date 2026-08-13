@@ -464,7 +464,44 @@ export function hostAgentEnv(config: OpsConfig, agent: AgentUser): Record<string
   env['CLAWCIUS_HOST_AGENT'] = '1';
 
   assertNoSecrets(env, config.hostAgent.envPassthrough);
+  assertNoNodeOptions(env);
   return env;
+}
+
+/**
+ * Refuse an environment that would let Node run code before the drop.
+ *
+ * New on 2026-08-13 and a direct consequence of the fix for #21: the first
+ * process in the session is now `node -e <bootstrap>`, and it runs AS ROOT for
+ * the few milliseconds before it calls `setuid`. It is handed this environment.
+ * `NODE_OPTIONS=--require=/tmp/x.js` — or `--import`, or
+ * `NODE_REPL_EXTERNAL_MODULE` — would therefore execute a file of the caller's
+ * choosing as root, in the daemon's own cgroup, before any privilege had been
+ * dropped. That is a strictly worse hole than the one being fixed.
+ *
+ * Nothing in `ENV_ALLOWLIST`, `PROXY_VARS` or `CLAUDE_CONFIG_VARS` begins with
+ * `NODE_`, so this can only ever fire on a `hostAgent.envPassthrough` entry —
+ * and unlike the credential check it is deliberately NOT exempt for those. The
+ * whole point of `envPassthrough` is that it widens what the session sees; it
+ * must not be able to widen what runs as root before the session exists.
+ * `NODE_EXTRA_CA_CERTS` is refused with the rest: if this host ever needs it
+ * for the squid MITM, it belongs in the unit's own `Environment=` where it
+ * applies to a process that is root by design, not smuggled through a key
+ * intended for the agent.
+ */
+export function assertNoNodeOptions(env: Record<string, string>): void {
+  for (const name of Object.keys(env)) {
+    if (!name.startsWith('NODE_')) continue;
+    throw new HostAgentEnvError(
+      `refusing to start the host agent: its environment would contain "${name}". The ` +
+        'privilege drop is performed by a `node -e` bootstrap that runs as ROOT until it ' +
+        'calls setuid, and NODE_OPTIONS (and friends) make node execute a file named in the ' +
+        'environment before anything else. A NODE_* variable here is arbitrary code as root, ' +
+        'which is a larger hole than the one the bootstrap exists to close. If this is ' +
+        'genuinely needed, put it in the systemd unit rather than in ' +
+        'hostAgent.envPassthrough.',
+    );
+  }
 }
 
 /**
@@ -1078,34 +1115,25 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
       }
     });
 
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      // Bounded: a session that fails to start can produce megabytes of the
-      // same line, and the first 8 KB says everything the rest would.
-      if (stderr.length < 8192) stderr += text;
-
-      // ── The self-check ─────────────────────────────────────────────────
-      //
-      // The bootstrap writes one line saying what the kernel gave it, before
-      // it execs. It is scanned for here rather than trusted, so the journal
-      // records an OBSERVED credential next to the intended one — which is the
-      // single thing whose absence let #21 survive a boot banner, a session log
-      // line and two reviews. `credentialComplaint` compares them; if they
-      // disagree this is shouted about even though the bootstrap would already
-      // have refused, because two independent checks of the same fact is the
-      // cheapest thing in this file.
+    // ── The self-check ───────────────────────────────────────────────────
+    //
+    // The bootstrap writes one line saying what the KERNEL gave it, before it
+    // execs. It is read here rather than taken on trust, so the journal records
+    // an observed credential next to the intended one — which is the single
+    // thing whose absence let #21 survive a boot banner, a session log line and
+    // two reviews. `credentialComplaint` then compares the two; a disagreement
+    // is shouted about even though the bootstrap would already have refused,
+    // because a second independent check of the same fact is the cheapest thing
+    // in this file.
+    const noteCredentials = (lines: readonly string[]): void => {
       if (!viaBootstrap || credentialsSeen) return;
-      stderrPending += text;
-      if (stderrPending.length > MAX_LINE_BYTES) stderrPending = '';
-      const lines = stderrPending.split('\n');
-      stderrPending = lines.pop() ?? '';
       for (const line of lines) {
         const report = parseCredentialReport(line);
         if (report === null) continue;
         credentialsSeen = true;
         stderrPending = '';
-        const complaint = credentialComplaint(request.agent, report);
         request.onLog(`host agent: privilege drop — ${describeCredentials(request.agent, report)}`);
+        const complaint = credentialComplaint(request.agent, report);
         if (complaint !== null) {
           request.onLog(
             `host agent: ══ PRIVILEGE DROP DID NOT TAKE ══ ${complaint}. The session is ` +
@@ -1121,8 +1149,22 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
             detail: `the session's real credentials do not match the intended ones: ${complaint}`,
           });
         }
-        break;
+        return;
       }
+    };
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      // Bounded: a session that fails to start can produce megabytes of the
+      // same line, and the first 8 KB says everything the rest would.
+      if (stderr.length < 8192) stderr += text;
+
+      if (!viaBootstrap || credentialsSeen) return;
+      stderrPending += text;
+      if (stderrPending.length > MAX_LINE_BYTES) stderrPending = '';
+      const lines = stderrPending.split('\n');
+      stderrPending = lines.pop() ?? '';
+      noteCredentials(lines);
     });
 
     child.on('error', (error) => {
@@ -1144,6 +1186,11 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
 
     child.on('close', (code, signal) => {
       if (timedOut) return; // the timeout path owns the outcome
+
+      // Last chance to find the report, over everything stderr ever held: a
+      // line that arrived without its newline would otherwise sit unparsed in
+      // `stderrPending` and be read as "the drop never happened".
+      noteCredentials(stderr.split('\n'));
 
       // The session process never told us what it became. Either the bootstrap
       // refused (it exits PRIVILEGE_DROP_EXIT and says why on stderr) or it
