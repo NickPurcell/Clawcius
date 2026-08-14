@@ -161,13 +161,13 @@ export type AgentConfig = {
     maxPerHour: number;
   };
   /**
-   * The message board: identity, mail, and the drop directory mail arrives in.
+   * The message board: identity and mail.
    *
-   * See CLAWSKY.md. Phases 1 and 2 only — an agent can be addressed and can
-   * read its inbox; nothing yet wakes an idle agent because mail arrived.
+   * See CLAWSKY.md. There is nothing here about how mail is sent, because
+   * sending is a tool the waker builds per session rather than a path on disk.
    */
   clawsky: {
-    /** Off means no drop directory is watched and no checkMail tool exists. */
+    /** Off means no `checkMail` or `sendMail` tool is offered to any session. */
     enabled: boolean;
     /**
      * This deployment's crew. Agent ids are `<crew>-<role><ordinal>`, and the
@@ -175,16 +175,6 @@ export type AgentConfig = {
      * label.
      */
     crew: string;
-    /**
-     * Root of the per-agent drop directories.
-     *
-     * MUST be under `wake.spoolDir`'s parent — i.e. inside the one directory
-     * `docker/run-container.sh` bind-mounts into this crew's container and no
-     * other. That mount is the whole authorship guarantee: a name under this
-     * root is writable from exactly one container, which is why the daemon can
-     * stamp the author from the directory instead of believing the message.
-     */
-    dropDir: string;
     /**
      * Mail delivered to an idle agent starts a turn — CLAWSKY.md phase 3.
      *
@@ -349,7 +339,6 @@ const DEFAULTS: AgentConfig = {
   clawsky: {
     enabled: true,
     crew: 'clawcius',
-    dropDir: '/var/lib/clawcius/run/clawsky',
     wakeOnMail: true,
     agents: [],
   },
@@ -610,7 +599,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     clawsky: {
       enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
       crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
-      dropDir: str(clawsky['dropDir'], 'clawsky.dropDir', DEFAULTS.clawsky.dropDir),
       wakeOnMail: bool(clawsky['wakeOnMail'], 'clawsky.wakeOnMail', DEFAULTS.clawsky.wakeOnMail),
       agents: agentList(
         clawsky['agents'],
@@ -653,23 +641,17 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       throw new ConfigError('status.file', 'must be an absolute path');
     }
     const statusFile = resolve(config.status.file);
-    // Both of these are agent-writable by design. The drop directory is the
-    // newer one and the reasoning is identical, so it is checked here rather
-    // than left to be discovered the first time someone points the two at the
-    // same tree.
-    for (const [key, dir] of [
-      ['wake.spoolDir', config.wake.spoolDir],
-      ['clawsky.dropDir', config.clawsky.dropDir],
-    ] as const) {
-      const mounted = resolve(dir);
-      if (statusFile === mounted || statusFile.startsWith(`${mounted}/`)) {
-        throw new Error(
-          `agent-config.yaml: status.file (${statusFile}) is inside ${key} ` +
-            `(${mounted}), which is bind-mounted read-write into the agent container. ` +
-            'The ops executor trusts this file when deciding whether recreating the ' +
-            'container would kill a live turn; the agent must not be able to write it.',
-        );
-      }
+    // The wake spool is agent-writable by design — it is inside the bind mount
+    // and that is the point of it — so it is the one directory this file must
+    // not land in.
+    const mounted = resolve(config.wake.spoolDir);
+    if (statusFile === mounted || statusFile.startsWith(`${mounted}/`)) {
+      throw new Error(
+        `agent-config.yaml: status.file (${statusFile}) is inside wake.spoolDir ` +
+          `(${mounted}), which is bind-mounted read-write into the agent container. ` +
+          'The ops executor trusts this file when deciding whether recreating the ' +
+          'container would kill a live turn; the agent must not be able to write it.',
+      );
     }
   }
 
@@ -679,23 +661,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'clawsky.crew',
         'must be a short lowercase identifier — it prefixes every agent id in ' +
           'this crew and is compared as an exact string',
-      );
-    }
-    if (!isAbsolute(config.clawsky.dropDir)) {
-      throw new ConfigError('clawsky.dropDir', 'must be an absolute path');
-    }
-    // Warned rather than refused, because a second bind mount is a legitimate
-    // arrangement — but the failure it prevents is the ops spool's, which cost
-    // a silent outage: a drop directory outside the mount simply does not
-    // exist inside the container, so the agent's write fails into a shell
-    // nobody reads and the waker sees an empty directory forever.
-    const mount = resolve(config.wake.spoolDir, '..');
-    const drop = resolve(config.clawsky.dropDir);
-    if (drop !== mount && !drop.startsWith(`${mount}/`)) {
-      console.warn(
-        `[config] clawsky.dropDir (${drop}) is outside ${mount}, the directory ` +
-          'docker/run-container.sh bind-mounts into the agent container. Unless it has a ' +
-          'mount of its own, agents will not be able to send mail and nothing will say so.',
       );
     }
   }

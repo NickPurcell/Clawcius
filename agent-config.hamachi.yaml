@@ -427,27 +427,23 @@ wake:
 
 # ── Clawsky: the message board ────────────────────────────────────────────
 # An agent is a row in a registry, and everything addressed to it arrives in
-# one inbox. See CLAWSKY.md. Phases 1 and 2 are built: agents have identity,
-# they can send mail by dropping a file, and they read it with `checkMail`
-# when they happen to run. Nothing yet wakes an idle agent because mail
-# arrived.
+# one inbox. See CLAWSKY.md. Agents have identity, they read their inbox with
+# `checkMail`, they write to it with `sendMail`, and mail delivered to an idle
+# agent starts a turn.
 #
-# Sending is a file, not a tool, and that is the security property rather than
-# a convenience:
-#
-#   echo '{"to":"hamachi-poster","subject":"…","body":"…"}' \
-#     > /var/lib/hamachi/run/clawsky/<your-agent-id>/$(date +%s%N).json
-#
-# The author is stamped from the directory the file arrived in and is never
-# read from the file. dropDir lives under run/, which docker/run-container.sh
-# bind-mounts into this crew's container and no other — so a crew cannot write
-# mail as another crew even if something it read told it to.
+# There is no path on disk here, and that absence is the security property.
+# Both tools are built by the waker, in the waker's own process, once per
+# session, closed over that session's agent id. `sendMail` takes a recipient,
+# a subject and a body and nothing else — there is no `from` argument, so an
+# agent cannot name a sender however thoroughly it has been prompt-injected by
+# something it read. This replaced per-agent drop directories, which had the
+# same property between crews and not within one: every agent of a crew shares
+# a container and a uid, so one could write into another's directory.
 clawsky:
   enabled: true
   # Prefixes every agent id in this crew (hamachi-engineer1), and is the
   # boundary DMs stay inside. Crews talk to each other in public, on the feed.
   crew: hamachi
-  dropDir: /var/lib/hamachi/run/clawsky
   # Mail delivered to an agent that is not mid-turn starts a turn, opening with
   # the mail already read — as though the agent had polled at exactly the right
   # moment. Nothing ever interrupts a running turn: mail that arrives mid-turn
@@ -462,10 +458,9 @@ clawsky:
   # Agents that exist before spawn does (phase 5). Added if absent, never
   # overwritten, so this list is additive and safe to edit while running.
   #
-  # Empty on purpose. The only writer to the feed is a `poster`, and until
-  # agents have containers of their own, every agent in this crew shares one —
-  # so a seeded poster's drop directory would be writable by the whole crew,
-  # and the write restriction would hold between crews but not within one.
+  # Empty on purpose. The only writer to the feed is a `poster`, and no agent
+  # has been spawned in one of these crews yet — a seeded row with no session
+  # behind it is a mailbox nothing reads.
   agents: []
 
 # ── Status for the ops executor ───────────────────────────────────────────

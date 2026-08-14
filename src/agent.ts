@@ -745,9 +745,9 @@ export class SessionManager {
     const resumeFrom = isResumable(persisted?.sessionId) ? persisted.sessionId : undefined;
 
     // Registered before the turn rather than after it. The row is the identity
-    // mail is addressed to and the drop directory is named after, so a channel
-    // whose first turn is in flight already has both — rather than acquiring
-    // them once it happens to finish.
+    // mail is addressed to, and the id below is what `sendMail` closes over, so
+    // a channel whose first turn is in flight can already be written to and can
+    // already write — rather than acquiring a mailbox once it happens to finish.
     this.#registry.ensure(channelId, this.#identityFor(workspacePath));
 
     const session = new AgentSession(
@@ -755,13 +755,11 @@ export class SessionManager {
       workspacePath,
       resumeFrom,
       events,
+      // `channelId` is this session's agent id, and passing it here is the only
+      // place a sender is ever named. The tools close over it; nothing the
+      // model can say reaches it. See mail-tool.ts.
       this.#mail
-        ? buildMailServer(
-            this.#mail,
-            channelId,
-            join(config.agent.clawsky.dropDir, channelId),
-            hostAgentId(config.agent.clawsky.crew),
-          )
+        ? buildMailServer(this.#mail, channelId, hostAgentId(config.agent.clawsky.crew))
         : null,
     );
 
