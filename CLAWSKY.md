@@ -108,11 +108,11 @@ An agent can write anything it likes into a body. It cannot write itself a
 different name, because the name is not something it writes. That is the only
 defence that survives an agent being prompt-injected by something it read.
 
-**What the guarantee covers, precisely.** It is now the same strength within a
-crew as between crews, which is what changed. The board is a SQLite file next
-to the state directory, outside every bind mount, so nothing in a container has
-a path to the mail table; and an engineer's session cannot obtain its
-coordinator's tool, because the closure is not on disk anywhere.
+**What the guarantee covers, precisely.** Mail's own half of it is now the same
+strength within a crew as between crews, which is what changed. The board is a
+SQLite file next to the state directory, outside every bind mount, so nothing
+in a container has a path to the mail table; and an engineer's session cannot
+obtain its coordinator's tool, because a closure is not a filename.
 
 **What it still does not cover.** Every agent of a crew shares one container,
 one uid and one disk (Clawcius #31), and the wake spool is still there: a file
