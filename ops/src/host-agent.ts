@@ -464,7 +464,44 @@ export function hostAgentEnv(config: OpsConfig, agent: AgentUser): Record<string
   env['CLAWCIUS_HOST_AGENT'] = '1';
 
   assertNoSecrets(env, config.hostAgent.envPassthrough);
+  assertNoNodeOptions(env);
   return env;
+}
+
+/**
+ * Refuse an environment that would let Node run code before the drop.
+ *
+ * New on 2026-08-13 and a direct consequence of the fix for #21: the first
+ * process in the session is now `node -e <bootstrap>`, and it runs AS ROOT for
+ * the few milliseconds before it calls `setuid`. It is handed this environment.
+ * `NODE_OPTIONS=--require=/tmp/x.js` — or `--import`, or
+ * `NODE_REPL_EXTERNAL_MODULE` — would therefore execute a file of the caller's
+ * choosing as root, in the daemon's own cgroup, before any privilege had been
+ * dropped. That is a strictly worse hole than the one being fixed.
+ *
+ * Nothing in `ENV_ALLOWLIST`, `PROXY_VARS` or `CLAUDE_CONFIG_VARS` begins with
+ * `NODE_`, so this can only ever fire on a `hostAgent.envPassthrough` entry —
+ * and unlike the credential check it is deliberately NOT exempt for those. The
+ * whole point of `envPassthrough` is that it widens what the session sees; it
+ * must not be able to widen what runs as root before the session exists.
+ * `NODE_EXTRA_CA_CERTS` is refused with the rest: if this host ever needs it
+ * for the squid MITM, it belongs in the unit's own `Environment=` where it
+ * applies to a process that is root by design, not smuggled through a key
+ * intended for the agent.
+ */
+export function assertNoNodeOptions(env: Record<string, string>): void {
+  for (const name of Object.keys(env)) {
+    if (!name.startsWith('NODE_')) continue;
+    throw new HostAgentEnvError(
+      `refusing to start the host agent: its environment would contain "${name}". The ` +
+        'privilege drop is performed by a `node -e` bootstrap that runs as ROOT until it ' +
+        'calls setuid, and NODE_OPTIONS (and friends) make node execute a file named in the ' +
+        'environment before anything else. A NODE_* variable here is arbitrary code as root, ' +
+        'which is a larger hole than the one the bootstrap exists to close. If this is ' +
+        'genuinely needed, put it in the systemd unit rather than in ' +
+        'hostAgent.envPassthrough.',
+    );
+  }
 }
 
 /**
@@ -807,47 +844,49 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
 
   const env = hostAgentEnv(config, request.agent);
 
+  const dropping = request.agent.uid !== process.getuid?.();
+  // `groups` and `gids` are built separately in agent-user.ts and #21 spent an
+  // afternoon on the difference, so both are printed and they are labelled
+  // INTENDED. What actually happened is a separate line, below, and it comes
+  // from the kernel.
   request.onLog(
     `host agent: session ${sessionId} for ${request.requester}, ` +
-      `${dryRun ? 'DRY RUN (execution denied)' : 'LIVE'}, as ${request.agent.user} ` +
-      `(uid ${request.agent.uid}, gid ${request.agent.gid}, groups ` +
-      `${request.agent.groups.join('/') || 'none'}), cwd ${config.hostAgent.workDir}, ` +
+      `${dryRun ? 'DRY RUN (execution denied)' : 'LIVE'}, intending to run as ` +
+      `${request.agent.user} (uid ${request.agent.uid}, gid ${request.agent.gid}, groups ` +
+      `${request.agent.groups.join('/') || 'none'} = gids ` +
+      `${request.agent.gids.join(',') || 'none'}), cwd ${config.hostAgent.workDir}, ` +
       `env: ${Object.keys(env).sort().join(' ')}`,
   );
 
+  // The bootstrap path is the only one that can produce a non-empty
+  // supplementary group list — see the long note above `PRIVILEGE_DROP_BOOTSTRAP`.
+  const viaBootstrap = dropping && supportsExecve();
+  if (dropping && !viaBootstrap) {
+    request.onLog(
+      'host agent: WARNING — this node has no process.execve, so the session is started ' +
+        'with the spawn uid/gid options instead. libuv calls setgroups(0, NULL) in the child ' +
+        'whenever those are used, so the session will hold ONLY its primary group: no ' +
+        'journal access (systemd-journal) and no write access to the shared checkout ' +
+        '(clawcius-dev). Tasks that pull, build or read logs will fail. Node >= 22.15 fixes ' +
+        'this.',
+    );
+  }
+  const launch = viaBootstrap
+    ? privilegeDropLaunch(request.agent, config.hostAgent.claudePath, args)
+    : { command: config.hostAgent.claudePath, argv: [...args] };
+
   return new Promise<HostAgentOutcome>((resolve) => {
     let child: ReturnType<typeof spawn>;
-    const dropping = request.agent.uid !== process.getuid?.();
     try {
-      child = withSupplementaryGroups(dropping ? request.agent : null, request.onLog, () =>
-        spawn(config.hostAgent.claudePath, args, {
-          // A directory of our own, NOT the checkout. Claude Code auto-discovers
-          // CLAUDE.md and project settings from the working directory, and the
-          // checkout is a tree the agents push to — so pointing this at the
-          // checkout would hand a session with sudo a set of instructions any
-          // agent can edit and get merged. The agent can still `cd` there in a
-          // Bash command, which is a deliberate act it takes and the audit
-          // records, rather than context it silently absorbs.
+      child = spawn(
+        launch.command,
+        launch.argv,
+        sessionSpawnOptions({
           cwd: config.hostAgent.workDir,
           env,
-          // The drop to the service account: `setuid(2)` performed by libuv in
-          // the forked child before `execve`, which is a DIFFERENT operation
-          // from anything `sudo` or `su` does. It drops privilege rather than
-          // gaining it, so `NoNewPrivileges` has no bearing on it — see the
-          // unit file, where NNP has to stay false anyway for the sudo the
-          // session itself runs.
-          //
-          // Deliberately not `sudo -u clawcius-ops claude …`: sudo is a setuid
-          // binary, NNP would make it a no-op, it would need its own sudoers
-          // rule (a rule that says "become the agent user and run anything",
-          // which is a strange thing to write in a file whose whole purpose is
-          // enumerating what may be run), and the resulting process tree would
-          // have a sudo between this daemon and the session for no benefit.
-          ...(dropping ? { uid: request.agent.uid, gid: request.agent.gid } : {}),
-          stdio: ['ignore', 'pipe', 'pipe'],
-          // Its own process group, so a timeout can take out the commands it
-          // started as well as the session itself.
-          detached: true,
+          agent: request.agent,
+          dropping,
+          viaBootstrap,
         }),
       );
     } catch (error) {
@@ -870,6 +909,8 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
 
     const commands: string[] = [];
     let stderr = '';
+    let stderrPending = '';
+    let credentialsSeen = false;
     let pending = '';
     let turns = 0;
     let costUsd = 0;
@@ -1074,10 +1115,56 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
       }
     });
 
+    // ── The self-check ───────────────────────────────────────────────────
+    //
+    // The bootstrap writes one line saying what the KERNEL gave it, before it
+    // execs. It is read here rather than taken on trust, so the journal records
+    // an observed credential next to the intended one — which is the single
+    // thing whose absence let #21 survive a boot banner, a session log line and
+    // two reviews. `credentialComplaint` then compares the two; a disagreement
+    // is shouted about even though the bootstrap would already have refused,
+    // because a second independent check of the same fact is the cheapest thing
+    // in this file.
+    const noteCredentials = (lines: readonly string[]): void => {
+      if (!viaBootstrap || credentialsSeen) return;
+      for (const line of lines) {
+        const report = parseCredentialReport(line);
+        if (report === null) continue;
+        credentialsSeen = true;
+        stderrPending = '';
+        request.onLog(`host agent: privilege drop — ${describeCredentials(request.agent, report)}`);
+        const complaint = credentialComplaint(request.agent, report);
+        if (complaint !== null) {
+          request.onLog(
+            `host agent: ══ PRIVILEGE DROP DID NOT TAKE ══ ${complaint}. The session is ` +
+              'running with credentials the executor did not ask for. Everything ' +
+              'ops/README.md claims about group membership is about the intent, not about ' +
+              'this process.',
+          );
+          audit({
+            kind: 'note',
+            tool: '(auditor)',
+            command: '',
+            toolUseId: '',
+            detail: `the session's real credentials do not match the intended ones: ${complaint}`,
+          });
+        }
+        return;
+      }
+    };
+
     child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
       // Bounded: a session that fails to start can produce megabytes of the
       // same line, and the first 8 KB says everything the rest would.
-      if (stderr.length < 8192) stderr += chunk.toString();
+      if (stderr.length < 8192) stderr += text;
+
+      if (!viaBootstrap || credentialsSeen) return;
+      stderrPending += text;
+      if (stderrPending.length > MAX_LINE_BYTES) stderrPending = '';
+      const lines = stderrPending.split('\n');
+      stderrPending = lines.pop() ?? '';
+      noteCredentials(lines);
     });
 
     child.on('error', (error) => {
@@ -1099,6 +1186,45 @@ export function runHostAgent(request: HostAgentRequest): Promise<HostAgentOutcom
 
     child.on('close', (code, signal) => {
       if (timedOut) return; // the timeout path owns the outcome
+
+      // Last chance to find the report, over everything stderr ever held: a
+      // line that arrived without its newline would otherwise sit unparsed in
+      // `stderrPending` and be read as "the drop never happened".
+      noteCredentials(stderr.split('\n'));
+
+      // The session process never told us what it became. Either the bootstrap
+      // refused (it exits PRIVILEGE_DROP_EXIT and says why on stderr) or it
+      // died before it could say, and in both cases `claude` was never
+      // `execve`d. This is reported as its own failure rather than as a
+      // confusing "no result": a task that fails here is a host problem, not an
+      // agent problem, and the difference is what the operator needs at 3am.
+      if (viaBootstrap && !credentialsSeen) {
+        const said = stderr.trim().slice(0, 800);
+        request.onLog(
+          `host agent: ══ PRIVILEGE DROP FAILED ══ session ${sessionId} never reported its ` +
+            `credentials (exit ${code ?? signal}). The session was NOT started. ${said}`,
+        );
+        finish({
+          ok: false,
+          reason: 'privilege-drop',
+          detail:
+            `could not start the session as ${request.agent.user} (uid ${request.agent.uid}, ` +
+            `gid ${request.agent.gid}, gids ${request.agent.gids.join(',')}): the privilege-drop ` +
+            `bootstrap exited ${code ?? signal} without reaching execve, so nothing ran. ` +
+            (said ? `It said: ${said}` : 'It said nothing.'),
+          resultText,
+          turns,
+          costUsd,
+          commands,
+          denials,
+          unparsedLines,
+          durationMs: Date.now() - started,
+          dryRun,
+          sessionId,
+        });
+        return;
+      }
+
       if (pending.trim()) {
         unparsedLines += 1;
         audit({
@@ -1210,103 +1336,373 @@ function summariseToolInput(input: Record<string, unknown>): string {
   return parts.join(' ') || '(no notable arguments)';
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * The privilege drop.
+ *
+ * ── What was wrong until 2026-08-13, and how it hid ──────────────────────
+ *
+ * From 2026-08-11 this file dropped the session with `spawn`'s `uid`/`gid`
+ * options and, immediately before the (synchronous) `spawn` call, set THIS
+ * process's own supplementary groups to the agent's — on the stated reasoning
+ * that "libuv performs `setgid`/`setuid` in the forked child but never
+ * `setgroups`, so the child inherits the parent's list".
+ *
+ * That reasoning is false, and it is false in libuv's source rather than in
+ * some subtlety of the event loop. `uv__process_child_init`, in
+ * `src/unix/process.c`, has done this since 2013 and still does in the 1.51.0
+ * that Node 22 bundles:
+ *
+ *     if (options->flags & (UV_PROCESS_SETUID | UV_PROCESS_SETGID)) {
+ *       // When dropping privileges from root, the `setgroups` call will
+ *       // remove any extraneous groups. ...
+ *       SAVE_ERRNO(setgroups(0, NULL));
+ *     }
+ *     if ((options->flags & UV_PROCESS_SETGID) && setgid(options->gid)) ...
+ *     if ((options->flags & UV_PROCESS_SETUID) && setuid(options->uid)) ...
+ *
+ * libuv CLEARS the supplementary group list in the child whenever either the
+ * `uid` or the `gid` spawn option is used. So the parent's list — whatever it
+ * is, root's or the agent's — is discarded a few instructions after the fork,
+ * and the session comes up holding exactly its primary group. Which is what
+ * `id` reported in #21:
+ *
+ *     uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops)
+ *
+ * Note that libuv's behaviour is the SAFE default and it is not a bug: it is
+ * there to stop exactly the hole the old comment worried about (a child that
+ * is nominally unprivileged while still carrying root's groups). It is only
+ * wrong for us because we want a specific, non-empty list.
+ *
+ * The failure survived a boot banner, a per-session log line and two reviews
+ * for one reason worth writing down: every one of those printed the INTENT.
+ * `resolveAgentUser` read /etc/group correctly, the banner named all three
+ * groups correctly, and the code that logged them was nowhere near the code
+ * that would have observed them. Nothing in the pipeline ever asked the kernel
+ * what the child actually got. See `PRIVILEGE_DROP_BOOTSTRAP` below, which now
+ * does, and refuses to `exec` the session if the answer is wrong.
+ *
+ * ── What replaces it ─────────────────────────────────────────────────────
+ *
+ * The `uid`/`gid` spawn options are not used at all any more — using either of
+ * them is what triggers `setgroups(0, NULL)`. Instead this daemon spawns a
+ * three-line `node -e` bootstrap, still as root, which does the whole
+ * transition itself in the right order and then REPLACES ITSELF with the
+ * session via `process.execve(3)`:
+ *
+ *     setgroups(agent.gids) → setgid(agent.gid) → setuid(agent.uid)
+ *       → read back getuid/getgid/getgroups and compare
+ *       → execve(claude, argv, env)
+ *
+ * `execve` rather than a nested `spawn`, so the pid is unchanged: `child.pid`,
+ * the `detached` process group, `killTree`, the stdio pipes and the timeout all
+ * behave exactly as they did before. (Verified: `process.execve` keeps the pid.)
+ *
+ * Why this is not the alternatives that were rejected before, and still are:
+ * `sudo -u`/`su` are setuid binaries, which `NoNewPrivileges` would turn into a
+ * no-op and which would need a sudoers rule saying "become the agent and run
+ * anything"; `setpriv --groups` is a third-party binary this host has never
+ * run. The bootstrap is Node — the same binary already running — making three
+ * ordinary syscalls, and it is in this file where a reviewer sees it.
+ *
+ * `process.execve` landed in Node 22.15/23.11. If it is missing the launcher
+ * falls back to the old `spawn({ uid, gid })`, loudly: that path still drops
+ * uid and gid correctly and now provably ends with an EMPTY supplementary list,
+ * which is a loss of capability (no journal, no shared checkout) and not a loss
+ * of containment. Degrading toward less privilege is the right direction for a
+ * fallback; degrading silently is not, hence the log line.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
 /**
- * Run `fn` with the parent's supplementary groups set to the agent's, then put
- * them back.
- *
- * ── The hole this closes, and why it needed closing on 2026-08-11 ────────
- *
- * `spawn`'s `uid`/`gid` options make libuv call `setgid(2)` and `setuid(2)` in
- * the forked child. It does NOT call `setgroups(2)` or `initgroups(3)`. So the
- * child's SUPPLEMENTARY groups are inherited from the parent — and the parent
- * is root.
- *
- * build.ts wrote that down as an honest limitation and left it, on the grounds
- * that what mattered was the ownership of the files the build produced. That
- * was defensible while the session ran as the checkout's owner. It stopped
- * being defensible the moment the entire containment argument became "this
- * account is not in any root-equivalent group": a process running as
- * `clawcius-ops` while still carrying root's group list is not the thing
- * agent-user.ts just spent two hundred lines asserting about. In particular it
- * would carry gid 0, and "not in the root group" is one of the things that file
- * refuses to start without.
- *
- * The fix is not clever, and the alternatives are worse: `setpriv
- * --clear-groups` is another binary to depend on and one that has never been
- * run on this host, and `sudo -u` is a setuid binary in a unit that has to
- * think about `NoNewPrivileges`. What happens instead is that this process — as
- * root, which is the only thing allowed to — sets ITS OWN supplementary groups
- * to the agent's for exactly the duration of the `spawn` call, and restores
- * them in a `finally`.
- *
- * That is safe for one specific reason and it is worth stating, because it
- * looks alarming: `fn` here is a single synchronous `spawn()`, and Node is
- * single-threaded with a run-to-completion event loop. No other JavaScript in
- * this process can observe the window. If anybody ever puts an `await` inside
- * this callback, that stops being true and this comment is the warning.
- *
- * Failure to restore would leave the root daemon carrying the agent's groups,
- * which is a downgrade rather than an escalation, and is in practice impossible
- * (root may always `setgroups`). It is shouted about anyway.
+ * The one line the bootstrap prints, and the parent parses, to say what the
+ * kernel actually handed back. A fixed prefix rather than a sentence, because
+ * something machine-read must not be reworded by the next person tidying log
+ * strings.
  */
-function withSupplementaryGroups<T>(
-  agent: AgentUser | null,
-  log: (line: string) => void,
-  fn: () => T,
-): T {
-  const getgroups = process.getgroups;
-  const setgroups = process.setgroups;
-  const canSet =
-    agent !== null &&
-    process.getuid?.() === 0 &&
-    typeof getgroups === 'function' &&
-    typeof setgroups === 'function';
+export const CREDENTIAL_REPORT_MARKER = '[ops] host-agent-credentials ';
 
-  if (!canSet || agent === null || !getgroups || !setgroups) {
-    if (agent !== null) {
-      // Not root, or a platform without setgroups. Nothing to do and nothing
-      // to hide: the caller is either the self-test (running as itself, not
-      // dropping at all) or a host where this daemon is not root, in which
-      // case it cannot drop to anybody either and `resolveAgentUser` has
-      // already refused.
-      log(
-        `host agent: not adjusting supplementary groups (uid ${String(process.getuid?.())}); ` +
-          'the child inherits this process\'s group list',
-      );
-    }
-    return fn();
-  }
+/** Exit status the bootstrap uses when it refuses to `exec` the session. */
+export const PRIVILEGE_DROP_EXIT = 120;
 
-  const saved = getgroups();
+/** What the kernel said, as opposed to what /etc/group said. */
+export type DroppedCredentials = { uid: number; gid: number; groups: number[] };
+
+/**
+ * The bootstrap, as source, run by `node -e`.
+ *
+ * Inline rather than a second file in `dist/`, deliberately. The first suspect
+ * in #21 was a stale build; a separate artifact is a second thing that can be
+ * stale, missing, or resolved from the wrong directory when this daemon is
+ * started with `--experimental-strip-types` out of `src/`. As a string constant
+ * it is part of `host-agent.js` and cannot disagree with it.
+ *
+ * Deliberately old-fashioned JavaScript (`var`, no optional chaining, no
+ * imports): `node -e` is evaluated as CommonJS, this is the last code that runs
+ * as root before the session exists, and it should be readable by somebody
+ * debugging it out of a `ps` listing at 3am. It touches nothing but `process`.
+ *
+ * Note the "already correct" short-circuit. It makes the bootstrap idempotent,
+ * and it is what lets the self-test run this exact string end-to-end as an
+ * unprivileged user: hand it the credentials it already has and it verifies and
+ * execs, hand it anybody else's and it refuses. Without that there would be no
+ * way to test this code without root, and untestable is how the last version
+ * got here.
+ */
+export const PRIVILEGE_DROP_BOOTSTRAP = [
+  "'use strict';",
+  '// clawcius host agent privilege drop — see withSupplementaryGroups history',
+  '// and PRIVILEGE_DROP_BOOTSTRAP in ops/src/host-agent.ts.',
+  'var intent = JSON.parse(process.argv[1]);',
+  'var shout = function (why) {',
+  "  process.stderr.write('[ops] PRIVILEGE DROP REFUSED: ' + why + '\\n');",
+  `  process.exit(${PRIVILEGE_DROP_EXIT});`,
+  '};',
+  '// Sorted, de-duplicated, decimal. Compared as a string so that ordering and',
+  '// the kernel folding the egid into getgroups() cannot fake a mismatch.',
+  'var norm = function (list) {',
+  '  var seen = {};',
+  '  var out = [];',
+  '  for (var i = 0; i < list.length; i++) {',
+  '    var g = list[i];',
+  '    if (seen[g]) continue;',
+  '    seen[g] = 1;',
+  '    out.push(g);',
+  '  }',
+  '  out.sort(function (a, b) { return a - b; });',
+  "  return out.join(',');",
+  '};',
+  '// The check #21 asked for by name: a STRING here would be taken by',
+  '// process.setgroups() as a group NAME, resolved through NSS, and would fail',
+  '// or resolve to something nobody intended.',
+  "var whole = function (v) { return typeof v === 'number' && Number.isInteger(v) && v >= 0; };",
+  'if (!whole(intent.uid) || !whole(intent.gid) || !Array.isArray(intent.gids)) {',
+  "  shout('the intended credentials are not whole numbers: ' + JSON.stringify(intent.uid) +",
+  "    '/' + JSON.stringify(intent.gid));",
+  '}',
+  'for (var n = 0; n < intent.gids.length; n++) {',
+  '  if (whole(intent.gids[n])) continue;',
+  "  shout('gid list entry ' + n + ' is ' + JSON.stringify(intent.gids[n]) + ', not a number. " +
+    "process.setgroups() would treat a string as a group NAME.');",
+  '}',
+  "if (intent.uid === 0) shout('refusing to \"drop\" to uid 0');",
+  'var want = norm([intent.gid].concat(intent.gids));',
+  'var actual = function () {',
+  '  return {',
+  '    uid: process.getuid(),',
+  '    gid: process.getgid(),',
+  '    groups: norm(process.getgroups()),',
+  '  };',
+  '};',
+  'var have = actual();',
+  'if (have.uid !== intent.uid || have.gid !== intent.gid || have.groups !== want) {',
+  '  if (have.uid !== 0) {',
+  "    shout('this process is uid ' + have.uid + ' (not root) and does not already hold ' +",
+  "      'the intended credentials, so it cannot take them.');",
+  '  }',
+  '  // Order matters and is not negotiable: setgroups needs CAP_SETGID, setgid',
+  '  // needs it too, and setuid to a non-root uid throws both away.',
+  '  try { process.setgroups(intent.gids); }',
+  "  catch (e) { shout('setgroups([' + intent.gids.join(',') + ']) failed: ' + String(e)); }",
+  '  try { process.setgid(intent.gid); }',
+  "  catch (e) { shout('setgid(' + intent.gid + ') failed: ' + String(e)); }",
+  '  try { process.setuid(intent.uid); }',
+  "  catch (e) { shout('setuid(' + intent.uid + ') failed: ' + String(e)); }",
+  '  have = actual();',
+  '}',
+  '// Read back from the kernel, every time, including on the short-circuit.',
+  "if (have.uid !== intent.uid) shout('uid is ' + have.uid + ', wanted ' + intent.uid);",
+  "if (have.gid !== intent.gid) shout('gid is ' + have.gid + ', wanted ' + intent.gid);",
+  'if (have.groups !== want) {',
+  "  shout('supplementary groups are [' + have.groups + '], wanted [' + want + ']. This is " +
+    'the 2026-08-13 failure: libuv clears the group list in the child whenever the uid or gid ' +
+    "spawn option is used, so the list has to be taken here instead.');",
+  '}',
+  '// Checked HERE, after the drop and before the report, because',
+  '// process.execve() failing is a fatal native abort that no try/catch sees —',
+  '// it prints a V8 stack trace and no explanation. And because the question',
+  '// worth asking is whether the AGENT can execute it: claude lives under a',
+  "// home the agent does not own, and root's answer is not the one that counts.",
+  'try {',
+  "  var fs = require('node:fs');",
+  '  fs.accessSync(intent.command, fs.constants.X_OK);',
+  '} catch (e) {',
+  "  shout(intent.command + ' is not executable by uid ' + have.uid + ': ' + String(e) +",
+  "    '. Check hostAgent.claudePath and its mode.');",
+  '}',
+  "process.stderr.write('" +
+    CREDENTIAL_REPORT_MARKER +
+    "' + JSON.stringify({",
+  '  uid: have.uid,',
+  '  gid: have.gid,',
+  "  groups: have.groups ? have.groups.split(',').map(Number) : [],",
+  "}) + '\\n');",
+  "if (typeof process.execve !== 'function') {",
+  "  shout('this node has no process.execve, so the session cannot be started without a " +
+    "second spawn that would clear the group list again.');",
+  '}',
+  '// Replaces this process: same pid, same process group, same pipes.',
+  'process.execve(intent.command, [intent.command].concat(intent.argv), process.env);',
+  "shout('process.execve returned instead of replacing this process');",
+].join('\n');
+
+/** Does this Node have `process.execve`? Added in 22.15 / 23.11. */
+export function supportsExecve(): boolean {
+  return typeof (process as { execve?: unknown }).execve === 'function';
+}
+
+/**
+ * What to actually `spawn`, given an agent to become.
+ *
+ * Exported so the self-test can assert the shape without starting anything: in
+ * particular that the `uid`/`gid` spawn options are NOT in it, which is the
+ * whole point, and that the gid list crossing into the payload is numeric.
+ */
+export function privilegeDropLaunch(
+  agent: AgentUser,
+  command: string,
+  argv: readonly string[],
+): { command: string; argv: string[] } {
+  return {
+    command: process.execPath,
+    argv: [
+      '-e',
+      PRIVILEGE_DROP_BOOTSTRAP,
+      // One JSON argument. `spawn` is given an argv array and no shell, so
+      // there is no quoting to get wrong, and `execve` replaces this argv with
+      // the session's a millisecond later.
+      JSON.stringify({
+        uid: agent.uid,
+        gid: agent.gid,
+        gids: agent.gids,
+        command,
+        argv: [...argv],
+      }),
+    ],
+  };
+}
+
+/**
+ * The `spawn` options for the session.
+ *
+ * Extracted from `runHostAgent` and exported for ONE reason, and it is a
+ * regression guard rather than tidiness: the self-test asserts that the
+ * bootstrap path carries no `uid` and no `gid` key. Passing either of them is
+ * how #21 happened — libuv responds by running `setgroups(0, NULL)` in the
+ * forked child — and it is the single most natural "simplification" for a
+ * future reader to make, because to the naked eye those two options are exactly
+ * what this function is trying to achieve.
+ */
+export function sessionSpawnOptions(input: {
+  cwd: string;
+  env: Record<string, string>;
+  agent: AgentUser;
+  dropping: boolean;
+  viaBootstrap: boolean;
+}): {
+  cwd: string;
+  env: Record<string, string>;
+  stdio: ['ignore', 'pipe', 'pipe'];
+  detached: true;
+  uid?: number;
+  gid?: number;
+} {
+  return {
+    // A directory of our own, NOT the checkout. Claude Code auto-discovers
+    // CLAUDE.md and project settings from the working directory, and the
+    // checkout is a tree the agents push to — so pointing this at the checkout
+    // would hand a session with sudo a set of instructions any agent can edit
+    // and get merged. The agent can still `cd` there in a Bash command, which
+    // is a deliberate act it takes and the audit records, rather than context
+    // it silently absorbs.
+    cwd: input.cwd,
+    env: input.env,
+    // NOTE THE ABSENCE of `uid`/`gid` whenever the bootstrap is in play, and
+    // that it is the entire fix for #21. The drop is done by the bootstrap
+    // instead — in the child, in the right order, and verified there before it
+    // execs anything.
+    //
+    // Still deliberately not `sudo -u clawcius-ops claude …`: sudo is a setuid
+    // binary, NNP would make it a no-op, it would need its own sudoers rule (a
+    // rule that says "become the agent user and run anything", which is a
+    // strange thing to write in a file whose whole purpose is enumerating what
+    // may be run), and the resulting process tree would have a sudo between
+    // this daemon and the session.
+    ...(input.dropping && !input.viaBootstrap
+      ? { uid: input.agent.uid, gid: input.agent.gid }
+      : {}),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    // Its own process group, so a timeout can take out the commands it started
+    // as well as the session itself.
+    detached: true,
+  };
+}
+
+/**
+ * Read the bootstrap's credential line, or `null` if this is not one.
+ *
+ * Pure and exported: the parent has to be able to tell the difference between
+ * "the session started and holds these groups" and "the session started".
+ */
+export function parseCredentialReport(line: string): DroppedCredentials | null {
+  const at = line.indexOf(CREDENTIAL_REPORT_MARKER);
+  if (at === -1) return null;
+  let parsed: unknown;
   try {
-    setgroups(agent.gids);
-  } catch (error) {
-    // Not fatal. The uid/gid drop below still happens and is the property that
-    // matters most; this is the belt to its braces. Loud, because a session
-    // that is `clawcius-ops` with root's group list is not what the README
-    // says it is, and somebody should know.
-    log(
-      `host agent: WARNING — could not set supplementary groups to ` +
-        `${agent.gids.join(',')} (${String(error)}). The session will run as ` +
-        `${agent.user} but with this process's supplementary groups, which are root's. ` +
-        'Everything ops/README.md says about group membership is weaker than it claims ' +
-        'until this is fixed.',
+    parsed = JSON.parse(line.slice(at + CREDENTIAL_REPORT_MARKER.length));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const value = parsed as { uid?: unknown; gid?: unknown; groups?: unknown };
+  if (!Number.isInteger(value.uid) || !Number.isInteger(value.gid)) return null;
+  if (!Array.isArray(value.groups) || !value.groups.every((g) => Number.isInteger(g))) return null;
+  return { uid: value.uid as number, gid: value.gid as number, groups: value.groups as number[] };
+}
+
+/**
+ * Does what the kernel handed back match what /etc/group said it should be?
+ * Returns a sentence naming the difference, or `null` when they agree.
+ *
+ * This is the check whose absence let #21 live: it is the only place in this
+ * file that compares an OBSERVED credential against an intended one. Everything
+ * else — the boot banner, `describeAgentUser`, the session log line — prints
+ * the intent twice and calls it agreement.
+ */
+export function credentialComplaint(
+  agent: AgentUser,
+  actual: DroppedCredentials,
+): string | null {
+  const wanted = [...new Set([agent.gid, ...agent.gids])].sort((a, b) => a - b);
+  const got = [...new Set(actual.groups)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  if (actual.uid !== agent.uid) parts.push(`uid is ${actual.uid}, expected ${agent.uid}`);
+  if (actual.gid !== agent.gid) parts.push(`gid is ${actual.gid}, expected ${agent.gid}`);
+  if (wanted.join(',') !== got.join(',')) {
+    const missing = wanted.filter((g) => !got.includes(g));
+    const extra = got.filter((g) => !wanted.includes(g));
+    parts.push(
+      `groups are [${got.join(',')}], expected [${wanted.join(',')}]` +
+        (missing.length ? `; missing ${missing.join(',')}` : '') +
+        (extra.length ? `; unexpected ${extra.join(',')}` : ''),
     );
-    return fn();
   }
+  if (parts.length === 0) return null;
+  return parts.join('; ');
+}
 
-  try {
-    return fn();
-  } finally {
-    try {
-      setgroups(saved);
-    } catch (error) {
-      process.stderr.write(
-        `[ops] ══ COULD NOT RESTORE SUPPLEMENTARY GROUPS ══ ${String(error)}. This process ` +
-          `is still carrying ${agent.user}'s group list. Restart clawcius-ops.\n`,
-      );
-    }
-  }
+/** The credential line, for the journal, phrased so `groups` is unambiguous. */
+export function describeCredentials(agent: AgentUser, actual: DroppedCredentials): string {
+  const names = new Map<number, string>();
+  agent.gids.forEach((gid, index) => {
+    const name = agent.groups[index];
+    if (name !== undefined) names.set(gid, name);
+  });
+  const rendered = actual.groups
+    .map((gid) => `${gid}${names.has(gid) ? `(${names.get(gid)})` : ''}`)
+    .join(',');
+  return (
+    `uid=${actual.uid}(${agent.user}) gid=${actual.gid} groups=${rendered || '(none)'}` +
+    ' — read back from the kernel in the session process itself, not from /etc/group'
+  );
 }
 
 /**

@@ -434,17 +434,68 @@ stopping the unit.
 `NoNewPrivileges` has no bearing on it (NNP still has to stay `false` for the
 sake of the `sudo` the session itself runs; different argument, same file).
 
-**And the supplementary groups are set too**, which they were not before.
-`spawn`'s `uid`/`gid` options do not call `setgroups(2)`, so the child inherits
-the parent's groups — and the parent is root. `build.ts` recorded that as an
-honest limitation and left it, which was defensible while the session was the
-checkout's owner and stopped being defensible the moment the whole argument
-became "this account is in no root-equivalent group": a process running as
-`clawcius-ops` while carrying gid 0 is not that. `withSupplementaryGroups` in
-`host-agent.ts` sets this process's own group list to the account's for the
-duration of the synchronous `spawn` call and restores it in a `finally`. The
-window is one synchronous block, so no other JavaScript in this process can
-observe it — which stops being true the day somebody puts an `await` inside it.
+More precisely, since 2026-08-13: the `uid`/`gid` spawn options are **not used
+at all**, and that is deliberate. libuv's `uv__process_child_init` runs
+
+```c
+if (options->flags & (UV_PROCESS_SETUID | UV_PROCESS_SETGID))
+  SAVE_ERRNO(setgroups(0, NULL));      /* then setgid, then setuid */
+```
+
+in the forked child whenever either option is present. It **clears the
+supplementary group list**. That is a sane default — it is there to stop a
+child that is nominally unprivileged from still carrying root's groups — but it
+means no arrangement of the *parent's* groups can ever reach the session, and
+it is why #21 saw
+
+```
+uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops)
+```
+
+from a session whose boot banner named three groups. The version between
+2026-08-11 and 2026-08-13 (`withSupplementaryGroups`, which set this daemon's
+own group list around the synchronous `spawn`) could never have worked.
+
+What runs instead is a short `node -e` bootstrap, spawned as root with no
+`uid`/`gid` options, which performs the whole transition itself and then
+`process.execve`s the session:
+
+```
+setgroups(agent.gids) → setgid(agent.gid) → setuid(agent.uid)
+  → read getuid/getgid/getgroups back and compare against the intent
+  → execve(claude, argv, env)     # same pid, same process group, same pipes
+```
+
+`execve` rather than a nested spawn, so `child.pid`, `detached`, `killTree`, the
+stdio pipes and the timeout all mean exactly what they meant before. The source
+is the `PRIVILEGE_DROP_BOOTSTRAP` string in `src/host-agent.ts` — inline rather
+than a second file in `dist/`, because a separate artifact is a second thing
+that can be stale, and "stale build" was the first suspect in #21.
+
+**The drop is now verified rather than announced.** The bootstrap compares what
+the kernel gave it against what `/etc/group` said it should get, and if they
+differ it prints why and exits `120` **without exec-ing anything** — no session
+starts. On success it prints one line that the executor parses and writes to the
+journal, so the record contains an *observed* credential:
+
+```
+[ops] host agent: privilege drop — uid=997(clawcius-ops) gid=988 groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)
+  — read back from the kernel in the session process itself, not from /etc/group
+```
+
+That distinction is the lesson of #21. The boot banner, `describeAgentUser` and
+the per-session log line were all correct and all useless, because every one of
+them printed the *intent*: `resolveAgentUser` read `/etc/group`, and nothing in
+the pipeline ever asked the kernel what the child actually got. **When checking
+this, run `id` in a live session. Reading `/etc/group`, or the boot banner, only
+tells you what was asked for.**
+
+On a Node without `process.execve` (< 22.15) the launcher falls back to the old
+`spawn({ uid, gid })` and says so loudly in the journal. That path still drops
+uid and gid correctly and provably ends with an *empty* supplementary list: the
+session loses journal access and the shared checkout, which is a loss of
+capability rather than of containment. Degrading toward less privilege is the
+right direction for a fallback; degrading silently is not.
 
 #### Filesystem: a shared group, not shared ownership
 
@@ -1355,7 +1406,7 @@ unit itself:
 | `PrivateTmp` | No. npm stages tarballs through `TMPDIR`, and a private `/tmp` also hides it from the operator debugging this at 3am. |
 | `ProtectSystem` | `strict` breaks the docker socket (a read-only `/run` denies the write permission a unix socket connect needs). `full` is likely fine and likewise untested. |
 | `RestrictSUIDSGID` | Kept. It restricts *creating* setuid files; it does not touch `setuid(2)` and does not stop *executing* an existing setuid binary — checked deliberately, because if it did it would break `sudo` and therefore the host agent, exactly as NNP would. Re-checked 2026-08-11: it **does** block `chmod g+s` on a directory, which the shared-group scheme needs. Survives only because those chmods are the operator's, run outside this cgroup. |
-| `SupplementaryGroups=` | Not added, and it would do nothing: it applies to the unit's own `User=`, which is root. The session's supplementary groups are set around the `spawn` in `src/host-agent.ts`, because they have to be the *agent's* and systemd has no directive for "the groups of a process this unit forks with a different uid". |
+| `SupplementaryGroups=` | Not added, and it would do nothing: it applies to the unit's own `User=`, which is root. The session's supplementary groups are set by the privilege-drop bootstrap in `src/host-agent.ts`, in the child, because they have to be the *agent's* and systemd has no directive for "the groups of a process this unit forks with a different uid". Setting them on the unit would in fact be worse than useless — libuv discards the inherited list in any child spawned with the `uid`/`gid` options, which is #21. |
 | `User=` the agent instead of root | Rejected. The executor itself needs the docker socket for snapshots, rollbacks and the health sample, and giving the agent account that means putting it in the `docker` group — which is precisely what this whole rework forbids. The split is the design: a small readable root supervisor, and an unprivileged session that is neither. |
 
 `clawcius-snapshot-verify.service` carried no hardening block at all, which is
@@ -1532,11 +1583,18 @@ use it.
   no `chgrp`/`chmod`/`find` on the checkout, no `claude auth` as another
   account, no `ssh-keygen` deploy key, no `git pull` as `clawcius-ops` in a tree
   owned by `npurcell`. The document says so at the top.
-- **The privilege drop itself is not exercised.** The self-test's fixture
+- **The privilege drop itself is only half exercised.** The self-test's fixture
   account carries the test process's own uid — it has to, because dropping to
-  another uid needs root — so what is tested is the resolution, the refusals and
-  the environment, not `setuid(2)` or `withSupplementaryGroups`. Check
-  `ps -o user= -p <pid>` on a live session and `id` inside a task's own report.
+  another uid needs root — so the `setgroups`/`setgid`/`setuid` transition is
+  never actually performed here. What *is* executed, since 2026-08-13, is the
+  bootstrap itself: handed the credentials the test process already holds it
+  verifies them against the kernel and execs, and handed anybody else's — a
+  group *name* where a gid belongs, a uid it cannot take, uid 0 — it refuses
+  with a message and execs nothing. That plus an assertion that the spawn
+  options carry no `uid`/`gid` key is as close as an unprivileged suite can get
+  to #21. Check `id` inside a task's own report for the rest, and read the
+  `host agent: privilege drop —` line in the journal, which is the observed
+  credential rather than the intended one.
 - **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
   a shell that already has root. Still true on 2026-08-12, and re-checked rather
   than copied forward: the machine it is edited on has no `sudo` and no `visudo`

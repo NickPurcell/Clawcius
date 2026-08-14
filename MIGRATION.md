@@ -621,8 +621,25 @@ home /var/lib/clawcius-agent, shell /usr/sbin/nologin,
 groups: clawcius-ops, clawcius-dev.
 ```
 
-Read the `groups:` list. It must be the account's own group and
-`clawcius-dev`, and nothing else.
+Read the `groups:` list. It must be the account's own group,
+`clawcius-dev`, `systemd-journal`, and nothing else.
+
+> **That banner is the INTENT, not the outcome.** It is `/etc/group`, read and
+> reprinted. In #21 it named all three groups while the session held one, and
+> it did so for two days. The line that describes what actually happened is
+> written per session, immediately after the privilege drop, and says so:
+>
+> ```
+> [ops] host agent: privilege drop — uid=997(clawcius-ops) gid=988
+>   groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)
+>   — read back from the kernel in the session process itself, not from /etc/group
+> ```
+>
+> If the drop does not take, the session is **not started**: the bootstrap says
+> `[ops] PRIVILEGE DROP REFUSED: …` and the task fails with reason
+> `privilege-drop`. There is no longer a state in which the log says three
+> groups and the session has one. Confirm it yourself with § 8 below, which
+> asks a live session to run `id`.
 
 If anything is wrong you get a banner instead, with the fix in it:
 
@@ -664,11 +681,28 @@ sudo tail -f /var/lib/clawcius-ops/journal.jsonl | jq -r 'select(.kind=="audit")
 ```
 
 In dry run it will report the commands it *would* have run. Turn `dryRun` off
-and file it again to get the actual output, and read the report: `id` should
-say `clawcius-ops` with two groups, `sudo -l` should list the aliases from
-`ops/clawcius-sudoers` and nothing else, and the `.env` read should say
-*Permission denied*.
+and file it again to get the actual output, and read the report. `id` should
+say **all three groups**:
 
+```
+uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)
+```
+
+`sudo -l` should list the aliases from `ops/clawcius-sudoers` and nothing else,
+and the `.env` read should say *Permission denied*.
+
+**Read that `groups=` list, and read it from `id` rather than from
+`/etc/group`.** It is the only place the supplementary groups are observed
+rather than intended, and #21 is exactly the gap between the two: three groups
+in the banner, one in the session, for two days, past two reviews. Two cheap
+follow-ups from the same session are worth asking for in the same task:
+
+```sh
+journalctl -u clawcius-status.service -n 3   # needs systemd-journal
+test -w /home/npurcell/clawcius              # needs clawcius-dev
+```
+
+Both were failing under #21 and both are the point of the group memberships.
 That last line is the whole migration, verified by the thing being migrated.
 
 ---
