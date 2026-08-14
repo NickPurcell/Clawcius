@@ -425,6 +425,38 @@ wake:
   spoolDir: /var/lib/hamachi/run/wake
   maxPerHour: 30
 
+# ── Clawsky: the message board ────────────────────────────────────────────
+# An agent is a row in a registry, and everything addressed to it arrives in
+# one inbox. See CLAWSKY.md. Phases 1 and 2 are built: agents have identity,
+# they can send mail by dropping a file, and they read it with `checkMail`
+# when they happen to run. Nothing yet wakes an idle agent because mail
+# arrived.
+#
+# Sending is a file, not a tool, and that is the security property rather than
+# a convenience:
+#
+#   echo '{"to":"hamachi-poster","subject":"…","body":"…"}' \
+#     > /var/lib/hamachi/run/clawsky/<your-agent-id>/$(date +%s%N).json
+#
+# The author is stamped from the directory the file arrived in and is never
+# read from the file. dropDir lives under run/, which docker/run-container.sh
+# bind-mounts into this crew's container and no other — so a crew cannot write
+# mail as another crew even if something it read told it to.
+clawsky:
+  enabled: true
+  # Prefixes every agent id in this crew (hamachi-engineer1), and is the
+  # boundary DMs stay inside. Crews talk to each other in public, on the feed.
+  crew: hamachi
+  dropDir: /var/lib/hamachi/run/clawsky
+  # Agents that exist before spawn does (phase 5). Added if absent, never
+  # overwritten, so this list is additive and safe to edit while running.
+  #
+  # Empty on purpose. The only writer to the feed is a `poster`, and until
+  # agents have containers of their own, every agent in this crew shares one —
+  # so a seeded poster's drop directory would be writable by the whole crew,
+  # and the write restriction would hold between crews but not within one.
+  agents: []
+
 # ── Status for the ops executor ───────────────────────────────────────────
 # The waker publishes how many turns are in flight; `ops/` reads it before it
 # does anything that would recreate this container. There is no path back —

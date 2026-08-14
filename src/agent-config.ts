@@ -10,6 +10,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
 import { parse } from 'yaml';
+import { AGENT_ROLES, isAgentRole, type AgentRole } from './store.js';
 
 export type SystemPromptConfig = {
   /**
@@ -149,6 +150,42 @@ export type AgentConfig = {
     maxPerHour: number;
   };
   /**
+   * The message board: identity, mail, and the drop directory mail arrives in.
+   *
+   * See CLAWSKY.md. Phases 1 and 2 only — an agent can be addressed and can
+   * read its inbox; nothing yet wakes an idle agent because mail arrived.
+   */
+  clawsky: {
+    /** Off means no drop directory is watched and no checkMail tool exists. */
+    enabled: boolean;
+    /**
+     * This deployment's crew. Agent ids are `<crew>-<role><ordinal>`, and the
+     * crew is the boundary DMs stay inside, so this is identity rather than a
+     * label.
+     */
+    crew: string;
+    /**
+     * Root of the per-agent drop directories.
+     *
+     * MUST be under `wake.spoolDir`'s parent — i.e. inside the one directory
+     * `docker/run-container.sh` bind-mounts into this crew's container and no
+     * other. That mount is the whole authorship guarantee: a name under this
+     * root is writable from exactly one container, which is why the daemon can
+     * stamp the author from the directory instead of believing the message.
+     */
+    dropDir: string;
+    /**
+     * Agents that exist before there is anything to spawn them.
+     *
+     * Spawn/kill/resurrect are phase 5. Until then this is how a crew gets
+     * anyone but the coordinator: the rows are created at startup if absent
+     * and never overwritten, so an operator edit adds an agent without
+     * disturbing the ones already running.
+     */
+    agents: Array<{ id: string; role: AgentRole }>;
+  };
+
+  /**
    * What this instance publishes for the ops executor (`ops/`).
    *
    * The waker does not read anything from the executor and holds no privilege
@@ -284,6 +321,12 @@ const DEFAULTS: AgentConfig = {
     spoolDir: '/var/lib/clawcius/run/wake',
     maxPerHour: 30,
   },
+  clawsky: {
+    enabled: true,
+    crew: 'clawcius',
+    dropDir: '/var/lib/clawcius/run/clawsky',
+    agents: [],
+  },
   status: {
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
     file: '/var/lib/clawcius/waker-status.json',
@@ -346,6 +389,46 @@ function strList(raw: unknown, path: string, fallback: string[]): string[] {
   });
 }
 
+/** `hamachi-engineer1` — lowercase, and prefixed with the crew that owns it. */
+export const AGENT_ID = /^[a-z][a-z0-9-]{0,63}$/;
+
+/**
+ * The pre-spawn agent list.
+ *
+ * The crew prefix is enforced rather than assumed: an agent id is a handle
+ * people and other agents type, mail is addressed to it, and a `hamachi-`
+ * agent registered in the `clawcius` crew would be a DM boundary that reads
+ * one way and behaves another.
+ */
+function agentList(
+  raw: unknown,
+  path: string,
+  crew: string,
+): Array<{ id: string; role: AgentRole }> {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ConfigError(path, 'must be a list');
+
+  return raw.map((entry, index) => {
+    const where = `${path}[${index}]`;
+    if (!isRecord(entry)) throw new ConfigError(where, 'must be a mapping with id and role');
+
+    const id = entry['id'];
+    if (typeof id !== 'string' || !AGENT_ID.test(id)) {
+      throw new ConfigError(`${where}.id`, 'must be a lowercase identifier, e.g. hamachi-engineer1');
+    }
+    if (!id.startsWith(`${crew}-`)) {
+      throw new ConfigError(`${where}.id`, `must start with "${crew}-" — it belongs to that crew`);
+    }
+
+    const role = entry['role'];
+    if (typeof role !== 'string' || !isAgentRole(role)) {
+      throw new ConfigError(`${where}.role`, `must be one of: ${AGENT_ROLES.join(', ')}`);
+    }
+
+    return { id, role };
+  });
+}
+
 /**
  * A prompt template, with its placeholders checked against what the renderer
  * will actually supply.
@@ -402,6 +485,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
   const wake = section(root['wake'], 'wake');
+  const clawsky = section(root['clawsky'], 'clawsky');
   const status = section(root['status'], 'status');
   const git = section(root['git'], 'git');
   const prompts = section(root['prompts'], 'prompts');
@@ -496,6 +580,16 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       spoolDir: str(wake['spoolDir'], 'wake.spoolDir', DEFAULTS.wake.spoolDir),
       maxPerHour: num(wake['maxPerHour'], 'wake.maxPerHour', DEFAULTS.wake.maxPerHour, 1),
     },
+    clawsky: {
+      enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
+      crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
+      dropDir: str(clawsky['dropDir'], 'clawsky.dropDir', DEFAULTS.clawsky.dropDir),
+      agents: agentList(
+        clawsky['agents'],
+        'clawsky.agents',
+        str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
+      ),
+    },
     status: {
       file: str(status['file'], 'status.file', DEFAULTS.status.file),
       intervalSeconds: num(
@@ -530,14 +624,50 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     if (!isAbsolute(config.status.file)) {
       throw new ConfigError('status.file', 'must be an absolute path');
     }
-    const spool = resolve(config.wake.spoolDir);
     const statusFile = resolve(config.status.file);
-    if (statusFile === spool || statusFile.startsWith(`${spool}/`)) {
-      throw new Error(
-        `agent-config.yaml: status.file (${statusFile}) is inside wake.spoolDir ` +
-          `(${spool}), which is bind-mounted read-write into the agent container. ` +
-          'The ops executor trusts this file when deciding whether recreating the ' +
-          'container would kill a live turn; the agent must not be able to write it.',
+    // Both of these are agent-writable by design. The drop directory is the
+    // newer one and the reasoning is identical, so it is checked here rather
+    // than left to be discovered the first time someone points the two at the
+    // same tree.
+    for (const [key, dir] of [
+      ['wake.spoolDir', config.wake.spoolDir],
+      ['clawsky.dropDir', config.clawsky.dropDir],
+    ] as const) {
+      const mounted = resolve(dir);
+      if (statusFile === mounted || statusFile.startsWith(`${mounted}/`)) {
+        throw new Error(
+          `agent-config.yaml: status.file (${statusFile}) is inside ${key} ` +
+            `(${mounted}), which is bind-mounted read-write into the agent container. ` +
+            'The ops executor trusts this file when deciding whether recreating the ' +
+            'container would kill a live turn; the agent must not be able to write it.',
+        );
+      }
+    }
+  }
+
+  if (config.clawsky.enabled) {
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(config.clawsky.crew)) {
+      throw new ConfigError(
+        'clawsky.crew',
+        'must be a short lowercase identifier — it prefixes every agent id in ' +
+          'this crew and is compared as an exact string',
+      );
+    }
+    if (!isAbsolute(config.clawsky.dropDir)) {
+      throw new ConfigError('clawsky.dropDir', 'must be an absolute path');
+    }
+    // Warned rather than refused, because a second bind mount is a legitimate
+    // arrangement — but the failure it prevents is the ops spool's, which cost
+    // a silent outage: a drop directory outside the mount simply does not
+    // exist inside the container, so the agent's write fails into a shell
+    // nobody reads and the waker sees an empty directory forever.
+    const mount = resolve(config.wake.spoolDir, '..');
+    const drop = resolve(config.clawsky.dropDir);
+    if (drop !== mount && !drop.startsWith(`${mount}/`)) {
+      console.warn(
+        `[config] clawsky.dropDir (${drop}) is outside ${mount}, the directory ` +
+          'docker/run-container.sh bind-mounts into the agent container. Unless it has a ' +
+          'mount of its own, agents will not be able to send mail and nothing will say so.',
       );
     }
   }

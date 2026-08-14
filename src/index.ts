@@ -11,9 +11,12 @@
  */
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
+import { join } from 'node:path';
 import { config } from './config.js';
-import { SessionStore } from './store.js';
+import { AgentRegistry } from './store.js';
 import { SessionManager } from './agent.js';
+import { MailStore } from './mail.js';
+import { MailDrop } from './mail-drop.js';
 import { WakeSpool } from './wake-spool.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
@@ -26,8 +29,39 @@ import type { TurnSummary, WakeContext } from './types.js';
 // a missing agent or proxy container reads as a bot that never answers.
 await preflight();
 
-const store = new SessionStore(config.storage.dbPath);
-const sessions = new SessionManager(store);
+const registry = new AgentRegistry(config.storage.dbPath, { crew: config.agent.clawsky.crew });
+
+/**
+ * The board. Off is a supported state — with `clawsky.enabled: false` nothing
+ * is watched, no `checkMail` tool is offered, and the waker behaves exactly as
+ * it did before any of this existed.
+ *
+ * The seeded agents are how a crew gets anyone but its Discord coordinator
+ * before spawn exists (CLAWSKY.md phase 5). They are created if absent and
+ * never overwritten, so the list is additive: an operator can name a poster
+ * without disturbing rows that are already running.
+ */
+const mail = config.agent.clawsky.enabled ? new MailStore(registry) : null;
+if (config.agent.clawsky.enabled) {
+  for (const { id, role } of config.agent.clawsky.agents) {
+    registry.ensure(id, {
+      crew: config.agent.clawsky.crew,
+      role,
+      workspacePath: join(config.agent.sessions.workspaceRoot, id),
+    });
+  }
+}
+
+const mailDrop = mail
+  ? new MailDrop({
+      root: config.agent.clawsky.dropDir,
+      crew: config.agent.clawsky.crew,
+      registry,
+      mail,
+    })
+  : null;
+
+const sessions = new SessionManager(registry, mail);
 const windows = new ConversationWindows(
   config.agent.discord.followUpWindowSeconds,
   config.agent.discord.followUpChannelIds,
@@ -128,13 +162,16 @@ async function handleCommand(message: Message, command: string): Promise<boolean
 
     case 'reset': {
       await sessions.release(channelId);
-      store.delete(channelId);
+      // The session, not the identity: the registry row is what mail is
+      // addressed to, so deleting it would throw away the mailbox along with
+      // the transcript.
+      registry.clearSession(channelId);
       await message.reply('Session cleared. The next mention starts fresh.');
       return true;
     }
 
     case 'status': {
-      const persisted = store.get(channelId);
+      const persisted = registry.get(channelId);
       const idle = config.agent.sessions.idleTimeoutMinutes;
       await message.reply(
         [
@@ -158,9 +195,12 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           // Naming the enforcing proxy matters: "uncontrolled" here would be the
           // difference between a contained agent and one with open egress.
           `Egress: Squid allowlist (${config.agent.container.name} has no other route)`,
-          persisted
+          persisted?.sessionId
             ? `This channel: session ${persisted.sessionId.slice(0, 8)}…`
             : 'This channel: no session yet',
+          mail
+            ? `Mail: ${mail.unread(channelId).length} unread as ${channelId} (crew ${config.agent.clawsky.crew})`
+            : 'Mail: disabled',
         ].join('\n'),
       );
       return true;
@@ -478,6 +518,7 @@ const wakeSpool = config.agent.wake.enabled
     })
   : null;
 wakeSpool?.start();
+mailDrop?.start();
 
 client.once(Events.ClientReady, (ready) => {
   // Stamped with the pid and the boot time because Restart=always makes a
@@ -558,6 +599,7 @@ async function shutdown(signal: string): Promise<void> {
   systemd.stopping();
   try {
     wakeSpool?.stop();
+    mailDrop?.stop();
     wakerStatus.stop();
     // Absent reads as busy to the executor, which is the correct answer for a
     // waker that is no longer running: it cannot vouch for anything.
@@ -565,7 +607,7 @@ async function shutdown(signal: string): Promise<void> {
     clearInterval(windowSweeper);
     bundler.flushAll();
     await sessions.shutdown();
-    store.close();
+    registry.close();
     await client.destroy();
   } finally {
     process.exit(0);
