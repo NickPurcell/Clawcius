@@ -333,13 +333,15 @@ instances:
     wakeChannelId: "000000000000000000"
     buildRepo: clawcius
 
-    # CONFIRM `db` AGAINST .env.hamachi BEFORE TRUSTING IT. CLAWCIUS_DB_PATH
-    # defaults to /var/lib/clawcius/clawcius.db when it is not set, which for
-    # this instance would put Hamachi's board inside Clawcius's state directory
-    # and give the two crews one shared board. If that is what the env file
-    # actually says, fix the env file rather than this line.
+    # Confirmed against .env.hamachi on 2026-08-14: CLAWCIUS_DB_PATH is
+    # /var/lib/hamachi/hamachi.db. Note the file is named for the instance, not
+    # for the variable — the guess here was clawcius.db and it was wrong. If
+    # CLAWCIUS_DB_PATH is ever unset it falls back to /var/lib/clawcius/
+    # clawcius.db, which would put Hamachi's board inside Clawcius's state
+    # directory and give two crews one shared board. Fix the env file in that
+    # case, not this line.
     board:
-      db: /var/lib/hamachi/clawcius.db
+      db: /var/lib/hamachi/hamachi.db
       crew: hamachi
 
     # ── Optional: narrow what this instance may ask for ─────────────────
