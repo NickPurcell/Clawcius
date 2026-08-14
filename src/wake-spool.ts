@@ -16,6 +16,22 @@
  * The waker still owns the decision to run a turn. A request is a request:
  * the concurrency cap and rate limit still apply, so this cannot be used to
  * get around them.
+ *
+ * AND A REQUEST MAY NOT MINT AN IDENTITY. This directory is inside the crew's
+ * bind mount, so anything in the container can write to it, and `channel` used
+ * to be handed straight on to a call that registers a row for an id it has not
+ * seen. That made this a forge rather than a scheduler: name any id you like
+ * and a turn starts under that name, holding that name's tools, running a
+ * prompt of your choosing — an engineer could wake as its coordinator and from
+ * there reach the host agent. `knows` is checked here, at the parse boundary,
+ * for the same reason the author of a message is: it is the last point at which
+ * the request is still data.
+ *
+ * It does not make this route safe. One crewmate can still wake another,
+ * because a crew shares a container and this spool is not per agent (#31, #39).
+ * It removes the ability to invent a name, which is what turned a shared
+ * filesystem into a privilege boundary anybody could cross. The full answer is
+ * the durable scheduler in CLAWSKY.md phase 4, which retires this file.
  */
 
 import { readFileSync, readdirSync, mkdirSync, unlinkSync, statSync, watch, type FSWatcher } from 'node:fs';
@@ -27,6 +43,9 @@ export type WakeRequest = {
 };
 
 export type WakeHandler = (request: WakeRequest) => { accepted: boolean; detail: string };
+
+/** Whether an id is already an agent on the board. See the header. */
+export type KnowsAgent = (channelId: string) => boolean;
 
 /** Ignore anything larger — a wake request is a couple of lines of JSON. */
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -41,13 +60,15 @@ const SWEEP_INTERVAL_MS = 5_000;
 export class WakeSpool {
   #dir: string;
   #onWake: WakeHandler;
+  #knows: KnowsAgent;
   #watcher: FSWatcher | null = null;
   #sweeper: NodeJS.Timeout | null = null;
   #draining = false;
 
-  constructor(dir: string, onWake: WakeHandler) {
+  constructor(dir: string, onWake: WakeHandler, knows: KnowsAgent = () => true) {
     this.#dir = dir;
     this.#onWake = onWake;
+    this.#knows = knows;
   }
 
   get dir(): string {
@@ -121,6 +142,14 @@ export class WakeSpool {
 
           if (!channelId || !prompt) {
             process.stderr.write(`[wake] ${name}: needs "channel" and "prompt", discarded\n`);
+            continue;
+          }
+
+          if (!this.#knows(channelId)) {
+            process.stderr.write(
+              `[wake] ${name}: REFUSED — ${channelId} is not an agent on this board. ` +
+                'A wake may name an identity that exists; it may not create one.\n',
+            );
             continue;
           }
 
