@@ -467,9 +467,32 @@ hostAgent:
   # assertNoSecrets refuses it, and sharing the operator's GitHub credential
   # with a session that has a shell is exactly what the separate account
   # exists to prevent. A deploy key is scoped to one repository and can be
-  # revoked on its own. Empty means "no private repositories"; see
-  # MIGRATION.md § 5.
-  gitSshKey: ""
+  # revoked on its own. Empty means "no private repositories".
+  #
+  # Set on 2026-08-13 to the key MIGRATION.md § 5 creates: generated as the
+  # agent account, 0600, in that account's own home — NOT the operator's
+  # ~/.ssh, which is in secretPaths above precisely so the session cannot read
+  # it. The executor turns this into
+  #
+  #   GIT_SSH_COMMAND=ssh -i <key> -o IdentitiesOnly=yes \
+  #                       -o StrictHostKeyChecking=yes -o BatchMode=yes
+  #
+  # so github.com must already be in the agent account's known_hosts (§ 5
+  # step 3). An unpinned host is a clean failure with nobody there to answer
+  # the prompt, which is the correct behaviour and a bad surprise at 3am.
+  #
+  # A key that is missing, owned by somebody else, or group- or
+  # world-accessible WARNS — at boot and again before every task — and does
+  # not refuse. Deliberate: a broken deploy key breaks pulls from private
+  # repositories and nothing else, and refusing every task over it would take
+  # more away than it protects. The warnings land in the boot journal and in
+  # journal.jsonl next to the request.
+  #
+  # IdentitiesOnly=yes means this is the ONLY key offered, and there is only
+  # one of these — a second private repository needs a second key and there is
+  # nowhere to put it. Written down rather than worked around with an ssh
+  # `Host` alias, which would hide which credential is in play.
+  gitSshKey: /var/lib/clawcius-agent/.ssh/oj_deploy
 
   # Absolute. Never looked up on PATH: this daemon is root and a PATH lookup is
   # one writable directory away from being somebody else's choice of binary.

@@ -486,7 +486,27 @@ sudo chgrp -R clawcius-dev /home/npurcell/oj
 sudo chmod -R g+w /home/npurcell/oj
 sudo find /home/npurcell/oj -type d -exec chmod g+s {} +
 
-# 6. The OJ checkout must use ssh, not https.
+#    Then take this tree's secret back out of the group, the same way § 2 did
+#    for the Clawcius checkout — `chgrp -R` sweeps up `.env` and `chmod -R g+w`
+#    hands the agent a write to it. `/home/npurcell/oj/.env` holds no key
+#    material, but it holds OJ_GITHUB_PRIVATE_KEY_PATH, which names the GitHub
+#    App private key under /etc/oj. That key is 0600 and stays out of reach;
+#    the file that decides WHICH key OJ loads should not be one the agent can
+#    rewrite. On this host it was also 0644 — world-readable — which the same
+#    two lines fix:
+sudo chgrp npurcell /home/npurcell/oj/.env
+sudo chmod 0600     /home/npurcell/oj/.env
+
+# 6. git refuses a repository owned by another user. § 2 made that exception
+#    for the Clawcius checkout and it names ONE tree — `safe.directory` is a
+#    list of exact paths, not a policy — so this checkout needs its own:
+sudo -u clawcius-ops -H git config --global --add safe.directory /home/npurcell/oj
+#    `-H` is not decoration. Without it the entry can land in the CALLING
+#    user's ~/.gitconfig, where the agent account will never read it and where
+#    it is invisible to the obvious `sudo -u clawcius-ops git config --global
+#    --get-all safe.directory` you would run to check.
+
+# 7. The OJ checkout must use ssh, not https.
 sudo -u clawcius-ops git -C /home/npurcell/oj remote set-url origin \
   git@github.com:NickPurcell/OJ.git
 ```
@@ -511,15 +531,39 @@ credential is being used.
 ### Verify
 
 ```sh
+# The key is handed to ssh with `-i`, on the ssh command line.
+#
+# Until 2026-08-13 this block said `env GIT_SSH_COMMAND='ssh -i …' ssh -T`,
+# which cannot work: GIT_SSH_COMMAND is read by GIT and by nothing else. `ssh`
+# ignores it completely, so that command offered the account's default
+# identities — it has none, the deploy key is not called `id_ed25519` — and
+# failed with `git@github.com: Permission denied (publickey)`, which is the
+# exact error this step exists to rule out. A verification that fails the same
+# way whether or not the thing works is worse than no verification.
 sudo -u clawcius-ops -H \
-  env GIT_SSH_COMMAND='ssh -i /var/lib/clawcius-agent/.ssh/oj_deploy -o IdentitiesOnly=yes' \
-  ssh -T git@github.com
-# "Hi NickPurcell/oj! You've successfully authenticated, but GitHub does not
+  ssh -i /var/lib/clawcius-agent/.ssh/oj_deploy -o IdentitiesOnly=yes \
+  -T git@github.com
+# "Hi NickPurcell/OJ! You've successfully authenticated, but GitHub does not
 #  provide shell access." — the repository name in that line is the proof it
 #  is the deploy key and not somebody's account key.
+#
+# `Permission denied (publickey)` here, with `-i` present, means the public
+# half is not on the repository (§ 5 step 2) — that is the real failure this
+# line tests for.
 
-sudo -u clawcius-ops git -C /home/npurcell/oj fetch --dry-run
+# git needs the credential too, and typed by hand there is nothing to supply
+# it. The executor puts GIT_SSH_COMMAND into the SESSION's environment; your
+# shell is not that session, and `git fetch` as clawcius-ops from a terminal
+# gets no more credential than any other stranger. So say it here, in the
+# variable git actually reads:
+sudo -u clawcius-ops -H \
+  env GIT_SSH_COMMAND='ssh -i /var/lib/clawcius-agent/.ssh/oj_deploy -o IdentitiesOnly=yes' \
+  git -C /home/npurcell/oj fetch --dry-run
 ```
+
+Those two commands look nearly identical and the difference is the whole point:
+the first passes the key **to ssh**, the second passes it **to git**, and the
+variable that does the second does nothing for the first.
 
 ### If you skip this step
 
