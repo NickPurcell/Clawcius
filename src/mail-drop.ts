@@ -33,13 +33,27 @@
  * inotify events for writes made inside the sandbox), oversized files are
  * discarded rather than read, and every file is unlinked *before* it is acted
  * on so a message that throws is not retried forever on every sweep.
+ *
+ * NOTHING HERE FOLLOWS A SYMLINK. The drop root is written by the container and
+ * read by the waker, which runs on the host — so a link the agent writes is a
+ * string the *host* resolves, against the host's filesystem rather than the
+ * sandbox's. `msg.json -> /etc/somewhere.json` would otherwise be read by this
+ * process with this process's privileges and delivered as the agent's own mail.
+ * Directories are `lstat`ed and refused unless they are real directories, and
+ * files are opened `O_NOFOLLOW` and `fstat`ed through the descriptor, so the
+ * thing read is the thing checked. `ops/src/spool.ts` has the same defence and
+ * the longer explanation of why the obvious version of it is not enough.
  */
 
 import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
-  statSync,
   unlinkSync,
   watch,
   type FSWatcher,
@@ -162,7 +176,9 @@ export class MailDrop {
         const dir = join(this.#root, author);
         let names: string[];
         try {
-          if (!statSync(dir).isDirectory()) continue;
+          // lstat, not stat: a symlink named after an agent would otherwise let
+          // the container choose a directory on the *host* for us to read.
+          if (!lstatSync(dir).isDirectory()) continue;
           names = readdirSync(dir);
         } catch {
           continue;
@@ -196,17 +212,65 @@ export class MailDrop {
     }
   }
 
-  #handleFile(author: string, path: string, name: string): void {
+  /**
+   * Read a message without ever following a link.
+   *
+   * `O_NOFOLLOW` fails outright if the final component is a symlink, and the
+   * size and file-type checks go through the returned descriptor rather than
+   * the path, so what is measured is what is read — there is no window between
+   * the check and the read for the container to swap the file underneath us.
+   * Returns null when the file should be skipped; the caller has already
+   * unlinked in every case where it reads.
+   */
+  #readMessage(author: string, path: string, name: string): string | null {
+    let fd: number;
     try {
-      if (statSync(path).size > MAX_MESSAGE_BYTES) {
+      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EMLINK') {
+        process.stderr.write(
+          `[mail] ${author}/${name}: is a symlink, discarded without reading it\n`,
+        );
+        try {
+          unlinkSync(path);
+        } catch {
+          /* already gone */
+        }
+        return null;
+      }
+      throw error;
+    }
+
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) {
+        process.stderr.write(`[mail] ${author}/${name}: not a regular file, discarded\n`);
+        unlinkSync(path);
+        return null;
+      }
+      if (stat.size > MAX_MESSAGE_BYTES) {
         process.stderr.write(`[mail] ${author}/${name}: too large, discarded\n`);
         unlinkSync(path);
-        return;
+        return null;
       }
-
-      const raw = readFileSync(path, 'utf8');
+      const raw = readFileSync(fd, 'utf8');
       // Remove before acting — see the header.
       unlinkSync(path);
+      return raw;
+    } finally {
+      try {
+        closeSync(fd);
+      } catch {
+        /* readFileSync(fd) closes it on some paths */
+      }
+    }
+  }
+
+  #handleFile(author: string, path: string, name: string): void {
+    try {
+      const raw = this.#readMessage(author, path, name);
+      if (raw === null) return;
 
       let parsed: unknown;
       try {
