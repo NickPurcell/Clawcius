@@ -173,6 +173,21 @@ export type RequestScope = {
 };
 
 /**
+ * Where an instance's Clawsky board is, and whose it is.
+ *
+ * The board is the SQLite file the instance's waker writes its registry and
+ * mail tables into. The executor opens it to give the host agent a mailbox —
+ * see `ops/src/board.ts` — and that is the only reason the ops config knows
+ * anything about it.
+ */
+export type BoardEntry = {
+  /** The instance's `CLAWCIUS_DB_PATH`. Never created; opened or refused. */
+  db: string;
+  /** The instance's `clawsky.crew`. The host agent registers as `<crew>-host`. */
+  crew: string;
+};
+
+/**
  * An agent instance whose container this executor may recreate.
  *
  * Everything needed to rebuild it is here rather than being derived, because
@@ -238,6 +253,24 @@ export type InstanceEntry = {
    * bind mount already is, and there is no second thing to remember.
    */
   opsSpoolDir: string;
+  /**
+   * This instance's Clawsky board, or null for "the host agent has no mailbox
+   * on this instance".
+   *
+   * Both fields are required when the block is present and neither is guessed,
+   * because both can only be got right by matching something written
+   * elsewhere. `db` must be the same file as that instance's
+   * `CLAWCIUS_DB_PATH` — which lives in its env file, not here — and `crew`
+   * must be its `clawsky.crew` from `agent-config.yaml`. A wrong `db` would
+   * open a second, empty database that looks exactly like a mailbox nobody is
+   * writing to; a wrong `crew` would register the host agent into a crew whose
+   * coordinator is not the one asking. Neither failure is visible from the
+   * outside, so neither gets a default.
+   *
+   * Absent is the shipped state, and it is inert: no row is created, and a
+   * coordinator that DMs `<crew>-host` is told there is no such recipient.
+   */
+  board: BoardEntry | null;
   /**
    * Optional narrowing of what this instance may ask for. Null means
    * unrestricted, which is the default and the pre-2026-08-10 behaviour.
@@ -1097,6 +1130,26 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       explicitOpsSpoolDir.add(name);
     }
 
+    // Absent is "no mailbox", which is what an upgrade gets: the host agent
+    // stays reachable only through the spool until somebody writes down where
+    // the board is. Present means both fields, and neither has a default —
+    // see `InstanceEntry.board` for why guessing either one fails invisibly.
+    const boardRaw = entry['board'];
+    let board: BoardEntry | null = null;
+    if (boardRaw !== undefined && boardRaw !== null) {
+      const boardSection = section(boardRaw, `${at}.board`);
+      const crew = str(boardSection['crew'], `${at}.board.crew`, '');
+      if (!NAME_PATTERN.test(crew)) {
+        throw new OpsConfigError(
+          `${at}.board.crew`,
+          `("${crew}") must be the instance's clawsky.crew from its agent-config.yaml, ` +
+            'lowercase. The host agent registers as <crew>-host and only that crew\'s ' +
+            'coordinator can reach it, so a crew nobody is in is a mailbox nobody can use.',
+        );
+      }
+      board = { db: requiredAbsPath(boardSection['db'], `${at}.board.db`), crew };
+    }
+
     // Absent is unrestricted. That is the pre-2026-08-10 behaviour and it is
     // what an upgrade gets, deliberately: this change ships a *mechanism*, and
     // a mechanism that silently starts refusing requests on a running
@@ -1158,6 +1211,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       wakeChannelId,
       buildRepo,
       opsSpoolDir,
+      board,
       mayRequest,
     };
   });
@@ -1397,6 +1451,33 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         `ops-config.yaml: stateDir is inside instances[${instance.name}].wakeSpoolDir, ` +
           'which the container can write.',
       );
+    }
+
+    // Same argument again, for the board. A root daemon opens that file by
+    // name, reads rows out of it and runs a Claude Code session with a shell on
+    // whatever they say. Inside a bind mount it would be a database the
+    // container can rewrite in place — every registry role in it, including
+    // which agents are coordinators, and therefore the only access control left
+    // on running commands on this host. `ops/src/board.ts` also refuses a path
+    // that is not a regular file; this is the check that catches the
+    // misconfiguration before anything is opened at all.
+    if (instance.board) {
+      for (const other of instances) {
+        for (const [what, dir] of [
+          ['opsSpoolDir', other.opsSpoolDir],
+          ['wakeSpoolDir', other.wakeSpoolDir],
+        ] as const) {
+          if (isInside(instance.board.db, dir)) {
+            throw new Error(
+              `ops-config.yaml: instances[${instance.name}].board.db ` +
+                `(${instance.board.db}) is inside instances[${other.name}].${what} ` +
+                `(${dir}), which that container writes. The board decides who is a ` +
+                'coordinator, and a coordinator is the only agent that may run commands ' +
+                'on this host. It must live outside every mount, next to wakerStatusFile.',
+            );
+          }
+        }
+      }
     }
 
     // Same argument, at the sharpest point. A waker status file the container

@@ -44,6 +44,19 @@ service" from "an injected agent owns the machine the agents live on".
 only remaining access control on running commands. Engineers ask their captain;
 the captain asks the host.
 
+As built, that is enforced twice, in two processes, against two different
+things: `src/mail.ts` refuses the DM at delivery by the sender's registry role,
+and `ops/src/host-mailbox.ts` re-reads the author column of the committed row
+and looks the role up again immediately before running anything. The second
+exists because something can already write to that table other than `deliver` —
+the executor itself does, as root, when it answers.
+
+What went with the queue is the ability to undo. The spool path snapshotted
+every container in scope before running and restored on failure; a task filed by
+mail does not, because the snapshot was part of the apparatus being removed. The
+health sample either side survives and now reports rather than repairs, and the
+reply says so.
+
 **checkMail delivers everything at once.** No paging, no priority ordering. If
 that turns out to be wrong it will be obvious, and it can be fixed then.
 
@@ -152,6 +165,30 @@ external prod, which is the difference between an agent that continues its work
 and one that stops to ask what just happened to it. This has been confirmed to
 work.
 
+**As built** (`src/mail-wake.ts`), with one honest correction. The SDK's
+streaming input accepts user messages and nothing else, so the turn does not
+literally open with an assistant `tool_use` block and its `tool_result`. It
+opens with `renderMail`'s output — `checkMail`'s own text, verbatim — arriving
+as a *synthetic* user message (`isSynthetic`) under a two-word template,
+`prompts.mailWake`. The property is bought by the framing rather than by the
+transcript's structure, and the template is deliberately the thinnest of the
+four: everything wrapped around that text is wrapping around the agent's own
+tool result.
+
+Three rules fall out of "nothing interrupts a running turn":
+
+- mail arriving mid-turn is left unread, and a sweep on every busy-count
+  change is what makes sure there *is* a next turn to pick it up on. That
+  sweep is not a throttle: it never delays, drops or merges anything, it only
+  re-tries what the delivery-time fast path could not do at the moment it
+  fired;
+- mail does **not** resurrect a dead agent. The design settles that for a
+  scheduled wake, not for mail, and resurrecting on mail would mean `kill` does
+  not kill — any crewmate could bring an agent back by writing to it. The mail
+  keeps, and whoever resurrects the agent hands it over as its first turn;
+- the host agent's mailbox is not swept by the waker at all. Its row is on the
+  crew's board but it runs on the host, and the ops executor owns it.
+
 ### Spawn and kill
 
 Held by the coordinator alone.
@@ -206,6 +243,13 @@ Four: **coordinator**, **engineer**, **researcher**, **poster**.
 | engineer    | avoids colliding with other engineers; worktree coordination | read  | yes       |
 | researcher  | rarely                                                     | read  | yes       |
 | poster      | receives `@`s and routes them inward                        | write | no        |
+
+A fifth value exists in the registry and is not a crew role: **`host`**. It
+belongs to the one participant that is not in a container, has no session to
+resume and is never woken by a waker. It is a role rather than a naming
+convention because two rules key off it and neither should be a string
+comparison against an id — only a coordinator may DM it, and nothing inside a
+container may run it.
 
 **Every agent gets the whole picture, not just its own rules.** Negative
 knowledge only works if you know who else exists: an agent that has never heard
@@ -296,17 +340,26 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
 
 ## Build order
 
-1. **Board and identity.** Registry, drop directories, authorship stamping,
-   DM/feed policy split. Nothing consumes it yet.
-2. **checkMail as a pull tool.** Agents can read mail when they happen to run.
-   Useful on its own, and the natural place to stop and use it for a while
-   before going further.
-3. **Synthetic injection.** Mail wakes idle agents.
+1. ~~**Board and identity.**~~ Registry, drop directories, authorship stamping,
+   DM/feed policy split. **Done.**
+2. ~~**checkMail as a pull tool.**~~ Agents can read mail when they happen to
+   run. **Done.**
+3. ~~**Synthetic injection.**~~ Mail wakes idle agents. **Done** —
+   `src/mail-wake.ts`, `clawsky.wakeOnMail` in agent-config.yaml.
 4. **Migrate wakes.** Durable scheduler; retire the wake spool and the Claude
-   Code cron/wake tools.
+   Code cron/wake tools. The wake spool is still running.
 5. **Long-lived crew.** Spawn/kill/resurrect, role prompts, subagent removal
    from the coordinator.
-6. **Retire the ops queue.** Host agent becomes a participant; keep the user,
-   the sudoers file and the privilege drop untouched.
+6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
+   user, the sudoers file and the privilege drop untouched. **Done** —
+   `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a
+   `board:` block per instance in ops-config.yaml.
 
-Steps 1 and 2 are worth living with before committing to 3.
+Steps 1 and 2 were worth living with before committing to 3. Step 6 came before
+4 and 5 because it was the one the operator was actually waiting on.
+
+The ops spool is left in place and **inert but running**: the directories are
+still watched and a request filed there is still executed the old way, with the
+snapshot, the idle wait and the deadline. Nothing files one any more. It is not
+deleted because a rollback to the previous `dist/` — the most common way this
+system breaks — must not find a request format that nothing reads.

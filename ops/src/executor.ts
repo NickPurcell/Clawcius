@@ -86,7 +86,13 @@ import { Journal, type OpsStatusSnapshot, type TaskSummary } from './journal.js'
 import { StateStore, type PendingCheckin } from './state.js';
 import { readIdle } from './idle.js';
 import { Runner, render, summarise, type CommandResult } from './runner.js';
-import { describeRequest, isDestructive, parseRequest, type OpsRequest } from './request.js';
+import {
+  describeRequest,
+  isDestructive,
+  parseRequest,
+  sanitiseTask,
+  type OpsRequest,
+} from './request.js';
 import { readDirty } from './build.js';
 import {
   identityOptionsFor,
@@ -753,6 +759,91 @@ export class Executor {
   }
 
   /**
+   * Resolve the account the session will run as, and prepare its directories.
+   *
+   * Extracted from `#doTask` when the host agent got a mailbox, so that both
+   * ways in reach exactly the same gate. Nothing in it changed: a second copy
+   * of these refusals is how one of them quietly grows a hole.
+   *
+   * Re-resolved from /etc/passwd and /etc/group on EVERY call rather than
+   * cached from boot. That is the whole reason the check lives here: the
+   * membership it exists to catch — `usermod -aG docker clawcius-ops`, typed to
+   * make something work — is added to a RUNNING host, and a boot-time check on
+   * a unit that stays up for weeks would not see it until the next restart.
+   * Costs two small file reads per task.
+   */
+  #hostAgentAccount(
+    what: string,
+    requester: string,
+  ): { ok: true; user: AgentUser } | { ok: false; detail: string } {
+    const agent = this.#resolveAgent();
+    if (!agent.ok) {
+      return { ok: false, detail: `${agent.reason}\n\nThe host agent was not started.` };
+    }
+
+    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
+    if (problems.length > 0) {
+      return {
+        ok: false,
+        detail:
+          `refusing to run a task as ${describeAgentUser(agent.user)}:\n\n` +
+          problems.map((problem) => `  * ${problem}`).join('\n\n') +
+          '\n\nSince 2026-08-11 the containment story for this service is that the session ' +
+          'runs as an unprivileged account of its own. The sudoers scoping, the root-owned ' +
+          'journal and the claim that it holds no credential are all downstream of that one ' +
+          'fact and none of them survive without it. Nothing was run; the executor is still ' +
+          'holding its deadlines and will still perform rollbacks and check-ins.',
+      };
+    }
+
+    for (const warning of agentWarnings(agent.user, identityOptionsFor(this.#config))) {
+      this.#journal.write({
+        kind: 'request',
+        what,
+        requester,
+        detail: `host agent identity warning: ${warning}`,
+      });
+    }
+
+    // Idempotent, and here as well as at boot on purpose. `execFile`/`spawn`
+    // report a missing cwd as ENOENT on the BINARY, which reads as "claude is
+    // not installed" and sends whoever is debugging it to the wrong place
+    // entirely. Costs a stat; saves an evening.
+    //
+    // Owned by the agent account rather than by the checkout's owner, which is
+    // the change of 2026-08-11: the session writes here and it is no longer the
+    // same user as the one that owns /home/npurcell/clawcius.
+    ensureDirOwnedBy(
+      this.#config.hostAgent.workDir,
+      { uid: agent.user.uid, gid: agent.user.gid },
+      (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
+      0o750,
+      `so the host agent (${agent.user.user}) can write its own working directory`,
+    );
+
+    // The three directories the unit desk runs on. Created and chowned here for
+    // the same reason the working directory is: a session that finds them
+    // missing would create them itself and the executor would then be reading
+    // and unlinking inside something whose ancestry it never established. See
+    // `ensureDirOwnedBy`, which refuses a symlink rather than repairing it.
+    for (const dir of [
+      unitStagingDir(this.#config.hostAgent.workDir),
+      unitRequestDir(this.#config.hostAgent.workDir),
+      unitResultDir(this.#config.hostAgent.workDir),
+    ]) {
+      ensureDirOwnedBy(
+        dir,
+        { uid: agent.user.uid, gid: agent.user.gid },
+        (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
+        0o750,
+        `so the host agent (${agent.user.user}) can stage and request unit installs`,
+      );
+    }
+
+    return { ok: true, user: agent.user };
+  }
+
+  /**
    * Hand a task to a Claude Code session on the host and supervise it.
    *
    * The order of the steps is the design, and every one of them is here because
@@ -797,76 +888,12 @@ export class Executor {
       return;
     }
 
-    // ── Who is this session, and is that account still contained? ────────
-    //
-    // Re-resolved from /etc/passwd and /etc/group here, for every task, rather
-    // than cached from boot. That is the whole reason the check lives at task
-    // time: the membership it exists to catch — `usermod -aG docker
-    // clawcius-ops`, typed to make something work — is added to a RUNNING host,
-    // and a boot-time check on a unit that stays up for weeks would not see it
-    // until the next restart. Costs two small file reads per task.
-    const agent = this.#resolveAgent();
-    if (!agent.ok) {
-      this.#fail(job, `${agent.reason}\n\nThe host agent was not started.`);
+    const account = this.#hostAgentAccount(describeRequest(request), job.requester);
+    if (!account.ok) {
+      this.#fail(job, account.detail);
       return;
     }
-    const problems = agentProblems(agent.user, identityOptionsFor(this.#config));
-    if (problems.length > 0) {
-      this.#fail(
-        job,
-        `refusing to run a task as ${describeAgentUser(agent.user)}:\n\n` +
-          problems.map((problem) => `  * ${problem}`).join('\n\n') +
-          '\n\nSince 2026-08-11 the containment story for this service is that the session ' +
-          'runs as an unprivileged account of its own. The sudoers scoping, the root-owned ' +
-          'journal and the claim that it holds no credential are all downstream of that one ' +
-          'fact and none of them survive without it. Nothing was run; the executor is still ' +
-          'holding its deadlines and will still perform rollbacks and check-ins.',
-      );
-      return;
-    }
-    for (const warning of agentWarnings(agent.user, identityOptionsFor(this.#config))) {
-      this.#journal.write({
-        kind: 'request',
-        what: describeRequest(request),
-        requester: job.requester,
-        detail: `host agent identity warning: ${warning}`,
-      });
-    }
-
-    // Idempotent, and here as well as at boot on purpose. `execFile`/`spawn`
-    // report a missing cwd as ENOENT on the BINARY, which reads as "claude is
-    // not installed" and sends whoever is debugging it to the wrong place
-    // entirely. Costs a stat; saves an evening.
-    //
-    // Owned by the agent account rather than by the checkout's owner, which is
-    // the change of 2026-08-11: the session writes here and it is no longer the
-    // same user as the one that owns /home/npurcell/clawcius.
-    ensureDirOwnedBy(
-      this.#config.hostAgent.workDir,
-      { uid: agent.user.uid, gid: agent.user.gid },
-      (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
-      0o750,
-      `so the host agent (${agent.user.user}) can write its own working directory`,
-    );
-
-    // The three directories the unit desk runs on. Created and chowned here for
-    // the same reason the working directory is: a session that finds them
-    // missing would create them itself and the executor would then be reading
-    // and unlinking inside something whose ancestry it never established. See
-    // `ensureDirOwnedBy`, which refuses a symlink rather than repairing it.
-    for (const dir of [
-      unitStagingDir(this.#config.hostAgent.workDir),
-      unitRequestDir(this.#config.hostAgent.workDir),
-      unitResultDir(this.#config.hostAgent.workDir),
-    ]) {
-      ensureDirOwnedBy(
-        dir,
-        { uid: agent.user.uid, gid: agent.user.gid },
-        (line) => process.stdout.write(`[ops host-agent] ${line}\n`),
-        0o750,
-        `so the host agent (${agent.user.user}) can stage and request unit installs`,
-      );
-    }
+    const agent = { user: account.user };
 
     const scope = this.#scopeOf(request);
     const before = await this.#sampleHealth();
@@ -911,7 +938,7 @@ export class Executor {
       if (unitOps >= MAX_UNIT_OPS_PER_TASK) return;
       for (const result of this.#drainUnitRequests(MAX_UNIT_OPS_PER_TASK - unitOps)) {
         unitOps += 1;
-        this.#journalUnitOp(job, result);
+        this.#journalUnitOp(job.requester, job.request.instance || undefined, result);
       }
     };
     const desk = setInterval(serveUnitRequests, UNIT_DESK_POLL_MS);
@@ -927,7 +954,7 @@ export class Executor {
         briefing: await this.#briefing(scope, agent.user),
         onAudit: (event) => {
           if (event.kind === 'bash') commands.push(event.command);
-          this.#audit(job, event);
+          this.#audit(job.requester, job.request.instance || undefined, event);
         },
         onLog: (line) => process.stdout.write(`[ops] ${line}\n`),
       });
@@ -1047,6 +1074,257 @@ export class Executor {
     }
   }
 
+  // ── The mail path — CLAWSKY.md phase 6 ──────────────────────────────────
+
+  /**
+   * Run a task that arrived as a DM to the host agent, and answer it.
+   *
+   * Read `#doTask` first, then this, and the difference is the whole change:
+   * everything between "somebody asked" and "the session starts" is gone. No
+   * spool file, no queue entry, no rate-limit budget, no snapshot of every
+   * container in scope, no wait for every container in scope to fall idle, no
+   * armed rollback deadline, no check-in owed afterwards, and no reply written
+   * as a wake file to be read whenever the requester next happens to run. The
+   * answer is a DM, and it comes back to the agent that asked.
+   *
+   * That apparatus is what the operator asked to remove, and it is worth being
+   * exact about what went with it: **there is no longer anything to undo.** The
+   * old path could restore every container in scope to an image taken sixty
+   * seconds earlier; this one cannot, because the snapshot was part of the
+   * apparatus. The health sample either side survives, and it now reports
+   * rather than repairs — the reply says so in as many words, because a
+   * coordinator asking for something destructive should know which of the two
+   * paths it is on.
+   *
+   * What did NOT go: the account, the sudoers file, the privilege drop, the
+   * tool deny-lists, the per-command audit written before its result is known,
+   * the unit desk, and the freeze. Those are the containment story and none of
+   * them was scheduling.
+   *
+   * Concurrency: refused rather than queued while anything else holds the
+   * executor. `#busy` covers a redeploy, a rollback and another mail task
+   * alike, and "no" arriving in a second is a better answer than a session
+   * that starts twenty minutes later next to a rollback it knows nothing
+   * about. It is not a rate limit — nothing is counted and nothing is delayed.
+   */
+  async runMailTask(task: {
+    crew: string;
+    requester: string;
+    subject: string;
+    task: string;
+  }): Promise<{ subject: string; body: string }> {
+    // The same cap and the same control-character strip a spool task gets. A
+    // DM is not parsed by request.ts — there is no request JSON — but it ends
+    // up in the same journal and the same prompt.
+    //
+    // A message can be 64 KB and a task cannot, so truncation is possible and
+    // is REPORTED rather than silent: a coordinator whose last two paragraphs
+    // — the ones saying what not to touch — were dropped without being told
+    // would be the worst version of this.
+    const sanitised = sanitiseTask(task.task);
+    const truncated = sanitised.length < task.task.trim().length;
+    task = { ...task, subject: sanitiseTask(task.subject).slice(0, 200), task: sanitised };
+    const what = `task by mail from ${task.requester}`;
+    const reply = (subject: string, body: string): { subject: string; body: string } => ({
+      subject,
+      body,
+    });
+
+    this.#journal.write({
+      kind: 'request',
+      what,
+      requester: task.requester,
+      detail:
+        `by DM to the host agent — subject: ${task.subject || '(none)'}` +
+        (truncated ? '; TASK TRUNCATED to the same cap a spool task has' : ''),
+    });
+
+    if (!task.task) {
+      const detail = 'the message had no task in it once control characters were stripped.';
+      this.#journal.write({ kind: 'rejected', what, requester: task.requester, ok: false, detail });
+      return reply(`Refused: ${task.subject || '(no subject)'}`, detail);
+    }
+
+    if (!this.#config.hostAgent.enabled) {
+      const detail =
+        'hostAgent.enabled is false in ops-config.yaml, so tasks are refused. Deadlines, ' +
+        'check-ins and rollbacks still work — this is the setting to leave the host in ' +
+        'while somebody works out what the last task did. Nothing was run.';
+      this.#journal.write({ kind: 'rejected', what, requester: task.requester, ok: false, detail });
+      return reply(`Refused: ${task.subject || '(no subject)'}`, detail);
+    }
+
+    if (this.#state.state.frozen) {
+      const detail =
+        `the executor is FROZEN: ${this.#state.state.frozenReason}. Nothing was run. A human ` +
+        'clears it with ops/unfreeze.sh once they know why.';
+      this.#journal.write({ kind: 'rejected', what, requester: task.requester, ok: false, detail });
+      return reply(`Refused: ${task.subject || '(no subject)'}`, detail);
+    }
+
+    if (this.#busy) {
+      const detail =
+        `the executor is busy with "${this.#busy}". Refused rather than queued — the queue ` +
+        'is the thing this replaced. Ask again when it is done.';
+      this.#journal.write({ kind: 'rejected', what, requester: task.requester, ok: false, detail });
+      return reply(`Refused: ${task.subject || '(no subject)'}`, detail);
+    }
+
+    const account = this.#hostAgentAccount(what, task.requester);
+    if (!account.ok) {
+      this.#journal.write({
+        kind: 'failed',
+        what,
+        requester: task.requester,
+        ok: false,
+        detail: account.detail,
+      });
+      return reply(`Failed: ${task.subject || '(no subject)'}`, account.detail);
+    }
+
+    this.#busy = what;
+    this.#journal.publishStatus();
+    try {
+      const answer = await this.#runMailSession(what, task, account.user);
+      return truncated
+        ? {
+            subject: answer.subject,
+            body:
+              'NOTE: your message was longer than a task may be and was cut off at 8000 ' +
+              'characters. What the session saw is in the ops journal. If the part that was ' +
+              'dropped mattered, assume it did not happen.\n\n' +
+              answer.body,
+          }
+        : answer;
+    } finally {
+      this.#busy = null;
+      this.#journal.publishStatus();
+      // The spool path is inert but not deleted, and a deadline rollback still
+      // arrives through the queue. Whatever was waiting behind this is owed a
+      // pump now that the lock is free.
+      void this.#pump();
+    }
+  }
+
+  async #runMailSession(
+    what: string,
+    task: { crew: string; requester: string; subject: string; task: string },
+    user: AgentUser,
+  ): Promise<{ subject: string; body: string }> {
+    // Every instance, because a DM carries no `instance` field. That is the
+    // briefing's scope, not a permission: the briefing is facts the executor
+    // gathered itself, and a session that can see the whole host is the same
+    // session the spool path gave an unscoped task.
+    const scope = [...this.#config.instances];
+    const before = await this.#sampleHealth();
+
+    let unitOps = 0;
+    const serveUnitRequests = (): void => {
+      if (unitOps >= MAX_UNIT_OPS_PER_TASK) return;
+      for (const result of this.#drainUnitRequests(MAX_UNIT_OPS_PER_TASK - unitOps)) {
+        unitOps += 1;
+        this.#journalUnitOp(task.requester, undefined, result);
+      }
+    };
+    const desk = setInterval(serveUnitRequests, UNIT_DESK_POLL_MS);
+    desk.unref();
+
+    let outcome: HostAgentOutcome;
+    try {
+      outcome = await runHostAgent({
+        config: this.#config,
+        agent: user,
+        task: task.task,
+        // The author column of the mail row, which the waker stamped from the
+        // drop directory. There is no field a message can carry that reaches
+        // this, and nothing here reads one.
+        requester: task.requester,
+        briefing: await this.#briefing(scope, user),
+        onAudit: (event) => this.#audit(task.requester, undefined, event),
+        onLog: (line) => process.stdout.write(`[ops] ${line}\n`),
+      });
+    } catch (error) {
+      clearInterval(desk);
+      const detail = `the host agent was not started: ${String(error)}`;
+      this.#journal.write({ kind: 'failed', what, requester: task.requester, ok: false, detail });
+      return { subject: `Failed: ${task.subject || '(no subject)'}`, body: detail };
+    }
+    clearInterval(desk);
+    serveUnitRequests();
+
+    this.#lastTask = {
+      at: Date.now() - outcome.durationMs,
+      requester: task.requester,
+      instance: '(all)',
+      what,
+      commands: outcome.commands.length,
+      turns: outcome.turns,
+      costUsd: outcome.costUsd,
+      ok: outcome.ok,
+      dryRun: outcome.dryRun,
+      sessionId: outcome.sessionId,
+    };
+
+    // Same three tests as `#doTask`, and for the same reasons: an audit with an
+    // admitted hole in it is the absence of the only control there is; the
+    // agent is told to say "failed" plainly and first; and a health regression
+    // is believed over a cheerful report.
+    const auditBroken = outcome.unparsedLines > 0;
+    const saidFailed = /\bfailed\b/i.test(outcome.resultText.slice(0, 400));
+    const after = await this.#sampleHealth();
+    const regressions = compareHealth(before, after);
+    const ok = outcome.ok && !auditBroken && !saidFailed && regressions.length === 0;
+
+    const summary =
+      `host agent session ${outcome.sessionId}: ${outcome.reason} — ${outcome.detail} ` +
+      `${outcome.commands.length} command(s), ${outcome.turns} turn(s), ` +
+      `$${outcome.costUsd.toFixed(4)}, ${(outcome.durationMs / 1000).toFixed(1)}s` +
+      (outcome.denials ? `, ${outcome.denials} call(s) refused by the permission system` : '');
+
+    this.#journal.write({
+      kind: ok ? 'finished' : 'failed',
+      what,
+      requester: task.requester,
+      ok,
+      dryRun: outcome.dryRun,
+      detail:
+        `${summary}` +
+        (auditBroken
+          ? `\nAUDIT INCOMPLETE: ${outcome.unparsedLines} unparseable line(s) in the output ` +
+            'stream. The task is failed for this on its own.'
+          : '') +
+        (saidFailed && outcome.ok
+          ? '\nThe agent exited cleanly but its report says "failed", which is taken at its word.'
+          : '') +
+        (regressions.length ? `\nHEALTH REGRESSED: ${regressions.join('; ')}` : '') +
+        `\nreport: ${outcome.resultText.slice(0, 4000) || '(none)'}`,
+    });
+
+    return {
+      subject: `${ok ? 'Done' : 'Failed'}: ${task.subject || '(no subject)'}`,
+      body: [
+        `${ok ? 'SUCCEEDED' : 'FAILED'}${outcome.dryRun ? ' (DRY RUN — nothing was executed)' : ''}.`,
+        summary,
+        ...(regressions.length ? ['', `Health regressed: ${regressions.join('; ')}`] : []),
+        ...(ok || outcome.dryRun
+          ? []
+          : [
+              '',
+              'NOT ROLLED BACK. A task filed by mail takes no snapshot first, so there is ' +
+                'nothing to restore to. Whatever it did is still done. If that needs undoing ' +
+                'it is a person\'s decision and the ops journal holds every command it ran.',
+            ]),
+        '',
+        'The host agent reported:',
+        '',
+        outcome.resultText.slice(0, 6000) || '(it produced no report)',
+        '',
+        'Every command it ran is in the ops journal, in full. If you are about to tell the',
+        'operator what happened, tell them what it actually did, not what you asked for.',
+      ].join('\n'),
+    };
+  }
+
   /**
    * Which instances did the task actually touch?
    *
@@ -1109,12 +1387,20 @@ export class Executor {
    * them is what a session probing for a way past the name validation looks like
    * from outside, and that is worth being able to find later.
    */
-  #journalUnitOp(job: Job, result: UnitOpResult): void {
+  /**
+   * Takes `requester` and `instance` rather than a `Job`, since 2026-08-14.
+   *
+   * A mail task has no Job — there is no queue for it to be an entry in — and
+   * the journal only ever wanted these two fields off it. Passing them down
+   * keeps one audit path for both ways in; a second one would be a second
+   * place for a command to run without being recorded.
+   */
+  #journalUnitOp(requester: string, instance: string | undefined, result: UnitOpResult): void {
     this.#journal.write({
       kind: 'unit',
       what: `${result.op} ${result.unit || '(unnamed)'}`,
-      instance: job.request.instance || undefined,
-      requester: job.requester,
+      instance,
+      requester,
       ok: result.ok,
       dryRun: result.skipped,
       ...(result.path ? { command: result.path } : {}),
@@ -1123,13 +1409,14 @@ export class Executor {
   }
 
   /** One audit line into the durable record, before the command's result is known. */
-  #audit(job: Job, event: AuditEvent): void {
+  /** See `#journalUnitOp` for why this takes fields rather than a `Job`. */
+  #audit(requester: string, instance: string | undefined, event: AuditEvent): void {
     this.#auditedCommands += event.kind === 'bash' ? 1 : 0;
     this.#journal.write({
       kind: 'audit',
       what: event.kind === 'bash' ? 'bash' : `${event.kind} ${event.tool}`,
-      instance: job.request.instance || undefined,
-      requester: job.requester,
+      instance,
+      requester,
       dryRun: this.#config.dryRun,
       // The FULL command string, in the field the status page already renders
       // as a command. Not summarised, not shell-quoted, not re-parsed — this is

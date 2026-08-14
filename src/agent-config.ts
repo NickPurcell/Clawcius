@@ -50,6 +50,16 @@ export type PromptTemplates = {
   messageLine: string;
   /** Wake message for a schedule the agent set for itself. */
   scheduleWake: string;
+  /**
+   * Wake message for mail that arrived while the agent was idle.
+   *
+   * Deliberately the thinnest template of the four. `{mail}` is `checkMail`'s
+   * own output, verbatim, and everything wrapped around it is wrapping around
+   * the agent's own tool result — so the more this says, the more it reads as
+   * somebody else having prodded the agent, which is exactly what the design
+   * is trying not to do. No `{roleNotice}` for the same reason.
+   */
+  mailWake: string;
 };
 
 /** Placeholders each template may use. Anything else is a startup error. */
@@ -59,6 +69,7 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
   scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
+  mailWake: ['mail', 'count', 'plural'],
 };
 
 export type AgentConfig = {
@@ -175,6 +186,16 @@ export type AgentConfig = {
      */
     dropDir: string;
     /**
+     * Mail delivered to an idle agent starts a turn — CLAWSKY.md phase 3.
+     *
+     * Separable from the board itself, and it stays separable: off, agents
+     * still send mail and still read it whenever they happen to run, which is
+     * the state phases 1 and 2 shipped and which CLAWSKY.md says is worth
+     * living with. An operator who wants that back should not have to switch
+     * the whole board off to get it.
+     */
+    wakeOnMail: boolean;
+    /**
      * Agents that exist before there is anything to spawn them.
      *
      * Spawn/kill/resurrect are phase 5. Until then this is how a crew gets
@@ -281,6 +302,10 @@ Your instruction to yourself:
 
 No message to reply to. To post:
   {cli} send -c {channelId} -t "..."`,
+
+  mailWake: `checkMail →
+
+{mail}`,
 };
 
 const DEFAULTS: AgentConfig = {
@@ -325,6 +350,7 @@ const DEFAULTS: AgentConfig = {
     enabled: true,
     crew: 'clawcius',
     dropDir: '/var/lib/clawcius/run/clawsky',
+    wakeOnMail: true,
     agents: [],
   },
   status: {
@@ -502,6 +528,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
       messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
       scheduleWake: template(prompts['scheduleWake'], 'scheduleWake', DEFAULT_PROMPTS.scheduleWake),
+      mailWake: template(prompts['mailWake'], 'mailWake', DEFAULT_PROMPTS.mailWake),
     },
     model: str(root['model'], 'model', DEFAULTS.model),
     maxTurns: num(root['maxTurns'], 'maxTurns', DEFAULTS.maxTurns, 0),
@@ -584,6 +611,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
       crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
       dropDir: str(clawsky['dropDir'], 'clawsky.dropDir', DEFAULTS.clawsky.dropDir),
+      wakeOnMail: bool(clawsky['wakeOnMail'], 'clawsky.wakeOnMail', DEFAULTS.clawsky.wakeOnMail),
       agents: agentList(
         clawsky['agents'],
         'clawsky.agents',

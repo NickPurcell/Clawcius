@@ -61,6 +61,14 @@ export function buildWakeMessage(context: WakeContext): string {
   const cli = config.agent.paths.discordCli;
   const { prompts } = config.agent;
 
+  if (context.kind === 'mail') {
+    return render(prompts.mailWake, {
+      mail: context.mail,
+      count: String(context.count),
+      plural: context.count === 1 ? 'message' : 'messages',
+    });
+  }
+
   if (context.kind === 'schedule') {
     return render(prompts.scheduleWake, {
       cli,

@@ -31,6 +31,23 @@ export type WakeContext =
       prompt: string;
       /** Present for repeating schedules. */
       repeats?: string;
+    }
+  | {
+      /**
+       * Mail arrived for an agent that was not running a turn.
+       *
+       * The turn opens with the mail already read, rendered exactly as
+       * `checkMail` renders it, because the alternative — telling the agent it
+       * has mail and asking it to go and look — reads as an external prod and
+       * makes an agent stop to ask what just happened to it rather than get on
+       * with what arrived. See CLAWSKY.md § checkMail.
+       */
+      kind: 'mail';
+      /** The agent id. Named for the session key it shares with the others. */
+      channelId: string;
+      /** `renderMail` output — the tool's own text, not a paraphrase of it. */
+      mail: string;
+      count: number;
     };
 
 export type TurnSummary = {

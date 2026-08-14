@@ -10,6 +10,10 @@
  *   DM         one agent    anyone           sender + recipient
  *   feed       `*`          posters only     every agent
  *
+ * With one exception, and it is the load-bearing one: a DM to an agent whose
+ * role is `host` may only be written by a coordinator. That is now the sole
+ * access control on running commands on the VPS — see the predicate below.
+ *
  * The write restriction exists from the first commit deliberately. On day one
  * the poster looks idle — Discord stays with the coordinator, so the feed's
  * only audience is the other crew — and that quiet is correct. Adding a write
@@ -65,6 +69,21 @@ export type DeliveryResult = { accepted: boolean; detail: string };
 export class MailStore {
   readonly #db: DatabaseSync;
   readonly #registry: AgentRegistry;
+
+  /**
+   * Fired once per accepted message, after it is committed.
+   *
+   * This is what makes mail wake anybody: without it the board is a table
+   * nobody looks at until an agent happens to run. It is set by the waker and
+   * fires synchronously inside `deliver`, so the subscriber must not throw —
+   * the caller is a directory sweep in the middle of a batch. index.ts wraps
+   * it for the same reason it wraps the status publisher.
+   *
+   * It carries the message rather than just the recipient because a feed post
+   * has no single recipient, and the subscriber needs the author to know who
+   * not to wake.
+   */
+  onDelivered: (message: MailMessage) => void = () => {};
 
   constructor(registry: AgentRegistry) {
     this.#registry = registry;
@@ -125,6 +144,49 @@ export class MailStore {
       if (!recipient) {
         return { accepted: false, detail: `unknown recipient "${mail.recipient}"` };
       }
+      // ── The only access control left on running commands on the VPS ──────
+      //
+      // A DM to the host agent runs a Claude Code session on the host, with a
+      // shell and a scoped sudoers file. There is no longer a queue, an idle
+      // wait or an armed rollback deadline in front of that; the ops spool's
+      // whole scheduling apparatus is what phase 6 removed. This predicate is
+      // what took its place, so it is written here — in the one place mail
+      // policy lives — rather than in a system prompt, which is not a control
+      // at all against an agent that has been prompt-injected by something it
+      // read.
+      //
+      // Enforced AGAIN on the host, in ops/src/host-mailbox.ts, against the
+      // author column of the row it is about to act on. Two checks because
+      // they defend different things: this one keeps a well-behaved engineer's
+      // mistake out of the mail table, and the one on the host is what holds
+      // if anything ever writes to that table other than this method.
+      //
+      // ── What this does NOT hold against, stated plainly ──────────────────
+      //
+      // Authorship is stamped from the drop directory, and a drop directory is
+      // per AGENT while the bind mount is per CREW: every agent in a crew today
+      // shares one container, one uid and one disk (see mail-drop.ts, and
+      // Clawcius #31). So an engineer that goes looking can write into its
+      // coordinator's drop directory, and this check will see a coordinator.
+      //
+      // That was already the boundary before the host agent had a mailbox —
+      // anything sharing a container already shares everything — but it did
+      // not previously end in a shell on the VPS, and it is dishonest to write
+      // "only a coordinator may" without saying so. The rule holds against a
+      // mistake and against another crew; it does not hold against an agent in
+      // the same container that is deliberately impersonating its captain.
+      // Separate uids per agent is the fix and it is the one thing that would
+      // make this a boundary rather than a convention.
+      //
+      // Engineers ask their captain; the captain asks the host.
+      if (recipient.role === 'host' && author.role !== 'coordinator') {
+        return {
+          accepted: false,
+          detail:
+            `only a coordinator may DM the host agent; ${author.id} is a ${author.role}. ` +
+            `Ask ${author.crew}'s coordinator to file it.`,
+        };
+      }
       // Crews talk to each other in public on the feed; within a crew, agents
       // talk privately. Enforced here because it is the same boundary that
       // stops an `@` reaching past a crew into someone's engineer, and a
@@ -142,9 +204,21 @@ export class MailStore {
     }
 
     const subject = mail.subject.slice(0, MAX_SUBJECT_CHARS);
-    this.#db
+    const sentAt = Date.now();
+    const inserted = this.#db
       .prepare('INSERT INTO mail (author, recipient, subject, body, sent_at) VALUES (?, ?, ?, ?, ?)')
-      .run(author.id, mail.recipient, subject, mail.body, Date.now());
+      .run(author.id, mail.recipient, subject, mail.body, sentAt);
+
+    // After the insert, never before: a subscriber that reads the inbox must
+    // find the message it is being told about.
+    this.onDelivered({
+      id: Number(inserted.lastInsertRowid),
+      author: author.id,
+      recipient: mail.recipient,
+      subject,
+      body: mail.body,
+      sentAt,
+    });
 
     return {
       accepted: true,

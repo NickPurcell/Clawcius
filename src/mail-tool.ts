@@ -57,7 +57,7 @@ export function renderMail(messages: readonly MailMessage[]): string {
  * shape of an outgoing message is here, where it is delivered alongside the
  * tool itself rather than in a system prompt it may not have been given.
  */
-function describe(agentId: string, dropDir: string): string {
+function describe(agentId: string, dropDir: string, hostId: string): string {
   return [
     'Read everything waiting in your inbox. No arguments; returns all of it at once and',
     'marks it read.',
@@ -76,6 +76,15 @@ function describe(agentId: string, dropDir: string): string {
     '',
     'Your name is taken from that directory, never from the file, so there is no',
     '"from" field and writing one does nothing.',
+    '',
+    // Stated as a fact about the system rather than as an instruction to
+    // whoever is reading, so the same sentence is true from every seat. An
+    // engineer that has never heard of the host agent does not think "not my
+    // job", it goes looking for another way to restart a service.
+    `${hostId} runs commands on this VPS. It has a mailbox like anyone else: DM it`,
+    'and it runs, now, and answers by DM. ONLY A COORDINATOR MAY DM IT — that is the',
+    'only access control there is on running commands on the host, and it is enforced',
+    'in code rather than by asking. Everyone else asks their coordinator.',
   ].join('\n');
 }
 
@@ -83,10 +92,11 @@ export function buildMailServer(
   mail: MailStore,
   agentId: string,
   dropDir: string,
+  hostId: string,
 ): Record<string, McpServerConfig> {
   const checkMail = tool(
     'checkMail',
-    describe(agentId, dropDir),
+    describe(agentId, dropDir, hostId),
     {},
     async () => {
       const messages = mail.collect(agentId);
