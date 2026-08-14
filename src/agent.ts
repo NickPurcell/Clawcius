@@ -17,13 +17,15 @@
  * Code startup every time.
  */
 
-import { query, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
 import { buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import { containerSpawner } from './container.js';
-import type { SessionStore } from './store.js';
+import { buildMailServer } from './mail-tool.js';
+import type { MailStore } from './mail.js';
+import type { AgentIdentity, AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
 /**
@@ -243,6 +245,13 @@ export class AgentSession {
   #query: Query | null = null;
   #sessionId: string;
   #events: AgentEvents;
+  /**
+   * In-process tools for this session — today, `checkMail`, bound to this
+   * agent's id. Built per session rather than shared because the binding is
+   * the identity: a tool that took the agent id as an argument would let any
+   * session read any mailbox.
+   */
+  #mcpServers: Record<string, McpServerConfig> | null;
   #consuming: Promise<void> | null = null;
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
@@ -301,10 +310,12 @@ export class AgentSession {
     workspacePath: string,
     resumeSessionId: string | undefined,
     events: AgentEvents,
+    mcpServers: Record<string, McpServerConfig> | null = null,
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
     this.#events = events;
+    this.#mcpServers = mcpServers;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
@@ -339,6 +350,13 @@ export class AgentSession {
         process.stderr.write(`[agent ${this.channelId}] ${data}`);
       },
     };
+
+    // The board is a SQLite file on the host and the container has no route to
+    // it, so the mail tools run here, in the waker, and reach the agent over
+    // the SDK's own control channel rather than through the sandbox.
+    if (this.#mcpServers) {
+      options.mcpServers = this.#mcpServers;
+    }
 
     // 0 means unlimited: omit the cap entirely rather than sending a zero,
     // which the SDK would read as "no turns allowed".
@@ -615,13 +633,33 @@ export class AgentSession {
 
 export class SessionManager {
   #sessions = new Map<string, AgentSession>();
-  #store: SessionStore;
+  #registry: AgentRegistry;
+  #mail: MailStore | null;
   #sweeper: NodeJS.Timeout;
 
-  constructor(store: SessionStore) {
-    this.#store = store;
+  constructor(registry: AgentRegistry, mail: MailStore | null = null) {
+    this.#registry = registry;
+    this.#mail = mail;
     this.#sweeper = setInterval(() => void this.#evictIdle(), 60_000);
     this.#sweeper.unref();
+  }
+
+  /**
+   * What a channel's agent is, if the registry has never heard of it.
+   *
+   * `coordinator`, because the only agents that existed before the registry
+   * were the ones Discord wakes, and Discord stays with the coordinator. The
+   * id is the channel id: that is what every caller here looks a session up
+   * by, and minting a prettier name would detach live sessions from their
+   * channels for nothing.
+   */
+  #identityFor(workspacePath: string): AgentIdentity {
+    return {
+      crew: config.agent.clawsky.crew,
+      role: 'coordinator',
+      workspacePath,
+      spawnedBy: null,
+    };
   }
 
   get liveCount(): number {
@@ -670,7 +708,7 @@ export class SessionManager {
   acquire(channelId: string, events: AgentEvents): AgentSession {
     const existing = this.#sessions.get(channelId);
     if (existing) {
-      this.#store.touch(channelId);
+      this.#registry.touch(channelId);
       return existing;
     }
 
@@ -680,15 +718,24 @@ export class SessionManager {
       );
     }
 
-    const persisted = this.#store.get(channelId);
+    const persisted = this.#registry.get(channelId);
     const workspacePath = persisted?.workspacePath ?? join(config.agent.sessions.workspaceRoot, channelId);
     const resumeFrom = isResumable(persisted?.sessionId) ? persisted.sessionId : undefined;
+
+    // Registered before the turn rather than after it. The row is the identity
+    // mail is addressed to and the drop directory is named after, so a channel
+    // whose first turn is in flight already has both — rather than acquiring
+    // them once it happens to finish.
+    this.#registry.ensure(channelId, this.#identityFor(workspacePath));
 
     const session = new AgentSession(
       channelId,
       workspacePath,
       resumeFrom,
       events,
+      this.#mail
+        ? buildMailServer(this.#mail, channelId, join(config.agent.clawsky.dropDir, channelId))
+        : null,
     );
 
     session.onBusyChanged = () => this.onCountsChanged();
@@ -703,7 +750,12 @@ export class SessionManager {
     const session = this.#sessions.get(channelId);
     if (!session) return;
     if (!isResumable(session.sessionId)) return;
-    this.#store.upsert(channelId, session.sessionId, session.workspacePath);
+    this.#registry.recordSession(
+      channelId,
+      session.sessionId,
+      session.workspacePath,
+      this.#identityFor(session.workspacePath),
+    );
   }
 
   async release(channelId: string): Promise<void> {
