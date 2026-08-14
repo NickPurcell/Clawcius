@@ -551,9 +551,25 @@ windowSweeper.unref();
 /**
  * Wake requests from inside the container.
  *
- * The agent schedules itself with cron and curls this socket. Limits still
- * apply here — a request is a request, not a command, so it cannot be used to
+ * The agent schedules itself with cron and drops a file here. Limits still
+ * apply — a request is a request, not a command, so it cannot be used to
  * escape the concurrency cap.
+ *
+ * THE CHANNEL MUST ALREADY EXIST ON THE BOARD. This file is inside the crew's
+ * bind mount, so anything in the container can write it, and `channel` used to
+ * be handed straight to `sessions.acquire` — which registers a row for an id it
+ * has not seen. That made this an identity forge rather than a scheduler: write
+ * a file naming any id you like and a turn starts under that name, holding that
+ * name's `sendMail`, with a prompt of your choosing. An engineer could wake as
+ * its coordinator and, from there, reach the host agent.
+ *
+ * Requiring an existing row does not make this route safe — one crewmate can
+ * still wake another, because a crew shares a container and this spool is not
+ * per agent (Clawcius #31, #39). It removes the ability to *mint* an identity,
+ * which is the part that turned a shared filesystem into a privilege boundary
+ * anyone could cross. The full answer is the durable scheduler in CLAWSKY.md
+ * phase 4, which retires this spool; until that exists, refusing loudly beats
+ * registering silently.
  */
 const wakeCounts = new Map<string, number[]>();
 
@@ -613,7 +629,11 @@ const wakeSpool = config.agent.wake.enabled
           detail: error instanceof Error ? error.message : String(error),
         };
       }
-    })
+    },
+    // Policy lives here, the refusal lives at the parse boundary: a wake may
+    // name an identity that already exists, never mint one. See the comment
+    // above and `WakeSpool`.
+    (channelId) => registry.get(channelId) !== undefined)
   : null;
 wakeSpool?.start();
 mailWaker?.start();
