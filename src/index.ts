@@ -13,10 +13,11 @@
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
 import { config } from './config.js';
-import { AgentRegistry } from './store.js';
+import { AgentRegistry, hostAgentId } from './store.js';
 import { SessionManager } from './agent.js';
 import { MailStore } from './mail.js';
 import { MailDrop } from './mail-drop.js';
+import { MailWaker } from './mail-wake.js';
 import { WakeSpool } from './wake-spool.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
@@ -62,6 +63,81 @@ const mailDrop = mail
   : null;
 
 const sessions = new SessionManager(registry, mail);
+
+/**
+ * Mail wakes an idle agent — CLAWSKY.md phase 3.
+ *
+ * Separable from the board itself and it stays separable: with `wakeOnMail`
+ * off, agents still send mail and still read it whenever they happen to run,
+ * which is exactly what phases 1 and 2 shipped. An operator who wants that back
+ * should not have to switch the whole board off to get it.
+ *
+ * The events handed to a mail wake are deliberately thinner than the Discord
+ * ones. There is no channel to announce an outage in and no message anybody is
+ * waiting on, so a failure is a line in the journal; and a stale token drops
+ * the session without replaying, because the mail has already been marked read
+ * and handed over, and replaying it would deliver the same message twice.
+ */
+const mailWaker =
+  mail && config.agent.clawsky.wakeOnMail
+    ? new MailWaker({
+        crew: config.agent.clawsky.crew,
+        registry,
+        mail,
+        busy: (agentId) => sessions.isBusy(agentId),
+        start: (agent, context) => {
+          const session = sessions.acquire(agent.id, {
+            onToolUse: (tool) => process.stdout.write(`[clawcius ${agent.id}] ${tool}\n`),
+            onCliFailure: (cmd, out) =>
+              process.stderr.write(
+                `[clawcius ${agent.id}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`,
+              ),
+            onDone: (summary) => {
+              sessions.persist(agent.id);
+              if (summary.apiError) {
+                process.stderr.write(
+                  `[clawcius ${agent.id}] mail wake REFUSED (${summary.apiErrorKind})\n` +
+                    `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
+                    (summary.retryScheduled
+                      ? `  retry ${summary.retryAttempt} queued\n`
+                      : `  not retrying — the mail is already in the transcript\n`),
+                );
+              }
+              process.stdout.write(
+                `[clawcius ${agent.id}] mail wake turn ${summary.subtype} ` +
+                  `$${summary.costUsd.toFixed(4)}\n`,
+              );
+            },
+            onError: (error) => {
+              process.stderr.write(`[clawcius ${agent.id}] ${error.message}\n`);
+              void sessions.release(agent.id);
+            },
+            onNeedsRespawn: () => {
+              process.stderr.write(
+                `[clawcius ${agent.id}] stale token on a mail wake — dropping session\n`,
+              );
+              void sessions.release(agent.id);
+            },
+          });
+          session.wake(context);
+        },
+        log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
+      })
+    : null;
+
+if (mail && mailWaker) {
+  // Wrapped for the same reason `onCountsChanged` is: this fires from inside
+  // the mail drop's drain loop, mid-batch, and a throw would abandon the rest
+  // of the batch having already delivered this one.
+  mail.onDelivered = (message) => {
+    try {
+      mailWaker.onDelivered(message.recipient);
+    } catch (error) {
+      process.stderr.write(`[mail-wake] onDelivered failed: ${String(error)}\n`);
+    }
+  };
+}
+
 const windows = new ConversationWindows(
   config.agent.discord.followUpWindowSeconds,
   config.agent.discord.followUpChannelIds,
@@ -93,6 +169,15 @@ sessions.onCountsChanged = () => {
     wakerStatus.noteChange();
   } catch (error) {
     process.stderr.write(`[waker-status] noteChange failed: ${String(error)}\n`);
+  }
+  // A turn just ended is the moment "picked up on the next turn" comes due:
+  // mail that arrived while this agent was busy has been sitting unread since,
+  // and without this the next turn might never happen. Guarded against
+  // re-entrancy inside the waker — `start` flips `busy` and lands back here.
+  try {
+    mailWaker?.sweep();
+  } catch (error) {
+    process.stderr.write(`[mail-wake] sweep failed: ${String(error)}\n`);
   }
 };
 wakerStatus.start();
@@ -199,8 +284,12 @@ async function handleCommand(message: Message, command: string): Promise<boolean
             ? `This channel: session ${persisted.sessionId.slice(0, 8)}…`
             : 'This channel: no session yet',
           mail
-            ? `Mail: ${mail.unread(channelId).length} unread as ${channelId} (crew ${config.agent.clawsky.crew})`
+            ? `Mail: ${mail.unread(channelId).length} unread as ${channelId} (crew ${config.agent.clawsky.crew})` +
+              `, wake-on-mail ${mailWaker ? 'on' : 'off'}`
             : 'Mail: disabled',
+          // Whether the ops executor has claimed its row. A coordinator that
+          // is about to be told "unknown recipient" would rather find out here.
+          mail ? `Host agent: ${describeHostAgent()}` : 'Host agent: unreachable (mail disabled)',
         ].join('\n'),
       );
       return true;
@@ -209,6 +298,24 @@ async function handleCommand(message: Message, command: string): Promise<boolean
     default:
       return false;
   }
+}
+
+/**
+ * Is there a host agent on this board, and is this channel allowed to reach it?
+ *
+ * The row is created by the ops executor, not here, so its absence is a real
+ * answer rather than a missing feature: it means no process that can actually
+ * run the host agent has claimed the name. Read-only — nothing about this
+ * enforces anything, the rule lives in `MailStore.deliver`.
+ */
+function describeHostAgent(): string {
+  const id = hostAgentId(config.agent.clawsky.crew);
+  const row = registry.get(id);
+  if (!row || row.role !== 'host') {
+    return `${id} is not on this board — the ops executor has not registered it ` +
+      '(no board: block in ops-config.yaml, or it could not open the database)';
+  }
+  return `DM ${id} — coordinators only, enforced in code`;
 }
 
 function silentEvents() {
@@ -519,6 +626,7 @@ const wakeSpool = config.agent.wake.enabled
   : null;
 wakeSpool?.start();
 mailDrop?.start();
+mailWaker?.start();
 
 client.once(Events.ClientReady, (ready) => {
   // Stamped with the pid and the boot time because Restart=always makes a
@@ -600,6 +708,7 @@ async function shutdown(signal: string): Promise<void> {
   try {
     wakeSpool?.stop();
     mailDrop?.stop();
+    mailWaker?.stop();
     wakerStatus.stop();
     // Absent reads as busy to the executor, which is the correct answer for a
     // waker that is no longer running: it cannot vouch for anything.

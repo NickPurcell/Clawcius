@@ -219,6 +219,20 @@ function text(value: unknown, max: number = MAX_TEXT_CHARS): string {
 }
 
 /**
+ * The same treatment `task` gets, for text that did not arrive through
+ * `parseRequest`.
+ *
+ * A task filed as a DM to the host agent skips this whole file — there is no
+ * request JSON to parse — but it lands in the same journal and the same prompt,
+ * so it gets the same cap and the same control-character strip. Exported rather
+ * than reimplemented so there is one answer to "how long can a task be", not
+ * two that drift.
+ */
+export function sanitiseTask(value: string): string {
+  return text(value, MAX_TASK_CHARS);
+}
+
+/**
  * Fields this schema knows. Anything else is reported, never acted on.
  *
  * Note what is deliberately NOT here: `requester`, `from`, `instanceName` or

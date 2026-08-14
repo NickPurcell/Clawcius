@@ -291,6 +291,35 @@ instances:
     # build is a new build.
     buildRepo: clawcius
 
+    # ── The Clawsky board: how a coordinator reaches the host agent ──────
+    # Since 2026-08-14 the host agent is an ordinary Clawsky participant with a
+    # mailbox. A DM to `<crew>-host` from that crew's COORDINATOR runs a session
+    # on this host, immediately, and the answer comes back as a DM. No queue, no
+    # waiting for containers to fall idle, no snapshot, no armed rollback
+    # deadline, no check-in — that scheduling apparatus is exactly what this
+    # replaced. The `clawcius-ops` account, its sudoers file and the privilege
+    # drop are untouched and are still the whole containment story.
+    #
+    # Only a coordinator may DM it. With the queue gone, that is the only
+    # access control left on running commands on this host. It is enforced in
+    # code twice: where the DM is delivered, and again here against the row.
+    #
+    # NEITHER FIELD HAS A DEFAULT, because both can only be got right by
+    # matching something written somewhere else, and both fail invisibly:
+    #
+    #   db:   the instance's CLAWCIUS_DB_PATH, from its env file above. A wrong
+    #         path is refused at boot rather than creating a second empty
+    #         database that looks exactly like a mailbox nobody writes to.
+    #   crew: the instance's clawsky.crew, from its agent-config.yaml. A wrong
+    #         crew registers the host agent where the coordinator asking is not.
+    #
+    # Leave the block out entirely and the host agent has no mailbox on this
+    # instance: a coordinator DMing it is told there is no such recipient, which
+    # is the honest answer. The ops spool still works either way.
+    board:
+      db: /var/lib/clawcius/clawcius.db
+      crew: clawcius
+
   - name: hamachi
     container: hamachi-agent
     image: hamachi-agent:latest
@@ -303,6 +332,15 @@ instances:
     # is inside the bind mount Hamachi's container has always had.
     wakeChannelId: "000000000000000000"
     buildRepo: clawcius
+
+    # CONFIRM `db` AGAINST .env.hamachi BEFORE TRUSTING IT. CLAWCIUS_DB_PATH
+    # defaults to /var/lib/clawcius/clawcius.db when it is not set, which for
+    # this instance would put Hamachi's board inside Clawcius's state directory
+    # and give the two crews one shared board. If that is what the env file
+    # actually says, fix the env file rather than this line.
+    board:
+      db: /var/lib/hamachi/clawcius.db
+      crew: hamachi
 
     # ── Optional: narrow what this instance may ask for ─────────────────
     # OFF BY DEFAULT. No `mayRequest:` block means unrestricted, which is what

@@ -25,7 +25,7 @@ import { buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
 import type { MailStore } from './mail.js';
-import type { AgentIdentity, AgentRegistry } from './store.js';
+import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
 /**
@@ -204,13 +204,23 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
   #resolve: (() => void) | null = null;
   #closed = false;
 
-  push(text: string, sessionId: string): void {
+  /**
+   * `synthetic` marks a turn nobody typed.
+   *
+   * The SDK's streaming input accepts user messages and nothing else, so a
+   * mail wake cannot literally be an assistant `tool_use` block followed by
+   * its result — it is the tool's output, verbatim, arriving as a user
+   * message. `isSynthetic` is how that message says it did not come from a
+   * person. The framing does the rest; see `prompts.mailWake`.
+   */
+  push(text: string, sessionId: string, synthetic = false): void {
     if (this.#closed) throw new Error('Cannot push to a closed PromptQueue');
     this.#pending.push({
       type: 'user',
       message: { role: 'user', content: text },
       parent_tool_use_id: null,
       session_id: sessionId,
+      ...(synthetic ? { isSynthetic: true } : {}),
     });
     this.#resolve?.();
     this.#resolve = null;
@@ -564,7 +574,7 @@ export class AgentSession {
     this.#retries = 0;
     // Only a genuine wake clears this — see the field for why a retry must not.
     this.#actedSinceWake = false;
-    this.#push(buildWakeMessage(context));
+    this.#push(buildWakeMessage(context), context.kind === 'mail');
   }
 
   /**
@@ -578,11 +588,11 @@ export class AgentSession {
     const text = this.#actedSinceWake
       ? CONTINUATION_PROMPT
       : buildWakeMessage(this.#lastContext);
-    this.#push(text);
+    this.#push(text, this.#lastContext.kind === 'mail' && !this.#actedSinceWake);
   }
 
   /** Shared turn setup: reset per-turn state, then hand the text over. */
-  #push(text: string): void {
+  #push(text: string, synthetic = false): void {
     this.lastActiveAt = Date.now();
     this.busy = true;
     this.#sentThisTurn = false;
@@ -590,7 +600,7 @@ export class AgentSession {
     this.#apiErrorKindThisTurn = null;
     this.#discordCalls.clear();
     try {
-      this.#queue.push(text, this.#sessionId);
+      this.#queue.push(text, this.#sessionId, synthetic);
     } catch (error) {
       // The child transport can be dead — a failed spawn, or a process that
       // exited. Route it through onError so the caller can drop the session
@@ -701,6 +711,18 @@ export class SessionManager {
   }
 
   /**
+   * Is a turn in flight for this agent right now?
+   *
+   * False for an agent with no session at all, which is the same answer as an
+   * agent with an idle one — and deliberately so. Nothing interrupts a running
+   * turn (CLAWSKY.md § Lifecycle), and "resumed, not resident" means having a
+   * live `claude` process is not part of what it is to be busy.
+   */
+  isBusy(channelId: string): boolean {
+    return this.#sessions.get(channelId)?.busy === true;
+  }
+
+  /**
    * Live session for a channel, resuming a stored one or creating fresh.
    * Throws at the concurrency cap — the caller surfaces that to Discord rather
    * than queueing silently, so the user learns why nothing happened.
@@ -734,7 +756,12 @@ export class SessionManager {
       resumeFrom,
       events,
       this.#mail
-        ? buildMailServer(this.#mail, channelId, join(config.agent.clawsky.dropDir, channelId))
+        ? buildMailServer(
+            this.#mail,
+            channelId,
+            join(config.agent.clawsky.dropDir, channelId),
+            hostAgentId(config.agent.clawsky.crew),
+          )
         : null,
     );
 

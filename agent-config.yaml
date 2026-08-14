@@ -425,6 +425,17 @@ clawsky:
   # boundary DMs stay inside. Crews talk to each other in public, on the feed.
   crew: clawcius
   dropDir: /var/lib/clawcius/run/clawsky
+  # Mail delivered to an agent that is not mid-turn starts a turn, opening with
+  # the mail already read — as though the agent had polled at exactly the right
+  # moment. Nothing ever interrupts a running turn: mail that arrives mid-turn
+  # waits and is picked up on the next one.
+  #
+  # There is no loop breaker, no throttle and no coalescing window, on purpose.
+  # Sending is a tool call and a tool call happens inside a turn, so the message
+  # rate is turn-paced by construction: two agents can argue for a long time and
+  # cannot argue fast. Set false to go back to the phase-2 behaviour, where mail
+  # is only read by an agent that ran for some other reason.
+  wakeOnMail: true
   # Agents that exist before spawn does (phase 5). Added if absent, never
   # overwritten, so this list is additive and safe to edit while running.
   #

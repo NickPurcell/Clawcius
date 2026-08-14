@@ -41,18 +41,40 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /**
- * The four roles. `coordinator` is the default for anything that predates the
- * registry, because the only agents that existed before it were the ones
- * Discord wakes, and Discord stays with the coordinator.
+ * The four crew roles, and `host`.
+ *
+ * `coordinator` is the default for anything that predates the registry, because
+ * the only agents that existed before it were the ones Discord wakes, and
+ * Discord stays with the coordinator.
+ *
+ * `host` is not a crew member. It is the account on the VPS that runs commands,
+ * given a registry row and a mailbox so that reaching it is a DM rather than a
+ * queue. It is a role rather than a naming convention because two rules key off
+ * it and neither should be a string comparison against an id: only a
+ * coordinator may DM it (mail.ts), and nothing inside a container may run it —
+ * the ops executor owns that mailbox, from the host (src/mail-wake.ts).
  */
-export type AgentRole = 'coordinator' | 'engineer' | 'researcher' | 'poster';
+export type AgentRole = 'coordinator' | 'engineer' | 'researcher' | 'poster' | 'host';
 
 export const AGENT_ROLES: readonly AgentRole[] = [
   'coordinator',
   'engineer',
   'researcher',
   'poster',
+  'host',
 ];
+
+/**
+ * The host agent's id in a given crew.
+ *
+ * Derived rather than configured, so the executor on the host and the waker in
+ * the container arrive at the same name without a shared config file — they
+ * have no other way to agree on one. The role on the row is what carries the
+ * meaning; this is only how the row is found.
+ */
+export function hostAgentId(crew: string): string {
+  return `${crew}-host`;
+}
 
 export function isAgentRole(value: string): value is AgentRole {
   return (AGENT_ROLES as readonly string[]).includes(value);

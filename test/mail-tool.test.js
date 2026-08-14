@@ -22,7 +22,12 @@ test('the mail server builds as an in-process SDK server', () => {
   const registry = new AgentRegistry(path, { crew: 'hamachi' });
   const mail = new MailStore(registry);
 
-  const servers = buildMailServer(mail, 'hamachi-engineer1', '/drop/hamachi-engineer1');
+  const servers = buildMailServer(
+    mail,
+    'hamachi-engineer1',
+    '/drop/hamachi-engineer1',
+    'hamachi-host',
+  );
 
   assert.equal(servers.clawsky.type, 'sdk');
   assert.equal(servers.clawsky.name, 'clawsky');

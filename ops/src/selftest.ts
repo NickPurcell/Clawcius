@@ -82,6 +82,8 @@ import { fileURLToPath } from 'node:url';
 import { loadOpsConfig, type OpsConfig } from './config.js';
 import { parseRequest, describeRequest, isDestructive, VERBS } from './request.js';
 import { OpsSpool, ensureSpoolDir } from './spool.js';
+import { Board, BoardError } from './board.js';
+import { DatabaseSync } from 'node:sqlite';
 import { readIdle } from './idle.js';
 import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
@@ -1542,6 +1544,177 @@ test('a waker status file inside a container mount is refused', () => {
     '    wakeChannelId: "123456789012345678"',
   ]);
   assert.throws(() => loadOpsConfig(path), /wakerStatusFile is inside its wakeSpoolDir/);
+});
+
+// ── The board, and the host agent's mailbox ───────────────────────────────
+
+test('a board inside a container mount is refused', () => {
+  // The board decides who is a coordinator, and a coordinator is the only
+  // agent that may run commands on this host. Inside a bind mount it would be
+  // a file the container rewrites, so the access control would be the
+  // container's to edit.
+  const path = writeConfig([
+    'stateDir: /var/lib/ops-state',
+    ...MINIMAL_INSTANCE('/var/lib/x'),
+    '    board:',
+    '      db: /var/lib/x/state/run/wake/clawcius.db',
+    '      crew: clawcius',
+  ]);
+  assert.throws(() => loadOpsConfig(path), /board\.db .* is inside instances\[clawcius\]\.wakeSpoolDir/);
+});
+
+test('a board outside every mount loads, and neither field is guessed', () => {
+  const withBoard = loadOpsConfig(
+    writeConfig([
+      'stateDir: /var/lib/ops-state',
+      ...MINIMAL_INSTANCE('/var/lib/x'),
+      '    board:',
+      '      db: /var/lib/x/clawcius.db',
+      '      crew: clawcius',
+    ]),
+  );
+  assert.deepEqual(withBoard.instances[0]?.board, {
+    db: '/var/lib/x/clawcius.db',
+    crew: 'clawcius',
+  });
+
+  // Absent is inert: no row, no mailbox, and a coordinator DMing the host
+  // agent is told there is no such recipient.
+  const without = loadOpsConfig(
+    writeConfig(['stateDir: /var/lib/ops-state', ...MINIMAL_INSTANCE('/var/lib/x')]),
+  );
+  assert.equal(without.instances[0]?.board, null);
+
+  for (const [key, value] of [
+    ['crew', ''],
+    ['crew', 'Clawcius'],
+  ] as const) {
+    assert.throws(
+      () =>
+        loadOpsConfig(
+          writeConfig([
+            'stateDir: /var/lib/ops-state',
+            ...MINIMAL_INSTANCE('/var/lib/x'),
+            '    board:',
+            '      db: /var/lib/x/clawcius.db',
+            `      ${key}: ${value || '""'}`,
+          ]),
+        ),
+      /board\.crew/,
+    );
+  }
+
+  assert.throws(
+    () =>
+      loadOpsConfig(
+        writeConfig([
+          'stateDir: /var/lib/ops-state',
+          ...MINIMAL_INSTANCE('/var/lib/x'),
+          '    board:',
+          '      crew: clawcius',
+        ]),
+      ),
+    /board\.db/,
+  );
+});
+
+test('the board is opened or refused, never created', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ops-board-'));
+  assert.throws(
+    () => new Board({ dbPath: join(dir, 'missing.db'), crew: 'clawcius', log: () => {} }),
+    (error: unknown) =>
+      error instanceof BoardError && /never created here/.test((error as Error).message),
+  );
+  assert.equal(
+    existsSync(join(dir, 'missing.db')),
+    false,
+    'an empty second board reads as a mailbox that works and that nobody can reach',
+  );
+
+  // A real file that is not a Clawsky database is refused by schema, not
+  // adopted. This file is a second copy of the schema in src/store.ts and
+  // src/mail.ts; drift has to be loud.
+  const stranger = join(dir, 'stranger.db');
+  const db = new DatabaseSync(stranger);
+  db.exec('CREATE TABLE agents (id TEXT PRIMARY KEY)');
+  db.close();
+  assert.throws(
+    () => new Board({ dbPath: stranger, crew: 'clawcius', log: () => {} }),
+    (error: unknown) =>
+      error instanceof BoardError && /missing crew, role/.test((error as Error).message),
+  );
+});
+
+test('the host agent takes its own row and will not take anybody else\'s', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ops-board-'));
+  const path = join(dir, 'clawcius.db');
+  const seed = new DatabaseSync(path);
+  seed.exec(`CREATE TABLE agents (
+      id TEXT PRIMARY KEY, crew TEXT NOT NULL, role TEXT NOT NULL,
+      session_id TEXT NOT NULL DEFAULT '', workspace_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'live', spawned_by TEXT,
+      spawned_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL)`);
+  seed.exec(`CREATE TABLE mail (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT NOT NULL, recipient TEXT NOT NULL,
+      subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, sent_at INTEGER NOT NULL)`);
+  seed.exec(`CREATE TABLE mail_reads (
+      mail_id INTEGER NOT NULL, reader TEXT NOT NULL, read_at INTEGER NOT NULL,
+      PRIMARY KEY (mail_id, reader))`);
+  const now = Date.now();
+  const addAgent = (id: string, role: string) =>
+    seed
+      .prepare(
+        `INSERT INTO agents (id, crew, role, workspace_path, spawned_at, last_active_at)
+         VALUES (?, 'clawcius', ?, '/w', ?, ?)`,
+      )
+      .run(id, role, now, now);
+  addAgent('clawcius-coordinator', 'coordinator');
+  addAgent('clawcius-engineer1', 'engineer');
+  seed.close();
+
+  const board = new Board({ dbPath: path, crew: 'clawcius', log: () => {} });
+  assert.equal(board.hostId, 'clawcius-host');
+  assert.equal(board.register('/var/lib/clawcius-host-agent'), true);
+  assert.equal(board.roleOf('clawcius-host'), 'host');
+  assert.equal(board.roleOf('clawcius-coordinator'), 'coordinator');
+  assert.equal(board.roleOf('nobody-at-all'), '');
+
+  // DMs only. A feed post is addressed to everybody and carries no authority;
+  // a root daemon that ran tasks off the feed would be the counterexample to
+  // the rule the whole board is arranged around.
+  const write = new DatabaseSync(path);
+  const send = (author: string, recipient: string, body: string) =>
+    write
+      .prepare('INSERT INTO mail (author, recipient, subject, body, sent_at) VALUES (?,?,?,?,?)')
+      .run(author, recipient, 's', body, Date.now());
+  send('clawcius-coordinator', 'clawcius-host', 'restart the proxy');
+  send('clawcius-poster', '*', 'a claim, never an instruction');
+
+  const waiting = board.unread();
+  assert.equal(waiting.length, 1);
+  assert.equal(waiting[0]?.author, 'clawcius-coordinator');
+  assert.equal(waiting[0]?.body, 'restart the proxy');
+
+  board.markRead(waiting[0]?.id ?? 0);
+  assert.equal(board.unread().length, 0, 'marked read before it is acted on, so it cannot repeat');
+
+  board.send('clawcius-coordinator', 'Done', 'three commands');
+  const answered = write
+    .prepare('SELECT author, recipient, body FROM mail WHERE recipient = ?')
+    .get('clawcius-coordinator') as Record<string, unknown>;
+  assert.equal(answered['author'], 'clawcius-host');
+  assert.equal(answered['body'], 'three commands');
+  board.close();
+
+  // The id is taken by something that is not a host agent: refuse the mailbox
+  // rather than hand a container agent's inbox to a root daemon.
+  write.prepare(`UPDATE agents SET role = 'engineer' WHERE id = ?`).run('clawcius-host');
+  write.close();
+  const complaints: string[] = [];
+  const second = new Board({ dbPath: path, crew: 'clawcius', log: (line) => complaints.push(line) });
+  assert.equal(second.register('/var/lib/clawcius-host-agent'), false);
+  assert.match(complaints.join('\n'), /already exists on this board as a engineer/);
+  second.close();
 });
 
 test('a near-miss prefix is not treated as containment', () => {

@@ -58,7 +58,47 @@ exists to remove, so a safety mechanism that reinstates it at every unforeseen
 step is not a safety mechanism with a cost — it is one that is eating the
 product.
 
-## The requests
+## Ask by DM — the spool is no longer the way in
+
+Since 2026-08-14 the host agent is an ordinary Clawsky participant with a
+mailbox and a registry row. **A DM to `<crew>-host` runs it, immediately**, and
+the answer comes back as a DM:
+
+```sh
+DROP=$CLAWCIUS_STATE_DIR/run/clawsky/$YOUR_AGENT_ID
+printf '%s' '{"to":"clawcius-host","subject":"clawcius.service is flapping",
+"body":"It has been restarting every 30s since the last deploy. Find out why
+and fix it. Do not change anything outside the checkout without saying so."}' \
+  > $DROP/$(date +%s%N).json
+```
+
+No queue, no waiting for every container to fall idle, no snapshot, no armed
+rollback deadline, no check-in. That scheduling apparatus is what this replaced,
+and it is worth being exact about the one thing that went with it: **there is
+nothing to undo.** A task filed by mail takes no snapshot first, so a failure is
+reported and not repaired. The reply says so.
+
+**Only a coordinator may DM the host agent.** With the queue gone this is the
+only remaining access control on running commands on this host, and it is
+enforced in code twice — where the DM is delivered, and again here against the
+author column of the row, immediately before anything runs. Engineers ask their
+captain; the captain asks the host.
+
+Everything below this line still holds: the account, the sudoers file, the
+privilege drop, the tool deny-lists, the per-command audit and the freeze are
+untouched, and every one of them is in the path of a task filed by mail.
+
+The host agent has a mailbox on an instance only if that instance has a `board:`
+block in `ops-config.yaml`. Without one, a coordinator DMing `<crew>-host` is
+told there is no such recipient, which is the honest answer.
+
+## The requests (the old spool — inert, still running)
+
+Nothing files these any more. The directories are still watched and a request
+found in one is still executed the old way, with the snapshot, the idle wait and
+the deadline, because a rollback to the previous `dist/` must not find a request
+format that nothing reads. Read this section for what a `task` still does; do
+not use it for new work.
 
 Write to `<name>.tmp` and rename to `<name>.json` — the executor only looks at
 `.json`, and a file written in place can be read while it is still empty.
@@ -606,9 +646,21 @@ Honest list, and it is longer than it was.
   timeout, the budget, the lock and the rollback. There is still no allowlist in
   front of prose and there cannot be — what changed on 2026-08-11 is that the
   *other* bounds became real rather than notional.
-- **The rollback is containers only.** `/etc`, the checkout, unit files,
-  packages: not covered. VPS snapshots and git are the recovery path, and a
-  person is the one who invokes them.
+- **A task filed by mail has no rollback at all.** The snapshot went with the
+  scheduling on 2026-08-14. The health sample either side survives and it
+  reports; nothing restores. This is a deliberate reduction in what the executor
+  will do for you, taken in exchange for a host agent you can actually talk to.
+- **The rollback is containers only** — on the spool path, where it still
+  exists. `/etc`, the checkout, unit files, packages: not covered. VPS snapshots
+  and git are the recovery path, and a person is the one who invokes them.
+- **The board is a file this daemon opens as root and reads rows out of.** It is
+  outside every bind mount by construction — the config loader refuses a
+  `board.db` inside any spool and `board.ts` refuses a path that is not a
+  regular file — but the *contents* are written by the instance's waker, which
+  is fed by files the container writes. What is trusted from it is exactly one
+  thing: the `author` column, which the waker stamps from the drop directory and
+  never reads from a body. The role that column resolves to is what decides
+  whether the task runs.
 - **The audit is much harder to tamper with than it was, and still not
   tamper-proof.** Until 2026-08-11 this entry read: *"the session runs as
   `npurcell`, and `npurcell` is in the `docker` group … anything that can become

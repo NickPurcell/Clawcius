@@ -24,6 +24,7 @@ import { Executor } from './executor.js';
 import { OpsSpool, ensureDirOwnedBy } from './spool.js';
 import { agentProblems, agentWarnings, describeAgentUser } from './agent-user.js';
 import { identityOptionsFor } from './host-agent.js';
+import { HostMailbox } from './host-mailbox.js';
 
 const config = loadOpsConfig();
 
@@ -259,6 +260,60 @@ const spools = config.instances.map(
 
 for (const spool of spools) spool.start();
 
+/**
+ * One mailbox per instance that has a board — CLAWSKY.md phase 6.
+ *
+ * This is the way in that replaces the spool's scheduling: a coordinator DMs
+ * `<crew>-host` and the session runs, now. The spools above are left running
+ * and inert rather than deleted, so a rollback to the previous `dist/` does not
+ * strand a request format that nothing reads.
+ *
+ * A mailbox that cannot be opened is loud and not fatal — same rule as
+ * everywhere else in this daemon. It holds the rollback deadlines, and a
+ * mistyped database path must not be what takes those with it.
+ */
+const mailboxes = config.instances.flatMap((instance) => {
+  if (!instance.board) return [];
+  if (!config.hostAgent.enabled) {
+    process.stderr.write(
+      `[ops] instances[${instance.name}].board is configured but hostAgent.enabled is ` +
+        'false, so no mailbox is opened. A coordinator DMing the host agent would be told ' +
+        'there is no such recipient, which is the honest answer.\n',
+    );
+    return [];
+  }
+  try {
+    return [
+      new HostMailbox({
+        dbPath: instance.board.db,
+        crew: instance.board.crew,
+        instance: instance.name,
+        workDir: config.hostAgent.workDir,
+        pollSeconds: config.pollSeconds,
+        run: (task) => executor.runMailTask(task),
+        log: (line) => process.stdout.write(`[ops mail ${instance.name}] ${line}\n`),
+      }),
+    ];
+  } catch (error) {
+    process.stderr.write(
+      `[ops] ══ NO HOST MAILBOX FOR ${instance.name} ══\n[ops] ${String(error)}\n` +
+        '[ops] That crew\'s coordinator cannot reach the host agent by DM. Everything else\n' +
+        '[ops] about this daemon is unaffected.\n',
+    );
+    return [];
+  }
+});
+
+for (const mailbox of mailboxes) mailbox.start();
+
+if (mailboxes.length === 0 && config.hostAgent.enabled) {
+  process.stderr.write(
+    '[ops] NO HOST MAILBOX ON ANY INSTANCE — the host agent has no Clawsky identity, so no ' +
+      'coordinator can DM it. Add a board: block with db: and crew: under the instance in ' +
+      'ops-config.yaml. The ops spool still works.\n',
+  );
+}
+
 if (spools.length === 0) {
   // Not fatal — the deadlines and the breaker still need this process — but
   // said as loudly as anything in here, because an executor with no spools is
@@ -281,6 +336,7 @@ process.stdout.write(
 function shutdown(signal: string): void {
   process.stdout.write(`[ops] ${signal} received, shutting down\n`);
   for (const spool of spools) spool.stop();
+  for (const mailbox of mailboxes) mailbox.stop();
   executor.stop();
   releaseLock();
   process.exit(0);
