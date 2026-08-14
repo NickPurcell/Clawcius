@@ -64,13 +64,19 @@ Since 2026-08-14 the host agent is an ordinary Clawsky participant with a
 mailbox and a registry row. **A DM to `<crew>-host` runs it, immediately**, and
 the answer comes back as a DM:
 
-```sh
-DROP=$CLAWCIUS_STATE_DIR/run/clawsky/$YOUR_AGENT_ID
-printf '%s' '{"to":"clawcius-host","subject":"clawcius.service is flapping",
-"body":"It has been restarting every 30s since the last deploy. Find out why
-and fix it. Do not change anything outside the checkout without saying so."}' \
-  > $DROP/$(date +%s%N).json
 ```
+sendMail(
+  to:      "clawcius-host",
+  subject: "clawcius.service is flapping",
+  body:    "It has been restarting every 30s since the last deploy. Find out
+            why and fix it. Do not change anything outside the checkout
+            without saying so."
+)
+```
+
+`sendMail` is one of the two tools the waker gives every session. It has no
+`from` argument — the sender is the id the tool closes over — and it returns
+what happened, so a coordinator that is refused is told in the same turn.
 
 No queue, no waiting for every container to fall idle, no snapshot, no armed
 rollback deadline, no check-in. That scheduling apparatus is what this replaced,
@@ -657,10 +663,10 @@ Honest list, and it is longer than it was.
   outside every bind mount by construction — the config loader refuses a
   `board.db` inside any spool and `board.ts` refuses a path that is not a
   regular file — but the *contents* are written by the instance's waker, which
-  is fed by files the container writes. What is trusted from it is exactly one
-  thing: the `author` column, which the waker stamps from the drop directory and
-  never reads from a body. The role that column resolves to is what decides
-  whether the task runs.
+  is fed by tool calls the container's agents make. What is trusted from it is
+  exactly one thing: the `author` column, which the waker writes from the id the
+  sending session's own `sendMail` tool closes over, and never reads from a
+  body. The role that column resolves to is what decides whether the task runs.
 - **The audit is much harder to tamper with than it was, and still not
   tamper-proof.** Until 2026-08-11 this entry read: *"the session runs as
   `npurcell`, and `npurcell` is in the `docker` group … anything that can become

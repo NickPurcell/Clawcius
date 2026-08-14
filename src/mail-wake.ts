@@ -30,9 +30,9 @@
  * than the message sitting in the table until somebody says something on
  * Discord.
  *
- * NO LOOP BREAKER, NO THROTTLE, NO COALESCING WINDOW. Sending is a tool call
- * and a tool call happens inside a turn, so an agent that never finishes a turn
- * never sends anything: the message rate is turn-paced by construction. Two
+ * NO LOOP BREAKER, NO THROTTLE, NO COALESCING WINDOW. Sending is a `sendMail`
+ * call and a tool call happens inside a turn, so an agent that never finishes a
+ * turn never sends anything: the rate is turn-paced by construction. Two
  * agents can argue for a long time and cannot argue fast. The ceiling is the
  * account's own rate limit and the operator would rather watch a runaway than
  * pre-empt one. The sweep here is not a throttle in disguise: it never delays,
@@ -64,10 +64,10 @@ import type { WakeContext } from './types.js';
  * `onDelivered` fires the moment a message lands, which covers the ordinary
  * case. It cannot cover: mail delivered while the recipient was mid-turn, mail
  * delivered while the session cap was full, mail that arrived while this
- * process was down, or a second message delivered in the same drain as the one
- * that started the turn. Every one of those is a message that would otherwise
- * wait for an unrelated event. Same shape as the mail drop's own sweep: the
- * event is the fast path, the timer is the promise.
+ * process was down, or a second message sent from the same turn as the one that
+ * started the recipient's. Every one of those is a message that would otherwise
+ * wait for an unrelated event. Same shape as every spool in this repository:
+ * the event is the fast path, the timer is the promise.
  */
 const SWEEP_INTERVAL_MS = 10_000;
 

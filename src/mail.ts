@@ -20,10 +20,18 @@
  * restriction to a board that has already had five writers is far worse than
  * starting with one.
  *
- * `author` is never a parameter an agent controls. It is stamped by the daemon
- * from the drop directory the file arrived in (see mail-drop.ts) and passed to
- * `deliver` by the daemon alone. Nothing in this module reads an author out of
- * a message body, and nothing should ever be added that does.
+ * `author` is never a parameter an agent controls. `deliver` is called from the
+ * `sendMail` tool, which runs in this process and closes over the agent id of
+ * the session it was built for (see mail-tool.ts); the field below is that
+ * variable. Nothing in this module reads an author out of a message body, and
+ * nothing should ever be added that does.
+ *
+ * Refusals are RETURNED, and the caller is expected to hand the answer back to
+ * the sender rather than log it. That is the whole of Clawcius #30: while
+ * sending was a file the daemon swept, a refusal could only be a journal line
+ * the sender never saw, so a mistyped recipient looked exactly like a delivered
+ * message. `deliver` did not change; what changed is that there is now somebody
+ * on the other end of the return value.
  *
  * Read state lives in its own table rather than as a column, because the feed
  * has as many readers as there are agents. That makes "read" per (message,
@@ -47,7 +55,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 const MAX_SUBJECT_CHARS = 200;
 
 export type OutgoingMail = {
-  /** Stamped by the caller from the drop directory. Never from the body. */
+  /** The sending session's own id, from the tool's closure. Never from the body. */
   author: string;
   /** An agent id, or `*` for the feed. */
   recipient: string;
@@ -113,10 +121,12 @@ export class MailStore {
   /**
    * Accept a message, or say why not.
    *
-   * Refusals are returned rather than thrown: the caller is a directory sweep
-   * that must keep going, and every refusal is a line in the journal naming
-   * the sender. A message that cannot be delivered is dropped, not queued —
-   * there is nothing that would make it deliverable later.
+   * Refusals are returned rather than thrown, and `detail` is written to be
+   * read by the model that sent the message: it is what `sendMail` hands back,
+   * in the turn the send was attempted. Nothing is queued — there is nothing
+   * that would make a refused message deliverable later — so the sender being
+   * told is the entire remedy, and it is enough, because the sender is still
+   * running and can simply try again.
    */
   deliver(mail: OutgoingMail): DeliveryResult {
     const author = this.#registry.get(mail.author);
@@ -163,20 +173,24 @@ export class MailStore {
       //
       // ── What this does NOT hold against, stated plainly ──────────────────
       //
-      // Authorship is stamped from the drop directory, and a drop directory is
-      // per AGENT while the bind mount is per CREW: every agent in a crew today
-      // shares one container, one uid and one disk (see mail-drop.ts, and
-      // Clawcius #31). So an engineer that goes looking can write into its
-      // coordinator's drop directory, and this check will see a coordinator.
+      // `author` now comes from a `sendMail` closure rather than from a
+      // directory name, so there is no longer a path on disk an agent can
+      // write into to be stamped as its coordinator (Clawcius #35, #31): a
+      // session cannot obtain another session's tool, and the board itself is
+      // outside every bind mount.
       //
-      // That was already the boundary before the host agent had a mailbox —
-      // anything sharing a container already shares everything — but it did
-      // not previously end in a shell on the VPS, and it is dishonest to write
-      // "only a coordinator may" without saying so. The rule holds against a
-      // mistake and against another crew; it does not hold against an agent in
-      // the same container that is deliberately impersonating its captain.
-      // Separate uids per agent is the fix and it is the one thing that would
-      // make this a boundary rather than a convention.
+      // One route survives, and it is the wake spool. `run/wake` is inside the
+      // crew's mount, a request there names the channel to wake, and nothing
+      // validates that name — so any process in the container can start a turn
+      // as its coordinator with a prompt of its choosing, and that turn holds
+      // the coordinator's `sendMail`. It is impersonation with a model in the
+      // middle rather than a forged stamp, which is weaker but not nothing.
+      // Retiring the spool is CLAWSKY.md phase 4 and Clawcius #39.
+      //
+      // So the rule holds against a mistake, against another crew, and against
+      // anything reached through mail. Within one container it is still worth
+      // no more than the container's own boundary, and per-agent uids remain
+      // the thing that would make it a boundary rather than a convention.
       //
       // Engineers ask their captain; the captain asks the host.
       if (recipient.role === 'host' && author.role !== 'coordinator') {

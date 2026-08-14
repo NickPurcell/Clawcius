@@ -1235,9 +1235,9 @@ export class Executor {
         config: this.#config,
         agent: user,
         task: task.task,
-        // The author column of the mail row, which the waker stamped from the
-        // drop directory. There is no field a message can carry that reaches
-        // this, and nothing here reads one.
+        // The author column of the mail row, which the waker wrote from the
+        // sending session's own id. There is no field a message can carry that
+        // reaches this, and nothing here reads one.
         requester: task.requester,
         briefing: await this.#briefing(scope, user),
         onAudit: (event) => this.#audit(task.requester, undefined, event),

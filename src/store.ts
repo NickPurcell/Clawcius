@@ -219,10 +219,10 @@ export class AgentRegistry {
    * Make sure a row exists, without touching one that already does.
    *
    * Called on every session acquire, so a channel that has never run a turn
-   * still has an identity — and therefore a mailbox and a drop directory —
-   * before its first turn rather than after it. Existing rows are left alone
-   * on purpose: role and crew are identity, and a later spawn or an operator
-   * edit must not be silently reverted by a wake.
+   * still has an identity — and therefore a mailbox, and a name its `sendMail`
+   * can be stamped with — before its first turn rather than after it. Existing
+   * rows are left alone on purpose: role and crew are identity, and a later
+   * spawn or an operator edit must not be silently reverted by a wake.
    */
   ensure(id: string, identity: AgentIdentity): AgentRecord {
     const existing = this.get(id);

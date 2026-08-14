@@ -16,7 +16,6 @@ import { config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
 import { SessionManager } from './agent.js';
 import { MailStore } from './mail.js';
-import { MailDrop } from './mail-drop.js';
 import { MailWaker } from './mail-wake.js';
 import { WakeSpool } from './wake-spool.js';
 import { WakerStatusPublisher } from './waker-status.js';
@@ -33,9 +32,9 @@ await preflight();
 const registry = new AgentRegistry(config.storage.dbPath, { crew: config.agent.clawsky.crew });
 
 /**
- * The board. Off is a supported state — with `clawsky.enabled: false` nothing
- * is watched, no `checkMail` tool is offered, and the waker behaves exactly as
- * it did before any of this existed.
+ * The board. Off is a supported state — with `clawsky.enabled: false` no
+ * `checkMail` or `sendMail` tool is offered and the waker behaves exactly as it
+ * did before any of this existed.
  *
  * The seeded agents are how a crew gets anyone but its Discord coordinator
  * before spawn exists (CLAWSKY.md phase 5). They are created if absent and
@@ -52,15 +51,6 @@ if (config.agent.clawsky.enabled) {
     });
   }
 }
-
-const mailDrop = mail
-  ? new MailDrop({
-      root: config.agent.clawsky.dropDir,
-      crew: config.agent.clawsky.crew,
-      registry,
-      mail,
-    })
-  : null;
 
 const sessions = new SessionManager(registry, mail);
 
@@ -126,9 +116,10 @@ const mailWaker =
     : null;
 
 if (mail && mailWaker) {
-  // Wrapped for the same reason `onCountsChanged` is: this fires from inside
-  // the mail drop's drain loop, mid-batch, and a throw would abandon the rest
-  // of the batch having already delivered this one.
+  // Wrapped for the same reason `onCountsChanged` is: this fires synchronously
+  // inside `deliver`, which is now inside another agent's `sendMail` call, and
+  // a throw here would surface to the sender as its own tool failing after the
+  // message had already been committed.
   mail.onDelivered = (message) => {
     try {
       mailWaker.onDelivered(message.recipient);
@@ -625,7 +616,6 @@ const wakeSpool = config.agent.wake.enabled
     })
   : null;
 wakeSpool?.start();
-mailDrop?.start();
 mailWaker?.start();
 
 client.once(Events.ClientReady, (ready) => {
@@ -707,7 +697,6 @@ async function shutdown(signal: string): Promise<void> {
   systemd.stopping();
   try {
     wakeSpool?.stop();
-    mailDrop?.stop();
     mailWaker?.stop();
     wakerStatus.stop();
     // Absent reads as busy to the executor, which is the correct answer for a

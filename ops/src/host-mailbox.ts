@@ -24,17 +24,17 @@
  *     holds if anything ever writes to the mail table other than `deliver` —
  *     and something already can: this file writes to it, as root.
  *
- * The author column is stamped by the waker from the drop directory the message
- * arrived in, which is bind-mounted into exactly one container. It is never
- * read from a body, and nothing here adds a way for a message to say who filed
- * it: the `requester` handed to `runHostAgent` is that column and only that
- * column.
+ * The author column is written by the waker from the agent id that session's
+ * own `sendMail` tool closes over — a variable in the waker's process, which no
+ * argument reaches. It is never read from a body, and nothing here adds a way
+ * for a message to say who filed it: the `requester` handed to `runHostAgent`
+ * is that column and only that column.
  *
  * ── What the trust boundary actually is ─────────────────────────────────────
  *
- * A crew's coordinator can now run commands on the host by writing a file into
- * its own drop directory. That was true before — the ops spool was reachable
- * the same way, from the same container, with the same authorship guarantee —
+ * A crew's coordinator can now run commands on the host by calling one tool.
+ * That was true before — the ops spool was reachable from the same container,
+ * with the same authorship guarantee —
  * and the checks that stood between the request and the machine were never the
  * queue: they are the unprivileged `clawcius-ops` account, its narrow sudoers
  * file, the setuid/setgid drop, the tool deny-list, and an audit written to
@@ -49,12 +49,15 @@
  *
  * And the coordinator check is a rule between crews and against a mistake, NOT
  * a boundary within a crew. Every agent in a crew shares one container, one uid
- * and one disk today (Clawcius #31), so an engineer that goes looking can write
- * into its coordinator's drop directory and be stamped as the coordinator. That
- * was already true of the ops spool, which any process in the container could
- * write; what is new is that the same reach now ends in a session rather than
- * in a queue entry. Per-agent uids are the fix, and until then this check is
- * exactly as strong as the container's own boundary and no stronger.
+ * and one disk today (Clawcius #31). Mail itself no longer gives that shared
+ * disk a way in — sending is a tool closed over the sending session's id, the
+ * per-agent drop directories that could be written across are gone (#35), and
+ * the board is outside every bind mount. The wake spool still does: `run/wake`
+ * takes any channel id, so any process in the container can start a turn as its
+ * coordinator with a prompt of its choosing, and that turn holds the
+ * coordinator's `sendMail` (#39). Retiring the spool is CLAWSKY.md phase 4;
+ * per-agent uids are the other half. Until both, this check is worth exactly
+ * what the container's own boundary is worth and no more.
  *
  * ── Reading the board ───────────────────────────────────────────────────────
  *

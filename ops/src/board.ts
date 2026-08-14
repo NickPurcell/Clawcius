@@ -25,12 +25,13 @@
  *
  * ── What is NOT read from a message ─────────────────────────────────────────
  *
- * The author. Never. It is stamped by the waker from the drop directory the
- * file arrived in, which is bind-mounted into exactly one container, and it
- * arrives here as the `author` column of a committed row. Nothing in this file
- * reads a sender out of a subject or a body, and the coordinator check in
- * `host-mailbox.ts` is made against that column and against the registry row it
- * names. There is no field a request can carry that says who filed it.
+ * The author. Never. It is written by the waker from the agent id its own
+ * `sendMail` tool closes over — an in-process variable, not anything the
+ * message carries — and it arrives here as the `author` column of a committed
+ * row. Nothing in this file reads a sender out of a subject or a body, and the
+ * coordinator check in `host-mailbox.ts` is made against that column and
+ * against the registry row it names. There is no field a request can carry
+ * that says who filed it.
  *
  * ── The database file itself ────────────────────────────────────────────────
  *
@@ -312,11 +313,12 @@ export class Board {
   /**
    * Answer, as the host agent.
    *
-   * Written straight into the table rather than through a drop directory: the
-   * drop directory mechanism exists to stamp authorship on messages from
-   * inside a sandbox, and this process is the host. There is no drop directory
-   * mounted into it, and inventing one would create a path on disk that writes
-   * mail as the host agent.
+   * Written straight into the table rather than through anything the container
+   * side offers. Every other participant sends with a `sendMail` tool the waker
+   * builds inside its own process, closed over the sending session's id; the
+   * host agent has no session and no waker, so its author name comes from
+   * `#hostId` here for exactly the same reason — it is a variable in the
+   * process that is entitled to it, and there is no path to it from outside.
    */
   send(to: string, subject: string, body: string): void {
     this.#db
