@@ -74,6 +74,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { taskPrompt } from './host-agent.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -4783,4 +4784,45 @@ test('the check-in instructions point the instance at its OWN spool', async () =
   );
   assert.ok(host.config.instances.length === 2);
   executor.stop();
+});
+
+/**
+ * The brief must name the route the request actually took.
+ *
+ * The host agent is told where a task came from because the two routes carry
+ * different provenance: a mail DM's author is stamped from the sending session
+ * and its role checked as coordinator twice, while a spool file's requester is
+ * the bind-mounted directory — which crew asked, not which agent. The agent's
+ * own judgement is part of the defence here, so a brief naming the wrong route
+ * is a lie about the one thing in this system that cannot be forged.
+ *
+ * Found by the host agent itself, on the first DM ever sent to it: it reported
+ * that the executor had briefed it as arriving "via its ops spool" when it had
+ * not.
+ */
+test('the task brief names the route the request actually took', () => {
+  const base = {
+    config: {} as never,
+    agent: {} as never,
+    task: 'report the SHA',
+    requester: 'hamachi-coordinator',
+    briefing: '',
+    onAudit: () => {},
+    onLog: () => {},
+  };
+
+  const byMail = taskPrompt({ ...base, route: 'mail' });
+  assert.match(byMail, /DM on the Clawsky board/);
+  assert.match(byMail, /coordinator twice/);
+  assert.equal(byMail.includes('via its ops spool'), false);
+
+  const bySpool = taskPrompt({ ...base, route: 'spool' });
+  assert.match(bySpool, /via its ops spool/);
+  assert.equal(bySpool.includes('Clawsky board'), false);
+
+  // Whichever route, the requester is named and the task is quoted whole.
+  for (const prompt of [byMail, bySpool]) {
+    assert.match(prompt, /hamachi-coordinator/);
+    assert.match(prompt, /report the SHA/);
+  }
 });
