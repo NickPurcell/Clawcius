@@ -130,7 +130,7 @@ export type ContainerConfig = {
   execEnvDir: string;
 };
 
-export class EnvFileError extends Error {}
+class EnvFileError extends Error {}
 
 /**
  * Render the environment in Docker's `--env-file` format.
@@ -151,7 +151,7 @@ export class EnvFileError extends Error {}
  * survives the parse but turns up invisibly at the end of a value, which is a
  * whole evening of debugging for no benefit anyone has asked for.
  */
-export function renderEnvFile(entries: ReadonlyArray<readonly [string, string]>): string {
+function renderEnvFile(entries: ReadonlyArray<readonly [string, string]>): string {
   let body = '';
   for (const [key, value] of entries) {
     if (/[\r\n]/.test(value)) {
