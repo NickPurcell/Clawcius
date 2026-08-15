@@ -951,6 +951,7 @@ export class Executor {
         agent: agent.user,
         task: request.task,
         requester: job.requester,
+        route: 'spool',
         briefing: await this.#briefing(scope, agent.user),
         onAudit: (event) => {
           if (event.kind === 'bash') commands.push(event.command);
@@ -1239,6 +1240,7 @@ export class Executor {
         // sending session's own id. There is no field a message can carry that
         // reaches this, and nothing here reads one.
         requester: task.requester,
+        route: 'mail',
         briefing: await this.#briefing(scope, user),
         onAudit: (event) => this.#audit(task.requester, undefined, event),
         onLog: (line) => process.stdout.write(`[ops] ${line}\n`),
