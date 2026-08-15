@@ -198,16 +198,23 @@ export function buildMailTools(
   return [checkMail, sendMail];
 }
 
+/**
+ * `extra` is how `remindMe` and `watchPr` join this server rather than starting
+ * a second one. They are built the same way — per session, closed over the same
+ * agent id — and an agent that had to look in two places for "things that reach
+ * my inbox" would find one of them.
+ */
 export function buildMailServer(
   mail: MailStore,
   agentId: string,
   hostId: string,
+  extra: SdkMcpToolDefinition<any>[] = [],
 ): Record<string, McpServerConfig> {
   return {
     clawsky: createSdkMcpServer({
       name: 'clawsky',
       version: '0.1.0',
-      tools: buildMailTools(mail, agentId, hostId),
+      tools: [...buildMailTools(mail, agentId, hostId), ...extra],
       alwaysLoad: true,
     }),
   };

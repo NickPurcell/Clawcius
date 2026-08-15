@@ -271,6 +271,37 @@ absorbs the existing wake spool.
 A wake is delivered as mail from the agent to itself, so there is still exactly
 one inbox and one tool.
 
+**As built** — `src/armed.ts`, `src/armed-tool.ts`, `src/armed-wake.ts` — a
+wake is an *armed condition*: a row saying whose it is, what would satisfy it,
+and when to look next. `remindMe` waits for a clock; `watchPr` waits for a
+stranger to review, comment on or merge a pull request. Same table, same loop,
+same delivery. The owner column is written from the tool's closure, exactly as
+`sendMail` stamps an author, so "an agent may only schedule itself" is the
+absence of an argument rather than the rejection of one.
+
+Two corrections to the paragraphs above, both honest rather than tidy.
+
+**A reminder is one-shot.** No repeat, no cron expression. The turn that
+receives a reminder holds `remindMe`, so "again tomorrow" is a call it makes
+then, with the note rewritten for what it now knows — and a standing repeat
+outlives its purpose without anything ever looking wrong.
+
+**A fired wake does NOT resurrect a dead agent, contradicting the bullet
+above.** A wake is delivered as mail, and `src/mail-wake.ts` already settled
+that mail does not resurrect: a killed agent any crewmate could bring back by
+writing to it was never killed. Both rules cannot hold, and the implemented one
+wins rather than a second answer being added quietly. So the reminder lands in
+the dead agent's inbox, the journal says so on every fire, and whoever
+resurrects it hands the mail over as the first turn. Reopening this is a change
+to one method in `ArmedWaker`, and it should be made on purpose.
+
+**What arrives from a watch is external content**, and is framed as such in the
+mail itself — quoted line by line, inside markers, carrying the same rule the
+feed does. A review body is written by a stranger, a bot, or OJ, which reads
+strangers' diffs for a living. The board keeps OJ off itself for that reason;
+`watchPr` is the one path that carries its words across, so it carries the
+warning with them. See `src/github.ts`.
+
 ---
 
 ## Roles
@@ -393,7 +424,11 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
 3. ~~**Synthetic injection.**~~ Mail wakes idle agents. **Done** —
    `src/mail-wake.ts`, `clawsky.wakeOnMail` in agent-config.yaml.
 4. **Migrate wakes.** Durable scheduler; retire the wake spool and the Claude
-   Code cron/wake tools. The wake spool is still running.
+   Code cron/wake tools. **Half done.** The durable scheduler exists —
+   `remindMe` and `watchPr`, on disk, firing late rather than never. The wake
+   spool is still running and still the impersonation route described above:
+   retiring it is a separate change, and doing it in the same commit as the
+   thing meant to replace it would have shipped both untested together.
 5. **Long-lived crew.** Spawn/kill/resurrect, role prompts, subagent removal
    from the coordinator.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the

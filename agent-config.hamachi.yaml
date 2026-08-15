@@ -463,6 +463,46 @@ clawsky:
   # behind it is a mailbox nothing reads.
   agents: []
 
+# ── Armed conditions: remindMe and watchPr ────────────────────────────────
+# One mechanism, two faces. An agent arms something that will be true later —
+# a moment, or a change to a pull request — and when it comes true the waker
+# delivers mail. Mail already wakes an idle agent, so nothing new starts a
+# turn: a reminder arriving and a colleague's DM arriving are the same event.
+#
+# Durable, because the alternative is worthless. A condition is a row in the
+# same SQLite file as the registry and the mailbox, so it survives a deploy,
+# a crash and a reboot; one that came due while the service was down fires
+# LATE on the next start rather than not at all, and the mail says how late.
+#
+# AN AGENT MAY ONLY ARM CONDITIONS FOR ITSELF, and there is nothing here to
+# configure about that. The owner comes from the tool's closure — the same
+# variable sendMail stamps an author with — so there is no argument that names
+# an agent and no setting that could widen one.
+#
+# NOTE WHAT IS NOT HERE: the GitHub token. It is a secret and lives in .env
+# with the others. What matters is WHOSE environment: the waker polls, not the
+# agent, and the two are different processes. On this deployment they read the
+# same env-file, but nothing enforces that, so watchPr checks for a usable
+# client and refuses at arm time if there is none — naming the variable —
+# rather than arming a watch that would poll nothing forever.
+armed:
+  enabled: true
+  # How often the waker looks for a condition that has come due. This is the
+  # resolution of a reminder, not the poll rate of a watch: a watch carries its
+  # own interval and is skipped on ticks before it.
+  tickSeconds: 15
+  github:
+    # Used when a watchPr call omits `repo`. Leave empty to require every call
+    # to name one.
+    repo: NickPurcell/Clawcius
+    # Seconds between polls of one watched pull request. A courtesy to GitHub's
+    # API, and NOT a throttle on anything reaching an agent: one poll produces
+    # one mail naming every new review and comment it found, however many that
+    # is. One repo and a handful of PRs is nowhere near 5000 requests an hour,
+    # and a shorter interval buys nothing a human review cycle can perceive.
+    pollSeconds: 120
+    apiBase: https://api.github.com
+
 # ── Status for the ops executor ───────────────────────────────────────────
 # The waker publishes how many turns are in flight; `ops/` reads it before it
 # does anything that would recreate this container. There is no path back —

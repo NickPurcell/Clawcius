@@ -24,6 +24,7 @@ import { config } from './config.js';
 import { buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
+import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import type { MailStore } from './mail.js';
 import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
@@ -645,11 +646,25 @@ export class SessionManager {
   #sessions = new Map<string, AgentSession>();
   #registry: AgentRegistry;
   #mail: MailStore | null;
+  /**
+   * What `remindMe` and `watchPr` need, or null when armed conditions are off.
+   *
+   * The store and the GitHub client are shared across every session — they are
+   * a table and an HTTP client, neither of which is per-agent — while the tools
+   * built from them are not, because the owner is the closure. Passing the
+   * options rather than the tools keeps that split explicit.
+   */
+  #armed: ArmedToolOptions | null;
   #sweeper: NodeJS.Timeout;
 
-  constructor(registry: AgentRegistry, mail: MailStore | null = null) {
+  constructor(
+    registry: AgentRegistry,
+    mail: MailStore | null = null,
+    armed: ArmedToolOptions | null = null,
+  ) {
     this.#registry = registry;
     this.#mail = mail;
+    this.#armed = armed;
     this.#sweeper = setInterval(() => void this.#evictIdle(), 60_000);
     this.#sweeper.unref();
   }
@@ -756,10 +771,16 @@ export class SessionManager {
       resumeFrom,
       events,
       // `channelId` is this session's agent id, and passing it here is the only
-      // place a sender is ever named. The tools close over it; nothing the
-      // model can say reaches it. See mail-tool.ts.
+      // place a sender is ever named — or an armed condition's owner. The tools
+      // close over it; nothing the model can say reaches it. See mail-tool.ts
+      // and armed-tool.ts.
       this.#mail
-        ? buildMailServer(this.#mail, channelId, hostAgentId(config.agent.clawsky.crew))
+        ? buildMailServer(
+            this.#mail,
+            channelId,
+            hostAgentId(config.agent.clawsky.crew),
+            this.#armed ? buildArmedTools(channelId, this.#armed) : [],
+          )
         : null,
     );
 

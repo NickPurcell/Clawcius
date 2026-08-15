@@ -11,6 +11,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
 import { parse } from 'yaml';
 import { AGENT_ROLES, isAgentRole, type AgentRole } from './store.js';
+import { REPO_NAME } from './github.js';
 
 export type SystemPromptConfig = {
   /**
@@ -197,6 +198,53 @@ export type AgentConfig = {
   };
 
   /**
+   * Armed conditions: `remindMe` and `watchPr`.
+   *
+   * Nothing here says which agent may arm what, because that is not a policy —
+   * an agent may only arm conditions for itself, and it is the tool's closure
+   * that makes it so rather than a setting somebody could widen. What is
+   * configurable is how often the waker looks, and where it looks.
+   *
+   * There is no token here on purpose. `GITHUB_TOKEN` is a secret and lives in
+   * the environment with the others (see config.ts); this file is committed.
+   */
+  armed: {
+    /** Off means neither tool is offered and nothing polls. */
+    enabled: boolean;
+    /**
+     * How often the waker looks for a condition that has come due.
+     *
+     * This is the resolution of a reminder, not the poll rate of a watch — a
+     * watch carries its own interval and is simply skipped on ticks before it.
+     * Reading a handful of indexed rows is cheap enough that the only reason
+     * not to make this a second is that no reminder needs that precision.
+     */
+    tickSeconds: number;
+    github: {
+      /**
+       * `owner/name` used when a `watchPr` call omits `repo`.
+       *
+       * Empty is legal and means every call must name one — which is the right
+       * default for a deployment that watches several repositories, and the
+       * wrong one for this deployment, which watches its own.
+       */
+      repo: string;
+      /**
+       * Seconds between polls of one watched pull request.
+       *
+       * A courtesy to a third party's API and not a limit on anything that
+       * reaches an agent: one poll produces one mail naming everything it
+       * found, however much that is. Two minutes against one repository and a
+       * handful of pull requests is nowhere near GitHub's 5000/hour, and a
+       * shorter interval buys nothing a human review cycle can perceive.
+       */
+      pollSeconds: number;
+      /** Overridable for a test double or an Enterprise host. */
+      apiBase: string;
+    };
+  };
+
+  /**
    * What this instance publishes for the ops executor (`ops/`).
    *
    * The waker does not read anything from the executor and holds no privilege
@@ -341,6 +389,15 @@ const DEFAULTS: AgentConfig = {
     crew: 'clawcius',
     wakeOnMail: true,
     agents: [],
+  },
+  armed: {
+    enabled: true,
+    tickSeconds: 15,
+    github: {
+      repo: '',
+      pollSeconds: 120,
+      apiBase: 'https://api.github.com',
+    },
   },
   status: {
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
@@ -501,6 +558,8 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const paths = section(root['paths'], 'paths');
   const wake = section(root['wake'], 'wake');
   const clawsky = section(root['clawsky'], 'clawsky');
+  const armed = section(root['armed'], 'armed');
+  const armedGithub = section(armed['github'], 'armed.github');
   const status = section(root['status'], 'status');
   const git = section(root['git'], 'git');
   const prompts = section(root['prompts'], 'prompts');
@@ -606,6 +665,23 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
       ),
     },
+    armed: {
+      enabled: bool(armed['enabled'], 'armed.enabled', DEFAULTS.armed.enabled),
+      tickSeconds: num(armed['tickSeconds'], 'armed.tickSeconds', DEFAULTS.armed.tickSeconds, 1, 3600),
+      github: {
+        repo: str(armedGithub['repo'], 'armed.github.repo', DEFAULTS.armed.github.repo),
+        pollSeconds: num(
+          armedGithub['pollSeconds'],
+          'armed.github.pollSeconds',
+          DEFAULTS.armed.github.pollSeconds,
+          // A floor of 30s, not as a throttle but because below it the poll is
+          // measuring GitHub's own cache rather than anything that happened.
+          30,
+          86_400,
+        ),
+        apiBase: str(armedGithub['apiBase'], 'armed.github.apiBase', DEFAULTS.armed.github.apiBase),
+      },
+    },
     status: {
       file: str(status['file'], 'status.file', DEFAULTS.status.file),
       intervalSeconds: num(
@@ -663,6 +739,14 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
           'this crew and is compared as an exact string',
       );
     }
+  }
+
+  // Checked at startup rather than at arm time. This string is the default for
+  // every `watchPr` call that omits a repository, so a typo here is a tool that
+  // refuses every agent that trusts the default — at whatever hour one of them
+  // first reaches for it.
+  if (config.armed.github.repo && !REPO_NAME.test(config.armed.github.repo)) {
+    throw new ConfigError('armed.github.repo', 'must be owner/name, e.g. NickPurcell/Clawcius');
   }
 
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(config.status.instance)) {
