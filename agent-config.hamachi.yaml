@@ -22,6 +22,7 @@
 #
 #   PLUMBING
 #     container.name          hamachi-agent          (its own sandbox)
+#     container.execEnvDir    /var/lib/hamachi/exec-env
 #     sessions.maxConcurrent  1                      (the VM has ~1.8 GB free)
 #     sessions.workspaceRoot  /var/lib/hamachi/workspaces
 #     wake.spoolDir           /var/lib/hamachi/run/wake
@@ -173,6 +174,11 @@ prompts:
 container:
   name: hamachi-agent
   claudePath: /usr/local/bin/claude
+  # This instance's own. Sharing one directory between the two deployments
+  # would work, but the file holds whichever instance's tokens wrote it and
+  # each state directory is otherwise strictly per-instance; there is no reason
+  # to make this the exception. See agent-config.yaml for the full account.
+  execEnvDir: /var/lib/hamachi/exec-env
 
 model: claude-opus-5[1m]
 

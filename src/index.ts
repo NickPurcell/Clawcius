@@ -26,11 +26,24 @@ import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
+import { sweepEnvFiles } from './container.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
 // Fail before touching Discord if the container stack is not actually up —
 // a missing agent or proxy container reads as a bot that never answers.
 await preflight();
+
+// Each turn writes its environment to a 0600 file and unlinks it when the exec
+// ends; a SIGKILL of this process skips that. This is where those survivors are
+// collected, because a file holding both tokens should not outlive the process
+// that wrote it by more than a restart. Nothing else deletes them.
+const sweptEnvFiles = sweepEnvFiles(config.agent.container.execEnvDir);
+if (sweptEnvFiles > 0) {
+  process.stderr.write(
+    `[clawcius] removed ${sweptEnvFiles} orphaned exec env file(s) from ` +
+      `${config.agent.container.execEnvDir} — this process was killed mid-turn last time.\n`,
+  );
+}
 
 const registry = new AgentRegistry(config.storage.dbPath, { crew: config.agent.clawsky.crew });
 

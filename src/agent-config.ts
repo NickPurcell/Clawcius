@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, isAbsolute } from 'node:path';
+import { resolve, isAbsolute, dirname } from 'node:path';
 import { parse } from 'yaml';
 import { AGENT_ROLES, isAgentRole, type AgentRole } from './store.js';
 import { REPO_NAME } from './github.js';
@@ -78,6 +78,20 @@ export type AgentConfig = {
     name: string;
     /** In-container path to the claude binary. */
     claudePath: string;
+    /**
+     * Where the per-exec `--env-file` is written (src/container.ts).
+     *
+     * MUST NOT be inside any bind mount in `docker/run-container.sh`. The file
+     * holds this instance's whole credential environment, and the read-only
+     * mounts — the skills directory, the discord CLI — are shared by BOTH
+     * instances, so a file placed there would hand one deployment's Discord
+     * token to the other deployment's agent. Checked below, as far as this
+     * config can see the mounts.
+     *
+     * Default is a sibling of the state directory's `run/`, chosen for the
+     * same reason `status.file` is: `run/` is the mount, its parent is not.
+     */
+    execEnvDir: string;
   };
   prompts: PromptTemplates;
   model: string;
@@ -350,6 +364,8 @@ const DEFAULTS: AgentConfig = {
   container: {
     name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
+    // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
+    execEnvDir: '/var/lib/clawcius/exec-env',
   },
   prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
@@ -534,6 +550,43 @@ function section(raw: unknown, path: string): Record<string, unknown> {
   return raw;
 }
 
+/**
+ * Is `child` inside `parent`? Both must already be resolved.
+ *
+ * A prefix test *with* the trailing separator, because the naive
+ * `startsWith(parent)` calls `/var/lib/clawcius-ops` a child of
+ * `/var/lib/clawcius`. Same helper, same reasoning, as `isInside` in
+ * `ops/src/config.ts` — the two files check different configs on different
+ * sides of the boundary and neither can import the other.
+ */
+function isInside(child: string, parent: string): boolean {
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+/**
+ * Host paths that `docker/run-container.sh` bind-mounts into the agent
+ * container, as far as this file can know them.
+ *
+ * NOT exhaustive, and the gap is worth naming: the script also mounts
+ * `<stateDir>/agent-home`, `gws-cli` and the Google service-account key, none
+ * of which appear in this config at all. So this catches the plausible
+ * mistakes (a path written under the workspaces root, or under `run/`) and
+ * cannot catch every one. The defence that does not depend on enumeration is
+ * the default value, which is a sibling of the mounts rather than a child.
+ */
+function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
+  return [
+    ['sessions.workspaceRoot', config.sessions.workspaceRoot],
+    // The script mounts `<stateDir>/run`, the PARENT of the wake spool — the
+    // spool rides along inside that one mount rather than having its own. So
+    // checking against wake.spoolDir alone would wave through a path that is
+    // its sibling and just as reachable from the container.
+    ['the directory containing wake.spoolDir', dirname(config.wake.spoolDir)],
+    ['paths.skillsDir', config.paths.skillsDir],
+    ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
+  ];
+}
+
 export function loadAgentConfig(configPath?: string): AgentConfig {
   const path = resolve(configPath ?? process.env['AGENT_CONFIG_PATH'] ?? 'agent-config.yaml');
 
@@ -569,6 +622,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     container: {
       name: str(container['name'], 'container.name', DEFAULTS.container.name),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
+      execEnvDir: str(
+        container['execEnvDir'],
+        'container.execEnvDir',
+        DEFAULTS.container.execEnvDir,
+      ),
     },
     prompts: {
       protocol: template(prompts['protocol'], 'protocol', DEFAULT_PROMPTS.protocol),
@@ -727,6 +785,31 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
           `(${mounted}), which is bind-mounted read-write into the agent container. ` +
           'The ops executor trusts this file when deciding whether recreating the ' +
           'container would kill a live turn; the agent must not be able to write it.',
+      );
+    }
+  }
+
+  // The exec env file holds DISCORD_TOKEN and GITHUB_TOKEN in plain text — it
+  // exists precisely so they are not on a command line any more (#53), and
+  // putting it inside a bind mount would trade a leak to every local account
+  // for a leak to every container that shares the mount. Two of them are
+  // shared by both deployments, so that is not hypothetical.
+  //
+  // Same shape as the status.file check above, and the same reason for being
+  // here rather than trusted: the default is right by construction and the
+  // override is the thing that can be wrong.
+  if (!isAbsolute(config.container.execEnvDir)) {
+    throw new ConfigError('container.execEnvDir', 'must be an absolute path');
+  }
+  const execEnvDir = resolve(config.container.execEnvDir);
+  for (const [label, mount] of bindMountedPaths(config)) {
+    if (isInside(execEnvDir, resolve(mount))) {
+      throw new Error(
+        `agent-config.yaml: container.execEnvDir (${execEnvDir}) is inside ${label} ` +
+          `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
+          'container. That file holds this instance\'s Discord and GitHub tokens; it must ' +
+          'not be reachable from inside any sandbox. Put it beside the state directory, ' +
+          'not in it — the default is /var/lib/<instance>/exec-env.',
       );
     }
   }

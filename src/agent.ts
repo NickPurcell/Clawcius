@@ -385,6 +385,10 @@ export class AgentSession {
     options.spawnClaudeCodeProcess = containerSpawner({
       name: config.agent.container.name,
       claudePath: config.agent.container.claudePath,
+      // The env above holds both tokens, and it reaches the container through
+      // a 0600 file in here rather than through the exec's argv, which is
+      // world-readable. See the header of src/container.ts.
+      execEnvDir: config.agent.container.execEnvDir,
     });
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;

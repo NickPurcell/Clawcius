@@ -13,7 +13,12 @@
  *      only route out is the proxy, so a dead proxy means *zero* egress —
  *      including discord.com. Verified on this VM: with Squid stopped, even an
  *      allowlisted domain fails.
- *   3. The allowlist on disk is not the one in the image. `squid/squid.conf`
+ *   3. This docker's `exec` has no `--env-file`. Since #53 the session
+ *      environment — both tokens included — reaches the container through a
+ *      file rather than through the argv, because the argv is world-readable.
+ *      The flag landed in Docker 20.10; on anything older every turn dies on
+ *      an unknown flag, which reads from Discord as a bot that never answers.
+ *   4. The allowlist on disk is not the one in the image. `squid/squid.conf`
  *      is the source; `docker/squid.conf` is the build-context copy baked into
  *      `clawcius-squid`. Editing the source without rebuilding leaves a
  *      running proxy enforcing the *old* list, and the file you are reading
@@ -56,10 +61,44 @@ function checkSquidConfSync(): void {
   }
 }
 
+/**
+ * Does `docker exec` take `--env-file`?
+ *
+ * Asked of the binary rather than assumed from a version string, because the
+ * version string is a lie on more hosts than it is not — a repackaged client,
+ * a podman shim, a Snap. `--help` is authoritative, costs one subprocess once
+ * at startup, and answers the exact question.
+ *
+ * Answers "yes" if it cannot tell. This check exists to catch a specific known
+ * shape of breakage, not to become a second way for the bot to refuse to boot.
+ */
+function execTakesEnvFile(): boolean {
+  try {
+    const help = execFileSync('docker', ['exec', '--help'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return help.includes('--env-file');
+  } catch {
+    return true;
+  }
+}
+
 export async function preflight(): Promise<void> {
   const problems: string[] = [];
   const name = config.agent.container.name;
   const proxy = 'clawcius-squid';
+
+  if (onPath('docker') && !execTakesEnvFile()) {
+    problems.push(
+      'this docker\'s `exec` does not accept --env-file (needs 20.10 or newer).\n' +
+        '    Every turn passes the session environment that way, because the alternative\n' +
+        '    puts DISCORD_TOKEN and GITHUB_TOKEN in a world-readable /proc/<pid>/cmdline.\n' +
+        '    Fix:  upgrade docker. Do not move the environment back onto the argv.\n' +
+        '    Check: docker exec --help | grep env-file',
+    );
+  }
 
   if (!onPath('docker')) {
     problems.push(
