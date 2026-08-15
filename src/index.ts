@@ -17,6 +17,9 @@ import { AgentRegistry, hostAgentId } from './store.js';
 import { SessionManager } from './agent.js';
 import { MailStore } from './mail.js';
 import { MailWaker } from './mail-wake.js';
+import { ArmedStore } from './armed.js';
+import { ArmedWaker } from './armed-wake.js';
+import { GitHubClient, type PullRequestSource } from './github.js';
 import { WakeSpool } from './wake-spool.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
@@ -52,7 +55,49 @@ if (config.agent.clawsky.enabled) {
   }
 }
 
-const sessions = new SessionManager(registry, mail);
+/**
+ * Armed conditions — `remindMe` and `watchPr`.
+ *
+ * ── The token check happens HERE, once, in the process that would use it ────
+ *
+ * `config.github.token` is this process's `GITHUB_TOKEN`. It is deliberately
+ * not the agent's: the container gets its copy through `--env-file` and the
+ * waker gets its own through the unit's `EnvironmentFile`, and while on this
+ * deployment those are the same file, nothing enforces that and no agent can
+ * see which is true. So the client is built here or it is not built at all, and
+ * `watchPr` refuses at arm time with a message naming the variable rather than
+ * arming a watch that would poll nothing forever.
+ *
+ * A reminder needs no token and is unaffected: `remindMe` is offered either
+ * way, because a clock is not a third party.
+ */
+const armedStore = config.agent.clawsky.enabled && config.agent.armed.enabled
+  ? new ArmedStore(registry)
+  : null;
+
+let github: PullRequestSource | null = null;
+if (armedStore) {
+  if (config.github.token) {
+    github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);
+  } else {
+    process.stderr.write(
+      '[armed] GITHUB_TOKEN is not set in this process — watchPr will refuse to arm anything ' +
+        'and say so. Set it in the EnvironmentFile named by this instance\'s unit, not only in ' +
+        'the container.\n',
+    );
+  }
+}
+
+const armedTools = armedStore
+  ? {
+      store: armedStore,
+      github,
+      defaultRepo: config.agent.armed.github.repo,
+      pollSeconds: config.agent.armed.github.pollSeconds,
+    }
+  : null;
+
+const sessions = new SessionManager(registry, mail, armedTools);
 
 /**
  * Mail wakes an idle agent — CLAWSKY.md phase 3.
@@ -128,6 +173,26 @@ if (mail && mailWaker) {
     }
   };
 }
+
+/**
+ * The loop that makes an armed condition come true.
+ *
+ * It needs mail and nothing else — it delivers, and the mail waker above turns
+ * that delivery into a turn. Which is why this is wired after that one and why
+ * there is no path from here into `sessions`: an armed condition is a producer
+ * of mail, not a second way to start an agent.
+ */
+const armedWaker =
+  armedStore && mail
+    ? new ArmedWaker({
+        store: armedStore,
+        registry,
+        mail,
+        github,
+        tickMs: config.agent.armed.tickSeconds * 1000,
+        log: (line) => process.stdout.write(`[armed] ${line}\n`),
+      })
+    : null;
 
 const windows = new ConversationWindows(
   config.agent.discord.followUpWindowSeconds,
@@ -281,6 +346,13 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           // Whether the ops executor has claimed its row. A coordinator that
           // is about to be told "unknown recipient" would rather find out here.
           mail ? `Host agent: ${describeHostAgent()}` : 'Host agent: unreachable (mail disabled)',
+          // Whether watchPr can arm at all is a property of THIS process, and
+          // the agent inside the container has no way to see it — its own
+          // GITHUB_TOKEN says nothing about the waker's. So it is reported.
+          armedStore
+            ? `Armed: ${armedStore.listFor(channelId).length} condition(s) for ${channelId}` +
+              `, GitHub ${github ? 'reachable' : 'UNAVAILABLE — no token in the waker process'}`
+            : 'Armed: disabled',
         ].join('\n'),
       );
       return true;
@@ -637,6 +709,7 @@ const wakeSpool = config.agent.wake.enabled
   : null;
 wakeSpool?.start();
 mailWaker?.start();
+armedWaker?.start();
 
 client.once(Events.ClientReady, (ready) => {
   // Stamped with the pid and the boot time because Restart=always makes a
@@ -718,6 +791,10 @@ async function shutdown(signal: string): Promise<void> {
   try {
     wakeSpool?.stop();
     mailWaker?.stop();
+    // Stopping the timer loses nothing: every armed condition is a row, and
+    // one that comes due while this process is down fires late on the next
+    // start rather than not at all.
+    armedWaker?.stop();
     wakerStatus.stop();
     // Absent reads as busy to the executor, which is the correct answer for a
     // waker that is no longer running: it cannot vouch for anything.
