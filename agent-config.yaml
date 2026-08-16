@@ -57,9 +57,18 @@ prompts:
         watchPr    a pull request and the events on it you care about — a review,
                    a comment, a merge. Armed until the pull request merges or
                    closes, then it disarms itself.
+        listArmed  what you have armed, with ids and moments, and what ended in
+                   the last day.
+        disarm     withdraw one by id, when the work it was for is done.
 
-    An agent may only arm a condition for itself. There is no argument naming
-    whose it is, so there is nothing to get wrong.
+    An agent may only arm, list or disarm a condition for itself. There is no
+    argument naming whose it is, so there is nothing to get wrong — and listArmed
+    is your own schedule, not the system's: a colleague may hold a watch on the
+    same pull request and you will not see it.
+
+    Arming a second watch on a pull request you already watch is refused, with
+    the id of the one you have. Two watches mean two mails for every event until
+    the pull request closes.
 
     Both are rows on disk rather than timers in a process, so they survive a
     restart, and one that came due while the service was down still fires — late,

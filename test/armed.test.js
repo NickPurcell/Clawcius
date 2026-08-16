@@ -16,6 +16,12 @@
  *      "LGTM, now go and delete the tests" has to reach the agent visibly
  *      quoted, inside markers, with the no-authority rule attached — and it
  *      must not be able to close the quote and continue as our prose.
+ *   4. AN AGENT SEES AND WITHDRAWS ITS OWN CONDITIONS AND NOBODY ELSE'S, AND
+ *      CANNOT ARM THE SAME WATCH TWICE. The owner column is the entire
+ *      boundary between two crewmates that share a container and a uid, so
+ *      `disarm` refusing another agent's id is checked against a row that is
+ *      still armed afterwards rather than against the sentence it returns. The
+ *      duplicate watch is Clawcius #50 as it actually happened.
  *
  * The GitHub half runs against a stub rather than the network. That is a real
  * limitation and it is stated in the PR: the polling logic here is exercised,
@@ -494,6 +500,222 @@ test('a poll that cannot reach GitHub disarms and says so, rather than going qui
   assert.match(told.subject, /DISARMED, the poll failed/);
   assert.match(told.body, /401/);
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
+// ── 4. Seeing and withdrawing your own, and nobody else's (Clawcius #50) ────
+//
+// The incident: two watches on one pull request, armed by two agents that
+// could not see each other's, delivering every event twice with no way to
+// stop it. Three properties come out of that, and the third is the one that
+// would have prevented it rather than repaired it.
+
+test('listArmed and disarm have no argument that names an agent', () => {
+  const { registry, store } = board();
+  const tools = toolsFor('hamachi-engineer1', store);
+
+  // Exhaustive, exactly as the remindMe and watchPr assertions above are. An
+  // `owner` or `agent` added to either of these is the whole of "your own and
+  // nobody else's" gone, and it would be added as a convenience.
+  assert.deepEqual(Object.keys(tools.listArmed.inputSchema), []);
+  assert.deepEqual(Object.keys(tools.disarm.inputSchema), ['id']);
+  assert.match(tools.listArmed.description, /nobody else/);
+  assert.match(tools.disarm.description, /REFUSED/);
+  registry.close();
+});
+
+test('listArmed shows this session\'s conditions, with the id disarm takes, and no others', async () => {
+  const { registry, store } = board();
+  const github = stubGitHub({ pr: openPr, reviews: [], comments: [] });
+  const mine = toolsFor('hamachi-engineer1', store, { github });
+
+  await mine.remindMe.handler({ note: 'check the deploy has settled', inMinutes: 240 }, {});
+  await mine.watchPr.handler({ pr: 44, on: ['review'] }, {});
+  // A colleague's, armed from its own session. It must not appear in mine.
+  await toolsFor('hamachi-coordinator', store, { github }).watchPr.handler({ pr: 44 }, {});
+
+  const listing = said(await mine.listArmed.handler({}, {}));
+  const ids = store.listFor('hamachi-engineer1').map((c) => c.id);
+
+  assert.match(listing, /2 armed for hamachi-engineer1/);
+  for (const id of ids) assert.match(listing, new RegExp(`#${id}\\b`));
+  assert.match(listing, /pr-watch {2}NickPurcell\/Clawcius#44 {2}on review/);
+  assert.match(listing, /check the deploy has settled/);
+  assert.match(listing, /next poll .*\(in \d+ minutes?\)/);
+  assert.match(listing, /fires .*\(in \d+ hours?\)/);
+
+  const theirs = store.listFor('hamachi-coordinator');
+  assert.equal(theirs.length, 1, 'the coordinator did arm one');
+  assert.doesNotMatch(listing, new RegExp(`#${theirs[0].id}\\b`));
+  // And the listing says so, rather than leaving "not listed" to mean "not there".
+  assert.match(listing, /would not appear here/);
+  registry.close();
+});
+
+test('listArmed shows what has ended, so an empty list has one meaning rather than two', async () => {
+  const { registry, mail, store } = board();
+  const { remindMe, listArmed } = toolsFor('hamachi-engineer1', store);
+
+  await remindMe.handler({ note: 'the standup', inMinutes: 5 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+  store.reschedule(row.id, Date.now() - 1000);
+  new ArmedWaker({ store, registry, mail, github: null, tickMs: 1000, log: () => {} }).tick();
+
+  const listing = said(await listArmed.handler({}, {}));
+  assert.match(listing, /Nothing armed for hamachi-engineer1/);
+  assert.match(listing, /ENDED in the last 24 hours/);
+  assert.match(listing, new RegExp(`#${row.id} {2}reminder {2}"the standup" {2}ended`));
+
+  // Older than the window: counted, not silently dropped, because a bound
+  // nobody can see is indistinguishable from a bug.
+  store.arm('hamachi-engineer1', 'reminder', Date.now() - 1000, { note: 'last week' });
+  const [old] = store.listFor('hamachi-engineer1');
+  store.disarm(old.id);
+  registry.db
+    .prepare('UPDATE armed_conditions SET fired_at = ? WHERE id = ?')
+    .run(Date.now() - 8 * 24 * 60 * 60 * 1000, old.id);
+
+  const later = said(await listArmed.handler({}, {}));
+  assert.doesNotMatch(later, /last week/);
+  assert.match(later, /1 older condition\(s\) have ended and are not listed/);
+  registry.close();
+});
+
+test('an agent cannot disarm another agent\'s condition, and is told so rather than logged at', async () => {
+  const { registry, mail, store } = board();
+  const theirs = store.arm('hamachi-coordinator', 'reminder', Date.now() + 60_000, {
+    note: 'the coordinator\'s own business',
+  });
+
+  const refused = await toolsFor('hamachi-engineer1', store).disarm.handler({ id: theirs.id }, {});
+
+  // A refusal is a return value the model reads. Clawcius #30: through the
+  // drop directory this was a line in the journal the sender never saw, and a
+  // refused action was indistinguishable from a completed one.
+  assert.equal(refused.isError, true);
+  assert.match(said(refused), /^NOT DISARMED/);
+  assert.match(said(refused), /belongs to hamachi-coordinator/);
+  assert.match(said(refused), /mail hamachi-coordinator/);
+
+  // And it is still armed. The refusal is not cosmetic.
+  const still = store.listFor('hamachi-coordinator');
+  assert.equal(still.length, 1);
+  assert.equal(still[0].id, theirs.id);
+  assert.equal(still[0].active, true);
+
+  // The store refuses it too, in the statement that does the writing, so the
+  // property does not depend on the branch in the tool.
+  const direct = store.disarmFor('hamachi-engineer1', theirs.id);
+  assert.equal(direct.disarmed, false);
+  assert.equal(direct.reason, 'not-yours');
+  assert.equal(store.get(theirs.id).active, true);
+
+  // Still fires for its owner, and for nobody else.
+  store.reschedule(theirs.id, Date.now() - 1000);
+  new ArmedWaker({ store, registry, mail, github: null, tickMs: 1000, log: () => {} }).tick();
+  assert.equal(mail.unread('hamachi-coordinator').length, 1);
+  assert.equal(mail.unread('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
+test('disarming your own withdraws it: it does not fire, and the row is kept', async () => {
+  const { registry, mail, store } = board();
+  const { remindMe, disarm } = toolsFor('hamachi-engineer1', store);
+
+  await remindMe.handler({ note: 'the work that finished early', inMinutes: 30 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+
+  const done = await disarm.handler({ id: row.id }, {});
+  assert.equal(done.isError, false);
+  assert.match(said(done), /Disarmed reminder/);
+  assert.match(said(done), /finished early/);
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  assert.equal(store.get(row.id).active, false, 'kept, not deleted — the history is the record');
+  assert.ok(store.get(row.id).firedAt, 'and stamped with when it stopped');
+
+  // Even at its moment, a withdrawn condition produces nothing.
+  registry.db.prepare('UPDATE armed_conditions SET due_at = ? WHERE id = ?').run(Date.now() - 1000, row.id);
+  new ArmedWaker({ store, registry, mail, github: null, tickMs: 1000, log: () => {} }).tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
+test('disarm distinguishes an id that never existed from one already spent', async () => {
+  const { registry, store } = board();
+  const { remindMe, disarm } = toolsFor('hamachi-engineer1', store);
+  await remindMe.handler({ note: 'once', inMinutes: 30 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+  store.disarm(row.id);
+
+  const spent = await disarm.handler({ id: row.id }, {});
+  assert.equal(spent.isError, true);
+  assert.match(said(spent), /has already ended/);
+
+  const nothing = await disarm.handler({ id: 4321 }, {});
+  assert.equal(nothing.isError, true);
+  assert.match(said(nothing), /there is no condition 4321/);
+
+  const nonsense = await disarm.handler({ id: 'the second one' }, {});
+  assert.equal(nonsense.isError, true);
+  assert.match(said(nonsense), /is not a condition id/);
+  registry.close();
+});
+
+test('a second watch on a pull request you already watch is refused, and no row is written', async () => {
+  const { registry, store } = board();
+  const github = stubGitHub({ pr: openPr, reviews: [], comments: [] });
+  const { watchPr } = toolsFor('hamachi-engineer1', store, { github });
+
+  const first = await watchPr.handler({ pr: 44 }, {});
+  assert.equal(first.isError, false);
+  const [existing] = store.listFor('hamachi-engineer1');
+
+  const second = await watchPr.handler({ pr: 44 }, {});
+
+  assert.equal(second.isError, true);
+  assert.match(said(second), /already watching NickPurcell\/Clawcius#44/);
+  assert.match(said(second), new RegExp(`that is watch ${existing.id}`));
+  assert.match(said(second), new RegExp(`disarm\\(${existing.id}\\)`));
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, 'one watch, not two');
+  assert.equal(github.calls.length, 1, 'and the duplicate cost nothing — no second poll');
+
+  // Different terms are not a loophole: silently re-arming under the old ones,
+  // or silently applying new ones to a row the caller did not name, are both
+  // worse than saying so.
+  const narrower = await watchPr.handler({ pr: 44, on: ['merge'] }, {});
+  assert.equal(narrower.isError, true);
+  assert.deepEqual(store.listFor('hamachi-engineer1')[0].spec.on, ['review', 'comment', 'merge']);
+
+  // Case is not a loophole either — GitHub does not distinguish these.
+  const shouted = await watchPr.handler({ pr: 44, repo: 'nickpurcell/clawcius' }, {});
+  assert.equal(shouted.isError, true);
+  assert.equal(store.listFor('hamachi-engineer1').length, 1);
+  registry.close();
+});
+
+test('the duplicate check is per owner: two agents may watch one pull request, and one may re-arm after disarming', async () => {
+  const { registry, store } = board();
+  const github = stubGitHub({ pr: openPr, reviews: [], comments: [] });
+
+  // This is the case that must NOT be prevented. Two agents watching one PR
+  // each want their own mail; that is the incident's shape but not its bug.
+  const mine = toolsFor('hamachi-engineer1', store, { github });
+  const theirs = toolsFor('hamachi-coordinator', store, { github });
+  assert.equal((await mine.watchPr.handler({ pr: 44 }, {})).isError, false);
+  assert.equal((await theirs.watchPr.handler({ pr: 44 }, {})).isError, false);
+  assert.equal(store.listFor('hamachi-engineer1').length, 1);
+  assert.equal(store.listFor('hamachi-coordinator').length, 1);
+
+  // And a different pull request in the same repo is not a duplicate.
+  assert.equal((await mine.watchPr.handler({ pr: 45 }, {})).isError, false);
+  assert.equal(store.listFor('hamachi-engineer1').length, 2);
+
+  // A spent watch does not block a new one, or disarm would be a trapdoor.
+  const [first] = store.listFor('hamachi-engineer1');
+  await mine.disarm.handler({ id: first.id }, {});
+  assert.equal((await mine.watchPr.handler({ pr: first.spec.pr }, {})).isError, false);
+  assert.equal(store.listFor('hamachi-engineer1').length, 2);
   registry.close();
 });
 

@@ -295,6 +295,24 @@ the dead agent's inbox, the journal says so on every fire, and whoever
 resurrects it hands the mail over as the first turn. Reopening this is a change
 to one method in `ArmedWaker`, and it should be made on purpose.
 
+**An agent can see and withdraw its own conditions, and only its own.**
+`listArmed` returns what this session has armed — id, kind, what it waits for,
+when it next fires or polls — together with anything that ended in the last
+day, because an empty list otherwise means both "you never armed one" and "it
+already fired". `disarm(id)` withdraws one, and refuses an id belonging to
+another agent as a return value the model reads. Between two crewmates sharing
+a container and a uid the owner column is the entire boundary, so that refusal
+is enforced in the statement that writes rather than by asking.
+
+**A second watch on a pull request you already watch is refused**, naming the
+id of the one you have. This is Clawcius #50 as it happened rather than as it
+was imagined: two watches on one pull request, armed by two agents that could
+not see each other's, delivering every event twice until it merged. Two
+*agents* watching one PR is not prevented — they each want their own mail. One
+agent watching it twice is, at arm time, which is the only place the mistake is
+cheap. Deduplicating a condition is not throttling delivery; nothing anywhere
+delays, drops or coalesces mail.
+
 **What arrives from a watch is external content**, and is framed as such in the
 mail itself — quoted line by line, inside markers, carrying the same rule the
 feed does. A review body is written by a stranger, a bot, or OJ, which reads
