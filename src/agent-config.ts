@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, isAbsolute, dirname } from 'node:path';
+import { resolve, isAbsolute, dirname, join } from 'node:path';
 import { parse } from 'yaml';
 import { AGENT_ROLES, isAgentRole, type AgentRole } from './store.js';
 import { REPO_NAME } from './github.js';
@@ -78,6 +78,27 @@ export type AgentConfig = {
     name: string;
     /** In-container path to the claude binary. */
     claudePath: string;
+    /**
+     * This instance's `CLAWCIUS_STATE_DIR`, and the only reason this file knows
+     * it: `<stateDir>/run` is what `docker/run-container.sh` bind-mounts
+     * read-write into the container, and nothing else in this config names it.
+     *
+     * It used to be reached through `dirname(wake.spoolDir)`, which was
+     * accidental — the spool was `<stateDir>/run/wake` and its parent happened
+     * to be the mount. That derivation was also wrong by one level for the check
+     * it was doing, so `status.file: <stateDir>/run/waker-status.json` passed
+     * every check in both loaders while sitting in a directory the agent can
+     * write (Clawcius #55). Retiring the spool removed the derivation; this
+     * names the thing directly instead, which is what the ops loader has always
+     * done with `instances[].stateDir`.
+     *
+     * MUST match `CLAWCIUS_STATE_DIR` in this instance's container unit, and
+     * `instances[].stateDir` in ops-config.yaml. Nothing is created from it and
+     * nothing is written to it — it is used to answer "is this path somewhere
+     * the container can write", and getting it wrong makes that answer wrong in
+     * the direction of passing.
+     */
+    stateDir: string;
     /**
      * Where the per-exec `--env-file` is written (src/container.ts).
      *
@@ -160,20 +181,6 @@ export type AgentConfig = {
     userName: string;
     /** Author email. Keep it distinct from yours so agent commits are obvious. */
     userEmail: string;
-  };
-  wake: {
-    /**
-     * Unix socket the agent POSTs to in order to be woken later.
-     *
-     * Replaces the old MCP scheduler: inside its container the agent has cron
-     * and daemons, so it schedules itself with tools it already knows and we
-     * only have to accept the request.
-     */
-    enabled: boolean;
-    /** Directory the agent drops wake-request JSON files into. */
-    spoolDir: string;
-    /** Cap on accepted wake requests per channel per rolling hour. */
-    maxPerHour: number;
   };
   /**
    * The message board: identity and mail.
@@ -270,13 +277,14 @@ export type AgentConfig = {
     /**
      * Absolute path for the status file, or empty to publish nothing.
      *
-     * MUST NOT live under `wake.spoolDir` or anywhere else bind-mounted into
-     * the agent container. The whole point of the file is that a privileged
-     * process trusts it, and the agent inside the container is exactly the
-     * party that must not be able to write "I am idle, go ahead and recreate
-     * me". `wake.spoolDir` is mounted read-write by design; this is one level
-     * up, outside every mount in `docker/run-container.sh`. The ops config
-     * loader re-checks the containment and refuses to start if it is violated.
+     * MUST NOT live anywhere bind-mounted into the agent container. The whole
+     * point of the file is that a privileged process trusts it, and the agent
+     * inside the container is exactly the party that must not be able to write
+     * "I am idle, go ahead and recreate me". `<stateDir>/run` is mounted
+     * read-write by design; the default here is one level up, outside every
+     * mount in `docker/run-container.sh`. The ops config loader re-checks the
+     * containment against that mount — which it can name, because it holds
+     * `instances[].stateDir` — and refuses to start if it is violated.
      */
     file: string;
     /** Republish this often even when the live count has not moved. */
@@ -364,6 +372,7 @@ const DEFAULTS: AgentConfig = {
   container: {
     name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
+    stateDir: '/var/lib/clawcius',
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
     execEnvDir: '/var/lib/clawcius/exec-env',
   },
@@ -394,11 +403,6 @@ const DEFAULTS: AgentConfig = {
   git: {
     userName: 'Clawcius',
     userEmail: 'clawcius@users.noreply.github.com',
-  },
-  wake: {
-    enabled: true,
-    spoolDir: '/var/lib/clawcius/run/wake',
-    maxPerHour: 30,
   },
   clawsky: {
     enabled: true,
@@ -567,21 +571,23 @@ function isInside(child: string, parent: string): boolean {
  * Host paths that `docker/run-container.sh` bind-mounts into the agent
  * container, as far as this file can know them.
  *
- * NOT exhaustive, and the gap is worth naming: the script also mounts
- * `<stateDir>/agent-home`, `gws-cli` and the Google service-account key, none
- * of which appear in this config at all. So this catches the plausible
- * mistakes (a path written under the workspaces root, or under `run/`) and
- * cannot catch every one. The defence that does not depend on enumeration is
- * the default value, which is a sibling of the mounts rather than a child.
+ * NOT exhaustive, and the gap is worth naming rather than discovering: the
+ * script also mounts `<stateDir>/agent-home`, `gws-cli` and the Google
+ * service-account key, none of which appear in this config at all. So this
+ * catches the plausible mistakes it can name, and the defence that does not
+ * depend on enumeration is the default value — every path this file defaults to
+ * is a sibling of the mounts rather than a child.
+ *
+ * `<stateDir>/run` is the READ-WRITE one, and therefore the only one where a
+ * file the executor trusts would be writable by the agent rather than merely
+ * shared with the other deployment. It used to be reached as
+ * `dirname(wake.spoolDir)`; the spool is gone and `container.stateDir` names it
+ * directly. See Clawcius #55 for what the old derivation let through.
  */
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
   return [
     ['sessions.workspaceRoot', config.sessions.workspaceRoot],
-    // The script mounts `<stateDir>/run`, the PARENT of the wake spool — the
-    // spool rides along inside that one mount rather than having its own. So
-    // checking against wake.spoolDir alone would wave through a path that is
-    // its sibling and just as reachable from the container.
-    ['the directory containing wake.spoolDir', dirname(config.wake.spoolDir)],
+    ['<container.stateDir>/run, which is bind-mounted read-write', join(config.container.stateDir, 'run')],
     ['paths.skillsDir', config.paths.skillsDir],
     ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
   ];
@@ -609,7 +615,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const sessions = section(root['sessions'], 'sessions');
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
-  const wake = section(root['wake'], 'wake');
   const clawsky = section(root['clawsky'], 'clawsky');
   const armed = section(root['armed'], 'armed');
   const armedGithub = section(armed['github'], 'armed.github');
@@ -622,6 +627,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     container: {
       name: str(container['name'], 'container.name', DEFAULTS.container.name),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
+      stateDir: str(container['stateDir'], 'container.stateDir', DEFAULTS.container.stateDir),
       execEnvDir: str(
         container['execEnvDir'],
         'container.execEnvDir',
@@ -708,11 +714,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
       userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
     },
-    wake: {
-      enabled: bool(wake['enabled'], 'wake.enabled', DEFAULTS.wake.enabled),
-      spoolDir: str(wake['spoolDir'], 'wake.spoolDir', DEFAULTS.wake.spoolDir),
-      maxPerHour: num(wake['maxPerHour'], 'wake.maxPerHour', DEFAULTS.wake.maxPerHour, 1),
-    },
     clawsky: {
       enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
       crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
@@ -764,28 +765,30 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   }
 
   // The status file is read by a root process that will recreate containers on
-  // the strength of it. Inside the spool directory it would be writable by the
-  // agent, which is the party the executor is defending against — a container
-  // that can publish `liveCount: 0` can talk a privileged process into
-  // destroying a session mid-turn, or into overwriting a rollback decision.
-  // Checked here as well as in the ops config loader; neither should be the
-  // only place this is true.
+  // the strength of it. Inside a bind mount it would be writable by the agent,
+  // which is the party the executor is defending against — a container that can
+  // publish `liveCount: 0` can talk a privileged process into destroying a
+  // session mid-turn, or into overwriting a rollback decision.
+  //
+  // It used to be checked against `wake.spoolDir` — `<stateDir>/run/wake`, one
+  // level BELOW the directory that is actually mounted — so a status file at
+  // `<stateDir>/run/waker-status.json` passed while sitting somewhere the agent
+  // can write (Clawcius #55). It is now checked against the same list the exec
+  // env file is, which names the mount itself.
   if (config.status.file) {
     if (!isAbsolute(config.status.file)) {
       throw new ConfigError('status.file', 'must be an absolute path');
     }
     const statusFile = resolve(config.status.file);
-    // The wake spool is agent-writable by design — it is inside the bind mount
-    // and that is the point of it — so it is the one directory this file must
-    // not land in.
-    const mounted = resolve(config.wake.spoolDir);
-    if (statusFile === mounted || statusFile.startsWith(`${mounted}/`)) {
-      throw new Error(
-        `agent-config.yaml: status.file (${statusFile}) is inside wake.spoolDir ` +
-          `(${mounted}), which is bind-mounted read-write into the agent container. ` +
-          'The ops executor trusts this file when deciding whether recreating the ' +
-          'container would kill a live turn; the agent must not be able to write it.',
-      );
+    for (const [label, mount] of bindMountedPaths(config)) {
+      if (isInside(statusFile, resolve(mount))) {
+        throw new Error(
+          `agent-config.yaml: status.file (${statusFile}) is inside ${label} ` +
+            `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
+            'container. The ops executor trusts this file when deciding whether recreating ' +
+            'the container would kill a live turn; the agent must not be able to write it.',
+        );
+      }
     }
   }
 

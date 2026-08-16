@@ -38,11 +38,13 @@
  * It is NOT inside a bind mount: `docker/run-container.sh` gives a container
  * `$CLAWCIUS_STATE/run` and nothing else, and the board sits a level above
  * that, next to `waker-status.json` — the file whose containment the ops config
- * loader already re-checks for exactly this reason. `config.ts` now refuses a
- * `board.db` inside any spool, and this file `lstat`s the path and refuses a
- * symlink or anything that is not a regular file before opening it, because
- * `node:sqlite` opens by name and the lesson of `ops/src/spool.ts` is that a
- * path an agent can influence is resolved with THIS process's privileges. Two
+ * loader already re-checks for exactly this reason. `config.ts` refuses a
+ * `board.db` inside any container's bind mount, and this file `lstat`s the path
+ * and refuses a symlink or anything that is not a regular file before opening
+ * it, because `node:sqlite` opens by name and the lesson of the retired ops
+ * spool — a root `mkdir`/`chown` of a path whose parent the sandbox owned, which
+ * was an arbitrary-path root chown (CWE-59) — is that a path an agent can
+ * influence is resolved with THIS process's privileges. Two
  * checks that should both be redundant; three occasions in this repository say
  * otherwise.
  *
@@ -173,9 +175,9 @@ export class Board {
    * silent, total failure of the thing this change exists to build — so the
    * sidecars are handed back to whoever owns the database file.
    *
-   * Through an `O_NOFOLLOW` descriptor and `fchown`, not `chown` by name, for
-   * the reason written across `ops/src/spool.ts`: what is changed is then the
-   * object that was checked. Failures are logged, never fatal — the usual
+   * Through an `O_NOFOLLOW` descriptor and `fchown`, not `chown` by name, so
+   * that what is changed is the object that was checked rather than whatever
+   * the name resolves to a moment later. Failures are logged, never fatal — the usual
    * cause is running the executor as something other than root, where the
    * problem being fixed does not arise.
    */

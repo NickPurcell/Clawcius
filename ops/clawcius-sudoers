@@ -555,19 +555,16 @@ Cmnd_Alias CLAWCIUS_UNIT_READ = \
 #     this host are created by docker/run-container.sh, which the EXECUTOR runs
 #     as root with an argv it builds itself.
 #   * `docker exec` — `docker exec -u root clawcius-agent …` is root inside a
-#     container that bind-mounts /var/lib/clawcius/run. That directory is the
-#     ops spool, and writing a request into another instance's spool is forging
-#     provenance, which is the one property per-instance spools exist to make
-#     unforgeable.
+#     crew's container, holding its Claude credential, its Discord token and
+#     every live session's transcript. It is also a shell as the uid that owns
+#     that instance's whole state directory.
 #   * `docker cp` — copies as root, to and from arbitrary host paths. It is
 #     `sudo cp` wearing a container.
 #   * `docker build` / `load` / `import` / `commit` / `save` — a build runs a
-#     Dockerfile as root, and the rest move image layers around. The snapshot
-#     path (`docker commit`) belongs to the executor, which takes one before
-#     every task without being asked.
-#   * `docker system prune`, `volume rm`, `network rm` — destructive, and the
-#     rollback is container-scoped, so a pruned image is a rollback target that
-#     no longer exists.
+#     Dockerfile as root, and the rest move image layers around.
+#   * `docker system prune`, `volume rm`, `network rm` — destructive, and since
+#     2026-08-16 nothing takes a snapshot before a task, so a pruned image is
+#     one a person was relying on.
 #
 # Most read-only verbs take a `*` because their arguments are flags and format
 # strings, the verb itself is pinned as the first token, and every flag those
@@ -673,10 +670,10 @@ Cmnd_Alias CLAWCIUS_DOCKER_LIFECYCLE = \
 # premise is gone, so the glob had to go with it. These are exact paths.
 #
 # Most of this is repair work rather than routine: the executor creates and
-# chowns every spool and the host agent's working directory at boot
-# (`ensureSpoolDir` / `ensureDirOwnedBy`), precisely so that an agent whose
-# requests silently vanish is not a state anybody has to discover. These rules
-# are for the case where that went wrong, and for standing up a new instance.
+# chowns the host agent's working directory at boot (`ensureDirOwnedBy`, in
+# ops/src/dirs.ts), and `docker/run-container.sh` creates `<stateDir>/run` as
+# npurcell before it starts a container. These rules are for the case where that
+# went wrong, and for standing up a new instance.
 #
 # Note the absence of /home/npurcell: the agent shares that tree through a
 # group, not through sudo, and a `sudo chown` inside it is how the 2026-08-09
@@ -706,38 +703,35 @@ Cmnd_Alias CLAWCIUS_DOCKER_LIFECYCLE = \
 # grep is empty rather than because of an argument: no rule below names
 # /var/lib/clawcius-ops, and no rule below takes a `*` in a writing position at
 # all, so there is no string that reaches it.
+# The six /run/ops and six /run/wake entries that used to be here went on
+# 2026-08-16 with the spools they created. Nothing reads or writes either
+# directory now, and a grant nobody uses is a grant nobody re-reads either — the
+# whole argument of this file is that the list is short enough to check.
+#
+# The state directory and its `run/` remain, because `docker/run-container.sh`
+# still bind-mounts `<stateDir>/run` and a first start on a fresh instance still
+# has to create it.
 Cmnd_Alias CLAWCIUS_STATE_MKDIR = \
     /usr/bin/mkdir -p /var/lib/clawcius, \
     /usr/bin/mkdir -p /var/lib/clawcius/run, \
-    /usr/bin/mkdir -p /var/lib/clawcius/run/ops, \
-    /usr/bin/mkdir -p /var/lib/clawcius/run/wake, \
     /usr/bin/mkdir -p /var/lib/hamachi, \
     /usr/bin/mkdir -p /var/lib/hamachi/run, \
-    /usr/bin/mkdir -p /var/lib/hamachi/run/ops, \
-    /usr/bin/mkdir -p /var/lib/hamachi/run/wake, \
     /usr/bin/mkdir -p /var/lib/oj, \
-    /usr/bin/mkdir -p /var/lib/oj/run, \
-    /usr/bin/mkdir -p /var/lib/oj/run/ops, \
-    /usr/bin/mkdir -p /var/lib/oj/run/wake
+    /usr/bin/mkdir -p /var/lib/oj/run
 
 # The uid:gid pairs are spelled out rather than matched with a character class,
 # because `[a-z]*\:[a-z]*` accepts `root:root` and the whole question this rule
-# answers is "who ends up owning the spool". npurcell is the answer for the
-# instance state directories, because that is the uid the containers run as
-# (the Dockerfile builds the agent user with AGENT_UID=1000 to match).
+# answers is "who ends up owning the directory the container writes". npurcell
+# is the answer for the instance state directories, because that is the uid the
+# containers run as (the Dockerfile builds the agent user with AGENT_UID=1000
+# to match).
 Cmnd_Alias CLAWCIUS_STATE_CHOWN = \
-    /usr/bin/chown npurcell\:npurcell /var/lib/clawcius/run/ops, \
-    /usr/bin/chown npurcell\:npurcell /var/lib/clawcius/run/wake, \
-    /usr/bin/chown npurcell\:npurcell /var/lib/hamachi/run/ops, \
-    /usr/bin/chown npurcell\:npurcell /var/lib/hamachi/run/wake, \
-    /usr/bin/chown npurcell\:npurcell /var/lib/oj/run/ops, \
-    /usr/bin/chown npurcell\:npurcell /var/lib/oj/run/wake, \
-    /usr/bin/chmod 0770 /var/lib/clawcius/run/ops, \
-    /usr/bin/chmod 0770 /var/lib/clawcius/run/wake, \
-    /usr/bin/chmod 0770 /var/lib/hamachi/run/ops, \
-    /usr/bin/chmod 0770 /var/lib/hamachi/run/wake, \
-    /usr/bin/chmod 0770 /var/lib/oj/run/ops, \
-    /usr/bin/chmod 0770 /var/lib/oj/run/wake
+    /usr/bin/chown npurcell\:npurcell /var/lib/clawcius/run, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/hamachi/run, \
+    /usr/bin/chown npurcell\:npurcell /var/lib/oj/run, \
+    /usr/bin/chmod 0770 /var/lib/clawcius/run, \
+    /usr/bin/chmod 0770 /var/lib/hamachi/run, \
+    /usr/bin/chmod 0770 /var/lib/oj/run
 
 # ══════════════════════════════════════════════════════════════════════════
 # Unit files — NOT HERE ANY MORE, and this section is the reason why

@@ -34,7 +34,7 @@
  *
  * A crew's coordinator can now run commands on the host by calling one tool.
  * That was true before — the ops spool was reachable from the same container,
- * with the same authorship guarantee —
+ * with the same authorship guarantee, until it was retired on 2026-08-16 —
  * and the checks that stood between the request and the machine were never the
  * queue: they are the unprivileged `clawcius-ops` account, its narrow sudoers
  * file, the setuid/setgid drop, the tool deny-list, and an audit written to
@@ -49,21 +49,26 @@
  *
  * And the coordinator check is a rule between crews and against a mistake, NOT
  * a boundary within a crew. Every agent in a crew shares one container, one uid
- * and one disk today (Clawcius #31). Mail itself no longer gives that shared
- * disk a way in — sending is a tool closed over the sending session's id, the
- * per-agent drop directories that could be written across are gone (#35), and
- * the board is outside every bind mount. The wake spool still does: `run/wake`
- * takes any channel id, so any process in the container can start a turn as its
- * coordinator with a prompt of its choosing, and that turn holds the
- * coordinator's `sendMail` (#39). Retiring the spool is CLAWSKY.md phase 4;
- * per-agent uids are the other half. Until both, this check is worth exactly
- * what the container's own boundary is worth and no more.
+ * and one process table today (Clawcius #31), so a crewmate can read another
+ * session's transcript and can `docker exec` alongside it.
+ *
+ * What it can no longer do is BECOME one. Sending is a tool closed over the
+ * sending session's id; the per-agent drop directories that could be written
+ * across are gone (#35); the board is outside every bind mount; and since
+ * 2026-08-16 so is the wake spool, which was the last path by which a name a
+ * process wrote into a file turned into a session holding that name's tools
+ * (#39). Per-agent uids are what would close the rest. Until they exist, this
+ * check is worth exactly what the container's own boundary is worth and no
+ * more — which is now the same thing the container boundary is worth, rather
+ * than less.
  *
  * ── Reading the board ───────────────────────────────────────────────────────
  *
  * `fs.watch` on the directory holding the database is the fast path — SQLite
- * touches `-wal` on every commit — and a poll is the guarantee, the same
- * arrangement as every spool in this repository. There is no notification
+ * touches `-wal` on every commit — and a poll is the guarantee, which is the
+ * arrangement every watcher in this repository has used: gVisor's gofer does
+ * not reliably deliver inotify for writes made inside the sandbox. There is no
+ * notification
  * across the process boundary and there is no socket: the container may not
  * have one, and the waker must not be able to call into a root daemon.
  */

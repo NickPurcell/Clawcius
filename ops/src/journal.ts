@@ -143,19 +143,25 @@ export type TaskSummary = {
 export type OpsStatusSnapshot = {
   /** What the executor is doing right now, or 'idle'. */
   current: string;
-  /** Requests waiting behind the lock. */
-  queued: number;
+  /**
+   * Frozen means every task is refused until a human runs `ops/unfreeze.sh`.
+   *
+   * Nothing sets it any more. It was set by the circuit breaker, which counted
+   * failed recoveries on the spool task path, and that path went with the
+   * spools — see the boot report in `Executor`. The flag is still read, still
+   * persisted and still clearable, because a host that is frozen today must not
+   * quietly unfreeze itself on the next deploy. Clawcius #63 is the decision
+   * about what to do with it.
+   */
   frozen: boolean;
   frozenReason: string;
   dryRun: boolean;
   /**
-   * The spools being watched, one per instance, and whether each is
-   * restricted. Published so the status page can show at a glance that every
-   * agent has a reachable queue — the failure this replaced was one agent
-   * silently having none.
+   * Check-in deadlines and quarantined builds still on disk from before the
+   * spools were retired. Always empty on a host that has booted this build
+   * once: nothing arms either any more, and the first boot reports and clears
+   * whatever it finds rather than leaving rows nothing will ever honour.
    */
-  spools: Array<{ instance: string; dir: string; restricted: boolean }>;
-  /** Instances with an armed check-in deadline, and when it expires. */
   pendingCheckins: Array<{ instance: string; deadlineAt: number; reason: string }>;
   quarantined: Array<{ instance: string; build: string; at: number }>;
   consecutiveFailedRecoveries: number;

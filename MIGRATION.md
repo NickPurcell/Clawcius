@@ -58,9 +58,9 @@ those from decoration into a control. Everything else in `ops/` is downstream
 of it.
 
 **The daemon will not do any of this for you, and it will not proceed without
-it.** Until § 1 is done, `clawcius-ops.service` boots, holds its rollback
-deadlines, answers check-ins, performs rollbacks — and refuses every task with
-the reason and the fix. It does not fall back to the checkout's owner and it
+it.** Until § 1 is done, `clawcius-ops.service` boots, takes its mailbox on each
+crew's board — and refuses every task with the reason and the fix, in a reply to
+the coordinator that asked. It does not fall back to the checkout's owner and it
 does not fall back to root.
 
 ---
@@ -81,11 +81,13 @@ sudo useradd \
 
 **The home directory matters and it is easy to get wrong.** It must **not** be
 `/var/lib/clawcius-ops`: that is `clawcius-ops.service`'s `StateDirectory`,
-0750 and root-owned, holding `journal.jsonl`, the circuit breaker and every
-armed rollback deadline. An account whose home is there owns the breaker that
-quarantines it and the audit that records it. The unit name and the account
-name being the same string is a genuine trap; `/var/lib/clawcius-agent` is
-deliberately a different path.
+0750 and root-owned, holding `journal.jsonl` and the freeze flag. An account
+whose home is there owns the audit that records it — and the flag that, once a
+human has set it, refuses every task it would otherwise run. (It used to hold
+the circuit breaker and every armed rollback deadline too; those went with the
+spools on 2026-08-16 and the argument is unchanged without them.) The unit name
+and the account name being the same string is a genuine trap;
+`/var/lib/clawcius-agent` is deliberately a different path.
 
 There is no `--groups` argument, on purpose. The account starts in exactly one
 group — its own — and § 2 adds exactly one more.
@@ -651,10 +653,13 @@ If anything is wrong you get a banner instead, with the fix in it:
 [ops] Every task will be REFUSED until this is fixed. Nothing else is affected.
 ```
 
-The daemon stays up and keeps holding its rollback deadlines while that is
+The daemon stays up and keeps answering — with that refusal — while that is
 true. It is deliberately not a boot failure: this unit is `Restart=always` with
-no start limit, so refusing to boot would be a five-second restart loop with
-every armed deadline unhonoured, which is the shape of #7.
+no start limit, so refusing to boot would be a five-second restart loop, and a
+daemon in one cannot tell anybody why it is refusing. That is the shape of #7.
+(Until 2026-08-16 the argument was stronger: a restart loop also left every
+armed rollback deadline unhonoured. There are no deadlines now, and the weaker
+version still holds.)
 
 The status file says the same thing, which is what the status page reads:
 
@@ -671,18 +676,25 @@ the log contains nothing surprising. In dry run the session has no Bash tool at
 all — it is removed by the permission system, not asked for politely — so this
 is a safe way to prove the identity plumbing end to end.
 
-```sh
-OPS=/var/lib/clawcius/run/ops
-STAMP=$(date +%s)
-printf '%s' '{"verb":"task","instance":"clawcius","task":"Report who you are: run id, whoami, sudo -l, and try to read /home/npurcell/clawcius/.env. Report exactly what each one said. Change nothing."}' \
-  > $OPS/$STAMP.tmp && mv $OPS/$STAMP.tmp $OPS/$STAMP.json
+**There is no command to type here, and that is the change.** Until 2026-08-16
+this step was a `printf` of a JSON request into `/var/lib/clawcius/run/ops`;
+that spool is gone and nothing reads it. A task is a DM from a crew's
+**coordinator** to `<crew>-host`, so ask Clawcius for one:
 
+> **Clawcius**, DM `clawcius-host`: *Report who you are: run `id`, `whoami`,
+> `sudo -l`, and try to read `/home/npurcell/clawcius/.env`. Report exactly what
+> each one said. Change nothing.*
+
+and watch it land from the host side:
+
+```sh
 sudo tail -f /var/lib/clawcius-ops/journal.jsonl | jq -r 'select(.kind=="audit") | .command'
 ```
 
-In dry run it will report the commands it *would* have run. Turn `dryRun` off
-and file it again to get the actual output, and read the report. `id` should
-say **all three groups**:
+The reply comes back to the coordinator as a DM; the journal is the durable copy
+and is the one to read. In dry run it will report the commands it *would* have
+run. Turn `dryRun` off and ask again to get the actual output, and read the
+report. `id` should say **all three groups**:
 
 ```
 uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)

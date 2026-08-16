@@ -1,12 +1,16 @@
 /**
  * clawcius-ops — the host-side executor.
  *
- * Watches one bind-mounted spool per instance, and carries out the tasks the
- * sandboxed agents file there by handing each one to a headless Claude Code
- * session on the host: snapshot first, audit every command, health-check after,
- * roll back if it went wrong.
+ * Holds one mailbox per crew on the Clawsky board, and carries out the tasks a
+ * coordinator DMs to `<crew>-host` by handing each one to a headless Claude
+ * Code session on the host: audit every command, health-check either side,
+ * answer by DM.
  *
- * It has no Discord connection and files no messages. Since 2026-08-10 it DOES
+ * It watched a bind-mounted spool per instance until 2026-08-16 and no longer
+ * does; the spools and everything that fed them are gone, and the account of
+ * what went with them is in ops/src/executor.ts.
+ *
+ * It has no Discord connection and posts no messages. Since 2026-08-10 it DOES
  * have a model — the sentence that used to be here said it never would, and
  * ops/src/host-agent.ts is the whole account of why that changed, what was
  * given up, and what was put in its place. Read that before this.
@@ -21,7 +25,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } f
 import { join } from 'node:path';
 import { loadOpsConfig } from './config.js';
 import { Executor } from './executor.js';
-import { OpsSpool, ensureDirOwnedBy } from './spool.js';
+import { ensureDirOwnedBy } from './dirs.js';
 import { agentProblems, agentWarnings, describeAgentUser } from './agent-user.js';
 import { identityOptionsFor } from './host-agent.js';
 import { HostMailbox } from './host-mailbox.js';
@@ -173,14 +177,9 @@ executor.journal.write({
   what: 'clawcius-ops',
   dryRun: config.dryRun,
   detail:
-    `pid ${process.pid}; state ${config.stateDir}; spools ` +
-    `${config.instances.map((i) => `${i.name}=${i.opsSpoolDir}`).join(', ') || '(NONE)'}; ` +
+    `pid ${process.pid}; state ${config.stateDir}; ` +
     `${config.units.length} unit(s) and ${config.instances.length} container(s) health-` +
-    `checked around every task; ${config.repos.length} repo(s) in the briefing; ` +
-    `deadline ${config.deadline.minutes}m (auto-rollback ` +
-    `${config.deadline.autoRollback ? 'on' : 'off'}); ` +
-    `breaker freezes after ${config.breaker.maxConsecutiveFailedRecoveries} consecutive ` +
-    `failed recoveries; snapshots kept: ${config.snapshotKeep}. ` +
+    `checked around every task; ${config.repos.length} repo(s) in the briefing. ` +
     `HOST AGENT: ${
       config.hostAgent.enabled
         ? `${config.hostAgent.claudePath}, up to ${config.hostAgent.timeoutMinutes}m and ` +
@@ -189,11 +188,11 @@ executor.journal.write({
             ? `${describeAgentUser(identity.user)}` +
               (agentProblems(identity.user, identityOptionsFor(config)).length > 0
                 ? ' — REFUSED: that account is not contained; see the banner above and ' +
-                  'MIGRATION.md. Tasks will be refused; deadlines and rollbacks continue'
+                  'MIGRATION.md. Every task will be refused'
                 : '')
             : `NOBODY (${config.hostAgent.user}: ${identity.reason.split('\n')[0]}) — tasks ` +
               'will be refused')
-        : 'DISABLED — tasks refused, deadlines and rollbacks still honoured'
+        : 'DISABLED — every task is refused'
     }. ` +
     (config.dryRun
       ? 'DRY RUN — the session has no Bash tool and cannot execute anything; it plans and ' +
@@ -203,11 +202,10 @@ executor.journal.write({
 });
 
 // Deprecation notices go in the journal, not just to stdout, because the whole
-// argument for tolerating the old `spoolDir` key rather than refusing to boot
-// on it is that the operator gets a durable record saying it was tolerated and
-// what it was taken to mean. A warning that only reaches the systemd journal
-// rotates away; this one is in journal.jsonl next to the operations it
-// governed. See migrateLegacySpoolDir() in config.ts.
+// argument for tolerating a retired key rather than refusing to boot on it is
+// that the operator gets a durable record saying it was tolerated and what it
+// was taken to mean. A warning that only reaches the systemd journal rotates
+// away; this one is in journal.jsonl next to the operations it governed.
 for (const notice of config.deprecations) {
   executor.journal.write({ kind: 'boot', what: 'config deprecation', detail: notice });
 }
@@ -216,61 +214,26 @@ if (executor.state.state.frozen) {
   process.stderr.write(
     `[ops] ══ FROZEN ══ ${executor.state.state.frozenReason}\n` +
       `[ops] Frozen since ${new Date(executor.state.state.frozenAt).toISOString()}. ` +
-      'Destructive verbs are refused. Clear it with ops/unfreeze.sh once you know why.\n',
+      'Every task is refused. Clear it with ops/unfreeze.sh once you know why. Nothing sets\n' +
+      '[ops] this any more — the breaker that did went with the spools — so this freeze\n' +
+      '[ops] predates that.\n',
   );
 }
 
-executor.restoreDeadlines();
-
-/**
- * One spool per instance, watched concurrently.
- *
- * They are separate `OpsSpool` objects rather than one watcher over a parent
- * directory, and that is the design rather than an implementation detail: the
- * directory a request arrives in is the ONLY evidence of who filed it, so each
- * watcher has to know whose it is and stamp that onto everything it emits. A
- * single watcher over a glob of `/var/lib/<instance>/run/ops` would have to
- * derive the instance from the path, which is string parsing on a
- * security-relevant fact.
- *
- * They are also physically separate mounts. `docker/run-container.sh` gives
- * each container `$CLAWCIUS_STATE/run` and nothing else, so a container can
- * write into exactly one of these directories no matter what it does. That is
- * what makes the provenance unforgeable, and it is the same property that made
- * the old single spool unreachable from Hamachi — the mount asymmetry was
- * always there; this is the first version that uses it instead of tripping
- * over it.
- */
-const spools = config.instances.map(
-  (instance) =>
-    new OpsSpool({
-      dir: instance.opsSpoolDir,
-      instance: instance.name,
-      // The spool should end up owned by whoever owns the instance's state
-      // directory — that is the uid the container runs as. See ensureSpoolDir.
-      ownerOf: instance.stateDir,
-      maxBytes: config.limits.maxRequestBytes,
-      maxPerSweep: config.limits.maxPerSweep,
-      maxFiles: config.limits.maxSpoolFiles,
-      pollSeconds: config.pollSeconds,
-      log: (line) => process.stdout.write(`[ops spool ${instance.name}] ${line}\n`),
-      onRequest: (raw) => executor.intake(raw),
-    }),
-);
-
-for (const spool of spools) spool.start();
+executor.reportRetiredDeadlines();
 
 /**
  * One mailbox per instance that has a board — CLAWSKY.md phase 6.
  *
- * This is the way in that replaces the spool's scheduling: a coordinator DMs
- * `<crew>-host` and the session runs, now. The spools above are left running
- * and inert rather than deleted, so a rollback to the previous `dist/` does not
- * strand a request format that nothing reads.
+ * The only way in. A coordinator DMs `<crew>-host` and the session runs, now,
+ * and the answer comes back as a DM. Until 2026-08-16 there was a second way —
+ * a JSON file in a bind-mounted directory per instance, swept on a timer — and
+ * it is gone along with everything that stood around it.
  *
- * A mailbox that cannot be opened is loud and not fatal — same rule as
- * everywhere else in this daemon. It holds the rollback deadlines, and a
- * mistyped database path must not be what takes those with it.
+ * A mailbox that cannot be opened is loud and not fatal, same rule as
+ * everywhere else in this daemon: this process also serves the unit desk and
+ * publishes the status file, and a mistyped database path must not be what
+ * takes those with it.
  */
 const mailboxes = config.instances.flatMap((instance) => {
   if (!instance.board) return [];
@@ -310,32 +273,27 @@ if (mailboxes.length === 0 && config.hostAgent.enabled) {
   process.stderr.write(
     '[ops] NO HOST MAILBOX ON ANY INSTANCE — the host agent has no Clawsky identity, so no ' +
       'coordinator can DM it. Add a board: block with db: and crew: under the instance in ' +
-      'ops-config.yaml. The ops spool still works.\n',
+      'ops-config.yaml. Nothing else can reach this daemon.\n',
   );
 }
 
-if (spools.length === 0) {
-  // Not fatal — the deadlines and the breaker still need this process — but
-  // said as loudly as anything in here, because an executor with no spools is
-  // a daemon nobody can talk to, and it looks exactly like a quiet night.
+if (config.instances.length === 0) {
+  // Said as loudly as anything in here, because an executor with no instances
+  // health-checks nothing and briefs a session about an empty host — and that
+  // looks exactly like a quiet night.
   process.stderr.write(
-    '[ops] NO INSTANCES CONFIGURED — there are no spools to watch and no agent can file ' +
-      'a request. Deadlines and the breaker still run. Add entries under instances: in ' +
-      'ops-config.yaml.\n',
+    '[ops] NO INSTANCES CONFIGURED — nothing is health-checked around a task and the ' +
+      'briefing will name no containers. Add entries under instances: in ops-config.yaml.\n',
   );
 }
 
 process.stdout.write(
-  `${spools
-    .map((spool) => `[ops] watching ${spool.dir} for ${spool.instance} (sweep ${config.pollSeconds}s)\n`)
-    .join('')}` +
-    `[ops] journal ${executor.journal.path}\n` +
+  `[ops] journal ${executor.journal.path}\n` +
     `[ops] status   ${executor.journal.statusPath}\n`,
 );
 
 function shutdown(signal: string): void {
   process.stdout.write(`[ops] ${signal} received, shutting down\n`);
-  for (const spool of spools) spool.stop();
   for (const mailbox of mailboxes) mailbox.stop();
   executor.stop();
   releaseLock();
@@ -346,7 +304,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('unhandledRejection', (reason) => {
-  // Logged, never fatal. An unhandled rejection in a verb handler must not
-  // take down the process that holds the rollback deadlines.
+  // Logged, never fatal. An unhandled rejection while a session is running must
+  // not take down the process that has to write down what it did.
   process.stderr.write(`[ops] unhandled rejection: ${String(reason)}\n`);
 });

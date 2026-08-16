@@ -75,7 +75,7 @@
  *     opened `O_NOFOLLOW`, and every decision is made against `fstat` of that
  *     descriptor rather than against the name. A staging entry that is a symlink
  *     to `/root/.ssh/id_ed25519` is refused rather than published into a
- *     world-readable unit file (CWE-59, and the same reasoning as spool.ts);
+ *     world-readable unit file (CWE-59);
  *   - the mode is 0644 and the owner is 0:0 because this code sets them on the
  *     file descriptor it wrote, not because a pattern in a text file asked
  *     politely.
@@ -579,11 +579,12 @@ export type UnitDeskOptions = {
  * request says WHICH unit, and nothing else. It cannot say where, or with what
  * mode, or as whom.
  *
- * Everything hostile-input-shaped about it is handled exactly as spool.ts
- * handles the same problem: implausible names discarded unread, size checked on
- * the descriptor rather than on the path, `O_NOFOLLOW | O_NONBLOCK`, and the
- * file unlinked BEFORE it is acted on so that a request which throws cannot come
- * back on the next drain.
+ * Everything hostile-input-shaped about it is handled the way the retired ops
+ * spool handled the same problem, which is where these rules were worked out:
+ * implausible names discarded unread, size checked on the descriptor rather than
+ * on the path, `O_NOFOLLOW | O_NONBLOCK`, and the file unlinked BEFORE it is
+ * acted on so that a request which throws cannot come back on the next drain.
+ * This is now the only directory-as-a-queue left in the repository.
  *
  * This is NOT "the host agent ingesting untrusted content" in the sense
  * host-agent.ts forbids: nothing read here reaches a prompt. It reaches
@@ -664,10 +665,11 @@ type ParsedUnitRequest =
 /**
  * `{"op":"install","unit":"clawcius-status.service"}` and nothing else.
  *
- * Structural rejection, never repair — the same rule request.ts states for the
- * ops spool. An unknown key is a rejection here rather than a logged
- * curiosity, because unlike a spool request this object has exactly two fields
- * and there is no forward-compatibility story to protect.
+ * Structural rejection, never repair. Malformed JSON is discarded whole,
+ * nothing salvages the parseable prefix of a broken file, and nothing coerces
+ * types — a number where a string belongs is a reject. An unknown key is a
+ * rejection here rather than a logged curiosity, because this object has
+ * exactly two fields and there is no forward-compatibility story to protect.
  */
 export function parseUnitRequest(body: string): ParsedUnitRequest {
   let parsed: unknown;
