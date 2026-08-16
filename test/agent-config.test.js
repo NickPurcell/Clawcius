@@ -133,6 +133,33 @@ test('both shipped agent configs set container.stateDir, and set it to their own
   assert.notEqual(clawcius.container.stateDir, hamachi.container.stateDir);
 });
 
+test('all three read-write mounts are checked, not just the one the spools lived in', () => {
+  // `run-container.sh` mounts workspaces/, run/ and agent-home/ read-write, all
+  // derived from CLAWCIUS_STATE. Until 2026-08-16 this file checked `run/` and
+  // named agent-home as a known gap, while ops/src/config.ts checked all three
+  // — two halves of one change disagreeing about the completeness of one
+  // enumeration. Both files check three now.
+  for (const child of ['run', 'workspaces', 'agent-home']) {
+    assert.throws(
+      () =>
+        loadAgentConfig(
+          writeConfig([
+            '  execEnvDir: /var/lib/x-env',
+            'status:',
+            `  file: /var/lib/x/${child}/waker-status.json`,
+          ]),
+        ),
+      /status\.file .* is inside .* bind-mounted read-write/,
+      `a status file under ${child}/ must be refused`,
+    );
+    assert.throws(
+      () => loadAgentConfig(writeConfig([`  execEnvDir: /var/lib/x/${child}/exec-env`])),
+      /container\.execEnvDir .* is inside/,
+      `an exec env directory under ${child}/ must be refused`,
+    );
+  }
+});
+
 test('the exec env directory is refused inside the container mount too', () => {
   // Same list, same rule. This one has always been checked against the mount;
   // the point of asserting it here is that both files now share one answer to

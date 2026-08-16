@@ -264,9 +264,14 @@ repos:
 # that is the only access control left on running commands on this host. The
 # read-only mounts (the skills directory, discord-cli, gws-cli, the
 # service-account key) are deliberately NOT checked here: a file the agent
-# cannot write is not a file it can lie with. agent-config.yaml checks them
-# anyway, because what it is protecting there is a credential rather than a
-# claim, and two of those mounts are shared by BOTH deployments.
+# cannot write is not a file it can lie with.
+#
+# agent-config.yaml checks TWO of those four — the skills directory and
+# discord-cli — and names gws-cli and the service-account key as known gaps in
+# the comment above its own list. It checks any of them because what it is
+# protecting there is a credential rather than a claim, and two of the four are
+# shared by BOTH deployments, so a file placed in one would hand this
+# deployment's Discord token to the other's agent.
 instances:
   - name: clawcius
     container: clawcius-agent

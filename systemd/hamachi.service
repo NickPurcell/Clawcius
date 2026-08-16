@@ -46,9 +46,15 @@ Restart=always
 RestartSec=5
 WatchdogSec=90
 
-# Creates and chowns /var/lib/hamachi. Separate from the main instance's
-# state directory: this holds its own SQLite database, its own per-channel
-# workspaces and its own wake spool.
+# Creates and chowns /var/lib/hamachi. Separate from the main instance's state
+# directory: this holds its own SQLite database — registry, mail and armed
+# conditions — its own per-channel workspaces, and its own agent-home.
+#
+# It held a wake spool at run/wake too, which is what this comment said until
+# 2026-08-16. The agent asked to be woken by dropping a JSON file there; it now
+# calls `remindMe`, a tool the waker builds per session. The directory is left
+# on disk and is inert, and `<stateDir>/run` is still the one part of this tree
+# bind-mounted read-write into the container.
 StateDirectory=hamachi
 StateDirectoryMode=0750
 

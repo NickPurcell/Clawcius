@@ -107,6 +107,7 @@ import {
 import { ensureDirOwnedBy } from './dirs.js';
 import {
   drainUnitRequests,
+  REQUEST_TEMP_SUFFIX,
   unitRequestDir,
   unitResultDir,
   unitStagingDir,
@@ -936,8 +937,10 @@ export class Executor {
     );
     lines.push(
       `  2. file the request:  printf '%s' '{"op":"install","unit":"<name>.service"}' > ` +
-        `${join(requests, '$(date +%s).json.tmp')} && mv that file to the same name without ` +
-        '.tmp;',
+        `${join(requests, `$(date +%s)${REQUEST_TEMP_SUFFIX}`)} && mv that file to the same ` +
+        `name without the ${REQUEST_TEMP_SUFFIX.replace('.json', '')}. Write to that exact ` +
+        'suffix and rename: it is the one the desk knows to leave alone while you are still ' +
+        'writing, and anything else can be swept away mid-write;',
     );
     lines.push(
       `  3. within a couple of seconds, read the answer at ${join(results, '<same name>.json')}: ` +
@@ -1006,6 +1009,32 @@ export type HealthSample = {
  * Exported and pure so the self-test can drive it directly, without docker,
  * without systemd, and without a task.
  */
+export function compareHealth(before: HealthSample, after: HealthSample): string[] {
+  const regressions: string[] = [];
+
+  for (const [unit, was] of Object.entries(before.units)) {
+    const now = after.units[unit] ?? 'unknown';
+    if (was === 'active' && now !== 'active') {
+      regressions.push(`${unit} was active and is now "${now}"`);
+    }
+  }
+  for (const [container, was] of Object.entries(before.containers)) {
+    const now = after.containers[container] ?? 'absent';
+    if (was === 'running' && now !== 'running') {
+      regressions.push(`container ${container} was running and is now "${now}"`);
+    }
+  }
+  return regressions;
+}
+
+// ── Module-level helpers, below the exports they serve ──────────────────
+//
+// Ordering, not taste. Three times now a helper has been inserted directly
+// above the function whose doc block it happened to land after, orphaning
+// that block: the reader gets one function carrying two headers and another
+// carrying none, and nothing in the tooling notices. Anything new and
+// unexported goes here, after everything it is called from.
+
 /**
  * An epoch millisecond as a timestamp, or a phrase, but never a throw.
  *
@@ -1030,23 +1059,5 @@ function describeInstant(at: unknown): string {
   } catch {
     return 'at an unreadable time';
   }
-}
-
-export function compareHealth(before: HealthSample, after: HealthSample): string[] {
-  const regressions: string[] = [];
-
-  for (const [unit, was] of Object.entries(before.units)) {
-    const now = after.units[unit] ?? 'unknown';
-    if (was === 'active' && now !== 'active') {
-      regressions.push(`${unit} was active and is now "${now}"`);
-    }
-  }
-  for (const [container, was] of Object.entries(before.containers)) {
-    const now = after.containers[container] ?? 'absent';
-    if (was === 'running' && now !== 'running') {
-      regressions.push(`container ${container} was running and is now "${now}"`);
-    }
-  }
-  return regressions;
 }
 

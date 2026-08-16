@@ -594,23 +594,54 @@ function isInside(child: string, parent: string): boolean {
  * Host paths that `docker/run-container.sh` bind-mounts into the agent
  * container, as far as this file can know them.
  *
- * NOT exhaustive, and the gap is worth naming rather than discovering: the
- * script also mounts `<stateDir>/agent-home`, `gws-cli` and the Google
- * service-account key, none of which appear in this config at all. So this
- * catches the plausible mistakes it can name, and the defence that does not
- * depend on enumeration is the default value — every path this file defaults to
- * is a sibling of the mounts rather than a child.
+ * ── The three read-write ones, all of them covered ───────────────────────
  *
- * `<stateDir>/run` is the READ-WRITE one, and therefore the only one where a
- * file the executor trusts would be writable by the agent rather than merely
- * shared with the other deployment. It used to be reached as
- * `dirname(wake.spoolDir)`; the spool is gone and `container.stateDir` names it
- * directly. See Clawcius #55 for what the old derivation let through.
+ * `docker/run-container.sh` mounts three directories read-write, and all three
+ * are derived from one variable:
+ *
+ *     -v "$CLAWCIUS_STATE/workspaces:…:rw"
+ *     -v "$CLAWCIUS_STATE/run:…:rw"
+ *     -v "$CLAWCIUS_STATE/agent-home:…:rw"
+ *
+ * Those are the ones that matter most here, because a file inside one is
+ * WRITABLE by the agent rather than merely shared with the other deployment —
+ * and `status.file` is a file a root process believes. `run` used to be reached
+ * as `dirname(wake.spoolDir)`, which was right by accident and wrong by one
+ * level (Clawcius #55); `container.stateDir` names it directly now, and the
+ * other two come off the same key.
+ *
+ * `agent-home` was missing from this list until 2026-08-16 and was named in
+ * this comment as a known gap instead. That left `ops/src/config.ts` checking
+ * three mounts while this file checked two and said so — two halves of one
+ * change disagreeing about the completeness of one enumeration, which is the
+ * same defect in the opposite direction from the one review had just found.
+ * Deriving it was three characters; documenting the disagreement would have
+ * been cheaper and worse.
+ *
+ * ── Still NOT exhaustive, and this is the honest remainder ───────────────
+ *
+ * Two read-only mounts do not appear in this config at all: `gws-cli` and the
+ * Google service-account key. They are read-only, so nothing in a container can
+ * write them — the risk there is not a forged claim but a shared secret, since
+ * a path placed in one would be visible to BOTH deployments' agents. The
+ * defence that does not depend on enumeration is the default value: every path
+ * this file defaults to is a sibling of the mounts rather than a child.
  */
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
+  const state = config.container.stateDir;
   return [
     ['sessions.workspaceRoot', config.sessions.workspaceRoot],
-    ['<container.stateDir>/run, which is bind-mounted read-write', join(config.container.stateDir, 'run')],
+    // The three `docker run -v … :rw` paths, by the same derivation the script
+    // uses. `sessions.workspaceRoot` above is configurable and usually the same
+    // directory as the first of these; both are listed because an operator who
+    // moves one has not moved the mount.
+    ...(['run', 'workspaces', 'agent-home'] as const).map(
+      (child) =>
+        [`<container.stateDir>/${child}, bind-mounted read-write`, join(state, child)] as [
+          string,
+          string,
+        ],
+    ),
     ['paths.skillsDir', config.paths.skillsDir],
     ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
   ];

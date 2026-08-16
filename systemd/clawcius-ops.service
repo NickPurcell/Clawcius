@@ -75,8 +75,11 @@ Type=simple
 # operator's. ops/src/host-agent.ts REFUSES TO SPAWN if the environment it
 # built contains anything that looks like a credential. Adding an
 # EnvironmentFile here would be handing a shell session the ability to speak as
-# the bot, which is the one thing the report-back-through-the-spool design
-# exists to prevent.
+# the bot, which is the one thing this daemon's whole reporting design exists to
+# prevent: it says nothing to anybody, it answers the coordinator that asked by
+# DM, and the sandboxed agent — which holds the token — does the talking. (That
+# answer was a file written into the requester's wake spool until 2026-08-16.
+# The route changed; the reason this unit holds no token did not.)
 User=root
 Group=root
 

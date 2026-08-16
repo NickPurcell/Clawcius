@@ -170,6 +170,17 @@ const MAX_REQUEST_BYTES = 4096;
 const REQUEST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$/;
 
 /**
+ * The suffix the briefing tells the session to write to before renaming.
+ *
+ * EXPORTED, and the export is the point: the sweeper's exemption and the
+ * instruction in `Executor#briefing` have to be the same string, and until
+ * 2026-08-16 they were two string literals in two files that happened to agree.
+ * A session told to use one suffix while the desk exempts another races the
+ * sweep and loses, silently, about half the time under load.
+ */
+export const REQUEST_TEMP_SUFFIX = '.json.tmp';
+
+/**
  * Where the session stages unit content, asks for it to be installed, and reads
  * the answer.
  *
@@ -622,6 +633,40 @@ export function drainUnitRequests(options: UnitDeskOptions): UnitOpResult[] {
       break;
     }
     const path = join(options.requestDir, name);
+
+    // A file still being written into place is LEFT ALONE, and the exemption is
+    // exactly as wide as the procedure that creates one — no wider.
+    //
+    // The briefing tells the session to file a request the only way that is
+    // safe against a reader on a timer: write `<name>.json.tmp`, then `mv` it
+    // to `<name>.json`, so the rename publishes a file that is already
+    // complete. This loop used to `discard()` every name that failed the
+    // pattern — which includes that `.tmp` file, for the whole window between
+    // the shell opening it and the `mv`. The desk polls every second while the
+    // session runs, so a poll landing in that window deleted the half-written
+    // request, the session's `mv` then failed with no source, and the unit was
+    // never installed. Nothing was logged that named a cause: the line said
+    // "implausible unit-request file name", about a file following the
+    // documented procedure exactly.
+    //
+    // Found on 2026-08-16 behind a self-test that failed about half the time
+    // under load and had been filed as flaky (Clawcius #66). The retired ops
+    // spool had already solved this — it filtered to `.json` BEFORE applying
+    // its stricter name check — and the unit desk, written from it, kept the
+    // strict check and dropped the filter.
+    //
+    // Narrow on purpose. The first fix skipped everything not ending `.json`,
+    // which is what the spool did — and the self-test caught it, because that
+    // also stops collecting the garbage a confused session leaves behind. A
+    // name is exempt here only if it is the documented halfway state, and every
+    // other implausible name is still discarded unread below.
+    //
+    // The cost is a `.json.tmp` from a session that died mid-write, sitting
+    // there until somebody looks. There is deliberately no age check to sweep
+    // it: a timer that deletes a file it cannot know is abandoned is how this
+    // bug happened in the first place, one layer down.
+    if (name.endsWith(REQUEST_TEMP_SUFFIX)) continue;
+
     if (!REQUEST_NAME_PATTERN.test(name)) {
       options.onLog(`${name}: implausible unit-request file name, discarded unread`);
       discard(path);

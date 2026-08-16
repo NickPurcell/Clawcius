@@ -77,6 +77,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -1761,6 +1762,68 @@ test('a unit request carries a name and nothing else — no path, no mode, no ow
   ]) {
     assert.equal(parseUnitRequest(body).ok, false, body);
   }
+});
+
+test('a request being renamed into place is not eaten by a sweep that lands mid-write', () => {
+  // Clawcius #66, which was filed as a flaky test and was a real bug behind it.
+  //
+  // The briefing tells the session to write `<name>.json.tmp` and `mv` it, so
+  // that what appears under `.json` is already complete. The desk polls every
+  // second WHILE the session runs, and it used to discard every name failing
+  // its strict pattern — including that temp file. A poll landing in the window
+  // between the shell opening the file and the rename deleted it, the `mv` then
+  // failed with no source, and the unit was never installed. The log line said
+  // "implausible unit-request file name" about a file doing exactly as it was
+  // told.
+  const fixture = unitFixture('race');
+  const requests = join(fixture.staging, '..', 'requests');
+  const results = join(fixture.staging, '..', 'results');
+  mkdirSync(requests);
+  mkdirSync(results);
+  fixture.stage('clawcius-race.service');
+
+  const logs: string[] = [];
+  const drain = () =>
+    drainUnitRequests({
+      requestDir: requests,
+      resultDir: results,
+      stagingDir: fixture.staging,
+      unitDir: fixture.unitDir,
+      dryRun: false,
+      max: 8,
+      onLog: (line) => logs.push(line),
+    });
+
+  writeFileSync(
+    join(requests, 'a.json.tmp'),
+    '{"op":"install","unit":"clawcius-race.service"}',
+  );
+
+  // A sweep catching the halfway state must do nothing at all to it.
+  assert.deepEqual(drain(), [], 'a .tmp is not a request yet');
+  assert.deepEqual(
+    readdirSync(requests),
+    ['a.json.tmp'],
+    'and it is still there for the rename to land on',
+  );
+  assert.deepEqual(logs, [], 'and nothing is said about it, because nothing happened');
+
+  // The rename, and the sweep after it, behave exactly as documented.
+  renameSync(join(requests, 'a.json.tmp'), join(requests, 'a.json'));
+  const served = drain();
+  assert.equal(served.length, 1);
+  assert.equal(served[0]?.ok, true, served[0]?.detail);
+  assert.equal(existsSync(join(fixture.unitDir, 'clawcius-race.service')), true);
+
+  // Still discarded: a name ending `.json` that is otherwise implausible.
+  // Skipping the temp file must not have turned the strict check off.
+  writeFileSync(join(requests, '.hidden.json'), '{}');
+  drain();
+  assert.equal(
+    existsSync(join(requests, '.hidden.json')),
+    false,
+    'an implausible .json name is still discarded unread',
+  );
 });
 
 test('the desk serves a request, answers it, and never serves it twice', () => {
