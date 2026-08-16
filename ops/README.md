@@ -233,8 +233,15 @@ hundred events in `<stateDir>/ops-status.json`, which is the file `status/`
 reads off local disk. `ops-status.json` also carries `hostAgent` (what this
 daemon is now capable of), `auditedCommands` and `lastTask`. Two fields **were**
 removed on 2026-08-16 — `queued`, because there is no queue, and `spools`,
-because there are no spools — so a reader written against the older shape needs
-to tolerate their absence. Everything else is where it was.
+because there are no spools. Both went from the `OpsStatusSnapshot` type *and*
+from every writer of it, which is two: `Executor.snapshot()` in
+`ops/src/executor.ts`, and the oneshot behind `clawcius-snapshot-verify.timer`
+(`ops/src/verify-main.ts`), which publishes a stub snapshot of its own while it
+runs and would otherwise have kept both keys alive in the published file after
+the type stopped declaring them. Neither key is written by anything now, so a
+reader built against the older shape has to tolerate their absence rather than
+find a `queued: 0` and a `spools: []` still going out of habit. Everything else
+is where it was.
 
 ## Nothing is rolled back, and that is the whole of it
 
@@ -894,7 +901,7 @@ can do rather than a description of the polite route.
 | `docker ps` / `images` / `logs` / `stats --no-stream` / `version` / `info` | Read-only; `logs` restricted to the three agent containers | This section did not exist before — the previous grantee reached docker through group membership, so a rule "would add nothing except the false impression that docker access is being controlled here". |
 | `docker inspect --format …` | **Enumerated**: six state formats × the three agent containers, plus `{{.Id}}` for the three images | Narrowed on 2026-08-12. The previous `docker inspect *` printed `Config.Env` — the sibling agents' API keys — from an alias called READ. No `*` on these lines: a trailing one re-admits a second `--format`, and docker takes the last. |
 | `docker restart` / `stop` / `start` | `clawcius-agent`, `hamachi-agent`, `oj-agent` | "The agent container is wedged" is a real task. |
-| `mkdir -p`, `chown`, `chmod` | **Exact paths** under `/var/lib/{clawcius,hamachi,oj}/run`, including `run/ops` and `run/wake` | Repair of the spool directories, which no longer exist as a mechanism. **These lines are now dead weight** — nothing creates, chowns or reads either directory, and a task that ran one of them would be tidying an inert path. They are enumerated exact paths with no wildcard, so leaving them costs nothing but a reader's time; deleting them is a sudoers edit, which wants `visudo -c` and its own diff. |
+| `mkdir -p`, `chown`, `chmod` | **Exact paths, no wildcard**: `mkdir -p` on `/var/lib/{clawcius,hamachi,oj}` and on `/var/lib/{clawcius,hamachi,oj}/run`; `chown npurcell:npurcell` and `chmod 0770` on `/var/lib/{clawcius,hamachi,oj}/run` | A first start on a fresh instance still has to create the state directory and the `run/` inside it, because `docker/run-container.sh` bind-mounts `<stateDir>/run` read-write and it has to exist, owned by the uid the container runs as. Until 2026-08-16 this alias also named `run/ops` and `run/wake` — six lines each — and those twelve went with the spools they served. That is a narrowing, not tidying: `run/ops` and `run/wake` are *inside* the bind mount, so the container owned their parent directory and could replace either entry with a symlink before root arrived to `mkdir`/`chown` it — the CWE-59 shape this file spends pages on below. `run` itself has its parent, `/var/lib/<instance>`, outside every mount, which is the property that makes the surviving lines safe. The directories are still on disk and inert; nothing creates, chowns or reads them any more. **The operator has to reinstall this file for the removal to take effect, and run `visudo -c` on it first** — the grants on the host are whatever was last installed, not what is in the repo. |
 
 **Removed on 2026-08-12, and not replaced by a narrower rule:**
 

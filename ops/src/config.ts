@@ -600,22 +600,6 @@ function strList(raw: unknown, path: string, fallback: string[]): string[] {
 }
 
 /**
- * A list of strings where "absent" and "empty" must stay distinguishable.
- *
- * `strList` cannot express this: it folds a missing key into its fallback, so
- * `[]` and "not written down" arrive identical. It was written for
- * `mayRequest`, where absent meant "unrestricted" and empty meant "none at
- * all", and collapsing the two would have turned a config that granted
- * everything into one that granted nothing. That key is retired; the helper is
- * kept because the distinction is a property of YAML rather than of any one
- * setting, and the next optional list will want it.
- */
-function strListOrNull(raw: unknown, path: string): string[] | null {
-  if (raw === undefined || raw === null) return null;
-  return strList(raw, path, []);
-}
-
-/**
  * An absolute path from config, resolved once.
  *
  * Relative paths are rejected rather than resolved against cwd. This process
@@ -859,6 +843,24 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     'mayRequest',
   ] as const;
 
+  /**
+   * The caps that bounded a directory an agent could write.
+   *
+   * These are the ones it would be easiest to drop in silence, and the ones
+   * where silence costs most: `maxPerHour: 20` read as "this host is rate
+   * limited", and nothing replaces it — `runMailTask` says so itself, that it
+   * is not a rate limit and nothing is counted or delayed. A person whose file
+   * still carries that line believes in a control that does not exist, which is
+   * exactly the case the rest of this block was written for.
+   */
+  const RETIRED_LIMITS = [
+    'maxRequestBytes',
+    'maxPerSweep',
+    'maxSpoolFiles',
+    'maxPerHour',
+    'maxQueued',
+  ] as const;
+
   const deprecations: string[] = [];
 
   for (const key of RETIRED_TOP_LEVEL) {
@@ -868,6 +870,26 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         'named was removed on 2026-08-16, along with the wake spool the executor answered ' +
         'into. A task now arrives as a DM to <crew>-host from that crew\'s coordinator and ' +
         'the answer is a DM back. Nothing has been deleted from disk; delete the key.',
+    );
+  }
+
+  for (const key of RETIRED_LIMITS) {
+    if (limits[key] === undefined || limits[key] === null) continue;
+    deprecations.push(
+      `limits.${key} is RETIRED and is being IGNORED. ` +
+        (key === 'maxPerHour'
+          ? 'It capped accepted operations per rolling hour across every verb and instance. ' +
+            'NOTHING REPLACES IT: a task by DM is refused while another is running and is ' +
+            'not counted or delayed otherwise, so this host is not rate limited. If that ' +
+            'matters, it is a change to make deliberately rather than a key to leave lying ' +
+            'here reading like one.'
+          : key === 'maxQueued'
+            ? 'It bounded the queue, and there is no queue — a second task is refused in the ' +
+              'turn that asked rather than made to wait.'
+            : 'It bounded the ops spool, which was removed on 2026-08-16 along with the ' +
+              'wake spool. There is no file to size-cap, sweep or flood.') +
+        ' Delete the key; the only limits left are commandTimeoutSeconds and ' +
+        'buildTimeoutSeconds.',
     );
   }
 
@@ -1053,32 +1075,46 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
 
   // ── Containment: nothing privileged inside a container's bind mount ─────
   //
-  // `docker/run-container.sh` gives each container exactly one read-write
-  // mount of the host filesystem:
+  // `docker/run-container.sh` gives each container THREE read-write mounts of
+  // the host filesystem, all three derived from that instance's state
+  // directory:
   //
   //     CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
-  //     -v "$CLAWCIUS_STATE/run:$CLAWCIUS_STATE/run:rw"
+  //     -v "$CLAWCIUS_STATE/workspaces:…:rw"     the agent's worktrees
+  //     -v "$CLAWCIUS_STATE/run:…:rw"            what the spools lived in
+  //     -v "$CLAWCIUS_STATE/agent-home:…:rw"     its Claude config and login
   //
-  // So `<stateDir>/run` is the whole of what an agent can write on this host,
-  // and every check below is the same question asked of a different file: is
-  // this thing, which a root process trusts, somewhere the least trusted
-  // process on the machine can rewrite?
+  // Every check below is the same question asked of a different file: is this
+  // thing, which a root process trusts, somewhere the least trusted process on
+  // the machine can rewrite?
   //
   // Until 2026-08-16 these were written against `opsSpoolDir` and
-  // `wakeSpoolDir` — two directories INSIDE that mount — which meant a path
-  // that was agent-writable but not in either of them passed. Both keys went
-  // with the spools, and checking the mount instead is both simpler and
-  // strictly wider. It is derived rather than configured because the script
-  // derives it too, and a second setting to keep in step is a setting that
-  // eventually is not.
+  // `wakeSpoolDir` — two directories inside ONE of those three — so a path that
+  // was agent-writable but not in either of them passed. Both keys went with
+  // the spools. Naming all three mounts instead is simpler and strictly wider:
+  // a `board.db` under `workspaces/` used to pass, and that file holds the role
+  // column `roleOf()` reads, which is the only access control left on running
+  // commands on this host.
+  //
+  // They are DERIVED rather than configured because the script derives them the
+  // same way, from one variable, and a second setting to keep in step is a
+  // setting that eventually is not. The read-only mounts — the skills
+  // directory, discord-cli, gws-cli, the service-account key — are not here,
+  // and their omission is deliberate rather than an oversight: a file the agent
+  // cannot write is not a file it can lie with. `src/agent-config.ts` names
+  // them anyway, because the thing it is protecting there is a credential
+  // rather than a claim, and a read-only mount shared by BOTH deployments hands
+  // one instance's token to the other.
   //
   // Written as an explicit loop over pairs rather than anything clever, because
   // the reader of this function at 3am is trying to answer "can the agent reach
   // this" and every abstraction between them and the answer costs more than it
   // saves.
 
-  const mounts = instances.map(
-    (instance) => [instance.name, join(instance.stateDir, 'run')] as const,
+  const mounts = instances.flatMap((instance) =>
+    (['run', 'workspaces', 'agent-home'] as const).map(
+      (child) => [instance.name, join(instance.stateDir, child)] as const,
+    ),
   );
 
   for (const [name, mount] of mounts) {

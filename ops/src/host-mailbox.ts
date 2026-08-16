@@ -134,7 +134,14 @@ export class HostMailbox {
       this.#log(`cannot watch ${this.#dbDir}: ${String(error)} — polling only`);
     }
     this.#poller = setInterval(() => void this.drain(), this.#pollMs);
-    this.#poller.unref();
+    // NOT unref'd, since 2026-08-16. The `catch` above logs "polling only" and
+    // that sentence has to be true: `fs.watch` throws when the host runs out of
+    // inotify watches, which is an ordinary Tuesday, and an unref'd poller is
+    // one the runtime is entitled to skip a shutdown for. It is also the only
+    // thing that delivers mail on that path. `stop()` clears it.
+    //
+    // This is not what keeps the PROCESS alive — see the keepalive in index.ts,
+    // which is deliberate and does not depend on a mailbox existing at all.
     // Anything filed while this daemon was down is still a request.
     void this.drain();
     this.#log(`${this.#board.hostId} is on the board for ${this.#instance} (${this.#dbDir})`);

@@ -196,6 +196,27 @@ export class StateStore {
     this.#save();
   }
 
+  /**
+   * Empty the quarantine list, and say how many rows went.
+   *
+   * Added 2026-08-16 for one job: `Executor.reportRetiredDeadlines()`, which
+   * clears what the retired spool path left behind. Nothing quarantines any
+   * more — `quarantine()` was called only from the automatic rollback after a
+   * missed check-in, and that whole path went with the spools — so a row still
+   * in this list is one nothing will ever act on, sitting in `ops-status.json`
+   * next to a comment promising it would be empty.
+   *
+   * A separate method rather than a flag on `disarm`, because the two answer
+   * different questions and only one of them is about a deadline.
+   */
+  clearQuarantine(): number {
+    const count = this.#state.quarantined.length;
+    if (count === 0) return 0;
+    this.#state.quarantined = [];
+    this.#save();
+    return count;
+  }
+
   // ── Pending check-ins ───────────────────────────────────────────────────
 
   pendingFor(instance: string): PendingCheckin | null {

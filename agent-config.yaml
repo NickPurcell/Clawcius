@@ -103,22 +103,6 @@ prompts:
   # Placeholders: {time} {author} {authorId} {messageId} {content}
   messageLine: "[{time}] {author}: {content}"
 
-  # Wake message for a schedule the agent set for itself.
-  # Placeholders: {roleNotice} {channelId} {scheduleId} {repeats} {prompt} {cli}
-  scheduleWake: |-
-    {roleNotice}
-
-    Scheduled wake.
-
-    channel_id:  {channelId}
-    schedule_id: {scheduleId}
-    repeats:     {repeats}
-
-    Your instruction to yourself:
-    {prompt}
-
-    No message to reply to. To post:
-      {cli} send -c {channelId} -t "..."
 # The "[1m]" suffix is not decoration and not part of the model name: the SDK
 # parses it. From cli.js --
 #
@@ -567,7 +551,14 @@ armed:
 # writable by the agent. A prompt-injected agent that can publish "no turns in
 # flight" can talk a root process into destroying a live session — or into
 # believing a rollback is safe. Both loaders refuse to start if this path ends
-# up inside the spool.
+# up inside `/var/lib/clawcius/run` — the directory docker/run-container.sh
+# actually bind-mounts read-write, and the one this check has to be written
+# against. Until 2026-08-16 it was written against the wake spool instead,
+# `<stateDir>/run/wake`, one level BELOW the mount, so a status file sitting
+# directly in `run/` passed every check in both loaders while being writable by
+# the agent (Clawcius #55). The spool is gone; the waker no longer derives the
+# mount from the spool's parent but reads it from the `container.stateDir` key
+# above, which names it outright.
 status:
   file: /var/lib/clawcius/waker-status.json
   # Republished on every change as well; this is the heartbeat that lets the

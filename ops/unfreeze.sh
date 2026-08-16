@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # Clear the ops executor's freeze.
 #
-# The executor freezes after `breaker.maxConsecutiveFailedRecoveries`
-# consecutive failed recoveries — a missed check-in, or a task that had to be
-# rolled back. Something is wrong that another task cannot fix, and continuing
-# would mean reinstalling the outage on a timer.
+# NOTHING SETS THE FREEZE ANY MORE. It was set by the circuit breaker, which
+# counted consecutive failed recoveries — a missed check-in, or a task that had
+# to be rolled back — and every one of those inputs went with the spools on
+# 2026-08-16. There are no rollbacks to count and no check-in to miss, so the
+# breaker has no writer left. It is worth knowing the mechanism existed, because
+# a rollback to an older `dist/` brings it back.
+#
+# What survives is the read side: the flag is still persisted in state.json,
+# still reported at boot, and a frozen executor still refuses every task. It is
+# still cleared here and nowhere else. So a freeze anybody is looking at now
+# PREDATES the retirement — read it as history rather than as something that
+# just happened, and expect no second one. Clawcius #63 is the open issue
+# deciding what to do about a flag that can be cleared but not set.
 #
 # There is deliberately no `unfreeze` verb. Unfreezing is a decision made after
 # looking at WHY it froze, and an agent that can unfreeze the breaker holding
@@ -18,9 +27,14 @@
 # have, and every command that session runs is in the audit log. That is the
 # whole of the protection now — a speed bump and a record, not a lock.
 #
-# The quarantine list is NOT cleared. A build that failed to come back does not
-# become trustworthy because someone unfroze the executor — commit a fix, and
-# the new sha goes through on its own.
+# This script does not clear the quarantine list, and since 2026-08-16 it does
+# not need to: nothing quarantines any more. The only caller was the automatic
+# rollback after a missed check-in, which went with the spools, and the executor
+# now clears whatever the retired path left behind on its first boot
+# (`Executor.reportRetiredDeadlines`). So the list this prints below is either
+# empty or about to be. It is still printed, because a row in it is evidence
+# about what happened on this host before the retirement, and reading it is the
+# point of running this script at all.
 set -euo pipefail
 
 STATE=${OPS_STATE_DIR:-/var/lib/clawcius-ops}/state.json

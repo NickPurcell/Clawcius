@@ -69,17 +69,6 @@ export function buildWakeMessage(context: WakeContext): string {
     });
   }
 
-  if (context.kind === 'schedule') {
-    return render(prompts.scheduleWake, {
-      cli,
-      roleNotice: prompts.roleNotice,
-      channelId: context.channelId,
-      scheduleId: context.scheduleId,
-      repeats: context.repeats ?? 'once',
-      prompt: context.prompt,
-    });
-  }
-
   const { messages } = context;
   const latest = messages[messages.length - 1];
 

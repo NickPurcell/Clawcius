@@ -292,8 +292,42 @@ process.stdout.write(
     `[ops] status   ${executor.journal.statusPath}\n`,
 );
 
+/**
+ * The reason this process stays running, stated rather than inherited.
+ *
+ * Until 2026-08-16 nothing here said it, because nothing had to: `OpsSpool`
+ * held one ref'd `fs.watch` per instance, so the executor was alive for as long
+ * as it had a spool to watch. Retiring the spools removed that handle, and the
+ * only ref'd one left was `HostMailbox`'s `fs.watch` — which is not a keepalive,
+ * it is an optimisation. Three states end with no ref'd handle at all and, with
+ * it, an immediate `EXIT=0`:
+ *
+ *   - no instance has a `board:` block, which is the shipped state of a fresh
+ *     ops-config.yaml and the documented way to run without a mailbox;
+ *   - `Board.register()` refuses because `<crew>-host` is held by something
+ *     that is not a host agent — a data condition on a live board, not a typo;
+ *   - every `watch()` throws. `HostMailbox.start()` catches that and promises
+ *     "polling only", and the poller cannot deliver on that promise if the
+ *     process has already exited.
+ *
+ * `clawcius-ops.service` is `Restart=always` with `StartLimitBurst=0`, so an
+ * immediate exit is not one loud failure — it is a five-second restart loop,
+ * which is the exact shape of #7 and the thing the retired-key handling in
+ * config.ts exists to avoid.
+ *
+ * And it would be a loop over a process that still has work to do. The comment
+ * on the mailbox loop above says a mistyped database path "must not be what
+ * takes those with it", meaning the unit desk and the status file; that
+ * sentence was false for as long as a mailbox was what held the loop open. So
+ * the keepalive is explicit, it is ref'd on purpose, and it is cleared in
+ * `shutdown()` — the daemon exits because it was asked to, and for no other
+ * reason.
+ */
+const keepalive = setInterval(() => {}, 60_000);
+
 function shutdown(signal: string): void {
   process.stdout.write(`[ops] ${signal} received, shutting down\n`);
+  clearInterval(keepalive);
   for (const mailbox of mailboxes) mailbox.stop();
   executor.stop();
   releaseLock();

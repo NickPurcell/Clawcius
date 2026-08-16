@@ -57,14 +57,19 @@ const runner = new Runner(config.dryRun, config.limits.commandTimeoutSeconds, (l
 // breaker. It only appends journal entries.
 const journal = new Journal(config.stateDir, () => ({
   current: 'snapshot-verify',
-  queued: 0,
   frozen: false,
   frozenReason: '',
   dryRun: config.dryRun,
-  // Empty rather than the real list: this process watches no spools, and a
+  // Empty rather than a real list: this process holds no executor state, and a
   // status file claiming otherwise would be the verifier lying about the
   // daemon's state on the one page an operator reads to check it.
-  spools: [],
+  //
+  // `queued` and `spools` were written here too until 2026-08-16, and went on
+  // being written after they were removed from `OpsStatusSnapshot`, because an
+  // object literal returned from an arrow in a contextually typed argument
+  // position is not freshness-checked — so the compiler had nothing to say and
+  // this oneshot published two keys the type no longer had. Found by OJ in
+  // review of #67.
   pendingCheckins: [],
   quarantined: [],
   consecutiveFailedRecoveries: 0,

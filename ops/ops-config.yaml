@@ -545,14 +545,13 @@ deadline:
 # `frozen` flag it set is still read — a frozen executor refuses every task —
 # and still cleared by ops/unfreeze.sh, but nothing can set it. Clawcius #63.
 breaker:
-  # Consecutive missed check-ins before the executor FREEZES: it stops
-  # accepting destructive verbs entirely and says so, until a human runs
-  # ops/unfreeze.sh. The alternative is a bad build that reinstalls the outage
-  # every fifteen minutes.
+  # WAS: consecutive missed check-ins before the executor froze, refusing every
+  # destructive request until a human ran ops/unfreeze.sh. Nothing counts a
+  # failed recovery now, so nothing reaches this ceiling and nothing freezes.
   maxConsecutiveFailedRecoveries: 2
-  # Quarantined builds remembered per host, oldest evicted. Persisted, because
-  # a breaker that clears on restart is no breaker at all — and `restart` is a
-  # verb the agent can ask for.
+  # WAS: quarantined builds remembered per host, oldest evicted. Nothing
+  # quarantines, and the executor clears any row the retired path left behind on
+  # its first boot rather than publishing a list nothing enforces.
   maxQuarantined: 32
 
 # ── Snapshot restore verification ─────────────────────────────────────────

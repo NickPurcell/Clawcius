@@ -71,26 +71,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmodSync,
-  chownSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
-  renameSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { taskPrompt } from './host-agent.js';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadOpsConfig, type OpsConfig } from './config.js';
-import { sanitiseTask } from './host-agent.js';
+import { sanitiseTask, sanitiseTaskText } from './host-agent.js';
 import { Board, BoardError } from './board.js';
 import { DatabaseSync } from 'node:sqlite';
 import { readIdle } from './idle.js';
@@ -680,16 +677,6 @@ emit({
 }
 
 /** The npm invocations recorded by the stand-in, in order, decoded. */
-function npmCalls(calls: string[][]): Array<{ argv: string[]; cwd: string; home: string }> {
-  return calls
-    .filter((call) => call[0] === 'npm')
-    .map((call) => ({
-      argv: call.filter((line) => !/^(cwd|uid|home)=/.test(line)),
-      cwd: call.find((line) => line.startsWith('cwd='))?.slice(4) ?? '',
-      home: call.find((line) => line.startsWith('home='))?.slice(5) ?? '',
-    }));
-}
-
 function journalEntries(config: OpsConfig): Array<Record<string, unknown>> {
   const path = join(config.stateDir, 'journal.jsonl');
   if (!existsSync(path)) return [];
@@ -697,16 +684,6 @@ function journalEntries(config: OpsConfig): Array<Record<string, unknown>> {
     .split('\n')
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
-}
-
-async function settle(executor: Executor, timeoutMs = 20_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const snapshot = executor.snapshot();
-    if (snapshot.current === 'idle') return;
-    if (Date.now() > deadline) throw new Error(`executor still busy: ${snapshot.current}`);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -740,6 +717,23 @@ test('a task is capped and stripped of control characters, and says nothing more
 
   const long = sanitiseTask('x'.repeat(9000));
   assert.equal(long.length, 8000, 'capped, and the cap is one number in one place');
+});
+
+test('truncation is reported only when the CAP fired, not whenever a byte was dropped', () => {
+  // The reply tells the sender "your message was longer than a task may be and
+  // was cut off at 8000 characters", and that sentence has to be true. The
+  // obvious test — result shorter than input — is not: stripping one leading
+  // control byte turns it into a space, trim() removes the space, and a
+  // seventeen-character task was answered with a warning about an 8000-character
+  // cap it never came near. Found by OJ in review of #67.
+  assert.deepEqual(sanitiseTaskText('\u0007restart the waker'), {
+    text: 'restart the waker',
+    truncated: false,
+  });
+  assert.equal(sanitiseTaskText('  padded  ').truncated, false);
+  assert.equal(sanitiseTaskText('x'.repeat(8000)).truncated, false, 'exactly the cap is not over it');
+  assert.equal(sanitiseTaskText('x'.repeat(8001)).truncated, true);
+  assert.equal(sanitiseTaskText('x'.repeat(8001)).text.length, 8000);
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1033,12 +1027,29 @@ test('a config still carrying the retired spool keys boots, and is told they are
     '    wakeChannelId: "123456789012345678"',
     '    mayRequest:',
     '      instances: [clawcius]',
+    'limits:',
+    '  maxRequestBytes: 16384',
+    '  maxPerSweep: 8',
+    '  maxSpoolFiles: 64',
+    '  maxPerHour: 20',
+    '  maxQueued: 8',
   ]);
 
   const config = loadOpsConfig(path);
   const said = config.deprecations.join('\n');
 
-  for (const key of ['spoolDir', 'opsSpoolDir', 'wakeSpoolDir', 'wakeChannelId', 'mayRequest']) {
+  for (const key of [
+    'spoolDir',
+    'opsSpoolDir',
+    'wakeSpoolDir',
+    'wakeChannelId',
+    'mayRequest',
+    'maxRequestBytes',
+    'maxPerSweep',
+    'maxSpoolFiles',
+    'maxPerHour',
+    'maxQueued',
+  ]) {
     assert.match(said, new RegExp(`${key}[^\\n]*(RETIRED|IGNORED)`), `${key} is named`);
   }
   // The one that would leave somebody believing they are protected gets the
@@ -1047,6 +1058,76 @@ test('a config still carrying the retired spool keys boots, and is told they are
   assert.match(said, /host-mailbox\.ts/);
   // And nothing was deleted from anybody's disk on the strength of a config key.
   assert.match(said, /Nothing has been deleted from disk/);
+
+  // maxPerHour is the one where silence costs most: it read as "this host is
+  // rate limited" and nothing replaces it. The notice has to say that outright
+  // rather than just naming the key.
+  assert.match(said, /NOTHING REPLACES IT/);
+  assert.match(said, /this host is not rate limited/);
+
+  // Ignored means ignored: the surviving limits are the two timeouts.
+  assert.deepEqual(Object.keys(config.limits).sort(), [
+    'buildTimeoutSeconds',
+    'commandTimeoutSeconds',
+  ]);
+});
+
+test("a board or a status file inside ANY of the container's three mounts is refused", () => {
+  // Found by OJ in review of #67. The rewritten guard checked
+  // `<stateDir>/run` — the directory the spools lived in — while its own new
+  // comment claimed that was the whole of what a container can write.
+  // `run-container.sh` mounts three, all derived from the same variable:
+  //
+  //     -v "$CLAWCIUS_STATE/workspaces:…:rw"
+  //     -v "$CLAWCIUS_STATE/run:…:rw"
+  //     -v "$CLAWCIUS_STATE/agent-home:…:rw"
+  //
+  // board.db is the one that matters. It holds the role column `roleOf()` reads,
+  // which is the only access control left on running commands on this host, and
+  // under `workspaces/` it was accepted.
+  const at = (path: string, extra: string[] = []): string =>
+    writeConfig([
+      'stateDir: /var/lib/ops-state',
+      'instances:',
+      '  - name: clawcius',
+      '    container: clawcius-agent',
+      '    image: clawcius-agent:latest',
+      '    stateDir: /var/lib/x',
+      '    envFile: /var/lib/x/env',
+      `    wakerStatusFile: ${path}`,
+      ...extra,
+    ]);
+
+  for (const child of ['run', 'workspaces', 'agent-home']) {
+    assert.throws(
+      () => loadOpsConfig(at(`/var/lib/x/${child}/waker-status.json`)),
+      new RegExp(`wakerStatusFile .* is inside /var/lib/x/${child}`),
+      `a status file under ${child}/ must be refused`,
+    );
+    assert.throws(
+      () =>
+        loadOpsConfig(
+          at('/var/lib/x/waker-status.json', [
+            '    board:',
+            `      db: /var/lib/x/${child}/clawcius.db`,
+            '      crew: clawcius',
+          ]),
+        ),
+      new RegExp(`board\\.db .* is inside /var/lib/x/${child}`),
+      `a board under ${child}/ must be refused`,
+    );
+  }
+
+  // And the sibling that is outside all three still loads, so this is wider
+  // rather than merely stricter.
+  const ok = loadOpsConfig(
+    at('/var/lib/x/waker-status.json', [
+      '    board:',
+      '      db: /var/lib/x/clawcius.db',
+      '      crew: clawcius',
+    ]),
+  );
+  assert.equal(ok.instances[0]?.wakerStatusFile, '/var/lib/x/waker-status.json');
 });
 
 test('a near-miss prefix is not treated as containment', () => {
@@ -1253,6 +1334,26 @@ test('a deadline armed by the retired spool path is reported and cleared, not le
     armedAt: Date.now() - 1000,
   });
 
+  // A quarantined build, written by the same event. Nothing consults the list
+  // and nothing can add to it, so a row here is a control that is published and
+  // enforced by nobody.
+  before.quarantine('clawcius', 'sha1', 'missed its check-in deadline');
+
+  // And a pending row with no `armedAt`, which is the shape that took the
+  // daemon down at boot: StateStore admits a row on `instance` and `deadlineAt`
+  // alone, and `new Date(undefined).toISOString()` throws. index.ts calls this
+  // before the mailboxes start, so the throw was a restart loop the daemon
+  // could not report from. Found by OJ in review of #67.
+  before.arm({
+    instance: 'hamachi',
+    deadlineAt: Date.now() + 60_000,
+    reason: '',
+    build: '',
+    rollbackTag: '',
+    fromRollback: false,
+    armedAt: undefined as unknown as number,
+  });
+
   const executor = new Executor(host.config);
   executor.reportRetiredDeadlines();
 
@@ -1261,14 +1362,32 @@ test('a deadline armed by the retired spool path is reported and cleared, not le
     null,
     'cleared, so it is not republished on every boot forever',
   );
+  assert.equal(new StateStore(host.config.stateDir, 8).pendingFor('hamachi'), null);
   assert.deepEqual(executor.snapshot().pendingCheckins, []);
+
+  // The quarantine list goes with them. The comment on OpsStatusSnapshot
+  // promises this and the method used to touch only `pending`.
+  assert.deepEqual(executor.snapshot().quarantined, []);
+  assert.deepEqual(new StateStore(host.config.stateDir, 8).state.quarantined, []);
+  const breaker = journalEntries(host.config).filter((entry) => entry['kind'] === 'breaker');
+  assert.equal(breaker.length, 1, 'and it is said out loud, not just done');
+  assert.match(String(breaker[0]?.['detail'] ?? ''), /cleared rather than left being published/);
+
+  // The row with no armedAt was reported rather than throwing, and it says so
+  // in words rather than printing an invalid date.
+  const forHamachi = journalEntries(host.config).find(
+    (entry) => entry['kind'] === 'deadline-missed' && entry['instance'] === 'hamachi',
+  );
+  assert.ok(forHamachi, 'the malformed row is reported, not skipped and not fatal');
+  assert.match(String(forHamachi?.['detail'] ?? ''), /at an unrecorded time/);
+  assert.doesNotMatch(String(forHamachi?.['detail'] ?? ''), /Invalid|NaN/);
 
   // Cleared LOUDLY. If that instance really is broken it is now a person's
   // problem, and the journal is where they find out it became one.
   const missed = journalEntries(host.config).filter(
     (entry) => entry['kind'] === 'deadline-missed',
   );
-  assert.equal(missed.length, 1);
+  assert.equal(missed.length, 2);
   assert.match(String(missed[0]?.['detail'] ?? ''), /That path has been retired/);
   assert.match(String(missed[0]?.['detail'] ?? ''), /a redeploy filed through the ops spool/);
 
@@ -1277,7 +1396,12 @@ test('a deadline armed by the retired spool path is reported and cleared, not le
   second.reportRetiredDeadlines();
   assert.equal(
     journalEntries(host.config).filter((entry) => entry['kind'] === 'deadline-missed').length,
+    2,
+  );
+  assert.equal(
+    journalEntries(host.config).filter((entry) => entry['kind'] === 'breaker').length,
     1,
+    'the quarantine notice does not repeat either',
   );
   executor.stop();
   second.stop();
@@ -2682,15 +2806,4 @@ test('a verify dry run says plainly that it proves nothing', async () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 /** A host with both agents, as the real one has had since 2026-08-08. */
-function twoInstances(suffix: string, extra?: Record<string, string[]>) {
-  return makeHost({
-    dryRun: true,
-    suffix,
-    instances: [
-      { name: 'clawcius', extra: extra?.['clawcius'] },
-      { name: 'hamachi', extra: extra?.['hamachi'] },
-    ],
-  });
-}
-
 // ── Containment, across every instance's bind mount ───────────────────────

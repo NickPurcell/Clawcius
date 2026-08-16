@@ -32,15 +32,17 @@ import { tmpdir } from 'node:os';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
 
-/** A config with just enough in it to load, plus whatever is under test. */
-function writeConfig(lines) {
+/** Exactly the lines given, for tests about the container block itself. */
+function writeConfigRaw(lines) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-'));
   const path = join(dir, 'agent-config.yaml');
-  writeFileSync(
-    path,
-    ['container:', '  stateDir: /var/lib/x', ...lines, ''].join('\n'),
-  );
+  writeFileSync(path, [...lines, ''].join('\n'));
   return path;
+}
+
+/** A config with just enough in it to load, plus whatever is under test. */
+function writeConfig(lines) {
+  return writeConfigRaw(['container:', '  stateDir: /var/lib/x', ...lines]);
 }
 
 test('a status file inside the container mount is refused, not just one inside a spool', () => {
@@ -85,6 +87,50 @@ test('the default layout loads: every trusted path is a sibling of the mount', (
   );
   assert.equal(config.container.stateDir, '/var/lib/x');
   assert.equal(config.status.file, '/var/lib/x/waker-status.json');
+});
+
+test('container.stateDir is required, absolute, and has no default', () => {
+  // The three values OJ put through the loader in review of #67. Each one makes
+  // the #55 fix pass a status.file that is inside a real bind mount, so each one
+  // silently undoes the thing this key was added to do.
+
+  // Relative: resolves against the WAKER'S cwd, so isInside() compares against a
+  // directory that does not exist and everything passes.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfigRaw(['container:', '  stateDir: var/lib/x', '  execEnvDir: /var/lib/x-env']),
+      ),
+    /container\.stateDir .* must be an absolute path/,
+  );
+
+  // Empty: same, and it is what a half-finished edit leaves behind.
+  assert.throws(
+    () =>
+      loadAgentConfig(writeConfigRaw(['container:', '  stateDir: ""', '  execEnvDir: /x-env'])),
+    /container\.stateDir is required/,
+  );
+
+  // Absent: the one that would actually happen. The key is new; a default would
+  // be /var/lib/clawcius, so an agent-config.hamachi.yaml that simply lacks it
+  // would point Hamachi's containment check at CLAWCIUS's mount and wave
+  // Hamachi's own run/ straight through.
+  assert.throws(
+    () => loadAgentConfig(writeConfigRaw(['container:', '  execEnvDir: /var/lib/x-env'])),
+    /container\.stateDir is required and has no default/,
+  );
+});
+
+test('both shipped agent configs set container.stateDir, and set it to their own', () => {
+  // The check above only bites if somebody writes the key. This is the one that
+  // says the two files in this repository are correct, and that they differ —
+  // a copy-paste that left Hamachi pointing at /var/lib/clawcius would pass
+  // every other test in this file.
+  const clawcius = loadAgentConfig('agent-config.yaml');
+  const hamachi = loadAgentConfig('agent-config.hamachi.yaml');
+  assert.equal(clawcius.container.stateDir, '/var/lib/clawcius');
+  assert.equal(hamachi.container.stateDir, '/var/lib/hamachi');
+  assert.notEqual(clawcius.container.stateDir, hamachi.container.stateDir);
 });
 
 test('the exec env directory is refused inside the container mount too', () => {

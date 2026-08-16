@@ -24,15 +24,6 @@ export type WakeContext =
       }>;
     }
   | {
-      kind: 'schedule';
-      channelId: string;
-      scheduleId: string;
-      /** The instruction the agent left for its future self. */
-      prompt: string;
-      /** Present for repeating schedules. */
-      repeats?: string;
-    }
-  | {
       /**
        * Mail arrived for an agent that was not running a turn.
        *

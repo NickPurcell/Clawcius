@@ -87,9 +87,14 @@
  * ┌────────────────────────────────────────────────────────────────────────┐
  * │ THE HOST AGENT MUST NEVER INGEST UNTRUSTED CONTENT.                    │
  * │                                                                        │
- * │ Its inputs are task files written by the agents into their own spools, │
- * │ and nothing else. Never a PR diff. Never repository files from a branch│
- * │ under review. Never OJ's findings. Never a web page.                   │
+ * │ Its input is the body of ONE DM, sent to <crew>-host by that crew's    │
+ * │ coordinator, plus facts the executor gathered itself — and nothing     │
+ * │ else. Never a PR diff. Never repository files from a branch under      │
+ * │ review. Never OJ's findings. Never a web page.                         │
+ * │                                                                        │
+ * │ Until 2026-08-16 that input was a task file an agent wrote into a      │
+ * │ bind-mounted spool. The substrate changed; the rule did not, and the   │
+ * │ rule is the part that matters.                                         │
  * │                                                                        │
  * │ The division of labour is deliberate and it is the whole design:       │
  * │                                                                        │
@@ -106,8 +111,8 @@
  *
  * This is enforced three ways, in descending order of how much they are worth:
  *
- *   - **Structurally**: the only text that reaches the prompt is the `task`
- *     field of a spool request plus facts the executor gathered itself. There
+ *   - **Structurally**: the only text that reaches the prompt is the body of
+ *     the DM plus facts the executor gathered itself. There
  *     is no code path in ops/ that reads a diff, a PR, or a file from a branch.
  *   - **By tool policy**: WebFetch, WebSearch and the sub-agent tool are denied
  *     outright, and `Bash(gh:*)`, `Bash(curl:*)` and `Bash(wget:*)` are denied
@@ -625,11 +630,32 @@ const MAX_TASK_CHARS = 8000;
 const CONTROL_CHARS_EXCEPT_WHITESPACE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 
 export function sanitiseTask(value: string): string {
-  if (typeof value !== 'string') return '';
-  return value
-    .replace(CONTROL_CHARS_EXCEPT_WHITESPACE, ' ')
-    .slice(0, MAX_TASK_CHARS)
-    .trim();
+  return sanitiseTaskText(value).text;
+}
+
+/**
+ * The same, and whether the CAP is what shortened it.
+ *
+ * Two answers rather than one, because the caller reports truncation to the
+ * sender and the obvious way to work it out is wrong. Comparing the result's
+ * length against the input's says "truncated" whenever ANY character was
+ * removed — and stripping a leading or trailing control byte removes one, then
+ * `trim()` removes the space it became. So a seventeen-character task beginning
+ * with a stray `\u0007` was answered with "your message was longer than a task
+ * may be and was cut off at 8000 characters", which is the machine confidently
+ * describing something that did not happen. Found by OJ in review of #67; it
+ * predates the retirement and moved here with the function.
+ *
+ * The honest test is whether the slice fired, which only the function that
+ * slices can know.
+ */
+export function sanitiseTaskText(value: string): { text: string; truncated: boolean } {
+  if (typeof value !== 'string') return { text: '', truncated: false };
+  const stripped = value.replace(CONTROL_CHARS_EXCEPT_WHITESPACE, ' ');
+  return {
+    text: stripped.slice(0, MAX_TASK_CHARS).trim(),
+    truncated: stripped.length > MAX_TASK_CHARS,
+  };
 }
 
 export type HostAgentRequest = {

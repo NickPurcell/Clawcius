@@ -17,6 +17,23 @@
  * the reason this one now sits in a file of its own rather than being read as
  * the relaxed version of a rule that no longer exists.
  *
+ * ── And "nothing owns these paths" is not quite true. Clawcius #68 ───────
+ *
+ * The safety argument above is about CONTAINERS, and it holds: none of the four
+ * paths is inside a bind mount. The party that does own them is the host agent
+ * service account — `workDir` is that session's own working directory, it holds
+ * `Bash`, and `#hostAgentAccount()` runs these calls before every task rather
+ * than once at boot. So a session that replaces `<workDir>/units` with a symlink
+ * gets a root `chown` of whatever it points at, on the next task.
+ *
+ * That is a real primitive and it is filed as #68. It is NOT new — the function
+ * body and all four call sites are unchanged from before the spools were
+ * retired; what changed is that the file which knew how to do this safely
+ * (`ensureSpoolDir`, with `lstat` at every level and `fchown` through an
+ * `O_NOFOLLOW | O_DIRECTORY` descriptor) has been deleted, so there is no longer
+ * an example next door. Whoever fixes #68 should read it out of git history
+ * rather than reinventing it.
+ *
  * The owner is passed in rather than discovered by `stat`. That is a
  * deliberate reversal of the rule the spool followed — "the owner is
  * discovered, never configured" — and it was the point of the 2026-08-11

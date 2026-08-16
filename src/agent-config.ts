@@ -49,8 +49,6 @@ export type PromptTemplates = {
   messageWake: string;
   /** How one message inside a bundle renders. */
   messageLine: string;
-  /** Wake message for a schedule the agent set for itself. */
-  scheduleWake: string;
   /**
    * Wake message for mail that arrived while the agent was idle.
    *
@@ -69,7 +67,6 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   roleNotice: [],
   messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
-  scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
   mailWake: ['mail', 'count', 'plural'],
 };
 
@@ -97,6 +94,14 @@ export type AgentConfig = {
      * nothing is written to it — it is used to answer "is this path somewhere
      * the container can write", and getting it wrong makes that answer wrong in
      * the direction of passing.
+     *
+     * So it is REQUIRED and must be ABSOLUTE, and it has no default. All three
+     * of those are the same decision. A relative value resolves against the
+     * waker's working directory and every check downstream then compares against
+     * a directory that does not exist; a default would be `/var/lib/clawcius`,
+     * correct for one instance and quietly wrong for the other, which is the
+     * shape of the bug this key was added to fix rather than a smaller version
+     * of it. A missing key fails the boot with the key named.
      */
     stateDir: string;
     /**
@@ -349,30 +354,28 @@ To reply to the latest:
 
   messageLine: '[{time}] {author}: {content}',
 
-  scheduleWake: `{roleNotice}
-
-Scheduled wake.
-
-channel_id:  {channelId}
-schedule_id: {scheduleId}
-repeats:     {repeats}
-
-Your instruction to yourself:
-{prompt}
-
-No message to reply to. To post:
-  {cli} send -c {channelId} -t "..."`,
-
   mailWake: `checkMail →
 
 {mail}`,
 };
 
-const DEFAULTS: AgentConfig = {
+/**
+ * Every setting that has a default, and nothing that does not.
+ *
+ * `container.stateDir` is deliberately absent, and the type says so rather than
+ * a comment alone: it names a per-instance directory, so any value here would be
+ * right for one instance and silently wrong for the other — which is the bug
+ * Clawcius #55 was, one level up. Omitting it from this type is what makes
+ * "somebody must write this down" a compile-time fact instead of a convention.
+ */
+type Defaults = Omit<AgentConfig, 'container'> & {
+  container: Omit<AgentConfig['container'], 'stateDir'>;
+};
+
+const DEFAULTS: Defaults = {
   container: {
     name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
-    stateDir: '/var/lib/clawcius',
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
     execEnvDir: '/var/lib/clawcius/exec-env',
   },
@@ -441,6 +444,26 @@ function str(raw: unknown, path: string, fallback: string): string {
   if (raw === undefined || raw === null) return fallback;
   if (typeof raw !== 'string') throw new ConfigError(path, 'must be a string');
   return raw;
+}
+
+/**
+ * A path that must be written down, and must be absolute.
+ *
+ * The same shape as `requiredAbsPath` in `ops/src/config.ts`, and here for the
+ * same reason: a relative path resolves against the WAKER'S working directory,
+ * which is not a place anybody was thinking about, and `isInside()` then
+ * compares against a directory that does not exist — so every containment check
+ * downstream passes. There is no fallback argument on purpose. A default for a
+ * path that names a per-instance directory is a default that is right for
+ * exactly one instance and silently wrong for the other.
+ */
+function requiredAbsPath(raw: unknown, path: string): string {
+  if (raw === undefined || raw === null || raw === '') {
+    throw new ConfigError(path, 'is required and has no default');
+  }
+  if (typeof raw !== 'string') throw new ConfigError(path, 'must be a string');
+  if (!isAbsolute(raw)) throw new ConfigError(path, `("${raw}") must be an absolute path`);
+  return resolve(raw);
 }
 
 function bool(raw: unknown, path: string, fallback: boolean): boolean {
@@ -627,7 +650,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     container: {
       name: str(container['name'], 'container.name', DEFAULTS.container.name),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
-      stateDir: str(container['stateDir'], 'container.stateDir', DEFAULTS.container.stateDir),
+      // Required, absolute, and with no default — see `requiredAbsPath`, and
+      // Clawcius #55, which this key exists to close. A default here would be
+      // `/var/lib/clawcius`, which is right for one of the two instances and
+      // would point the other's containment check at its neighbour's mount.
+      stateDir: requiredAbsPath(container['stateDir'], 'container.stateDir'),
       execEnvDir: str(
         container['execEnvDir'],
         'container.execEnvDir',
@@ -639,7 +666,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       roleNotice: template(prompts['roleNotice'], 'roleNotice', DEFAULT_PROMPTS.roleNotice),
       messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
       messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
-      scheduleWake: template(prompts['scheduleWake'], 'scheduleWake', DEFAULT_PROMPTS.scheduleWake),
       mailWake: template(prompts['mailWake'], 'mailWake', DEFAULT_PROMPTS.mailWake),
     },
     model: str(root['model'], 'model', DEFAULTS.model),

@@ -92,6 +92,7 @@ import {
   identityOptionsFor,
   runHostAgent,
   sanitiseTask,
+  sanitiseTaskText,
   type AuditEvent,
   type HostAgentOutcome,
 } from './host-agent.js';
@@ -174,7 +175,6 @@ export class Executor {
   #lastTask: TaskSummary | null = null;
   /** Bash invocations audited since boot. A counter the status page can show. */
   #auditedCommands = 0;
-  #stopped = false;
 
   constructor(config: OpsConfig) {
     this.#config = config;
@@ -275,7 +275,6 @@ export class Executor {
    */
   reportRetiredDeadlines(): void {
     const pending = [...this.#state.state.pending];
-    if (pending.length === 0) return;
 
     for (const entry of pending) {
       this.#journal.write({
@@ -284,19 +283,43 @@ export class Executor {
         instance: entry.instance,
         ok: false,
         detail:
-          `armed at ${new Date(entry.armedAt).toISOString()} by the ops spool, for: ` +
-          `${entry.reason}. That path has been retired, so nothing will roll ` +
-          `${entry.instance} back to ${entry.rollbackTag || '(no tag recorded)'} and nothing ` +
-          'can file a check-in to close it. Cleared. If that instance is actually broken, ' +
-          'it is a person\'s decision now — the ops journal holds every command the task ran.',
+          `armed ${describeInstant(entry.armedAt)} by the ops spool, for: ` +
+          `${entry.reason || '(no reason recorded)'}. That path has been retired, so nothing ` +
+          `will roll ${entry.instance} back to ${entry.rollbackTag || '(no tag recorded)'} ` +
+          'and nothing can file a check-in to close it. Cleared. If that instance is ' +
+          'actually broken, it is a person\'s decision now — the ops journal holds every ' +
+          'command the task ran.',
       });
       this.#state.disarm(entry.instance);
     }
 
+    // Quarantines go the same way, and for the same reason. `quarantine()` was
+    // called from one place — the automatic rollback after a missed check-in —
+    // and nothing can reach it now, so a row here is a build that will be
+    // refused by nobody, published forever as though something were enforcing
+    // it. Cleared with the deadlines rather than in a second pass, because they
+    // were written by the same event.
+    const quarantined = this.#state.state.quarantined.map((entry) => entry.instance);
+    const cleared = this.#state.clearQuarantine();
+    if (cleared > 0) {
+      this.#journal.write({
+        kind: 'breaker',
+        what: 'quarantine cleared',
+        ok: true,
+        detail:
+          `${cleared} quarantined build(s) (${quarantined.join(', ')}) were recorded by the ` +
+          'retired spool path. Nothing consults the list and nothing can add to it, so it is ' +
+          'cleared rather than left being published as a control. If one of those builds is ' +
+          'genuinely bad, that is now a fact about git and a person, not about this daemon.',
+      });
+    }
+
+    if (pending.length === 0 && cleared === 0) return;
+
     process.stderr.write(
-      `[ops] ${pending.length} check-in deadline(s) were armed by the retired spool path ` +
-        `(${pending.map((entry) => entry.instance).join(', ')}). Cleared — nothing arms or ` +
-        'honours them any more. See journal.jsonl.\n',
+      `[ops] the retired spool path left ${pending.length} check-in deadline(s) and ` +
+        `${cleared} quarantined build(s) behind. Cleared — nothing arms, honours or consults ` +
+        'either any more. See journal.jsonl.\n',
     );
   }
 
@@ -403,8 +426,21 @@ export class Executor {
     // The three directories the unit desk runs on. Created and chowned here for
     // the same reason the working directory is: a session that finds them
     // missing would create them itself and the executor would then be reading
-    // and unlinking inside something whose ancestry it never established. See
-    // `ensureDirOwnedBy`, which refuses a symlink rather than repairing it.
+    // and unlinking inside something whose ancestry it never established.
+    //
+    // This used to say "see `ensureDirOwnedBy`, which refuses a symlink rather
+    // than repairing it". IT DOES NOT, and never did. The function that refused
+    // a symlink was `ensureSpoolDir` — `lstat` at every level, `fchown` through
+    // an `O_NOFOLLOW | O_DIRECTORY` descriptor compared by device and inode —
+    // and it was deleted with the spools, so the sentence no longer even has a
+    // neighbour to have been confused with. `ensureDirOwnedBy` chowns BY NAME.
+    //
+    // That matters here more than it reads: these four paths are owned by the
+    // host agent account, which holds `Bash` and whose cwd is `workDir`, and
+    // this runs before EVERY task rather than once at boot. A session that
+    // replaces one of them with a symlink gets a root chown of the target on
+    // the next one. Clawcius #68; not introduced by the spool retirement, and
+    // not fixed by it either.
     for (const dir of [
       unitStagingDir(this.#config.hostAgent.workDir),
       unitRequestDir(this.#config.hostAgent.workDir),
@@ -470,8 +506,7 @@ export class Executor {
     // is REPORTED rather than silent: a coordinator whose last two paragraphs
     // — the ones saying what not to touch — were dropped without being told
     // would be the worst version of this.
-    const sanitised = sanitiseTask(task.task);
-    const truncated = sanitised.length < task.task.trim().length;
+    const { text: sanitised, truncated } = sanitiseTaskText(task.task);
     task = { ...task, subject: sanitiseTask(task.subject).slice(0, 200), task: sanitised };
     const what = `task by mail from ${task.requester}`;
     const reply = (subject: string, body: string): { subject: string; body: string } => ({
@@ -925,7 +960,6 @@ export class Executor {
   // ── Shutdown ────────────────────────────────────────────────────────────
 
   stop(): void {
-    this.#stopped = true;
     this.#journal.write({
       kind: 'shutdown',
       what: 'clawcius-ops',
@@ -972,6 +1006,32 @@ export type HealthSample = {
  * Exported and pure so the self-test can drive it directly, without docker,
  * without systemd, and without a task.
  */
+/**
+ * An epoch millisecond as a timestamp, or a phrase, but never a throw.
+ *
+ * `new Date(undefined).toISOString()` throws `RangeError: Invalid time value`,
+ * and `StateStore` admits a pending row on `instance` and `deadlineAt` alone —
+ * `armedAt` is not validated. So a `state.json` missing that one field would
+ * take the daemon down inside `reportRetiredDeadlines()`, which `index.ts` calls
+ * at boot before the mailboxes start, on every restart, forever.
+ *
+ * "A corrupt state file refuses to start rather than starting empty" is a rule
+ * this codebase holds deliberately and tests. This is not that: the file is not
+ * corrupt, one optional field on a row that is about to be DELETED is missing,
+ * and refusing to boot over it would mean a root daemon in a restart loop it
+ * cannot report from. Found by OJ in review of #67.
+ */
+function describeInstant(at: unknown): string {
+  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) {
+    return 'at an unrecorded time';
+  }
+  try {
+    return `at ${new Date(at).toISOString()}`;
+  } catch {
+    return 'at an unreadable time';
+  }
+}
+
 export function compareHealth(before: HealthSample, after: HealthSample): string[] {
   const regressions: string[] = [];
 
