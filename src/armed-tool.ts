@@ -330,15 +330,16 @@ export function renderArmed(
         (compact.length < overflow.length
           ? `The next ${compact.length}, one line each`
           : 'One line each') +
-        ' — disarm takes the id.',
+        ', no moments — disarm takes the id.',
     );
     for (const condition of compact) {
       lines.push(`  #${condition.id}  ${summarise(condition, OVERFLOW_PREVIEW_CHARS)}`);
     }
-    if (overflow.length > compact.length) {
+    const unlisted = overflow.length - compact.length;
+    if (unlisted > 0) {
       lines.push(
-        `  (and ${overflow.length - compact.length} more, not listed at all — their ids are ` +
-          'not recoverable from this tool.)',
+        `  (and ${unlisted} more, not listed at all — ` +
+          `${unlisted === 1 ? 'its id is' : 'their ids are'} not recoverable from this tool.)`,
       );
     }
   }
