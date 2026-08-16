@@ -37,10 +37,10 @@
  * rather than derived. The process that fires a condition is not the process
  * that armed it and has no session to ask.
  *
- * ── One-shot, deliberately ──────────────────────────────────────────────────
+ * ── A reminder is one-shot, and a schedule is the other thing ───────────────
  *
- * A reminder fires once and disarms. There is no `every` argument and no cron
- * expression. Two reasons, and the second is the real one:
+ * `remindMe` fires once and disarms. It has no `every` argument and no cron
+ * expression, and it never will:
  *
  *   - the agent receiving a reminder is, by definition, running, and it holds
  *     `remindMe`. "Remind me again tomorrow" is a tool call it can make in the
@@ -50,10 +50,21 @@
  *     because nothing about it looks wrong. A one-shot cannot rot: it is either
  *     pending or spent.
  *
- * A PR watch is not one-shot — it is armed until the pull request merges or
- * closes, which is a condition rather than a schedule, and it disarms itself
- * when that condition is met. That asymmetry is intentional: the watch has a
- * defined end and the reminder does not.
+ * The second argument is the one a `schedule` row has to answer, because a
+ * recurring job is exactly the thing that can rot. It is a separate kind rather
+ * than a flag on a reminder — one tool with a mode is two tools an agent has to
+ * read twice to tell apart, and the one-shot is wanted unchanged. What makes
+ * the repeat auditable instead of rotting is that it is VISIBLE and it is
+ * STOPPABLE: `listFor` returns it, `listArmed` prints when it last fired and
+ * when it fires next, `disarm` withdraws it, and every mail it sends carries
+ * the id that would stop it. A repeat nobody can see is the thing that was
+ * refused; a repeat in the listing with a last-fired stamp is not that thing.
+ *
+ * A PR watch is not one-shot either — it is armed until the pull request merges
+ * or closes, which is a condition rather than a schedule, and it disarms itself
+ * when that condition is met. So the table now holds one of each: something
+ * that ends by the clock, something that ends by a stranger, and something that
+ * ends only when it is told to.
  *
  * ── Self-terminating is not the same as harmless ────────────────────────────
  *
@@ -75,7 +86,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { AgentRegistry } from './store.js';
 
 /** What kind of condition a row holds. Persisted, so these strings are schema. */
-export type ArmedKind = 'reminder' | 'pr-watch';
+export type ArmedKind = 'reminder' | 'pr-watch' | 'schedule';
 
 /** Which happenings on a pull request produce mail. Chosen per `watchPr` call. */
 export type WatchEvent = 'review' | 'comment' | 'merge';
@@ -100,6 +111,56 @@ export type PrWatchSpec = {
 };
 
 /**
+ * A recurring schedule, stored as what it means rather than as when it is next.
+ *
+ * `cron` and `timezone` together ARE the schedule; `due_at` is a cache of them
+ * recomputed after every fire. Storing the timezone in the row rather than
+ * reading a default at fire time is the difference between a schedule that
+ * still means 9am in Los Angeles next March and one that quietly means 8am —
+ * see the header of schedule.ts, which is where the whole argument lives.
+ *
+ * `everyN` and `anchorAt` are the one thing five-field cron cannot say: every
+ * other week. The anchor fixes which week, and it is kept after arming even
+ * though nothing reads it again, because it is the only record of what the
+ * phase was chosen to be. A row that says "every 2nd Monday" without saying
+ * from when cannot be checked by anybody who did not arm it.
+ */
+export type ScheduleSpec = {
+  /** The agent's own words to its future self. Same payload as a reminder. */
+  note: string;
+  cron: string;
+  timezone: string;
+  /** Fire on every Nth matching occurrence. 1 is every one. */
+  everyN: number;
+  /** Occurrence zero is the first match at or after this. */
+  anchorAt: number;
+};
+
+/**
+ * What a schedule has done, which is the half that makes it auditable.
+ *
+ * Kept in the `seen` column beside a PR watch's watermarks, because it is the
+ * same question in both cases — what does this row already know — and a second
+ * column would have been a migration for four numbers.
+ */
+export type ScheduleSeen = {
+  /** Null until it has fired once. */
+  lastFiredAt: number | null;
+  fires: number;
+  /** Occurrences that passed with nothing running, over the schedule's life. */
+  missed: number;
+  /**
+   * Whether `missed` is a total or a floor — see `SchedulePlan.skippedExact`.
+   *
+   * Once a single catch-up walk has stopped on its budget the running total can
+   * never be exact again, so this latches false and stays there. Optional
+   * because rows written before it existed have no opinion, and absent is read
+   * as exact: those rows were written under a budget nothing reached.
+   */
+  missedExact?: boolean;
+};
+
+/**
  * Watermarks, so a poll reports what is new rather than everything.
  *
  * Ids rather than timestamps: GitHub's ids are monotonic per resource and an
@@ -115,6 +176,9 @@ export type PrWatchSeen = {
   state: string;
 };
 
+export type ArmedSpec = ReminderSpec | PrWatchSpec | ScheduleSpec;
+export type ArmedSeen = PrWatchSeen | ScheduleSeen;
+
 export type ArmedCondition = {
   id: number;
   /** The agent that armed it, and the only agent it can ever mail. */
@@ -126,8 +190,8 @@ export type ArmedCondition = {
   active: boolean;
   /** When it stopped being armed — fired, ended, or was withdrawn. Null while active. */
   firedAt: number | null;
-  spec: ReminderSpec | PrWatchSpec;
-  seen: PrWatchSeen | null;
+  spec: ArmedSpec;
+  seen: ArmedSeen | null;
 };
 
 /**
@@ -164,7 +228,7 @@ const COLUMNS = 'id, owner, kind, armed_at, due_at, active, spec, seen, fired_at
  */
 function toCondition(row: Record<string, unknown>): ArmedCondition | null {
   const kind = row['kind'] as string;
-  if (kind !== 'reminder' && kind !== 'pr-watch') return null;
+  if (kind !== 'reminder' && kind !== 'pr-watch' && kind !== 'schedule') return null;
 
   let spec: unknown;
   let seen: unknown;
@@ -184,8 +248,8 @@ function toCondition(row: Record<string, unknown>): ArmedCondition | null {
     dueAt: row['due_at'] as number,
     active: (row['active'] as number) === 1,
     firedAt: (row['fired_at'] as number | null) ?? null,
-    spec: spec as ReminderSpec | PrWatchSpec,
-    seen: (seen as PrWatchSeen | null) ?? null,
+    spec: spec as ArmedSpec,
+    seen: (seen as ArmedSeen | null) ?? null,
   };
 }
 
@@ -230,8 +294,8 @@ export class ArmedStore {
     owner: string,
     kind: ArmedKind,
     dueAt: number,
-    spec: ReminderSpec | PrWatchSpec,
-    seen: PrWatchSeen | null = null,
+    spec: ArmedSpec,
+    seen: ArmedSeen | null = null,
   ): ArmedCondition {
     const armedAt = Date.now();
     const inserted = this.#db
@@ -335,6 +399,65 @@ export class ArmedStore {
     return null;
   }
 
+  /**
+   * The agent's own live schedule with exactly these terms, if it has one.
+   *
+   * The same defence as `findPrWatch`, and it matters more here. A duplicate
+   * watch doubles the mail until the pull request closes, which is days; a
+   * duplicate schedule doubles it until somebody works out that there are two
+   * rows, which is never, because a repeat arriving twice a week looks exactly
+   * like a repeat arriving twice a week. That is Clawcius #50 with no end date.
+   *
+   * The note is part of the comparison, deliberately. Two schedules on the same
+   * cron with different notes are two jobs that happen to run at the same time
+   * — "9am Monday: check the deploys" and "9am Monday: review open PRs" — and
+   * refusing the second would be refusing something correct. The same note at
+   * the same time in the same zone is not two jobs.
+   *
+   * ── The phase is compared as the NEXT FIRE, not as the anchor ──────────────
+   *
+   * Two fortnightly schedules on alternating weeks are a coherent thing to want
+   * — together they are the weekly job you get by arming the halves separately —
+   * and the first version of this refused the second of them, because it
+   * compared everything except the one field that made them different.
+   *
+   * Comparing `anchorAt` instead would have been worse, and this is the trap
+   * worth writing down: `anchor` DEFAULTS TO NOW, so two genuinely identical
+   * schedules armed a second apart carry different anchors, and a comparison
+   * that included the anchor would never match anything. It would look like a
+   * duplicate check and be a no-op.
+   *
+   * So the comparison is on the computed first fire, which is what the anchor
+   * exists to determine and is the only thing about it an agent can observe.
+   * Same terms and the same next occurrence is one schedule twice; same terms
+   * on opposite weeks is two schedules. `due_at` on a live row is always its
+   * next fire, so this stays true after either row has fired any number of
+   * times.
+   *
+   * It is exact rather than approximate, with one seam: a row that has come due
+   * and not yet been swept by the waker still holds the fire it is about to
+   * make, so an identical schedule armed inside that window — at most one tick
+   * — is not recognised. Refusing a duplicate is a courtesy, `disarm` is the
+   * remedy, and closing a fifteen-second seam is not worth reaching into the
+   * waker's business from here.
+   */
+  findSchedule(owner: string, spec: ScheduleSpec, dueAt: number): ArmedCondition | null {
+    for (const condition of this.listFor(owner)) {
+      if (condition.kind !== 'schedule') continue;
+      const existing = condition.spec as ScheduleSpec;
+      if (
+        existing.note === spec.note &&
+        existing.cron === spec.cron &&
+        existing.timezone === spec.timezone &&
+        existing.everyN === spec.everyN &&
+        condition.dueAt === dueAt
+      ) {
+        return condition;
+      }
+    }
+    return null;
+  }
+
   get(id: number): ArmedCondition | null {
     const row = this.#db
       .prepare(`SELECT ${COLUMNS} FROM armed_conditions WHERE id = ?`)
@@ -343,7 +466,7 @@ export class ArmedStore {
   }
 
   /** Push a still-armed condition's next look further out. */
-  reschedule(id: number, dueAt: number, seen: PrWatchSeen | null = null): void {
+  reschedule(id: number, dueAt: number, seen: ArmedSeen | null = null): void {
     if (seen === null) {
       this.#db.prepare('UPDATE armed_conditions SET due_at = ? WHERE id = ?').run(dueAt, id);
       return;

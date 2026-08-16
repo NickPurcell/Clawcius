@@ -281,10 +281,31 @@ absence of an argument rather than the rejection of one.
 
 Two corrections to the paragraphs above, both honest rather than tidy.
 
-**A reminder is one-shot.** No repeat, no cron expression. The turn that
-receives a reminder holds `remindMe`, so "again tomorrow" is a call it makes
-then, with the note rewritten for what it now knows — and a standing repeat
-outlives its purpose without anything ever looking wrong.
+**A reminder is one-shot, and a repeat is a different tool.** `remindMe` has no
+repeat argument and is not getting one: the turn that receives a reminder holds
+`remindMe`, so "again tomorrow" is a call it makes then, with the note rewritten
+for what it now knows.
+
+The objection to a repeat was that a standing one outlives its purpose without
+anything ever looking wrong, and that objection is not answered by wanting
+repeats — it is answered by making one impossible to lose track of. So
+`scheduleRecurring` is a third kind of armed condition: a cron expression, an
+IANA timezone stored **with** the row, and an optional "every N occurrences from
+an anchor", which is the one thing five-field cron cannot say. It appears in
+`listArmed` with when it last fired and when it fires next, `disarm` stops it,
+and every mail it sends carries the id that would. What it delivers is a note
+that wakes the agent — never an outward-facing action taken on the agent's
+behalf.
+
+The timezone is stored rather than resolved to a UTC instant because "every
+Monday at 9am" is a wall clock: an instant plus seven days is an hour wrong for
+half the year, in a direction nobody notices for a week. An occurrence inside an
+hour the clocks skip does not run, an occurrence in an hour they repeat runs
+once, and "the 31st" does not run in a 30-day month — none of the three is moved
+to a nearby time, because a schedule that silently shifts is worse than one that
+visibly does not. A firing missed while the service was down arrives **once**,
+late, saying how late and how many occurrences were skipped. See
+`src/schedule.ts`, which holds the whole argument.
 
 **A fired wake does NOT resurrect a dead agent, contradicting the bullet
 above.** A wake is delivered as mail, and `src/mail-wake.ts` already settled

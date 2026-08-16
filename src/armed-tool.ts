@@ -1,11 +1,35 @@
 /**
- * `remindMe` and `watchPr` — the two ways an agent arms a condition — with
- * `listArmed` and `disarm`, which are how it sees and withdraws one.
+ * `remindMe`, `scheduleRecurring` and `watchPr` — the three ways an agent arms
+ * a condition — with `listArmed` and `disarm`, which are how it sees and
+ * withdraws one.
  *
- * They are the same tool twice: something that will be true later, a note about
- * what to do when it is, and a row on disk so the promise outlives the process.
- * `remindMe` waits for a clock; `watchPr` waits for a stranger. Both produce
- * mail, and mail already wakes an idle agent.
+ * They are the same tool three times: something that will be true later, a note
+ * about what to do when it is, and a row on disk so the promise outlives the
+ * process. `remindMe` waits for a clock once; `scheduleRecurring` waits for it
+ * over and over; `watchPr` waits for a stranger. All three produce mail, and
+ * mail already wakes an idle agent.
+ *
+ * ── Why the repeat is a second tool and not a flag on the first ─────────────
+ *
+ * `remindMe` is unchanged and stays unchanged. It is the standard one-shot
+ * timer and it is the right answer most of the time, so it keeps its whole
+ * description to itself rather than sharing one with a mode it will never use.
+ * A single tool with `repeat: true` would have made every caller read the
+ * recurring half — the cron grammar, the timezone, the anchor — to arm a
+ * fifteen-minute reminder, and would have made "is this thing going to keep
+ * firing?" a question about an argument's value rather than about which tool
+ * was called. `listArmed` says `reminder` or `schedule`, and that is a fact
+ * about the row rather than a field inside it.
+ *
+ * ── What makes a repeat safe to have at all ─────────────────────────────────
+ *
+ * `remindMe` is one-shot on purpose: a standing repeat outlives its purpose and
+ * nothing about it ever looks wrong. That argument is not answered by wanting
+ * repeats — it is answered by making the repeat impossible to lose track of.
+ * So a schedule appears in `listArmed` with when it last fired and when it
+ * fires next, `disarm` stops it, and EVERY MAIL IT SENDS CARRIES THE ID THAT
+ * WOULD STOP IT. The moment an agent decides a repeat is spent is the moment it
+ * is reading one, not a later moment when it thinks to go looking.
  *
  * ── The owner is the closure, and there is no argument for it ───────────────
  *
@@ -107,8 +131,19 @@ import {
   type PrWatchSeen,
   type PrWatchSpec,
   type ReminderSpec,
+  type ScheduleSeen,
+  type ScheduleSpec,
   type WatchEvent,
 } from './armed.js';
+import {
+  DEFAULT_TIMEZONE,
+  epochFromWall,
+  firstFire,
+  isTimezone,
+  parseCron,
+  preview,
+  zonedStamp,
+} from './schedule.js';
 import { EXTERNAL_WARNING, REPO_NAME, type PullRequestSource } from './github.js';
 
 /** A note is prose the agent writes to itself, not a payload. */
@@ -189,6 +224,22 @@ const MAX_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 
 /** An ISO instant must carry a zone. The waker and the container do not share one. */
 const ISO_WITH_ZONE = /(Z|[+-]\d{2}:?\d{2})$/i;
+
+/** A bare calendar date, which an anchor may be because a schedule has a zone. */
+const BARE_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * The largest `everyN` a schedule may have — a typo catcher, like `MAX_AHEAD_MS`.
+ *
+ * `everyN: 100` on a weekly cron is a job that runs twice in four years, which
+ * is not a schedule anybody meant to write. What it is, almost always, is a
+ * number that belonged in a different field. Refusing is visible; arming it is
+ * a row nobody will see fire.
+ */
+const MAX_EVERY_N = 100;
+
+/** How many upcoming fires the arming receipt prints back. */
+const PREVIEW_FIRES = 3;
 
 export type ArmedToolOptions = {
   store: ArmedStore;
@@ -286,10 +337,47 @@ function summarise(condition: ArmedCondition, previewChars = NOTE_PREVIEW_CHARS)
     const on = Array.isArray(spec.on) && spec.on.length > 0 ? spec.on.join(', ') : '(unreadable)';
     return `pr-watch  ${spec.repo ?? '(unreadable)'}#${spec.pr ?? '?'}  on ${on}`;
   }
+
   const note = (condition.spec as Partial<ReminderSpec>).note;
   const text = typeof note === 'string' ? note : '(unreadable)';
-  const preview = text.length > previewChars ? `${text.slice(0, previewChars)}…` : text;
-  return `reminder  "${preview.replace(/\s+/g, ' ')}"`;
+  const shown = text.length > previewChars ? `${text.slice(0, previewChars)}…` : text;
+  const quoted = `"${shown.replace(/\s+/g, ' ')}"`;
+
+  if (condition.kind === 'schedule') {
+    const spec = condition.spec as Partial<ScheduleSpec>;
+    const every = typeof spec.everyN === 'number' && spec.everyN > 1 ? ` every ${spec.everyN}` : '';
+    return (
+      `schedule  ${quoted}  \`${spec.cron ?? '(unreadable)'}\`${every} ` +
+      `· ${spec.timezone ?? '(unreadable)'}`
+    );
+  }
+  return `reminder  ${quoted}`;
+}
+
+/**
+ * When a schedule last fired, which is half of what makes it auditable.
+ *
+ * The other half is `dueAt`, which the caller already prints. An empty answer
+ * is "not yet" rather than nothing at all: "never fired" and "fired an hour
+ * ago" are different situations for a repeat somebody is deciding whether to
+ * keep, and a blank line makes them look the same.
+ */
+function history(condition: ArmedCondition): string {
+  const seen = condition.seen as Partial<ScheduleSeen> | null;
+  const fires = typeof seen?.fires === 'number' ? seen.fires : 0;
+  const missed = typeof seen?.missed === 'number' ? seen.missed : 0;
+  if (fires === 0) return 'has not fired yet';
+  const last = typeof seen?.lastFiredAt === 'number' ? stamp(seen.lastFiredAt) : 'an unknown moment';
+  // The hedge travels with the number wherever the number goes. A count that
+  // stopped short in the waker and is reprinted here as a bare total is the
+  // same untruth twice, and this is the copy somebody reads on purpose.
+  const exact = seen?.missedExact ?? true;
+  return (
+    `last fired ${last} · ${fires} time${fires === 1 ? '' : 's'}` +
+    (missed > 0
+      ? ` · ${exact ? '' : 'at least '}${missed} occurrence(s) missed while nothing was running`
+      : '')
+  );
 }
 
 /**
@@ -320,6 +408,18 @@ export function renderArmed(
       `      ${verb} ${stamp(condition.dueAt)} (${relative(condition.dueAt - now)})` +
         ` · armed ${stamp(condition.armedAt)}`,
     );
+    // A repeat is the one kind whose past matters as much as its future: it is
+    // how an agent tells a schedule that is doing its job from one that has
+    // been firing into nothing since March.
+    if (condition.kind === 'schedule') {
+      const spec = condition.spec as Partial<ScheduleSpec>;
+      // `isTimezone` because a row's spec is only guaranteed to be an object —
+      // see `summarise`. An unreadable zone must cost this line, not the listing.
+      const zone = typeof spec.timezone === 'string' && isTimezone(spec.timezone) ? spec.timezone : '';
+      lines.push(
+        `      ${zone ? `${zonedStamp(condition.dueAt, zone)} local · ` : ''}${history(condition)}`,
+      );
+    }
   }
   const overflow = active.slice(MAX_LISTED_ACTIVE);
   if (overflow.length > 0) {
@@ -372,8 +472,13 @@ export function renderArmed(
 
 function describeListArmed(agentId: string): string {
   return [
-    'Everything you have armed with remindMe or watchPr, with the id you would pass to',
-    'disarm. No arguments.',
+    'Everything you have armed with remindMe, scheduleRecurring or watchPr, with the id you',
+    'would pass to disarm. No arguments.',
+    '',
+    'A recurring schedule is listed with when it LAST fired and when it fires NEXT. That is',
+    'the line to read when deciding whether a repeat is still earning its place: a schedule',
+    'that has fired forty times for work that finished in March looks exactly like a useful',
+    'one until you look at it.',
     '',
     `You see ${agentId}'s conditions and nobody else's — the owner comes from the session`,
     'this tool belongs to, as with every tool here, so there is no argument that names an',
@@ -421,10 +526,86 @@ function describeRemindMe(agentId: string): string {
     '               local time is refused — this tool runs on the host, not in your',
     '               container, and the two do not share a timezone.',
     '',
-    'ONE-SHOT. It fires once and disarms. There is no repeat option: the turn that receives a',
-    'reminder is a turn that holds this tool, so "again tomorrow" is a call you make then,',
-    'with the note rewritten for what you know by then. A standing repeat outlives its',
-    'purpose without anything looking wrong.',
+    'ONE-SHOT. It fires once and disarms, and this tool has no repeat argument — the turn that',
+    'receives a reminder is a turn that holds this tool, so "again tomorrow" is a call you make',
+    'then, with the note rewritten for what you know by then.',
+    '',
+    'For something that genuinely repeats on a calendar — every Monday, the 1st and the 15th,',
+    'the 25th of December — use scheduleRecurring, which is a separate tool with a cron',
+    'expression and a timezone. Reach for it when the repetition is the point, not as a way of',
+    'avoiding a second remindMe call.',
+  ].join('\n');
+}
+
+/**
+ * `scheduleRecurring`, and the two things its description has to land.
+ *
+ * The first is that cron is the grammar and there is no other one. A model that
+ * does not know that will write English into the field and read a refusal, so
+ * the examples are the operator's own cases, spelled out, in the order he asked
+ * for them.
+ *
+ * The second is that A SCHEDULE IS A NOTE, NOT AN ERRAND. Every mail it sends
+ * arrives in the agent's inbox and stops there. It posts nothing, to Discord or
+ * anywhere else, and it never will — an outward-facing action is a decision the
+ * agent makes each time it wakes, with everything it knows at that moment. A
+ * standing job that posts by itself is a thing that keeps talking after the
+ * reason for it has gone, which is precisely the failure mode a repeat is
+ * suspected of and has to be built not to have.
+ */
+function describeScheduleRecurring(agentId: string): string {
+  return [
+    'Arrange for a note to arrive as mail on a repeating schedule — every week, every other',
+    'week, on given days of the month, or on a given day of the year. The schedule is a row',
+    'on disk, so it survives a restart, a deploy and a reboot.',
+    '',
+    `It is for ${agentId} and there is no argument that names an agent, exactly as with`,
+    'remindMe. Use it to wake yourself for a repeated job, or to remind yourself to chase',
+    'something on a particular day.',
+    '',
+    '    note      what your future self should read, each time. Self-contained: it arrives',
+    '              with no conversation around it, and it will arrive again next time.',
+    '    cron      five fields, "minute hour day-of-month month day-of-week". Names work:',
+    '              MON, DEC. See the examples below.',
+    '    timezone  an IANA Area/Location, or UTC. Default America/Los_Angeles, and it is',
+    '              STORED with the schedule: 9am stays 9am across the clock changes rather',
+    '              than drifting to 8am for half the year. Abbreviations like EST are refused',
+    '              — that one is a fixed offset whose clocks never change, which is the drift',
+    '              itself wearing a plausible name.',
+    '    everyN    fire on every Nth matching occurrence instead of every one. This is how',
+    '              "every other week" is said, because five-field cron genuinely cannot say',
+    '              it. Default 1.',
+    '    anchor    when the schedule starts, and which occurrence is number zero for everyN.',
+    '              A bare date (2026-08-17) is read as midnight in the schedule\'s own',
+    '              timezone. Default: now, and it must be within a year either way.',
+    '              A FUTURE anchor delays the first fire whatever everyN is — that is how you',
+    '              say "start this daily schedule in December". A PAST anchor only chooses',
+    '              which occurrences are selected, so with everyN 1 it changes nothing.',
+    '',
+    '    every Monday at 9am            cron "0 9 * * 1"',
+    '    every other Monday at 9am      cron "0 9 * * 1", everyN 2, anchor "2026-08-17"',
+    '    the 1st and the 15th at 9am    cron "0 9 1,15 * *"',
+    '    the 25th of December           cron "0 9 25 12 *"',
+    '    every weekday at 08:30         cron "30 8 * * 1-5"',
+    '',
+    'THE RECEIPT PRINTS THE NEXT THREE FIRE TIMES. Read them. They are the only reliable way',
+    'to tell whether the expression says what you meant, and they will show you the cases',
+    'that surprise people: "the 31st" does not run in a 30-day month, and an hour that a',
+    'clock change removes does not run that day. Neither is moved to a nearby time; a',
+    'schedule that silently shifts is worse than one that visibly does not run.',
+    '',
+    'IT REPEATS UNTIL YOU STOP IT. Nothing about a schedule ends by itself. listArmed() shows',
+    'it with when it last fired and when it fires next, disarm(id) withdraws it, and the id',
+    'is in every mail it sends. If the work a schedule was for is done, disarm it in the turn',
+    'you notice — that is the whole of what keeps a repeat from outliving its purpose.',
+    '',
+    'A firing missed while the service was down happens ONCE, late, when it comes back, and',
+    'the mail says how late it is and how many occurrences were skipped — or, after an outage',
+    'too long to count through, the least it can be sure of, said as such. Never a burst.',
+    '',
+    'WHAT ARRIVES IS A NOTE, NOT AN ERRAND. It lands in your inbox and goes nowhere else —',
+    'this posts nothing to Discord or anywhere outside on its own, ever. What the note',
+    'warrants is your decision each time, with what you know then.',
   ].join('\n');
 }
 
@@ -465,7 +646,7 @@ function describeWatchPr(agentId: string, defaultRepo: string): string {
 }
 
 /**
- * The two tools, built for one session.
+ * The tools, built for one session.
  *
  * Returned as definitions rather than a server so they can join the existing
  * `clawsky` MCP server alongside `checkMail` and `sendMail` — one server, one
@@ -475,7 +656,7 @@ function describeWatchPr(agentId: string, defaultRepo: string): string {
 export function buildArmedTools(
   agentId: string,
   options: ArmedToolOptions,
-  // `any` because the two tools have different argument shapes; the SDK's own
+  // `any` because the tools have different argument shapes; the SDK's own
   // signature for a heterogeneous tool list, as in mail-tool.ts.
 ): SdkMcpToolDefinition<any>[] {
   const remindMe = tool(
@@ -544,6 +725,203 @@ export function buildArmedTools(
           `(in ${Math.round((dueAt - now) / 60_000)} minutes). It is on disk, so a restart ` +
           'does not lose it, and it fires late rather than never if the service is down when ' +
           'it comes due.',
+      );
+    },
+    { alwaysLoad: true },
+  );
+
+  const scheduleRecurring = tool(
+    'scheduleRecurring',
+    describeScheduleRecurring(agentId),
+    {
+      note: z.string().describe('What your future self should read, each time. Self-contained.'),
+      cron: z
+        .string()
+        .describe('Five fields: minute hour day-of-month month day-of-week. e.g. "0 9 * * 1".'),
+      timezone: z
+        .string()
+        .optional()
+        .describe(`An IANA zone. Default ${DEFAULT_TIMEZONE}. Stored with the schedule.`),
+      everyN: z
+        .number()
+        .optional()
+        .describe('Fire on every Nth matching occurrence. 2 is "every other". Default 1.'),
+      anchor: z
+        .string()
+        .optional()
+        .describe('Which occurrence is number zero, for everyN. A bare date, or an ISO instant.'),
+    },
+    async ({ note, cron, timezone, everyN, anchor }) => {
+      const text = typeof note === 'string' ? note.trim() : '';
+      if (!text) return refuse('Not armed — a schedule with no note is a wake with no reason.');
+      if (text.length > MAX_NOTE_CHARS) {
+        return refuse(`Not armed — the note is over ${MAX_NOTE_CHARS} characters.`);
+      }
+
+      const parsed = parseCron(typeof cron === 'string' ? cron : '');
+      if (!parsed.ok) {
+        return refuse(
+          `Not armed — that is not a cron expression: ${parsed.error}. Five fields, ` +
+            '"minute hour day-of-month month day-of-week": "0 9 * * 1" is every Monday at 9am, ' +
+            '"0 9 1,15 * *" is the 1st and the 15th, "0 9 25 12 *" is the 25th of December.',
+        );
+      }
+      const fields = parsed.fields;
+
+      const zone = typeof timezone === 'string' && timezone.trim() ? timezone.trim() : DEFAULT_TIMEZONE;
+      if (!isTimezone(zone)) {
+        return refuse(
+          `Not armed — "${zone}" is not an IANA timezone this will accept. Give an ` +
+            `Area/Location, like ${DEFAULT_TIMEZONE} or Europe/London, or exactly UTC. ` +
+            'Abbreviations are refused even where the system would take them: "EST" is a ' +
+            'FIXED offset whose clocks never change, so a 9am schedule in it silently becomes ' +
+            '8am local for eight months of the year, while "PST" happens to be an alias that ' +
+            'does change. They are not even wrong consistently.',
+        );
+      }
+
+      const step = everyN === undefined ? 1 : everyN;
+      if (typeof step !== 'number' || !Number.isSafeInteger(step) || step < 1) {
+        return refuse(`Not armed — everyN must be a whole number of 1 or more, not "${String(everyN)}".`);
+      }
+      if (step > MAX_EVERY_N) {
+        return refuse(
+          `Not armed — everyN of ${step} means one firing in ${step} occurrences, which is ` +
+            'almost always a number that belonged in another field.',
+        );
+      }
+
+      const now = Date.now();
+      let anchorAt = now;
+      if (typeof anchor === 'string' && anchor.trim() !== '') {
+        const raw = anchor.trim();
+        const date = BARE_DATE.exec(raw);
+        if (date) {
+          // A bare date is allowed here and refused by `remindMe`, and the
+          // difference is not an inconsistency: this schedule HAS a timezone,
+          // so midnight on a named day is a moment. `remindMe` has none.
+          const at = epochFromWall(Number(date[1]), Number(date[2]), Number(date[3]), 0, 0, zone);
+          if (at === null) {
+            return refuse(
+              `Not armed — midnight on ${raw} does not exist in ${zone} (the clocks go forward ` +
+                'over it). Anchor on the day before or after.',
+            );
+          }
+          anchorAt = at;
+        } else {
+          if (!ISO_WITH_ZONE.test(raw)) {
+            return refuse(
+              `Not armed — "${raw}" is neither a date (2026-08-17) nor an ISO instant with a ` +
+                'zone. A bare date-and-time is ambiguous.',
+            );
+          }
+          anchorAt = Date.parse(raw);
+          if (!Number.isFinite(anchorAt)) {
+            return refuse(`Not armed — "${raw}" is not a date or an ISO 8601 instant.`);
+          }
+        }
+
+        // The same horizon `remindMe` puts on `at`, and for the same reason,
+        // in both directions: an anchor years out is a typo far more often
+        // than an intention.
+        //
+        // It is also the cheap half of not freezing the process. `firstFire`
+        // refuses an unreasonable walk in arithmetic rather than by taking it,
+        // but the two bounds answer different questions — that one is about
+        // how much work the expression implies, this one is about whether the
+        // date is plausible at all — and `2020-01-01` should be refused for
+        // being wrong rather than for being expensive.
+        if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
+          const past = anchorAt < now;
+          return refuse(
+            `Not armed — the anchor ${new Date(anchorAt).toISOString()} is more than a year ` +
+              `${past ? 'in the past' : 'away'}, which is almost always a typo. ` +
+              (past
+                ? 'A past anchor only chooses which occurrences are selected, and every phase ' +
+                  `is reachable with an anchor inside the last ${step} occurrences — move it ` +
+                  'nearer.'
+                : 'A future anchor is when the schedule starts, so this would arm something ' +
+                  'that does nothing for over a year. Arm it nearer the time, or start it ' +
+                  'sooner.'),
+          );
+        }
+      }
+
+      const first = firstFire(fields, zone, step, anchorAt, now);
+      if (!first.ok) {
+        return refuse(
+          `Not armed — ${first.error}. Nothing was written. "${fields.text}" in ${zone}, ` +
+            `anchored ${stamp(anchorAt)}.`,
+        );
+      }
+
+      const spec: ScheduleSpec = {
+        note: text,
+        cron: fields.text,
+        timezone: zone,
+        everyN: step,
+        anchorAt,
+      };
+
+      // One duplicate check, not two. `watchPr` needs a second one immediately
+      // before its insert because three round trips to GitHub sit between its
+      // first check and its write; there is no `await` anywhere in this handler,
+      // and a single event loop cannot interleave synchronous statements. If
+      // anything asynchronous is ever added above this line, this check has to
+      // move down to sit against the `arm` call.
+      const existing = options.store.findSchedule(agentId, spec, first.at);
+      if (existing) {
+        return refuse(
+          `Not armed — you already have that exact schedule: #${existing.id}, armed ` +
+            `${stamp(existing.armedAt)}. Same note, same expression, same zone, and the same ` +
+            `next occurrence — ${zonedStamp(existing.dueAt, zone)}. A second one would mail ` +
+            'you the same note twice every time it fires, forever, and a repeat arriving twice ' +
+            `looks exactly like a repeat arriving twice. Nothing was written. disarm(${existing.id}) ` +
+            'if you want to change its terms. A different note is a different job, and so is ' +
+            'the same job on the opposite weeks — neither is refused.',
+        );
+      }
+
+      const seen: ScheduleSeen = { lastFiredAt: null, fires: 0, missed: 0 };
+      // `agentId` is the closure's. As with remindMe, this one argument is the
+      // whole of "an agent may only schedule itself".
+      const armed = options.store.arm(agentId, 'schedule', first.at, spec, seen);
+
+      const fires = preview(fields, zone, step, first.at, PREVIEW_FIRES)
+        .map((at) => `      ${zonedStamp(at, zone)}  (${stamp(at)})`)
+        .join('\n');
+
+      return ok(
+        [
+          `Armed schedule ${armed.id} for ${agentId}: \`${fields.text}\`` +
+            `${step > 1 ? `, every ${step} occurrences from ${stamp(anchorAt)}` : ''}, in ${zone}.`,
+          '',
+          `  next ${PREVIEW_FIRES} fires:`,
+          fires,
+          '',
+          // The preview is the whole verification story — see the tool
+          // description. Saying so here is what makes an agent read it rather
+          // than skim past it to the id.
+          'CHECK THOSE TIMES. They are what the expression actually means, which is not always ' +
+            'what it looks like it means. A gap where you expected a fire is a month too short ' +
+            'for the day-of-month, or an hour a clock change removes; neither is moved to a ' +
+            'nearby time.',
+          ...(fields.domRestricted && fields.dowRestricted
+            ? [
+                '',
+                'NOTE — you narrowed both day-of-month and day-of-week. In cron those are OR, not ' +
+                  'AND: this fires on days matching EITHER, which is more often than "the 1st, ' +
+                  'if it is a Monday". That is standard cron rather than a choice made here. If ' +
+                  'you wanted the intersection, the times above will show it and there is no ' +
+                  'expression for it — disarm and arm the narrower one.',
+              ]
+            : []),
+          '',
+          `It is on disk and repeats until you stop it with disarm(${armed.id}). A firing missed ` +
+            'while the service is down arrives once, late, saying how late and how many were ' +
+            'skipped. What arrives is a note in your inbox: nothing is posted anywhere on your ' +
+            'behalf.',
+        ].join('\n'),
       );
     },
     { alwaysLoad: true },
@@ -745,5 +1123,5 @@ export function buildArmedTools(
     { alwaysLoad: true },
   );
 
-  return [remindMe, watchPr, listArmed, disarm];
+  return [remindMe, scheduleRecurring, watchPr, listArmed, disarm];
 }
