@@ -762,15 +762,17 @@ Two habits that go with it:
   agent session.** Everything up to the spawn is tested against stand-ins (see
   `ops/README.md` § *What has and has not been tested*), and everything past it
   is not: no `claude` session started by the daemon, no `systemctl restart`
-  performed, no container recreated, no snapshot committed or restored, no
-  post-task wake picked up by a live waker. It ships with `dryRun: true` for
-  exactly this reason, and in that mode the session has no Bash tool at all.
+  performed, no container recreated, and no reply DM read by the coordinator
+  that asked for it. It ships with `dryRun: true` for exactly this reason, and
+  in that mode the session has no Bash tool at all.
 - **The sandbox is no longer a security boundary for `clawcius-ops`.** Since
   2026-08-10 it starts a Claude Code session on the host with a shell and
-  passwordless sudo. The controls that replace the old verb allowlist are a
-  pre-task snapshot, an automatic rollback, and a complete audit log. This is a
-  deliberate, documented trade and not an oversight; `ops/README.md` § *The
-  trust model* is the honest version.
+  passwordless sudo. What replaces the old verb allowlist is **a complete audit
+  log**, an unprivileged service account, and a narrow sudoers file — and that
+  is now the whole list. It also said "a pre-task snapshot, an automatic
+  rollback" until 2026-08-16; both belonged to the ops spool and went with it,
+  so nothing undoes a task. This is a deliberate, documented trade and not an
+  oversight; `ops/README.md` § *The trust model* is the honest version.
 - **That session no longer runs as `npurcell` — and the migration to make that
   true has never been run.** Until 2026-08-11 it ran as the checkout's owner,
   which is `npurcell`, which is in the `docker` group, which the line above
@@ -779,8 +781,10 @@ Two habits that go with it:
   system account (`clawcius-ops`) that the daemon refuses to start without, and
   **that account does not exist on this host yet**. Until
   [`MIGRATION.md`](MIGRATION.md) is executed, every ops task is refused with the
-  reason and the fix; the daemon still boots and still honours its rollback
-  deadlines.
+  reason and the fix — in a reply to the coordinator that asked. The daemon
+  still boots, still takes its mailbox on each crew's board, still serves the
+  unit desk and still publishes the status file. (It said "still honours its
+  rollback deadlines" until 2026-08-16; there are no deadlines.)
 - **`ops/clawcius-sudoers` has never been parsed by `visudo -c`.** It was
   written on a machine without sudo, and it was rewritten (larger, and against
   a different user) on 2026-08-11. Check it before installing, from a second

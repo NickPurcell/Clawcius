@@ -241,20 +241,32 @@ repos:
 # would kill someone's live turn; the agent must not be able to write it. Both
 # loaders check the containment and refuse to start.
 #
-# ── The one bind mount, and what may not be inside it ─────────────────────
-# docker/run-container.sh gives each instance exactly one read-write window
-# onto this host:
+# ── The three bind mounts, and what may not be inside them ────────────────
+# docker/run-container.sh gives each instance THREE read-write windows onto this
+# host, all three derived from one variable:
 #
 #     CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
-#     -v "$CLAWCIUS_STATE/run:$CLAWCIUS_STATE/run:rw"
+#     -v "$CLAWCIUS_STATE/workspaces:…:rw"    the agent's worktrees
+#     -v "$CLAWCIUS_STATE/run:…:rw"           what the spools lived in
+#     -v "$CLAWCIUS_STATE/agent-home:…:rw"    its Claude config and login
 #
 # systemd/hamachi-container.service sets CLAWCIUS_STATE_DIR=/var/lib/hamachi, so
-# each container can write exactly one of those and nothing else. `stateDir`
-# above, every `board.db` and every `wakerStatusFile` must live OUTSIDE all of
-# them, and the loader refuses to start if one does not — checked against every
-# instance's mount rather than only against the file's own, because two state
-# directories are siblings under /var/lib and a fat-fingered path lands in the
-# neighbour rather than nowhere.
+# each container can write its own three and nothing else. `stateDir` above,
+# every `board.db` and every `wakerStatusFile` must live OUTSIDE all six, and
+# the loader refuses to start if one does not — checked against every instance's
+# mounts rather than only against the file's own, because two state directories
+# are siblings under /var/lib and a fat-fingered path lands in the neighbour
+# rather than nowhere.
+#
+# This paragraph said "exactly one" until 2026-08-16, and so did the loader: it
+# checked `run/` alone, because that is where the two spools lived. A `board.db`
+# under `workspaces/` therefore passed — and that file holds the role column
+# that is the only access control left on running commands on this host. The
+# read-only mounts (the skills directory, discord-cli, gws-cli, the
+# service-account key) are deliberately NOT checked here: a file the agent
+# cannot write is not a file it can lie with. agent-config.yaml checks them
+# anyway, because what it is protecting there is a credential rather than a
+# claim, and two of those mounts are shared by BOTH deployments.
 instances:
   - name: clawcius
     container: clawcius-agent
@@ -465,7 +477,9 @@ hostAgent:
   # is a tree the agents get commits merged into — pointing the session there
   # would let any agent hand standing instructions to a process with sudo,
   # through a route nobody would think to audit. The loader refuses a workDir
-  # inside any spool, inside stateDir, or inside a checkout. The executor
+  # inside any instance's bind mounts, inside (or containing) stateDir, or
+  # inside a checkout — it named "any spool" until 2026-08-16, and there are no
+  # spools. The executor
   # creates it at boot and chowns it to `user:` above (it used to chown it to
   # the checkout's owner, which since 2026-08-11 is a different account).
   workDir: /var/lib/clawcius-host-agent
@@ -490,23 +504,29 @@ hostAgent:
   # refuses to spawn a session whose environment contains something looking like
   # a token. That exemption is the point: it makes "yes, I mean it" a diff
   # somebody reviewed. DISCORD_TOKEN here would still be a mistake — this
-  # session reports back through the spool and the sandboxed agent does the
-  # talking, precisely so that a session with a shell cannot speak as anybody.
+  # session answers the coordinator that asked, by DM, and the sandboxed agent
+  # does the talking, precisely so that a session with a shell cannot speak as
+  # anybody. (It reported back through the wake spool until 2026-08-16; the
+  # route changed, the reason it holds no token did not.)
   envPassthrough: []
 
-# ── Waiting for an idle turn ──────────────────────────────────────────────
-# A task may recreate a container, and every live agent session is a `docker
-# exec` into one. Doing that mid-turn kills someone's conversation.
+# ── Waiting for an idle turn — NOTHING READS ANY OF THIS ──────────────────
+# It used to work like this: a task may recreate a container, and every live
+# agent session is a `docker exec` into one, so doing that mid-turn kills
+# someone's conversation. The executor read each in-scope instance's
+# `wakerStatusFile` and waited, up to `maxWaitMinutes`, then ABANDONED the
+# operation rather than deferring it or proceeding anyway.
 #
-# Every instance IN SCOPE is waited for. A task that names an instance scopes to
-# that one; a task that names none scopes to ALL of them, because "which
-# containers might this sentence disturb" has no answer and the safe reading of
-# no answer is "all of them". Naming an instance is how an agent buys a cheap,
-# fast task.
-# NOTHING READS THIS. The only consumer was the wait for an idle turn before
-# something destructive, and that went with the ops spool on 2026-08-16. The
-# waker still publishes wakerStatusFile and the loaders still keep it out of
-# every container's mount; the verdict reaches no decision. Clawcius #64.
+# The only caller was the wait in front of something destructive, and that went
+# with the ops spool on 2026-08-16 along with the snapshot, the deadline and the
+# rollback. A task by DM has never waited. So all three settings below are read
+# by the loader, validated by the loader, and consulted by nothing.
+#
+# They are left rather than deleted because the expensive half of this mechanism
+# is the containment — keeping `wakerStatusFile` out of every container's mounts
+# so a container cannot declare itself idle — and that is still enforced. The
+# cheap half is a consumer. Clawcius #64 decides whether to add one back or to
+# take the rest out.
 idle:
   # A waker status file older than this is treated as busy. Must be comfortably
   # more than the waker's status.intervalSeconds (20) and comfortably less than

@@ -367,7 +367,10 @@ export type HostAgentConfig = {
    * directory, and the checkout is a tree the agents can get commits merged
    * into. Pointing the session at it would let any agent supply standing
    * instructions to a process with sudo, through a route nobody would think to
-   * audit. The loader refuses a workDir inside any spool or inside stateDir.
+   * audit. The loader refuses a workDir inside any instance's bind mounts,
+   * inside or containing stateDir, or inside a checkout. It said "inside any
+   * spool" until 2026-08-16, which named two directories under `run/`; there
+   * are no spools, and all three mounts are checked now.
    */
   workDir: string;
   /** Wall-clock ceiling on one task. */
