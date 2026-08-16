@@ -404,8 +404,35 @@ export class ArmedStore {
    * — "9am Monday: check the deploys" and "9am Monday: review open PRs" — and
    * refusing the second would be refusing something correct. The same note at
    * the same time in the same zone is not two jobs.
+   *
+   * ── The phase is compared as the NEXT FIRE, not as the anchor ──────────────
+   *
+   * Two fortnightly schedules on alternating weeks are a coherent thing to want
+   * — together they are the weekly job you get by arming the halves separately —
+   * and the first version of this refused the second of them, because it
+   * compared everything except the one field that made them different.
+   *
+   * Comparing `anchorAt` instead would have been worse, and this is the trap
+   * worth writing down: `anchor` DEFAULTS TO NOW, so two genuinely identical
+   * schedules armed a second apart carry different anchors, and a comparison
+   * that included the anchor would never match anything. It would look like a
+   * duplicate check and be a no-op.
+   *
+   * So the comparison is on the computed first fire, which is what the anchor
+   * exists to determine and is the only thing about it an agent can observe.
+   * Same terms and the same next occurrence is one schedule twice; same terms
+   * on opposite weeks is two schedules. `due_at` on a live row is always its
+   * next fire, so this stays true after either row has fired any number of
+   * times.
+   *
+   * It is exact rather than approximate, with one seam: a row that has come due
+   * and not yet been swept by the waker still holds the fire it is about to
+   * make, so an identical schedule armed inside that window — at most one tick
+   * — is not recognised. Refusing a duplicate is a courtesy, `disarm` is the
+   * remedy, and closing a fifteen-second seam is not worth reaching into the
+   * waker's business from here.
    */
-  findSchedule(owner: string, spec: ScheduleSpec): ArmedCondition | null {
+  findSchedule(owner: string, spec: ScheduleSpec, dueAt: number): ArmedCondition | null {
     for (const condition of this.listFor(owner)) {
       if (condition.kind !== 'schedule') continue;
       const existing = condition.spec as ScheduleSpec;
@@ -413,7 +440,8 @@ export class ArmedStore {
         existing.note === spec.note &&
         existing.cron === spec.cron &&
         existing.timezone === spec.timezone &&
-        existing.everyN === spec.everyN
+        existing.everyN === spec.everyN &&
+        condition.dueAt === dueAt
       ) {
         return condition;
       }

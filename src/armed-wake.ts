@@ -79,7 +79,7 @@ import type {
   ScheduleSeen,
   ScheduleSpec,
 } from './armed.js';
-import { parseCron, planNextFire, zonedStamp } from './schedule.js';
+import { isTimezone, parseCron, planNextFire, zonedStamp } from './schedule.js';
 import type { AgentRegistry } from './store.js';
 
 /** UTC, spelled out. Same format `renderMail` uses. */
@@ -442,35 +442,61 @@ export class ArmedWaker {
    * synchronously, which can start a turn, and a turn that called `listArmed`
    * would otherwise be reading a row that still claimed to be due in the past.
    *
-   * A row whose expression no longer parses is disarmed rather than left to
-   * throw on every tick. That can only happen to a row written by a build whose
-   * parser accepted something this one does not, which is a schema change; it
-   * is handled here because the alternative is an agent's schedule silently
-   * doing nothing while the journal fills up.
+   * ── A row this build cannot read is disarmed, not retried forever ─────────
+   *
+   * BOTH HALVES OF THE SPEC ARE CHECKED HERE, and it took a review to make that
+   * true: the expression was guarded and the timezone was not. `wallOf` calls
+   * `new Intl.DateTimeFormat({ timeZone })`, which THROWS on a zone this
+   * process cannot resolve — the per-condition catch in `tick` then logs it and
+   * leaves the row armed and due in the past, so it throws again fifteen
+   * seconds later, forever, and the owner is never told anything.
+   *
+   * `isTimezone` validates against the ICU present when the row was ARMED, and
+   * the row outlives that process. The realistic route is an ICU downgrade: a
+   * slimmer base image, or a mis-set `NODE_ICU_DATA`, gives small-icu, which
+   * knows only UTC — and then every schedule on the board spins rather than one.
+   *
+   * Worth recording how this was missed, because the shape recurs: `renderArmed`
+   * already guards exactly this case on the READ path, so the hazard had been
+   * recognised and the fire path simply did not get the same treatment. A guard
+   * on one of two paths reads as a guarded system.
    */
   #fireSchedule(condition: ArmedCondition): void {
     const spec = condition.spec as ScheduleSpec;
     const seen = condition.seen as ScheduleSeen | null;
     const now = Date.now();
 
-    const parsed = parseCron(spec.cron);
-    if (!parsed.ok) {
+    const disarmUnreadable = (reason: string): void => {
       this.#options.store.disarm(condition.id);
       this.#deliver(
         condition,
-        `Schedule ${condition.id} DISARMED — its expression is unreadable`,
+        `Schedule ${condition.id} DISARMED — this build cannot read it`,
         [
-          `The schedule you armed on ${stamp(condition.armedAt)} holds \`${spec.cron}\`, which ` +
-            `this build cannot parse: ${parsed.error}.`,
+          `The schedule you armed on ${stamp(condition.armedAt)} cannot be read by the process ` +
+            `that fires it: ${reason}.`,
           '',
           'It is disarmed rather than left in the table, because a schedule that throws on ' +
             'every tick is a schedule that will never fire and would look like one that simply ' +
-            'has nothing to say. Arm it again with an expression this build accepts.',
+            'has nothing to say — the failure would be in the journal and nowhere you can see. ' +
+            'Arm it again once the cause is fixed; nothing else about it was lost.',
           '',
           'Your note on it was:',
           '',
           spec.note,
         ].join('\n'),
+      );
+    };
+
+    const parsed = parseCron(spec.cron);
+    if (!parsed.ok) {
+      disarmUnreadable(`its expression \`${spec.cron}\` — ${parsed.error}`);
+      return;
+    }
+    if (!isTimezone(spec.timezone)) {
+      disarmUnreadable(
+        `its timezone "${spec.timezone}", which this process cannot resolve. That is a property ` +
+          'of the build rather than of the schedule — the zone was valid when the row was armed, ' +
+          'and an ICU downgrade is the usual reason it stops being',
       );
       return;
     }

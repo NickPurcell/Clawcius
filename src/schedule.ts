@@ -52,11 +52,13 @@
  *   FALL BACK — 01:30 on 1 November 2026 happens twice, at 08:30Z (PDT) and
  *   again at 09:30Z (PST). There is ONE candidate for that wall clock, so it
  *   produces one instant and fires ONCE. `epochFromWall` resolves an ambiguous
- *   wall clock to the earlier of the two, so the fire is at 08:30Z and the
- *   repeated hour is passed over — an hourly schedule runs 24 times across that
- *   25-hour day, not 25. A repeat that fires twice is worse than one that fires
- *   once at the earlier reading, because "twice" is indistinguishable from a
- *   duplicate row, which this codebase has already paid for once (Clawcius #50).
+ *   wall clock to the earlier of the two — IN EVERY ZONE, which took a second
+ *   attempt to make true; see its own comment — so the fire is at 08:30Z and
+ *   the repeated hour is passed over. An hourly schedule runs 24 times across
+ *   that 25-hour day, not 25. A repeat that fires twice is worse than one that
+ *   fires once at the earlier reading, because "twice" is indistinguishable
+ *   from a duplicate row, which this codebase has already paid for once
+ *   (Clawcius #50).
  *
  * ── Short months are skipped, for the same reason as the gap ────────────────
  *
@@ -93,15 +95,29 @@ export const DEFAULT_TIMEZONE = 'America/Los_Angeles';
 const MAX_SCAN_DAYS = 3000;
 
 /**
- * How many missed occurrences the catch-up loop will count before giving up on
- * preserving the every-N phase.
+ * How many occurrences either walk will step through before it gives up.
  *
- * A minute-by-minute schedule and a service down for two months is the only way
- * to reach this, and past that point the phase of an every-other-minute job is
- * not worth the walk. It is reported rather than silently reset — see
+ * THIS IS A BUDGET FOR THE EVENT LOOP, not a policy about schedules. Every walk
+ * here runs synchronously in the process that serves Discord, mail delivery,
+ * the waker and every agent's tools, so its length is a length of time during
+ * which nothing else in the system happens. One step costs about 0.05 ms on
+ * this host, so twenty thousand is on the order of a second — which is a long
+ * time for a restart to stall and an eternity for a tool call.
+ *
+ * It was 100,000, chosen when a step was thought to be free. OJ measured what
+ * that bought: a single `scheduleRecurring` call with a back-dated anchor
+ * froze the process for nineteen seconds. The step is ~140x cheaper now (see
+ * `nextAfter`), and the budget came down rather than up, because the right
+ * number is "how long may this block for" and that answer never depended on
+ * how fast a step is.
+ *
+ * What it costs: a minutely schedule loses its every-N phase after a fortnight
+ * of downtime, a five-minute schedule after ten weeks, an hourly one after two
+ * years. All of them still FIRE — only the phase is abandoned, and only when
+ * `everyN` is above 1, and it is reported rather than silently reset. See
  * `SchedulePlan.phaseReset`.
  */
-const MAX_CATCHUP = 100_000;
+const MAX_CATCHUP = 20_000;
 
 /** Sorted, deduplicated field values, plus whether the field was narrowed. */
 export type CronFields = {
@@ -344,20 +360,44 @@ function offsetAt(at: number, timeZone: string): number {
 
 /**
  * The instant at which a zone's clock reads exactly this — or null if it never
- * does.
+ * does. When it reads that way twice, THE EARLIER INSTANT, in every zone.
  *
- * Two passes, because the offset that applies is a function of the answer. The
- * first guess uses the offset in force at the same numbers read as UTC, which
- * is right except within a day of a transition; the second uses the offset in
- * force at the first guess, which is right. Then the result is CONVERTED BACK
- * AND CHECKED, and that check is the whole spring-forward story: 02:30 on 8
- * March in Los Angeles converts back to 01:30, the numbers disagree, and the
- * answer is null rather than a plausible instant an hour out.
+ * The offset that applies is a function of the answer, so the answer cannot be
+ * computed directly. What is done instead is to CANDIDATE-AND-CHECK: take the
+ * offsets in force around the target, subtract each from the wall numbers read
+ * as UTC, convert each result back, and keep the ones that really do read the
+ * way they were asked to. That check is the whole spring-forward story — 02:30
+ * on 8 March in Los Angeles converts back to 01:30 under every candidate
+ * offset, so nothing survives and the answer is null rather than a plausible
+ * instant an hour out.
  *
- * When a wall clock happens twice — the fall-back hour — this returns the
- * EARLIER instant, because the first pass lands on the pre-transition offset
- * and the second agrees with it. That is a decision and it is why an hourly
- * schedule fires once in the repeated hour instead of twice. See the header.
+ * ── Why three probes and an explicit minimum, rather than two passes ────────
+ *
+ * The obvious implementation guesses with the offset at the wall numbers read
+ * as UTC, then corrects with the offset at that guess. It is right about which
+ * instants EXIST, and it was wrong about which one it returned for a doubled
+ * wall clock — and wrong in a way that could not be seen from this side of the
+ * Atlantic. The first probe lands *before* the true instant for a negative
+ * offset and *after* it for a positive one, so the tie broke earlier west of
+ * UTC and later east of it. `America/Los_Angeles` fired at the first 01:30 and
+ * `Europe/London` at the second, an hour apart, while this comment claimed a
+ * single rule for both. OJ found it by sweeping 23 zones against a brute-force
+ * reference: 406 cases, all east of Greenwich. The tests could not have found
+ * it, because every fixture in them was in California.
+ *
+ * The invariant was never actually broken — one wall clock still produced one
+ * instant and one fire, everywhere — so what was wrong was the DOCUMENTED
+ * GUARANTEE rather than any schedule. That is worth fixing properly rather than
+ * by weakening the sentence to match the code: most of this file's value to
+ * whoever reads it next is that its prose can be trusted, and "the earlier one,
+ * except east of UTC, where the later one" is a rule nobody can hold in their
+ * head while reasoning about anything else.
+ *
+ * So: probe a day either side of the target as well as at it. Any transition
+ * near enough to matter lies inside that bracket, so both offsets in play are
+ * sampled and both readings of a doubled clock are produced. Take the smallest
+ * that verifies. Away from a transition all three probes agree, the set has one
+ * member, and this costs one extra `Intl` call over the two-pass version.
  */
 export function epochFromWall(
   y: number,
@@ -368,16 +408,25 @@ export function epochFromWall(
   timeZone: string,
 ): number | null {
   const asUtc = Date.UTC(y, m - 1, d, h, mi);
-  const first = offsetAt(asUtc, timeZone);
-  let at = asUtc - first;
-  const second = offsetAt(at, timeZone);
-  if (second !== first) at = asUtc - second;
 
-  const check = wallOf(at, timeZone);
-  if (check.y !== y || check.m !== m || check.d !== d || check.h !== h || check.mi !== mi) {
-    return null;
+  // A Set, because away from a transition these are the same number and the
+  // ordinary case should cost one verification rather than three.
+  const offsets = new Set([
+    offsetAt(asUtc - 86_400_000, timeZone),
+    offsetAt(asUtc, timeZone),
+    offsetAt(asUtc + 86_400_000, timeZone),
+  ]);
+
+  let earliest: number | null = null;
+  for (const offset of offsets) {
+    const at = asUtc - offset;
+    const check = wallOf(at, timeZone);
+    if (check.y !== y || check.m !== m || check.d !== d || check.h !== h || check.mi !== mi) {
+      continue;
+    }
+    if (earliest === null || at < earliest) earliest = at;
   }
-  return at;
+  return earliest;
 }
 
 /** "2026-08-17 09:00 PDT" — the only rendering in which a schedule is legible. */
@@ -437,12 +486,34 @@ function matchesDay(fields: CronFields, civil: Civil): boolean {
  * refused at arm time rather than becoming a row that waits forever.
  */
 export function nextAfter(fields: CronFields, timeZone: string, after: number): number | null {
-  let civil: Civil = wallOf(after, timeZone);
+  const start = wallOf(after, timeZone);
+  let civil: Civil = start;
 
   for (let scanned = 0; scanned <= MAX_SCAN_DAYS; scanned += 1) {
     if (matchesDay(fields, civil)) {
       for (const hour of fields.hours) {
+        // ── SEEK, DO NOT RESCAN ────────────────────────────────────────────
+        //
+        // On the first day only, skip the slots that have already gone by in
+        // local time instead of converting each one and discarding it. Both
+        // arrays are sorted, so this is a handful of integer comparisons in
+        // place of a handful of hundred `Intl` conversions.
+        //
+        // This is not a micro-optimisation. Without it a call costs O(slots
+        // elapsed in the local day), and both `advance` and `planNextFire`
+        // repeat the call once per occurrence — synchronously, on the event
+        // loop that serves Discord, mail and every other agent's tools. OJ
+        // measured the shape it produces: one `* * * * *` walk from a
+        // day-old anchor blocked the process for 18,971 ms, and an ordinary
+        // five-minute schedule with a week's outage cost ~6 seconds per row
+        // on restart. Nothing was wrong with the answers; the process simply
+        // stopped for the duration.
+        //
+        // The `at > after` test below is kept and remains the correctness
+        // gate. This only declines to convert candidates that cannot pass it.
+        if (scanned === 0 && hour < start.h) continue;
         for (const minute of fields.minutes) {
+          if (scanned === 0 && hour === start.h && minute <= start.mi) continue;
           const at = epochFromWall(civil.y, civil.m, civil.d, hour, minute, timeZone);
           // null is the spring-forward gap: that clock reading does not happen
           // today, so the occurrence does not happen today.
@@ -507,12 +578,19 @@ export function planNextFire(
 ): SchedulePlan {
   let next = advance(fields, timeZone, from, everyN);
   let skipped = 0;
+  // THE BUDGET IS IN OCCURRENCES WALKED, NOT IN OCCURRENCES SKIPPED. One
+  // skipped firing costs `everyN` steps, so counting skips would let a
+  // schedule with `everyN: 100` do a hundred times the work of one with
+  // `everyN: 1` under a bound that looks identical. Measured, that is the
+  // difference between a second and a minute and a half of stopped process.
+  let walked = 0;
 
   while (next !== null && next <= now) {
-    if (skipped >= MAX_CATCHUP) {
+    if (walked >= MAX_CATCHUP) {
       return { nextAt: nextAfter(fields, timeZone, now), skipped, phaseReset: everyN > 1 };
     }
     skipped += 1;
+    walked += everyN;
     next = advance(fields, timeZone, next, everyN);
   }
 
@@ -524,6 +602,20 @@ export type FirstFire =
   | { ok: false; error: string };
 
 /**
+ * An O(1) upper bound on how many occurrences lie between two moments.
+ *
+ * `hours × minutes` is exactly how many times the expression can match in a
+ * day; the day fields can only ever remove days, never add them. So this
+ * over-counts — `0 9 * * 1` is scored as one a day rather than one a week —
+ * and over-counting is the safe direction for something whose only job is to
+ * refuse a walk before taking it.
+ */
+function occurrenceCeiling(fields: CronFields, from: number, to: number): number {
+  const days = Math.max(0, Math.ceil((to - from) / 86_400_000)) + 1;
+  return fields.hours.length * fields.minutes.length * days;
+}
+
+/**
  * The first fire of a newly armed schedule, and where the anchor comes in.
  *
  * Occurrence zero is the first match at or after the anchor; every selected
@@ -533,9 +625,26 @@ export type FirstFire =
  * the phase lives in `due_at` always being a selected occurrence, so this walk
  * happens once, at arm time, and never again.
  *
- * An anchor far enough in the past to exceed the walk is refused HERE, in the
- * turn that asked, rather than turned into a row with a plausible-looking next
- * fire.
+ * ── Two ways of not taking a walk that would freeze the process ─────────────
+ *
+ * This runs inside a tool call, which runs on the shared event loop, so the
+ * length of the walk is a length of time during which the whole system is
+ * stopped. `anchor` is caller-supplied and a back-dated one is cheap to write
+ * and expensive to honour.
+ *
+ * FIRST: WHEN `everyN` IS 1 THERE IS NOTHING TO WALK. Every occurrence is
+ * selected, so which one is "number zero" cannot change which one comes next —
+ * the answer is just the next occurrence after now, whatever the anchor says.
+ * That is not an optimisation with a rounding error in it; it is the same
+ * value by definition, and it removes the entire pathological class, because
+ * the dense expressions people write (`* * * * *`) are exactly the ones nobody
+ * writes an `everyN` for. A future anchor still walks, and walks zero steps.
+ *
+ * SECOND: COUNT BEFORE WALKING. `occurrenceCeiling` bounds the work in
+ * arithmetic, so an anchor that would cost a minute of frozen event loop is
+ * refused in the turn that asked, immediately, with the numbers that made it
+ * unreasonable. Refusing in O(1) beats refusing in O(MAX_CATCHUP) — the old
+ * code did the latter, and OJ timed it at nineteen seconds.
  */
 export function firstFire(
   fields: CronFields,
@@ -544,6 +653,34 @@ export function firstFire(
   anchorAt: number,
   now: number,
 ): FirstFire {
+  if (everyN === 1 && anchorAt <= now) {
+    const at = nextAfter(fields, timeZone, now);
+    if (at === null) {
+      return {
+        ok: false,
+        error:
+          'that expression has no occurrence at all — check the day-of-month against the month',
+      };
+    }
+    return { ok: true, at };
+  }
+
+  if (anchorAt < now) {
+    const ceiling = occurrenceCeiling(fields, anchorAt, now);
+    if (ceiling > MAX_CATCHUP) {
+      const perDay = fields.hours.length * fields.minutes.length;
+      const days = Math.ceil((now - anchorAt) / 86_400_000);
+      return {
+        ok: false,
+        error:
+          `the anchor is too far back for this expression to count from — it matches up to ` +
+          `${perDay} time(s) a day and the anchor is ${days} day(s) ago, which is up to ` +
+          `${ceiling} occurrences to step through before reaching today. Move the anchor ` +
+          `forward; any anchor picks the same phase as one ${everyN} occurrences later`,
+      };
+    }
+  }
+
   // `anchorAt - 1` so an anchor that lands exactly on an occurrence selects
   // that occurrence as number zero rather than the one after it.
   let at = nextAfter(fields, timeZone, anchorAt - 1);
@@ -554,8 +691,11 @@ export function firstFire(
     };
   }
 
-  for (let steps = 0; at !== null && at <= now; steps += 1) {
-    if (steps >= MAX_CATCHUP) {
+  // Occurrences walked, not selections made — see the note in `planNextFire`.
+  // The ceiling above should already have refused anything that reaches this,
+  // which is why it is a backstop rather than the bound anybody reads about.
+  for (let walked = 0; at !== null && at <= now; walked += everyN) {
+    if (walked >= MAX_CATCHUP) {
       return {
         ok: false,
         error:

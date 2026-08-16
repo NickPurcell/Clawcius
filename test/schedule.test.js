@@ -25,6 +25,22 @@
  *   schedule that fires on the wrong Mondays is right half the time, which is
  *   how it survives a test that only checks the interval.
  *
+ * ── And the zones are not all Californian, which cost a round to learn ──────
+ *
+ * The first version of this file was 31 tests that all sat in
+ * `America/Los_Angeles`. They passed, and they were passing over a real defect:
+ * a doubled wall clock resolved to the EARLIER instant west of UTC and the
+ * LATER one east of it, because the offset probe landed on opposite sides of
+ * the answer depending on the sign. OJ found it by sweeping 23 zones against a
+ * brute-force reference — 406 cases, every one of them east of Greenwich — and
+ * its closing line is the lesson: `Europe/London` in this file would have
+ * caught it, and `America/Los_Angeles` alone never could.
+ *
+ * So the DST fixtures now run east of UTC as well: 25 OCTOBER and 29 MARCH 2026
+ * in London and Berlin, 5 APRIL and 27 SEPTEMBER 2026 in Auckland, and
+ * `Australia/Lord_Howe`, whose DST shift is THIRTY MINUTES rather than an hour
+ * and which therefore breaks anything that assumes the size of the step.
+ *
  * The clock is the one thing not tested here: nothing verifies that a schedule
  * armed in real life fires at the real 9am, because that takes a day to observe
  * and a fake timer would only be testing the fake. What is tested is that the
@@ -182,6 +198,83 @@ test('an hour fall back repeats fires once, at the earlier reading, not twice', 
   assert.ok(!onTheDay.includes('2026-11-01T09:30:00.000Z'), 'the second 01:30 does not');
 });
 
+// ── The same two boundaries, east of Greenwich ─────────────────────────────
+
+test('a doubled wall clock resolves to the EARLIER instant east of UTC too, not the later', () => {
+  // This is the assertion that was false and passing. Every one of these zones
+  // has a positive offset on the day in question, which is the whole point:
+  // the defect was invisible from California and unmissable from anywhere else.
+  const cases = [
+    // zone,                  y  m  d  h  mi, earlier instant,          later
+    ['Europe/London', 2026, 10, 25, 1, 30, '2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'],
+    ['Europe/Berlin', 2026, 10, 25, 2, 30, '2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'],
+    ['Pacific/Auckland', 2026, 4, 5, 2, 30, '2026-04-04T13:30:00.000Z', '2026-04-04T14:30:00.000Z'],
+    // 30-minute DST: nothing here may assume the step is an hour.
+    ['Australia/Lord_Howe', 2026, 4, 5, 1, 45, '2026-04-04T14:45:00.000Z', '2026-04-04T15:15:00.000Z'],
+    // And the western case, unchanged, so the rule is one rule.
+    [LA, 2026, 11, 1, 1, 30, '2026-11-01T08:30:00.000Z', '2026-11-01T09:30:00.000Z'],
+  ];
+
+  for (const [zone, y, m, d, h, mi, earlier, later] of cases) {
+    const at = epochFromWall(y, m, d, h, mi, zone);
+    // Both instants really do show this clock — that is what makes it doubled.
+    assert.equal(zonedStamp(Date.parse(earlier), zone).slice(0, 16), zonedStamp(at, zone).slice(0, 16));
+    assert.equal(
+      new Date(at).toISOString(),
+      earlier,
+      `${zone} ${y}-${m}-${d} ${h}:${mi} must resolve to the earlier reading, not ${later}`,
+    );
+    assert.notEqual(new Date(at).toISOString(), later);
+  }
+});
+
+test('a spring-forward gap is a gap east of UTC as well, including a half-hour one', () => {
+  assert.equal(epochFromWall(2026, 3, 29, 1, 30, 'Europe/London'), null, 'London 29 Mar 01:30');
+  assert.equal(epochFromWall(2026, 3, 29, 2, 30, 'Europe/Berlin'), null, 'Berlin 29 Mar 02:30');
+  assert.equal(epochFromWall(2026, 9, 27, 2, 30, 'Pacific/Auckland'), null, 'Auckland 27 Sep 02:30');
+  // Lord Howe skips only 02:00-02:30, so 02:15 is a gap and 02:45 is not.
+  assert.equal(epochFromWall(2026, 10, 4, 2, 15, 'Australia/Lord_Howe'), null);
+  assert.notEqual(epochFromWall(2026, 10, 4, 2, 45, 'Australia/Lord_Howe'), null);
+  // And the minute either side of a gap is not a gap.
+  assert.notEqual(epochFromWall(2026, 3, 29, 0, 59, 'Europe/London'), null);
+  assert.notEqual(epochFromWall(2026, 3, 29, 2, 0, 'Europe/London'), null);
+});
+
+test('London keeps 9am at 9am, and fires once in its repeated hour', () => {
+  const daily = cron('0 9 * * *');
+  let at = nextAfter(daily, 'Europe/London', Date.parse('2026-03-27T00:00:00Z'));
+  const stamps = [];
+  for (let i = 0; i < 3; i += 1) {
+    stamps.push([new Date(at).toISOString(), zonedStamp(at, 'Europe/London')]);
+    at = nextAfter(daily, 'Europe/London', at);
+  }
+  // 29 March is when the UK clocks go forward. 9am stays 9am; the instant moves.
+  assert.deepEqual(stamps, [
+    ['2026-03-27T09:00:00.000Z', '2026-03-27 09:00 GMT'],
+    ['2026-03-28T09:00:00.000Z', '2026-03-28 09:00 GMT'],
+    ['2026-03-29T08:00:00.000Z', '2026-03-29 09:00 GMT+1'],
+  ]);
+
+  // 01:30 daily across 25 October fires once, at the BST reading.
+  const nightly = fires('30 1 * * *', Date.parse('2026-10-23T00:00:00Z'), 4, 'Europe/London');
+  assert.deepEqual(nightly, [
+    '2026-10-23T00:30:00.000Z',
+    '2026-10-24T00:30:00.000Z',
+    '2026-10-25T00:30:00.000Z', // BST, the earlier of the two 01:30s
+    '2026-10-26T01:30:00.000Z',
+  ]);
+
+  // And 24 fires across the 25-hour day, the same as Los Angeles.
+  const hourly = cron('30 * * * *');
+  const start = epochFromWall(2026, 10, 24, 23, 59, 'Europe/London');
+  const end = epochFromWall(2026, 10, 26, 0, 0, 'Europe/London');
+  let count = 0;
+  for (let t = nextAfter(hourly, 'Europe/London', start); t < end; t = nextAfter(hourly, 'Europe/London', t)) {
+    count += 1;
+  }
+  assert.equal(count, 24);
+});
+
 test('the timezone is a property of the schedule, not of the host', () => {
   const fields = cron('0 9 * * *');
   // June, so that all three zones are genuinely distinct: London is on GMT
@@ -287,6 +380,89 @@ test('a missed daily schedule fires once and counts the rest — never a burst',
   // the 1st, late, and it carries the number three.
   assert.equal(plan.skipped, 3);
   assert.equal(zonedStamp(plan.nextAt, LA), '2026-06-05 09:00 PDT');
+});
+
+// ── Walks that must not stop the process ───────────────────────────────────
+
+test('a back-dated anchor does not walk when everyN is 1, because it cannot matter', () => {
+  const fields = cron('* * * * *');
+  const now = Date.parse('2026-08-16T12:00:00Z');
+
+  // Six years of minutes lie between this anchor and now — three million
+  // occurrences. With everyN 1 every one of them is selected, so which is
+  // "number zero" cannot change the answer, and walking to find that out was
+  // 19 seconds of blocked event loop.
+  const started = Date.now();
+  const result = firstFire(fields, LA, 1, Date.parse('2020-01-01T00:00:00Z'), now);
+  const elapsed = Date.now() - started;
+
+  assert.ok(result.ok, result.error);
+  // The answer is the same one the anchor-free question has.
+  assert.equal(result.at, nextAfter(fields, LA, now));
+  assert.equal(new Date(result.at).toISOString(), '2026-08-16T12:01:00.000Z');
+  // Deliberately loose: this is a regression guard against an O(occurrences)
+  // walk reappearing, not a benchmark. The measured figure is under a
+  // millisecond and the value it replaced was 18,971.
+  assert.ok(elapsed < 1000, `took ${elapsed}ms — the anchor short-circuit is gone`);
+});
+
+test('an anchor whose walk would be unreasonable is refused by arithmetic, not by walking it', () => {
+  const now = Date.parse('2026-08-16T12:00:00Z');
+
+  // everyN above 1, so the anchor genuinely does select a phase and the walk
+  // cannot be skipped. It can still be declined before it is taken.
+  const started = Date.now();
+  const dense = firstFire(cron('* * * * *'), LA, 2, now - 300 * 86_400_000, now);
+  const elapsed = Date.now() - started;
+
+  assert.equal(dense.ok, false);
+  assert.match(dense.error, /1440 time\(s\) a day/);
+  assert.match(dense.error, /Move the anchor forward/);
+  assert.ok(elapsed < 1000, `took ${elapsed}ms — the refusal walked instead of counting`);
+
+  // A sparse expression over the same span is fine and is not refused: the
+  // bound is on the work implied, not on how old the anchor is.
+  const sparse = firstFire(cron('0 9 * * 1'), LA, 2, now - 300 * 86_400_000, now);
+  assert.ok(sparse.ok, sparse.error);
+});
+
+test('the catch-up budget is spent in occurrences walked, not in firings skipped', () => {
+  const fields = cron('* * * * *');
+  const now = Date.parse('2026-08-16T12:00:00Z');
+
+  // One skipped firing costs `everyN` steps. Budgeting by skips would let this
+  // do a hundred times the work of the everyN-1 case under a bound that reads
+  // the same — a second against a minute and a half of stopped process.
+  const started = Date.now();
+  const plan = planNextFire(fields, LA, 100, now - 400 * 86_400_000, now);
+  const elapsed = Date.now() - started;
+
+  assert.equal(plan.phaseReset, true, 'the phase was abandoned rather than walked to');
+  assert.ok(plan.nextAt !== null && plan.nextAt > now, 'and it still has a next fire');
+  assert.ok(elapsed < 5000, `took ${elapsed}ms`);
+
+  // Below the budget nothing is abandoned and the phase is exact.
+  const modest = planNextFire(cron('0 9 * * 1'), LA, 2, epochFromWall(2026, 8, 17, 9, 0, LA), now);
+  assert.equal(modest.phaseReset, false);
+});
+
+test('a phase reset is reported to the agent rather than quietly applied', () => {
+  const { registry, mail, store } = board();
+  const due = Date.parse('2025-06-01T16:00:00Z');
+  store.arm(
+    'hamachi-engineer1',
+    'schedule',
+    due,
+    { note: 'dense', cron: '* * * * *', timezone: LA, everyN: 3, anchorAt: due },
+    { lastFiredAt: null, fires: 0, missed: 0 },
+  );
+
+  waker(registry, mail, store).tick();
+
+  const [delivered] = mail.unread('hamachi-engineer1');
+  assert.match(delivered.body, /could not be walked forward/);
+  assert.match(delivered.body, /counts from this firing/);
+  registry.close();
 });
 
 // ── Days of the month, days of the year ────────────────────────────────────
@@ -500,6 +676,72 @@ test('the same schedule armed twice is refused — a duplicate repeat has no end
   registry.close();
 });
 
+test('two fortnightly schedules on opposite weeks are two schedules, not a duplicate', async () => {
+  const { registry, store } = board();
+  const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
+
+  // Anchors derived from the clock rather than written down, because the tool
+  // refuses an anchor over a year old and a fixture date would quietly become
+  // a failing test twelve months after it was written. The pure-arithmetic
+  // tests above pin real dates by name; these cannot.
+  const monday = cron('0 9 * * 1');
+  const first = nextAfter(monday, LA, Date.now());
+  const next = nextAfter(monday, LA, first);
+  const asDate = (at) => zonedStamp(at, LA).slice(0, 10);
+
+  // Together these are the weekly job you get by arming the halves separately,
+  // which is a coherent thing to want. Everything about them matches except
+  // the one field that makes them different.
+  const odd = await scheduleRecurring.handler(
+    { note: 'standup', cron: '0 9 * * 1', everyN: 2, anchor: asDate(first) },
+    {},
+  );
+  const even = await scheduleRecurring.handler(
+    { note: 'standup', cron: '0 9 * * 1', everyN: 2, anchor: asDate(next) },
+    {},
+  );
+  assert.notEqual(odd.isError, true, said(odd));
+  assert.notEqual(even.isError, true, said(even));
+
+  const armed = store.listFor('hamachi-engineer1');
+  assert.equal(armed.length, 2);
+  assert.notEqual(armed[0].dueAt, armed[1].dueAt, 'they fire on different Mondays');
+
+  // But the same schedule spelled with a different anchor is still one
+  // schedule twice: an anchor five days before that first Monday selects the
+  // very same Monday as occurrence zero, so it is the same first fire and the
+  // same schedule.
+  //
+  // This is also why the comparison is on the computed fire and not on
+  // `anchorAt`: the anchor DEFAULTS TO NOW, so two genuinely identical
+  // schedules armed a second apart carry different anchors, and a check that
+  // included the anchor would look like a duplicate check and match nothing.
+  const spelledDifferently = await scheduleRecurring.handler(
+    { note: 'standup', cron: '0 9 * * 1', everyN: 2, anchor: asDate(first - 5 * 86_400_000) },
+    {},
+  );
+  assert.equal(spelledDifferently.isError, true, said(spelledDifferently));
+  assert.match(said(spelledDifferently), /same next occurrence/);
+  assert.equal(store.listFor('hamachi-engineer1').length, 2, 'and no third row');
+  registry.close();
+});
+
+test('an anchor more than a year out is refused as the typo it almost always is', async () => {
+  const { registry, store } = board();
+  const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
+
+  for (const anchor of ['2020-01-01', '2040-01-01']) {
+    const result = await scheduleRecurring.handler(
+      { note: 'n', cron: '0 9 * * 1', everyN: 2, anchor },
+      {},
+    );
+    assert.equal(result.isError, true, anchor);
+    assert.match(said(result), /more than a year/);
+  }
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
 // ── Firing, and being seen to have fired ───────────────────────────────────
 
 test('a schedule fires, books the next occurrence, and stays armed', () => {
@@ -640,26 +882,43 @@ test('a schedule belongs to one agent, and a crewmate can neither see nor stop i
   registry.close();
 });
 
-test('a schedule whose expression this build cannot read is disarmed and says so', () => {
-  const { registry, mail, store } = board();
-  // The shape a schema change would leave behind: a row written by a build
-  // whose parser accepted something this one does not.
-  const due = Date.now() - 1000;
-  store.arm(
-    'hamachi-engineer1',
-    'schedule',
-    due,
-    { note: 'from the future', cron: '0 9 * * * L', timezone: LA, everyN: 1, anchorAt: due },
-    { lastFiredAt: null, fires: 0, missed: 0 },
-  );
+test('a schedule this build cannot read is disarmed and says so — expression OR timezone', () => {
+  // Both halves of the spec, because only one of them was guarded to begin
+  // with. An unresolvable timezone made `Intl.DateTimeFormat` throw inside the
+  // tick, which the per-condition catch logged and swallowed, leaving the row
+  // armed and due in the past — so it threw again every 15 seconds, forever,
+  // and the owner was never told. The realistic cause is an ICU downgrade,
+  // which would do it to every schedule on the board at once.
+  for (const [label, spec] of [
+    ['expression', { cron: '0 9 * * * L', timezone: LA }],
+    ['timezone', { cron: '0 9 * * 1', timezone: 'Mars/Olympus_Mons' }],
+  ]) {
+    const { registry, mail, store } = board();
+    const due = Date.now() - 1000;
+    store.arm(
+      'hamachi-engineer1',
+      'schedule',
+      due,
+      { note: 'from the future', ...spec, everyN: 1, anchorAt: due },
+      { lastFiredAt: null, fires: 0, missed: 0 },
+    );
 
-  waker(registry, mail, store).tick();
+    const loop = waker(registry, mail, store);
+    loop.tick();
+    loop.tick();
+    loop.tick();
 
-  const [delivered] = mail.unread('hamachi-engineer1');
-  assert.match(delivered.subject, /DISARMED/);
-  assert.match(delivered.body, /from the future/);
-  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'rather than throwing every tick');
-  registry.close();
+    const delivered = mail.unread('hamachi-engineer1');
+    assert.equal(delivered.length, 1, `${label}: told once, not once per tick`);
+    assert.match(delivered[0].subject, /DISARMED/, label);
+    assert.match(delivered[0].body, /from the future/, `${label}: the note comes back with it`);
+    assert.equal(
+      store.listFor('hamachi-engineer1').length,
+      0,
+      `${label}: disarmed rather than left throwing every tick`,
+    );
+    registry.close();
+  }
 });
 
 test('a schedule with an unreadable spec is listed as unreadable, not thrown over', () => {

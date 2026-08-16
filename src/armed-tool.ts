@@ -570,7 +570,9 @@ function describeScheduleRecurring(agentId: string): string {
     '              "every other week" is said, because five-field cron genuinely cannot say',
     '              it. Default 1.',
     '    anchor    which occurrence is number zero, for everyN. A bare date (2026-08-17) is',
-    '              read as midnight in the schedule\'s own timezone. Default: now.',
+    '              read as midnight in the schedule\'s own timezone. Default: now. It does',
+    '              NOTHING when everyN is 1 — every occurrence is selected then, so there is',
+    '              no phase for it to pick. Must be within a year either way.',
     '',
     '    every Monday at 9am            cron "0 9 * * 1"',
     '    every other Monday at 9am      cron "0 9 * * 1", everyN 2, anchor "2026-08-17"',
@@ -809,6 +811,26 @@ export function buildArmedTools(
             return refuse(`Not armed — "${raw}" is not a date or an ISO 8601 instant.`);
           }
         }
+
+        // The same horizon `remindMe` puts on `at`, and for the same reason,
+        // in both directions: an anchor years out is a typo far more often
+        // than an intention, and any anchor selects the same phase as one a
+        // few occurrences later, so nothing is lost by insisting it be near.
+        //
+        // It is also the cheap half of not freezing the process. `firstFire`
+        // refuses an unreasonable walk in arithmetic rather than by taking it,
+        // but the two bounds answer different questions — that one is about
+        // how much work the expression implies, this one is about whether the
+        // date is plausible at all — and `2020-01-01` should be refused for
+        // being wrong rather than for being expensive.
+        if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
+          return refuse(
+            `Not armed — the anchor ${new Date(anchorAt).toISOString()} is more than a year ` +
+              `${anchorAt < now ? 'in the past' : 'away'}, which is almost always a typo. The ` +
+              'anchor only picks which occurrences are selected, and every phase is reachable ' +
+              `with an anchor inside the last ${step} occurrences — move it nearer.`,
+          );
+        }
       }
 
       const first = firstFire(fields, zone, step, anchorAt, now);
@@ -833,15 +855,16 @@ export function buildArmedTools(
       // and a single event loop cannot interleave synchronous statements. If
       // anything asynchronous is ever added above this line, this check has to
       // move down to sit against the `arm` call.
-      const existing = options.store.findSchedule(agentId, spec);
+      const existing = options.store.findSchedule(agentId, spec, first.at);
       if (existing) {
         return refuse(
           `Not armed — you already have that exact schedule: #${existing.id}, armed ` +
-            `${stamp(existing.armedAt)}, next ${stamp(existing.dueAt)}. Same note, same ` +
-            'expression, same zone. A second one would mail you the same note twice every ' +
-            'time it fires, forever, and a repeat arriving twice looks exactly like a repeat ' +
-            `arriving twice. Nothing was written. disarm(${existing.id}) if you want to change ` +
-            'its terms; a different note is a different job and is not refused.',
+            `${stamp(existing.armedAt)}. Same note, same expression, same zone, and the same ` +
+            `next occurrence — ${zonedStamp(existing.dueAt, zone)}. A second one would mail ` +
+            'you the same note twice every time it fires, forever, and a repeat arriving twice ' +
+            `looks exactly like a repeat arriving twice. Nothing was written. disarm(${existing.id}) ` +
+            'if you want to change its terms. A different note is a different job, and so is ' +
+            'the same job on the opposite weeks — neither is refused.',
         );
       }
 
