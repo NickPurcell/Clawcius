@@ -1,4 +1,13 @@
-node_modules/
+# No trailing slash, deliberately. `node_modules/` matches a directory only, so
+# a *symlink* named node_modules — which is how a git worktree borrows the real
+# tree's install — slips past it and is committed by the next `git add -A`.
+# NickPurcell/OJ shipped exactly that on 2026-08-16: the blob was an absolute
+# path on one machine, so once checked out there the link pointed at itself,
+# every `tsc` died with "too many levels of symbolic links", and `npm run build`
+# exited 216 printing NOTHING — which meant `npm test` never reached the runner
+# while a stale `dist/` went on answering green. Restore the slash and this
+# comes back. See Clawcius #60.
+node_modules
 dist/
 # Per-instance env files each carry a bot token. The negation keeps the
 # template tracked — without it, adding .env.* silently untracks the one file
