@@ -54,6 +54,21 @@
  * closes, which is a condition rather than a schedule, and it disarms itself
  * when that condition is met. That asymmetry is intentional: the watch has a
  * defined end and the reminder does not.
+ *
+ * ── Self-terminating is not the same as harmless ────────────────────────────
+ *
+ * Both kinds end by themselves, which was the argument for shipping without a
+ * way to read the table back or cancel a row. It held for one condition and
+ * not for two: duplicates last as long as the thing they watch and multiply
+ * the mail for the whole of it. That is Clawcius #50, and it happened — two
+ * watches on one pull request, armed by two agents that each had no way to see
+ * the other's, delivering every event twice with no way to stop it.
+ *
+ * So `listFor` and `spentFor` are read by a tool now, `disarmFor` withdraws a
+ * row on an agent's say-so, and `findPrWatch` lets the arming tool refuse the
+ * second watch instead of writing it. The last of those is the one that
+ * matters: the other two describe and repair a mistake that has already cost
+ * something, and it prevents it.
  */
 
 import type { DatabaseSync } from 'node:sqlite';
@@ -109,9 +124,25 @@ export type ArmedCondition = {
   /** The next moment the waker should look at this row. */
   dueAt: number;
   active: boolean;
+  /** When it stopped being armed — fired, ended, or was withdrawn. Null while active. */
+  firedAt: number | null;
   spec: ReminderSpec | PrWatchSpec;
   seen: PrWatchSeen | null;
 };
+
+/**
+ * What `disarmFor` did, as a value rather than a thrown error or a log line.
+ *
+ * The four cases are different sentences to whoever asked — "there is no such
+ * condition" and "that one is another agent's" call for different next moves —
+ * and only the tool layer knows how to say them. See `mail.ts`: a refusal the
+ * caller cannot read is a refusal that did not happen.
+ */
+export type DisarmOutcome =
+  | { disarmed: true; condition: ArmedCondition }
+  | { disarmed: false; reason: 'missing' }
+  | { disarmed: false; reason: 'not-yours'; owner: string }
+  | { disarmed: false; reason: 'already-inactive'; condition: ArmedCondition };
 
 export type ReminderCondition = ArmedCondition & { kind: 'reminder'; spec: ReminderSpec };
 export type PrWatchCondition = ArmedCondition & {
@@ -120,7 +151,7 @@ export type PrWatchCondition = ArmedCondition & {
   seen: PrWatchSeen;
 };
 
-const COLUMNS = 'id, owner, kind, armed_at, due_at, active, spec, seen';
+const COLUMNS = 'id, owner, kind, armed_at, due_at, active, spec, seen, fired_at';
 
 /**
  * Rebuild a condition from its row.
@@ -152,9 +183,15 @@ function toCondition(row: Record<string, unknown>): ArmedCondition | null {
     armedAt: row['armed_at'] as number,
     dueAt: row['due_at'] as number,
     active: (row['active'] as number) === 1,
+    firedAt: (row['fired_at'] as number | null) ?? null,
     spec: spec as ReminderSpec | PrWatchSpec,
     seen: (seen as PrWatchSeen | null) ?? null,
   };
+}
+
+/** Repositories are not case-sensitive to GitHub, so they must not be here. */
+function sameRepo(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
 }
 
 export class ArmedStore {
@@ -211,6 +248,7 @@ export class ArmedStore {
       armedAt,
       dueAt,
       active: true,
+      firedAt: null,
       spec,
       seen,
     };
@@ -247,6 +285,56 @@ export class ArmedStore {
     return rows.map(toCondition).filter((c): c is ArmedCondition => c !== null);
   }
 
+  /**
+   * Conditions of one agent that have stopped, most recently first.
+   *
+   * `disarm` keeps the row, so this history has always existed and nothing has
+   * ever read it back. It matters because an empty `listArmed` has two
+   * meanings — you never armed one, or you armed one and it ended — and an
+   * agent that reads the first when the second is true arms a duplicate, which
+   * is the whole of Clawcius #50 happening again one step later.
+   *
+   * Bounded by `since` and reported with the number of rows older than it, so
+   * the bound is something the caller can see rather than a silent truncation.
+   */
+  spentFor(owner: string, since: number): { recent: ArmedCondition[]; older: number } {
+    const rows = this.#db
+      .prepare(
+        `SELECT ${COLUMNS} FROM armed_conditions
+          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) >= ?
+          ORDER BY fired_at DESC, id DESC`,
+      )
+      .all(owner, since) as Array<Record<string, unknown>>;
+    const older = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM armed_conditions
+          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) < ?`,
+      )
+      .get(owner, since) as { n: number };
+
+    return {
+      recent: rows.map(toCondition).filter((c): c is ArmedCondition => c !== null),
+      older: Number(older.n),
+    };
+  }
+
+  /**
+   * The agent's own live watch on a pull request, if it has one.
+   *
+   * Owner-scoped, and it has to be: two agents watching one PR is two agents
+   * each wanting their own mail, which is correct. One agent watching it twice
+   * is a mistake, and this is what lets `watchPr` say so at arm time instead of
+   * the operator working it out from duplicate mail (Clawcius #50).
+   */
+  findPrWatch(owner: string, repo: string, pr: number): ArmedCondition | null {
+    for (const condition of this.listFor(owner)) {
+      if (condition.kind !== 'pr-watch') continue;
+      const spec = condition.spec as PrWatchSpec;
+      if (spec.pr === pr && sameRepo(spec.repo, repo)) return condition;
+    }
+    return null;
+  }
+
   get(id: number): ArmedCondition | null {
     const row = this.#db
       .prepare(`SELECT ${COLUMNS} FROM armed_conditions WHERE id = ?`)
@@ -265,10 +353,49 @@ export class ArmedStore {
       .run(dueAt, JSON.stringify(seen), id);
   }
 
-  /** Spend a condition. It is kept, not deleted — the history is the record. */
+  /**
+   * Spend a condition. It is kept, not deleted — the history is the record.
+   *
+   * No owner, because the caller is the waker: a condition that has fired, or
+   * whose pull request has closed, is spent regardless of whose it was. Every
+   * path that acts on an *agent's* instruction goes through `disarmFor`.
+   */
   disarm(id: number): void {
     this.#db
       .prepare('UPDATE armed_conditions SET active = 0, fired_at = ? WHERE id = ?')
       .run(Date.now(), id);
+  }
+
+  /**
+   * Withdraw one agent's condition, and only that agent's.
+   *
+   * THE `owner = ?` IN THE UPDATE IS THE AUTHORISATION. Not the read above it,
+   * which exists only to choose which sentence the caller is told: a crew
+   * shares a container and a uid, so between two crewmates the owner column is
+   * the entire boundary, and it has to be enforced by the statement that does
+   * the writing rather than by a branch preceding it. Delete the read and this
+   * method is still safe; delete the `AND owner = ?` and it is not.
+   *
+   * Nothing here throws. A refusal is a return value the model reads, exactly
+   * as `MailStore.deliver` refuses a recipient — see mail-tool.ts, and Clawcius
+   * #30 for what happens when a refusal is only a line in the journal.
+   */
+  disarmFor(owner: string, id: number): DisarmOutcome {
+    const existing = this.get(id);
+    if (!existing) return { disarmed: false, reason: 'missing' };
+    if (existing.owner !== owner) {
+      return { disarmed: false, reason: 'not-yours', owner: existing.owner };
+    }
+    if (!existing.active) return { disarmed: false, reason: 'already-inactive', condition: existing };
+
+    const firedAt = Date.now();
+    const result = this.#db
+      .prepare(
+        'UPDATE armed_conditions SET active = 0, fired_at = ? WHERE id = ? AND owner = ? AND active = 1',
+      )
+      .run(firedAt, id, owner);
+    if (Number(result.changes) === 0) return { disarmed: false, reason: 'missing' };
+
+    return { disarmed: true, condition: { ...existing, active: false, firedAt } };
   }
 }

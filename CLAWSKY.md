@@ -295,6 +295,43 @@ the dead agent's inbox, the journal says so on every fire, and whoever
 resurrects it hands the mail over as the first turn. Reopening this is a change
 to one method in `ArmedWaker`, and it should be made on purpose.
 
+**An agent can see and withdraw its own conditions, and only its own.**
+`listArmed` returns what this session has armed — id, kind, what it waits for,
+when it next fires or polls — together with anything that ended in the last
+day, because an empty list otherwise means both "you never armed one" and "it
+already fired". `disarm(id)` withdraws one, and refuses an id belonging to
+another agent as a return value the model reads. Between two crewmates sharing
+a container and a uid the owner column is the entire boundary, so that refusal
+is enforced in the statement that writes rather than by asking.
+
+**A second watch on a pull request you already watch is refused**, naming the
+id of the one you have. This is Clawcius #50 as it happened: two watches on one
+pull request, delivering every event twice until it merged, with nothing able
+to list or stop them from inside a turn.
+
+Both rows had the **same owner**, and that is the part to remember, because it
+does not look that way from the outside. The second watch was armed by an
+engineer subagent, and a subagent has no tools of its own — `mcpServers` is a
+session option, so a subagent calls its parent's `watchPr`, closed over the
+parent's agent id, and the mail lands in the parent's inbox. One agent armed
+twice across two of its own turns.
+
+Owner is therefore the right key, and the check is made twice: once before the
+first poll, so a duplicate costs nothing, and once immediately before the
+insert with no `await` between, so two overlapping calls cannot both pass it.
+That is the whole of the guarantee, and it is worth stating what it is not. It
+holds within one process, which is where the tools run; it is not a database
+constraint, so it would not survive a second writer. What it covers is the
+incident's shape — the same owner arming twice, whether across two turns, side
+by side, or after a restart re-arms what an earlier turn already armed.
+
+Two *agents* watching one pull request is a different thing and is not
+prevented: they each want their own mail, and `listArmed` says plainly that it
+cannot see a colleague's rather than letting an absence be read as proof.
+
+Deduplicating a condition is not throttling delivery; nothing anywhere delays,
+drops or coalesces mail.
+
 **What arrives from a watch is external content**, and is framed as such in the
 mail itself — quoted line by line, inside markers, carrying the same rule the
 feed does. A review body is written by a stranger, a bot, or OJ, which reads

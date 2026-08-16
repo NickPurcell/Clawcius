@@ -688,6 +688,38 @@ unit. Full detail, including the security model, is in
 
 ---
 
+## 9. When the build says nothing at all
+
+`npm run build` exiting **216** with no output means `tsc` could not walk the
+tree, and by far the most likely reason is a `node_modules` **symlink pointing
+at itself**. A git worktree has no install of its own, so the usual move is to
+link the main clone's — and until 2026-08-16 `.gitignore` said `node_modules/`,
+whose trailing slash matches a directory and not a symlink. One `git add -A`
+and the link is committed, with an absolute path as its content; checked out on
+the machine that path names, it resolves to itself. `NickPurcell/OJ` shipped
+exactly this (Clawcius #60).
+
+What makes it expensive is the second half. `npm test` is `build && node --test`,
+so the suite never runs — but a test binary invoked directly returns **green
+from a stale `dist/`**, and a passing count gets reported from the previous
+commit's compiled output.
+
+```sh
+git check-ignore -v node_modules   # no output means it is NOT ignored
+ls -l node_modules                 # a self-referential link is visible here
+rm -rf dist && npm run build       # before believing a suspicious pass
+```
+
+Two habits that go with it:
+
+- **`rm -rf dist` before trusting a green run** that follows a build you did
+  not watch succeed.
+- **Do not gate on `$?` after a pipe.** `npm run build 2>&1 | tail -3; echo $?`
+  prints `tail`'s status, not the build's — it says `0` over a failed build.
+  Use `${PIPESTATUS[0]}`, or do not pipe.
+
+---
+
 ## Known gaps
 
 - **Not exercised end-to-end since the container migration.** Agent turns,

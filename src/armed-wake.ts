@@ -285,6 +285,17 @@ export class ArmedWaker {
     try {
       for (const condition of this.#options.store.due()) {
         try {
+          // The snapshot is taken once and this loop awaits inside it, so a
+          // row can be withdrawn by its owner between the query and its turn.
+          // `disarm` promises the condition will not fire; firing from a stale
+          // snapshot would make that a lie in the one case an agent went out
+          // of its way to prevent.
+          if (!this.#options.store.get(condition.id)?.active) {
+            this.#options.log(
+              `condition ${condition.id} was disarmed after this tick's query; skipped`,
+            );
+            continue;
+          }
           if (condition.kind === 'reminder') {
             this.#fireReminder(condition);
           } else {
@@ -333,21 +344,46 @@ export class ArmedWaker {
       return;
     }
 
-    let pr: PullRequestState;
-    let reviews: PrReview[];
-    let comments: PrComment[];
+    let polled: { pr: PullRequestState; reviews: PrReview[]; comments: PrComment[] } | null = null;
+    let failure: string | null = null;
     try {
-      pr = await github.getPullRequest(spec.repo, spec.pr);
-      [reviews, comments] = await Promise.all([
+      const pr = await github.getPullRequest(spec.repo, spec.pr);
+      const [reviews, comments] = await Promise.all([
         github.listReviews(spec.repo, spec.pr),
         github.listComments(spec.repo, spec.pr),
       ]);
+      polled = { pr, reviews, comments };
     } catch (error) {
+      failure = String(error).slice(0, 400);
+    }
+
+    // ── WITHDRAWN WHILE THE POLL WAS IN FLIGHT ──────────────────────────────
+    //
+    // Three requests to a third party is the longest this process ever holds a
+    // condition in a local variable, and the agent's `disarm` runs on the same
+    // event loop as this loop — its tools are SDK MCP tools, in this process,
+    // not in the container. So a withdrawal can land inside those awaits, and
+    // acting on the row captured before them would mail an agent that had just
+    // been told, in a tool result it read, that nothing further would fire.
+    //
+    // Re-read rather than trust the capture. Deliberately before the failure
+    // branch as well as the success one: a watch the owner has withdrawn
+    // should not produce "your watch could not reach GitHub" either.
+    if (!this.#options.store.get(condition.id)?.active) {
+      this.#options.log(
+        `watch ${condition.id} on ${spec.repo}#${spec.pr} was disarmed while its poll was in ` +
+          'flight; nothing delivered',
+      );
+      return;
+    }
+
+    if (!polled) {
       this.#options.store.disarm(condition.id);
-      const { subject, body } = composeWatchErrorMail(spec, String(error).slice(0, 400));
+      const { subject, body } = composeWatchErrorMail(spec, failure ?? 'unknown error');
       this.#deliver(condition, subject, body);
       return;
     }
+    const { pr, reviews, comments } = polled;
 
     const wants = (event: string): boolean => spec.on.includes(event as never);
 
