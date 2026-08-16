@@ -38,7 +38,7 @@ import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
 import { ArmedWaker, composeWatchMail, composeReminderMail } from '../dist/armed-wake.js';
-import { buildArmedTools } from '../dist/armed-tool.js';
+import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
 import { quoteExternal, MAX_EXTERNAL_CHARS } from '../dist/github.js';
 
@@ -863,6 +863,43 @@ test('listArmed is bounded, and every armed id is still reachable past the cap',
 
   // Nothing destructive is suggested for finding one of them.
   assert.doesNotMatch(listing, /Disarm some/i);
+  registry.close();
+});
+
+test('past seventy the listing says the remaining ids are not recoverable, rather than implying they are', async () => {
+  const { registry, store } = board();
+  const now = Date.now();
+  const armed = [];
+  for (let i = 0; i < 75; i += 1) {
+    armed.push(store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, {
+      note: `reminder ${i}`,
+    }));
+  }
+
+  const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
+
+  // 20 in full + 50 compact = 70. The other five are a count, and the point of
+  // this test is the boundary rather than the arithmetic: the previous test
+  // sits at 25, safely inside the reachable range, so nothing held the section
+  // heading honest. Three rounds of review found prose claiming a little more
+  // than the code did, and this is the assertion that stops the fourth.
+  assert.equal(listing.match(/^ {2}#\d+ {2}reminder/gm).length, 70);
+  assert.match(listing, /^75 armed for hamachi-engineer1\./m, 'the count stays true');
+  assert.match(listing, /The next 50, one line each/, 'not "one line each" of 55');
+  assert.match(listing, /and 5 more, not listed at all — their ids are not recoverable/);
+
+  for (const condition of armed.slice(0, 70)) {
+    assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
+  }
+  for (const condition of armed.slice(70)) {
+    assert.doesNotMatch(listing, new RegExp(`#${condition.id}\\b`), 'and it does not pretend');
+  }
+
+  // Under the compact cap the heading is the unqualified one, and true.
+  const fewer = renderArmed('hamachi-engineer1', store.listFor('hamachi-engineer1').slice(0, 30),
+    { recent: [], older: 0 }, now);
+  assert.match(fewer, /10 more armed, due later than those above\. One line each/);
+  assert.doesNotMatch(fewer, /not listed at all/);
   registry.close();
 });
 
