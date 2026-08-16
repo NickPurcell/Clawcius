@@ -149,6 +149,15 @@ export type ScheduleSeen = {
   fires: number;
   /** Occurrences that passed with nothing running, over the schedule's life. */
   missed: number;
+  /**
+   * Whether `missed` is a total or a floor — see `SchedulePlan.skippedExact`.
+   *
+   * Once a single catch-up walk has stopped on its budget the running total can
+   * never be exact again, so this latches false and stays there. Optional
+   * because rows written before it existed have no opinion, and absent is read
+   * as exact: those rows were written under a budget nothing reached.
+   */
+  missedExact?: boolean;
 };
 
 /**

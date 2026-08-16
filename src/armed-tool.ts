@@ -368,9 +368,15 @@ function history(condition: ArmedCondition): string {
   const missed = typeof seen?.missed === 'number' ? seen.missed : 0;
   if (fires === 0) return 'has not fired yet';
   const last = typeof seen?.lastFiredAt === 'number' ? stamp(seen.lastFiredAt) : 'an unknown moment';
+  // The hedge travels with the number wherever the number goes. A count that
+  // stopped short in the waker and is reprinted here as a bare total is the
+  // same untruth twice, and this is the copy somebody reads on purpose.
+  const exact = seen?.missedExact ?? true;
   return (
     `last fired ${last} · ${fires} time${fires === 1 ? '' : 's'}` +
-    (missed > 0 ? ` · ${missed} occurrence(s) missed while nothing was running` : '')
+    (missed > 0
+      ? ` · ${exact ? '' : 'at least '}${missed} occurrence(s) missed while nothing was running`
+      : '')
   );
 }
 
@@ -569,10 +575,12 @@ function describeScheduleRecurring(agentId: string): string {
     '    everyN    fire on every Nth matching occurrence instead of every one. This is how',
     '              "every other week" is said, because five-field cron genuinely cannot say',
     '              it. Default 1.',
-    '    anchor    which occurrence is number zero, for everyN. A bare date (2026-08-17) is',
-    '              read as midnight in the schedule\'s own timezone. Default: now. It does',
-    '              NOTHING when everyN is 1 — every occurrence is selected then, so there is',
-    '              no phase for it to pick. Must be within a year either way.',
+    '    anchor    when the schedule starts, and which occurrence is number zero for everyN.',
+    '              A bare date (2026-08-17) is read as midnight in the schedule\'s own',
+    '              timezone. Default: now, and it must be within a year either way.',
+    '              A FUTURE anchor delays the first fire whatever everyN is — that is how you',
+    '              say "start this daily schedule in December". A PAST anchor only chooses',
+    '              which occurrences are selected, so with everyN 1 it changes nothing.',
     '',
     '    every Monday at 9am            cron "0 9 * * 1"',
     '    every other Monday at 9am      cron "0 9 * * 1", everyN 2, anchor "2026-08-17"',
@@ -592,7 +600,8 @@ function describeScheduleRecurring(agentId: string): string {
     'you notice — that is the whole of what keeps a repeat from outliving its purpose.',
     '',
     'A firing missed while the service was down happens ONCE, late, when it comes back, and',
-    'the mail says how late it is and how many occurrences were skipped. Never a burst.',
+    'the mail says how late it is and how many occurrences were skipped — or, after an outage',
+    'too long to count through, the least it can be sure of, said as such. Never a burst.',
     '',
     'WHAT ARRIVES IS A NOTE, NOT AN ERRAND. It lands in your inbox and goes nowhere else —',
     'this posts nothing to Discord or anywhere outside on its own, ever. What the note',
@@ -814,8 +823,7 @@ export function buildArmedTools(
 
         // The same horizon `remindMe` puts on `at`, and for the same reason,
         // in both directions: an anchor years out is a typo far more often
-        // than an intention, and any anchor selects the same phase as one a
-        // few occurrences later, so nothing is lost by insisting it be near.
+        // than an intention.
         //
         // It is also the cheap half of not freezing the process. `firstFire`
         // refuses an unreasonable walk in arithmetic rather than by taking it,
@@ -824,11 +832,17 @@ export function buildArmedTools(
         // date is plausible at all — and `2020-01-01` should be refused for
         // being wrong rather than for being expensive.
         if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
+          const past = anchorAt < now;
           return refuse(
             `Not armed — the anchor ${new Date(anchorAt).toISOString()} is more than a year ` +
-              `${anchorAt < now ? 'in the past' : 'away'}, which is almost always a typo. The ` +
-              'anchor only picks which occurrences are selected, and every phase is reachable ' +
-              `with an anchor inside the last ${step} occurrences — move it nearer.`,
+              `${past ? 'in the past' : 'away'}, which is almost always a typo. ` +
+              (past
+                ? 'A past anchor only chooses which occurrences are selected, and every phase ' +
+                  `is reachable with an anchor inside the last ${step} occurrences — move it ` +
+                  'nearer.'
+                : 'A future anchor is when the schedule starts, so this would arm something ' +
+                  'that does nothing for over a year. Arm it nearer the time, or start it ' +
+                  'sooner.'),
           );
         }
       }

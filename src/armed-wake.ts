@@ -149,7 +149,9 @@ export function composeReminderMail(condition: ArmedCondition, firedAt: number):
  *     fact the reader has to do arithmetic on to check;
  *   - IT IS LATE AND N WERE SKIPPED, when the service was down. The operator
  *     asked to be made aware of missed alerts and this is the sentence that
- *     does it. One mail, one count, never a burst;
+ *     does it. One mail, one count, never a burst — and when the count is a
+ *     floor rather than a total it says so, because a number offered in place
+ *     of the firings themselves is worth exactly what it can be trusted for;
  *   - HERE IS HOW TO STOP IT. The id is in every mail, not only in `listArmed`,
  *     because the moment an agent decides a repeat has outlived its purpose is
  *     the moment it is reading one — not some later moment when it remembers to
@@ -163,7 +165,7 @@ export function composeReminderMail(condition: ArmedCondition, firedAt: number):
 export function composeScheduleMail(
   condition: ArmedCondition,
   firedAt: number,
-  plan: { nextAt: number | null; skipped: number; phaseReset: boolean },
+  plan: { nextAt: number | null; skipped: number; skippedExact: boolean; phaseReset: boolean },
 ): ComposedMail {
   const spec = condition.spec as ScheduleSpec;
   const seen = condition.seen as ScheduleSeen | null;
@@ -186,12 +188,26 @@ export function composeScheduleMail(
     );
   }
   if (plan.skipped > 0) {
+    const plural = plan.skipped === 1 ? '' : 's';
+    const was = plan.skipped === 1 ? 'was' : 'were';
     lines.push(
-      `${plan.skipped} further occurrence${plan.skipped === 1 ? '' : 's'} came and went while ` +
-        `nothing was running, and ${plan.skipped === 1 ? 'was' : 'were'} NOT delivered — you are ` +
-        'being told the count instead. A schedule fires once when it comes back, however long ' +
-        'it was away, because a burst of stale wakes is not the same work done later.',
+      `${plan.skippedExact ? '' : 'AT LEAST '}${plan.skipped} further occurrence${plural} came ` +
+        `and went while nothing was running, and ${was} NOT delivered — you are being told the ` +
+        'count instead. A schedule fires once when it comes back, however long it was away, ' +
+        'because a burst of stale wakes is not the same work done later.',
     );
+    if (!plan.skippedExact) {
+      // The count is the only thing standing in for the firings that did not
+      // happen, so it does not get to be approximate quietly. The hedge is on
+      // the number itself rather than only in this paragraph, because the
+      // number is what gets quoted onwards. See `SchedulePlan.skippedExact`.
+      lines.push(
+        `THAT IS A FLOOR AND NOT A TOTAL: counting stopped at ${plan.skipped}, because walking ` +
+          'further would have held up everything else this process does. More were missed than ' +
+          'that, and how many more was not established. The due moment above, the expression ' +
+          'and now are what a true figure would come from.',
+      );
+    }
   }
   if (plan.phaseReset) {
     lines.push(
@@ -508,6 +524,10 @@ export class ArmedWaker {
       lastFiredAt: now,
       fires: (seen?.fires ?? 0) + 1,
       missed: (seen?.missed ?? 0) + plan.skipped,
+      // Latches. One walk that stopped short makes the running total a floor
+      // for the rest of the row's life, and `listArmed` reads this to decide
+      // whether it may state the number plainly.
+      missedExact: (seen?.missedExact ?? true) && plan.skippedExact,
     };
     if (plan.nextAt === null) {
       // An expression with no next occurrence — `0 0 29 2 *` past the horizon,

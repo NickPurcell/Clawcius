@@ -57,7 +57,7 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
-import { ArmedWaker } from '../dist/armed-wake.js';
+import { ArmedWaker, composeScheduleMail } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import {
   advance,
@@ -406,6 +406,26 @@ test('a back-dated anchor does not walk when everyN is 1, because it cannot matt
   assert.ok(elapsed < 1000, `took ${elapsed}ms — the anchor short-circuit is gone`);
 });
 
+test('a FUTURE anchor starts the schedule later, at every everyN — a past one only picks phase', () => {
+  const daily = cron('0 9 * * *');
+  const now = Date.parse('2026-08-16T12:00:00Z');
+
+  // The short-circuit that makes a back-dated anchor free is guarded on the
+  // anchor being in the past, so this case still walks — and must, because
+  // "start this daily schedule in December" is a sensible thing to ask for and
+  // is the reason the tool description may not say the anchor does nothing.
+  const december = firstFire(daily, LA, 1, Date.parse('2026-12-01T08:00:00Z'), now);
+  assert.ok(december.ok, december.error);
+  assert.equal(zonedStamp(december.at, LA), '2026-12-01 09:00 PST');
+
+  // Whereas a past anchor at everyN 1 genuinely changes nothing.
+  const backdated = firstFire(daily, LA, 1, now - 30 * 86_400_000, now);
+  const none = firstFire(daily, LA, 1, now, now);
+  assert.ok(backdated.ok && none.ok);
+  assert.equal(backdated.at, none.at);
+  assert.equal(zonedStamp(backdated.at, LA), '2026-08-16 09:00 PDT');
+});
+
 test('an anchor whose walk would be unreasonable is refused by arithmetic, not by walking it', () => {
   const now = Date.parse('2026-08-16T12:00:00Z');
 
@@ -444,6 +464,89 @@ test('the catch-up budget is spent in occurrences walked, not in firings skipped
   // Below the budget nothing is abandoned and the phase is exact.
   const modest = planNextFire(cron('0 9 * * 1'), LA, 2, epochFromWall(2026, 8, 17, 9, 0, LA), now);
   assert.equal(modest.phaseReset, false);
+});
+
+test('a count that stopped on the budget is reported as a floor, not as a total', () => {
+  const now = Date.parse('2026-08-16T12:00:00Z');
+
+  // Ordinary case: the count is the count.
+  const exact = planNextFire(cron('0 9 * * *'), LA, 1, now - 4 * 86_400_000, now);
+  assert.equal(exact.skipped, 4);
+  assert.equal(exact.skippedExact, true);
+
+  // A minutely schedule thirty days late really missed 43,200 occurrences.
+  // The walk stops at the budget, so the number it can report is 20,000 — and
+  // the point is that it must not be handed over as though it were 43,200.
+  const stopped = planNextFire(cron('* * * * *'), LA, 1, now - 30 * 86_400_000, now);
+  assert.equal(stopped.skippedExact, false);
+  assert.ok(stopped.skipped < 30 * 1440, 'the walk stopped short, by construction');
+  assert.equal(stopped.phaseReset, false, 'everyN is 1, so there was no phase to lose');
+});
+
+test('the mail hedges the missed count when it is a floor, and does not when it is not', () => {
+  const condition = {
+    id: 4,
+    owner: 'hamachi-engineer1',
+    kind: 'schedule',
+    armedAt: 0,
+    dueAt: 1_000,
+    active: true,
+    firedAt: null,
+    spec: { note: 'n', cron: '* * * * *', timezone: LA, everyN: 1, anchorAt: 0 },
+    seen: { lastFiredAt: null, fires: 0, missed: 0 },
+  };
+
+  const floor = composeScheduleMail(condition, 2_000, {
+    nextAt: 9_000,
+    skipped: 20_000,
+    skippedExact: false,
+    phaseReset: false,
+  });
+  assert.match(floor.body, /AT LEAST 20000 further occurrences/);
+  assert.match(floor.body, /FLOOR AND NOT A TOTAL/);
+  assert.match(floor.body, /More were missed than that/);
+
+  const total = composeScheduleMail(condition, 2_000, {
+    nextAt: 9_000,
+    skipped: 3,
+    skippedExact: true,
+    phaseReset: false,
+  });
+  assert.match(total.body, /^3 further occurrences came and went/m);
+  assert.doesNotMatch(total.body, /AT LEAST/);
+  assert.doesNotMatch(total.body, /FLOOR AND NOT A TOTAL/);
+});
+
+test('the hedge follows the number into listArmed, and latches once it is set', () => {
+  const { registry, mail, store } = board();
+  const spec = { note: 'dense', cron: '* * * * *', timezone: LA, everyN: 1, anchorAt: 0 };
+  // Thirty days late on a minutely schedule: the walk cannot count them all.
+  const armed = store.arm(
+    'hamachi-engineer1',
+    'schedule',
+    Date.now() - 30 * 86_400_000,
+    spec,
+    { lastFiredAt: null, fires: 0, missed: 0 },
+  );
+
+  const loop = waker(registry, mail, store);
+  loop.tick();
+
+  const afterFirst = store.get(armed.id);
+  assert.equal(afterFirst.seen.missedExact, false, 'the row remembers that counting stopped');
+
+  const { listArmed } = toolsFor('hamachi-engineer1', store);
+  return listArmed.handler({}, {}).then(async (listed) => {
+    assert.match(said(listed), /at least \d+ occurrence\(s\) missed/);
+
+    // Fire it again, on time. This walk counts nothing and is exact, but the
+    // running total is a floor forever — one short walk cannot be undone.
+    store.reschedule(armed.id, Date.now() - 1000, afterFirst.seen);
+    loop.tick();
+    assert.equal(store.get(armed.id).seen.missedExact, false, 'it latches');
+    assert.match(said(await listArmed.handler({}, {})), /at least/);
+    registry.close();
+  });
 });
 
 test('a phase reset is reported to the agent rather than quietly applied', () => {
@@ -954,6 +1057,14 @@ test('the tool descriptions state what a schedule is and is not', () => {
   assert.match(scheduleRecurring.description, /posts nothing to Discord or anywhere outside/);
   assert.match(scheduleRecurring.description, /America\/Los_Angeles/);
   assert.match(scheduleRecurring.description, /hamachi-engineer1/);
+
+  // And it does not overstate the anchor. It said the anchor does NOTHING at
+  // everyN 1, which is false for a future one — the description is what an
+  // agent reads while deciding how to call the tool, so an absolute that is
+  // wrong in one direction is worse here than anywhere else in the change.
+  assert.doesNotMatch(scheduleRecurring.description, /does\s+NOTHING/);
+  assert.match(scheduleRecurring.description, /A FUTURE anchor delays the first fire/);
+  assert.match(scheduleRecurring.description, /A PAST anchor only chooses/);
 
   // And `remindMe` no longer claims a repeat is impossible, which it was until
   // this tool existed. A retracted sentence left in place is worse than either.

@@ -547,6 +547,23 @@ export type SchedulePlan = {
   /** Occurrences that came and went with nothing running. Never delivered. */
   skipped: number;
   /**
+   * Whether `skipped` is the true count or a floor.
+   *
+   * False when the walk stopped on its budget, which means the real number is
+   * larger and unknown — 20,000 counted against 43,200 that happened, for a
+   * minutely schedule thirty days late. The count exists so that an agent is
+   * told about firings it never received, and a count presented as exact when
+   * it is not undercuts the one job that sentence has. So the fact that
+   * counting stopped travels with the number, and the mail says "at least".
+   *
+   * THIS BECAME REACHABLE WHEN THE BUDGET CAME DOWN. At 100,000 occurrences
+   * nothing realistic hit it; at 20,000 a five-minute schedule with a year's
+   * outage does, and so does a minutely one with a fortnight. Lowering the
+   * budget was right — it bounds how long the process stops — and this is the
+   * consequence of it, handled rather than inherited.
+   */
+  skippedExact: boolean;
+  /**
    * Set when so many occurrences were missed that the every-N phase was
    * abandoned and now counts from this firing. Reported in the mail, not hidden.
    * Meaningless — and always false — when `everyN` is 1, where every occurrence
@@ -587,14 +604,22 @@ export function planNextFire(
 
   while (next !== null && next <= now) {
     if (walked >= MAX_CATCHUP) {
-      return { nextAt: nextAfter(fields, timeZone, now), skipped, phaseReset: everyN > 1 };
+      // `skipped` is now a floor rather than a count: the loop stopped, the
+      // occurrences did not. Saying so is the difference between a number and
+      // a number that can be trusted.
+      return {
+        nextAt: nextAfter(fields, timeZone, now),
+        skipped,
+        skippedExact: false,
+        phaseReset: everyN > 1,
+      };
     }
     skipped += 1;
     walked += everyN;
     next = advance(fields, timeZone, next, everyN);
   }
 
-  return { nextAt: next, skipped, phaseReset: false };
+  return { nextAt: next, skipped, skippedExact: true, phaseReset: false };
 }
 
 export type FirstFire =
