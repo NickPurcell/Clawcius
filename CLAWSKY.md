@@ -305,13 +305,25 @@ a container and a uid the owner column is the entire boundary, so that refusal
 is enforced in the statement that writes rather than by asking.
 
 **A second watch on a pull request you already watch is refused**, naming the
-id of the one you have. This is Clawcius #50 as it happened rather than as it
-was imagined: two watches on one pull request, armed by two agents that could
-not see each other's, delivering every event twice until it merged. Two
-*agents* watching one PR is not prevented — they each want their own mail. One
-agent watching it twice is, at arm time, which is the only place the mistake is
-cheap. Deduplicating a condition is not throttling delivery; nothing anywhere
-delays, drops or coalesces mail.
+id of the one you have. This is Clawcius #50 as it happened: two watches on one
+pull request, delivering every event twice until it merged, with nothing able
+to list or stop them from inside a turn.
+
+Both rows had the **same owner**, and that is the part to remember, because it
+does not look that way from the outside. The second watch was armed by an
+engineer subagent, and a subagent has no tools of its own — `mcpServers` is a
+session option, so a subagent calls its parent's `watchPr`, closed over the
+parent's agent id, and the mail lands in the parent's inbox. One agent armed
+twice across two of its own turns. Owner-scoped deduplication therefore covers
+the incident, and covers a restart re-arming what a previous turn already
+armed, which is the same shape.
+
+Two *agents* watching one pull request is a different thing and is not
+prevented: they each want their own mail, and `listArmed` says plainly that it
+cannot see a colleague's rather than letting an absence be read as proof.
+
+Deduplicating a condition is not throttling delivery; nothing anywhere delays,
+drops or coalesces mail.
 
 **What arrives from a watch is external content**, and is framed as such in the
 mail itself — quoted line by line, inside markers, carrying the same rule the

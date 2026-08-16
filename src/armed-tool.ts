@@ -45,16 +45,29 @@
  *
  * ── The second watch on one pull request is a refusal, not a second row ─────
  *
- * Clawcius #50, observed rather than imagined: the coordinator armed a watch on
- * a pull request that an engineer was already watching from its own session,
- * neither could see the other's, and every event on that PR arrived in the
- * coordinator's inbox twice for as long as it stayed open. Nothing was wrong
- * with the polling. There were simply two rows.
+ * Clawcius #50, observed rather than imagined. A watch was armed on a pull
+ * request, and a second was armed on the same pull request by an engineer
+ * subagent working on it. Every event then arrived in the coordinator's inbox
+ * twice, for as long as the PR stayed open, and nothing could be done about it
+ * from inside a turn. The polling was correct throughout. There were simply
+ * two rows.
  *
- * Two *agents* watching one pull request is not the bug and is not prevented —
- * they each want their own mail. One agent watching it twice is, so `watchPr`
- * looks for an existing live watch by the same owner on the same repo and
- * number and REFUSES, naming the id of the one that already exists.
+ * BOTH ROWS HAD THE SAME OWNER, which is the part worth writing down because
+ * it does not look that way from the outside. A subagent has no tools of its
+ * own: `mcpServers` is a session-level option (agent.ts), so a subagent
+ * spawned inside a session calls the PARENT'S `watchPr`, closed over the
+ * parent's agent id, and mail from its watch goes to the parent's inbox. The
+ * incident was one agent arming twice across two of its own turns, which reads
+ * as two agents and is not — and it is why deduplicating on the owner covers
+ * what actually happened rather than a neighbouring case.
+ *
+ * So `watchPr` looks for an existing live watch by the same owner on the same
+ * repo and number and REFUSES, naming the id of the one that already exists.
+ *
+ * Two *agents* watching one pull request is a genuinely different thing and is
+ * not prevented. They each want their own mail, in their own inbox, and
+ * neither can see the other's — `listArmed` says so in as many words rather
+ * than letting an absence be read as proof.
  *
  * Refusing rather than returning "already watching, here it is" was a choice
  * between two defensible answers, and the deciding argument is that a success
@@ -107,6 +120,24 @@ const SPENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** A note in a listing is an identifier, not the note. */
 const NOTE_PREVIEW_CHARS = 80;
+
+/**
+ * How many conditions `listArmed` renders before it starts counting instead.
+ *
+ * Nothing caps how many conditions an agent may arm, and the listing goes
+ * whole into a context window: 200 active reminders measure 32KB. Every
+ * neighbour already draws this line — `MAX_EXTERNAL_ITEMS`, the mail size
+ * refusal, `MAX_NOTE_CHARS` — and the cost of not drawing it is paid by the
+ * model rather than by whoever armed the two hundredth reminder.
+ *
+ * The rows are ordered soonest-first, so what is cut is what is furthest away.
+ * What is cut is COUNTED IN THE OUTPUT, not dropped from it, which is the
+ * difference between a bound and a lie: an agent that cannot see condition 150
+ * is at least told that fifty exist beyond the ones shown. Ended conditions get
+ * the smaller share because they are context rather than the point.
+ */
+const MAX_LISTED_ACTIVE = 20;
+const MAX_LISTED_ENDED = 10;
 
 /**
  * The furthest ahead a reminder may be armed.
@@ -174,15 +205,28 @@ function relative(ms: number): string {
   return ms >= 0 ? `in ${count}` : `${count} ago`;
 }
 
-/** What a condition is waiting for, in one line. */
+/**
+ * What a condition is waiting for, in one line.
+ *
+ * Every field is treated as possibly absent. `toCondition` only guarantees the
+ * spec is an object — it parses JSON and checks the kind, not the shape — and
+ * the promise it makes is that one unreadable row must not stop the others,
+ * which the waker honours with a per-condition catch. A `join` on a missing
+ * array here would throw out of the whole of `listArmed` and take an agent's
+ * readable conditions down with the one that is not. Nothing writes such a row
+ * today; a schema change is how one would appear, and that is exactly when
+ * being able to list the table matters.
+ */
 function summarise(condition: ArmedCondition): string {
   if (condition.kind === 'pr-watch') {
-    const spec = condition.spec as PrWatchSpec;
-    return `pr-watch  ${spec.repo}#${spec.pr}  on ${spec.on.join(', ')}`;
+    const spec = condition.spec as Partial<PrWatchSpec>;
+    const on = Array.isArray(spec.on) && spec.on.length > 0 ? spec.on.join(', ') : '(unreadable)';
+    return `pr-watch  ${spec.repo ?? '(unreadable)'}#${spec.pr ?? '?'}  on ${on}`;
   }
-  const note = (condition.spec as ReminderSpec).note ?? '';
+  const note = (condition.spec as Partial<ReminderSpec>).note;
+  const text = typeof note === 'string' ? note : '(unreadable)';
   const preview =
-    note.length > NOTE_PREVIEW_CHARS ? `${note.slice(0, NOTE_PREVIEW_CHARS)}…` : note;
+    text.length > NOTE_PREVIEW_CHARS ? `${text.slice(0, NOTE_PREVIEW_CHARS)}…` : text;
   return `reminder  "${preview.replace(/\s+/g, ' ')}"`;
 }
 
@@ -205,7 +249,8 @@ export function renderArmed(
       : `${active.length} armed for ${agentId}.`,
   );
 
-  for (const condition of active) {
+  // Soonest first, so what a cap removes is what is furthest from mattering.
+  for (const condition of active.slice(0, MAX_LISTED_ACTIVE)) {
     const verb = condition.kind === 'pr-watch' ? 'next poll' : 'fires';
     lines.push('');
     lines.push(`  #${condition.id}  ${summarise(condition)}`);
@@ -214,13 +259,26 @@ export function renderArmed(
         ` · armed ${stamp(condition.armedAt)}`,
     );
   }
+  if (active.length > MAX_LISTED_ACTIVE) {
+    lines.push('');
+    lines.push(
+      `(${active.length - MAX_LISTED_ACTIVE} further armed condition(s), due later than ` +
+        'those above, are not listed. Disarm some of these first if you are looking for one ' +
+        'of them.)',
+    );
+  }
 
   if (spent.recent.length > 0) {
     lines.push('');
     lines.push('── ENDED in the last 24 hours. Kept as a record; nothing further will fire.');
-    for (const condition of spent.recent) {
+    for (const condition of spent.recent.slice(0, MAX_LISTED_ENDED)) {
       const at = condition.firedAt ?? condition.armedAt;
       lines.push(`  #${condition.id}  ${summarise(condition)}  ended ${stamp(at)}`);
+    }
+    if (spent.recent.length > MAX_LISTED_ENDED) {
+      lines.push(
+        `  (and ${spent.recent.length - MAX_LISTED_ENDED} more that ended in the last 24 hours.)`,
+      );
     }
   }
   if (spent.older > 0) {
@@ -248,6 +306,9 @@ function describeListArmed(agentId: string): string {
     '',
     'Conditions that ended within the last day are listed too, marked as ended, because',
     '"nothing armed" otherwise means both "you never armed one" and "it already fired".',
+    '',
+    'Soonest first, and long lists are capped — the count at the top is always the true one,',
+    'and the output says how many rows it did not render.',
   ].join('\n');
 }
 

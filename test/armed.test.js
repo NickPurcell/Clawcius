@@ -694,6 +694,135 @@ test('a second watch on a pull request you already watch is refused, and no row 
   registry.close();
 });
 
+test('a disarm that lands while a poll is in flight stops the mail that poll was about to send', async () => {
+  const { registry, mail, store } = board();
+  await toolsFor('hamachi-engineer1', store, {
+    github: stubGitHub({ pr: openPr, reviews: [], comments: [] }),
+  }).watchPr.handler({ pr: 44 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+  store.reschedule(row.id, Date.now() - 1000, row.seen);
+
+  // A poll parked mid-flight. The waker and the agent's tools share a process
+  // and an event loop — the tools are SDK MCP tools, in this process — so a
+  // withdrawal really can land between the request and the response.
+  let release;
+  const parked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const slow = {
+    async getPullRequest() {
+      await parked;
+      return openPr;
+    },
+    async listReviews() {
+      return [{ id: 6, author: 'osmosis-jones', state: 'CHANGES_REQUESTED', body: 'a new review', htmlUrl: 'u6' }];
+    },
+    async listComments() {
+      return [];
+    },
+  };
+
+  const ticking = new ArmedWaker({
+    store, registry, mail, github: slow, tickMs: 1000, log: () => {},
+  }).tick();
+
+  const withdrawn = await toolsFor('hamachi-engineer1', store).disarm.handler({ id: row.id }, {});
+  assert.equal(withdrawn.isError, false);
+  assert.match(said(withdrawn), /It will not fire/);
+  release();
+  await ticking;
+
+  // The tool said it would not fire. That has to be true of a review the poll
+  // had already fetched, or the sentence is the kind of false receipt this
+  // whole change exists to remove.
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'and it did not fire');
+  assert.equal(store.get(row.id).active, false, 'nor was it resurrected by the poll finishing');
+  registry.close();
+});
+
+test('a condition disarmed after the tick\'s query, but before its turn, does not fire either', async () => {
+  const { registry, mail, store } = board();
+  // Both due. The watch is first, and the loop awaits inside it, which is the
+  // only reason there is a window at all.
+  await toolsFor('hamachi-engineer1', store, {
+    github: stubGitHub({ pr: openPr, reviews: [], comments: [] }),
+  }).watchPr.handler({ pr: 44 }, {});
+  const [watch] = store.listFor('hamachi-engineer1');
+  store.reschedule(watch.id, Date.now() - 5000, watch.seen);
+  const reminder = store.arm('hamachi-engineer1', 'reminder', Date.now() - 1000, {
+    note: 'the thing that was already done',
+  });
+
+  let release;
+  const parked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const slow = {
+    async getPullRequest() {
+      await parked;
+      return openPr;
+    },
+    async listReviews() {
+      return [];
+    },
+    async listComments() {
+      return [];
+    },
+  };
+
+  const lines = [];
+  const ticking = new ArmedWaker({
+    store, registry, mail, github: slow, tickMs: 1000, log: (line) => lines.push(line),
+  }).tick();
+
+  await toolsFor('hamachi-engineer1', store).disarm.handler({ id: reminder.id }, {});
+  release();
+  await ticking;
+
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'the snapshot is not the authority');
+  assert.ok(lines.some((line) => /was disarmed after this tick's query/.test(line)));
+  registry.close();
+});
+
+test('listArmed is bounded, and says how much it is not showing', async () => {
+  const { registry, store } = board();
+  const now = Date.now();
+  for (let i = 0; i < 25; i += 1) {
+    store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, { note: `reminder ${i}` });
+  }
+  for (let i = 0; i < 15; i += 1) {
+    const spent = store.arm('hamachi-engineer1', 'reminder', now, { note: `spent ${i}` });
+    store.disarm(spent.id);
+  }
+
+  const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
+
+  // The count is honest even where the rows are not all rendered.
+  assert.match(listing, /^25 armed for hamachi-engineer1\./m);
+  assert.equal(listing.match(/^ {2}#\d+ {2}reminder/gm).length, 30, '20 active + 10 ended');
+  assert.match(listing, /5 further armed condition\(s\), due later than those above, are not listed/);
+  assert.match(listing, /and 5 more that ended in the last 24 hours/);
+  assert.ok(listing.length < 8000, `32KB of listing goes into a context window: ${listing.length}`);
+  registry.close();
+});
+
+test('a condition whose spec lost a field is listed as unreadable rather than taking the listing down', async () => {
+  const { registry, store } = board();
+  // What a schema change looks like from the far side: parses as JSON, is the
+  // right kind, and does not have the field the renderer wants. `toCondition`
+  // promises one bad row will not stop the others; this is that promise at the
+  // rendering end, and listing the table is exactly what you want to do on the
+  // day such a row appears.
+  store.arm('hamachi-engineer1', 'pr-watch', Date.now() + 60_000, { repo: 'NickPurcell/OJ', pr: 13 });
+  store.arm('hamachi-engineer1', 'reminder', Date.now() + 120_000, { note: 'a readable one' });
+
+  const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
+
+  assert.match(listing, /pr-watch {2}NickPurcell\/OJ#13 {2}on \(unreadable\)/);
+  assert.match(listing, /a readable one/, 'the good row is still there');
+  registry.close();
+});
+
 test('the duplicate check is per owner: two agents may watch one pull request, and one may re-arm after disarming', async () => {
   const { registry, store } = board();
   const github = stubGitHub({ pr: openPr, reviews: [], comments: [] });
