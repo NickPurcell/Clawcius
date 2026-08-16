@@ -740,6 +740,50 @@ test('a disarm that lands while a poll is in flight stops the mail that poll was
   registry.close();
 });
 
+test('a disarm during a poll that then FAILS is silent too, not "could not reach GitHub"', async () => {
+  const { registry, mail, store } = board();
+  await toolsFor('hamachi-engineer1', store, {
+    github: stubGitHub({ pr: openPr, reviews: [], comments: [] }),
+  }).watchPr.handler({ pr: 44 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+  store.reschedule(row.id, Date.now() - 1000, row.seen);
+
+  // The re-read sits before the failure branch as well as the success one, and
+  // that ordering is a decision rather than an accident: a watch its owner has
+  // just withdrawn should not answer with an error about a poll it no longer
+  // cares about. Moving the re-read below `if (!polled)` passes every other
+  // test in this file, so this is the one that holds it in place.
+  let release;
+  const parked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const broken = {
+    async getPullRequest() {
+      await parked;
+      throw new Error('GitHub answered 500 for /repos/NickPurcell/Clawcius/pulls/44');
+    },
+    async listReviews() {
+      return [];
+    },
+    async listComments() {
+      return [];
+    },
+  };
+
+  const ticking = new ArmedWaker({
+    store, registry, mail, github: broken, tickMs: 1000, log: () => {},
+  }).tick();
+  await toolsFor('hamachi-engineer1', store).disarm.handler({ id: row.id }, {});
+  const withdrawnAt = store.get(row.id).firedAt;
+  release();
+  await ticking;
+
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'no mail of any kind');
+  assert.equal(store.get(row.id).active, false);
+  assert.equal(store.get(row.id).firedAt, withdrawnAt, 'and the disarm stamp is not overwritten');
+  registry.close();
+});
+
 test('a condition disarmed after the tick\'s query, but before its turn, does not fire either', async () => {
   const { registry, mail, store } = board();
   // Both due. The watch is first, and the loop awaits inside it, which is the
@@ -784,11 +828,14 @@ test('a condition disarmed after the tick\'s query, but before its turn, does no
   registry.close();
 });
 
-test('listArmed is bounded, and says how much it is not showing', async () => {
+test('listArmed is bounded, and every armed id is still reachable past the cap', async () => {
   const { registry, store } = board();
   const now = Date.now();
+  const armed = [];
   for (let i = 0; i < 25; i += 1) {
-    store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, { note: `reminder ${i}` });
+    armed.push(store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, {
+      note: `reminder ${i}`,
+    }));
   }
   for (let i = 0; i < 15; i += 1) {
     const spent = store.arm('hamachi-engineer1', 'reminder', now, { note: `spent ${i}` });
@@ -797,12 +844,62 @@ test('listArmed is bounded, and says how much it is not showing', async () => {
 
   const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
 
-  // The count is honest even where the rows are not all rendered.
+  // The count is honest even where the rows are not rendered in full.
   assert.match(listing, /^25 armed for hamachi-engineer1\./m);
-  assert.equal(listing.match(/^ {2}#\d+ {2}reminder/gm).length, 30, '20 active + 10 ended');
-  assert.match(listing, /5 further armed condition\(s\), due later than those above, are not listed/);
+  assert.match(listing, /5 more armed, due later than those above/);
   assert.match(listing, /and 5 more that ended in the last 24 hours/);
   assert.ok(listing.length < 8000, `32KB of listing goes into a context window: ${listing.length}`);
+
+  // Bounded is not the same as unreachable. `disarm` takes an id, so every id
+  // an agent still holds has to be somewhere in this output — a listing that
+  // said "and 5 others" would be an absence you cannot act on, which is the
+  // failure this tool exists to remove, one level down.
+  for (const condition of armed) {
+    assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
+  }
+  // And the ones past the cap are the cheap form: no moments on those lines.
+  const full = listing.match(/^ {6}fires /gm) ?? [];
+  assert.equal(full.length, 20, 'twenty rendered in full, the rest one line each');
+
+  // Nothing destructive is suggested for finding one of them.
+  assert.doesNotMatch(listing, /Disarm some/i);
+  registry.close();
+});
+
+test('two watchPr calls that overlap in flight write one row, not two', async () => {
+  const { registry, store } = board();
+
+  // Both calls get past the early check — it runs before the network — and
+  // then sit in the same await. This is the shape a subagent gives you: work
+  // that runs separately while sharing the parent's closure, which is where
+  // #50's second watch came from.
+  let release;
+  const parked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const slow = {
+    async getPullRequest() {
+      await parked;
+      return openPr;
+    },
+    async listReviews() {
+      return [];
+    },
+    async listComments() {
+      return [];
+    },
+  };
+  const { watchPr } = toolsFor('hamachi-engineer1', store, { github: slow });
+
+  const both = Promise.all([watchPr.handler({ pr: 44 }, {}), watchPr.handler({ pr: 44 }, {})]);
+  release();
+  const [a, b] = await both;
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, 'one watch, not two');
+  assert.notEqual(a.isError, b.isError, 'exactly one of them armed it');
+  const refusal = said(a.isError ? a : b);
+  assert.match(refusal, /already watching NickPurcell\/Clawcius#44/);
+  assert.match(refusal, /armed while this call was fetching/);
   registry.close();
 });
 

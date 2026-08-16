@@ -314,9 +314,16 @@ does not look that way from the outside. The second watch was armed by an
 engineer subagent, and a subagent has no tools of its own — `mcpServers` is a
 session option, so a subagent calls its parent's `watchPr`, closed over the
 parent's agent id, and the mail lands in the parent's inbox. One agent armed
-twice across two of its own turns. Owner-scoped deduplication therefore covers
-the incident, and covers a restart re-arming what a previous turn already
-armed, which is the same shape.
+twice across two of its own turns.
+
+Owner is therefore the right key, and the check is made twice: once before the
+first poll, so a duplicate costs nothing, and once immediately before the
+insert with no `await` between, so two overlapping calls cannot both pass it.
+That is the whole of the guarantee, and it is worth stating what it is not. It
+holds within one process, which is where the tools run; it is not a database
+constraint, so it would not survive a second writer. What it covers is the
+incident's shape — the same owner arming twice, whether across two turns, side
+by side, or after a restart re-arms what an earlier turn already armed.
 
 Two *agents* watching one pull request is a different thing and is not
 prevented: they each want their own mail, and `listArmed` says plainly that it

@@ -83,6 +83,12 @@
  * distinguish `NickPurcell/OJ` from `nickpurcell/oj`, and a duplicate that got
  * through on a capital letter would be this bug back with a better disguise.
  *
+ * The check is made TWICE, and the second one is the one that is load-bearing:
+ * immediately before the insert, with no `await` between them, because the
+ * first runs before three round trips to GitHub and therefore answers a
+ * question about a table as it was seconds ago. The early one is kept because
+ * it is what makes a duplicate cost nothing. See the comment at the insert.
+ *
  * ── This is not a throttle ──────────────────────────────────────────────────
  *
  * Nothing here delays, drops or coalesces a delivery, and nothing added here
@@ -121,6 +127,9 @@ const SPENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** A note in a listing is an identifier, not the note. */
 const NOTE_PREVIEW_CHARS = 80;
 
+/** And past the cap it is an identifier only — enough to tell two apart. */
+const OVERFLOW_PREVIEW_CHARS = 32;
+
 /**
  * How many conditions `listArmed` renders before it starts counting instead.
  *
@@ -131,13 +140,30 @@ const NOTE_PREVIEW_CHARS = 80;
  * model rather than by whoever armed the two hundredth reminder.
  *
  * The rows are ordered soonest-first, so what is cut is what is furthest away.
- * What is cut is COUNTED IN THE OUTPUT, not dropped from it, which is the
- * difference between a bound and a lie: an agent that cannot see condition 150
- * is at least told that fifty exist beyond the ones shown. Ended conditions get
- * the smaller share because they are context rather than the point.
+ * Ended conditions get the smaller share because they are context rather than
+ * the point.
+ *
+ * What is past the cap is not cut to a number. The first draft said only how
+ * many there were and advised disarming some to find the rest, which is
+ * destructive advice for a read-only question, and a count is precisely the
+ * shape of answer this whole change exists to stop giving — an absence that
+ * cannot be acted on. So the remainder is rendered one line each — id, kind,
+ * and enough of the subject to tell two apart — with no moments and a shorter
+ * preview: about a third of a full entry, and the id `disarm` wants is present
+ * for every condition an agent holds. A bare list of ids would have been
+ * cheaper still and would not answer "which of these is the watch on OJ#13",
+ * which is the question somebody scrolling actually has.
+ *
+ * Measured rather than estimated, because the first two numbers written here
+ * were both wrong. Three armed — the ordinary case, and the only one most
+ * agents will ever see — is 599 bytes. Twenty-five is 3.4KB. Two hundred armed
+ * with two hundred ended is 6.6KB, against 4.3KB if the overflow were a bare
+ * count and 33KB for the active half alone with no bound at all.
  */
 const MAX_LISTED_ACTIVE = 20;
 const MAX_LISTED_ENDED = 10;
+/** Past this the listing stops entirely; the count is still true. */
+const MAX_LISTED_COMPACT = 50;
 
 /**
  * The furthest ahead a reminder may be armed.
@@ -206,6 +232,31 @@ function relative(ms: number): string {
 }
 
 /**
+ * The refusal both duplicate checks return.
+ *
+ * One function so the two cannot drift into saying different things about the
+ * same situation — from the agent's seat it *is* the same situation, and the
+ * answer it needs is the id. `during` adds the one clause that differs: a watch
+ * that appeared while this call was in flight is worth knowing about, because
+ * from the caller's point of view it did not exist when it asked.
+ */
+function alreadyWatching(existing: ArmedCondition, during = false) {
+  const spec = existing.spec as Partial<PrWatchSpec>;
+  const on = Array.isArray(spec.on) ? spec.on.join(', ') : '(unreadable)';
+  return refuse(
+    `Not armed — you are already watching ${spec.repo}#${spec.pr}: that is watch ` +
+      `${existing.id}, armed ${stamp(existing.armedAt)}, on ${on}. A second watch would ` +
+      'mail you every event on that pull request twice until it merges or closes. Nothing ' +
+      `was written. If you want different terms, disarm(${existing.id}) and arm again; ` +
+      'listArmed() shows the rest.' +
+      (during
+        ? ' (That watch was armed while this call was fetching the pull request, so it was ' +
+          'not there when you asked — something else in this session armed it.)'
+        : ''),
+  );
+}
+
+/**
  * What a condition is waiting for, in one line.
  *
  * Every field is treated as possibly absent. `toCondition` only guarantees the
@@ -217,7 +268,7 @@ function relative(ms: number): string {
  * today; a schema change is how one would appear, and that is exactly when
  * being able to list the table matters.
  */
-function summarise(condition: ArmedCondition): string {
+function summarise(condition: ArmedCondition, previewChars = NOTE_PREVIEW_CHARS): string {
   if (condition.kind === 'pr-watch') {
     const spec = condition.spec as Partial<PrWatchSpec>;
     const on = Array.isArray(spec.on) && spec.on.length > 0 ? spec.on.join(', ') : '(unreadable)';
@@ -225,8 +276,7 @@ function summarise(condition: ArmedCondition): string {
   }
   const note = (condition.spec as Partial<ReminderSpec>).note;
   const text = typeof note === 'string' ? note : '(unreadable)';
-  const preview =
-    text.length > NOTE_PREVIEW_CHARS ? `${text.slice(0, NOTE_PREVIEW_CHARS)}…` : text;
+  const preview = text.length > previewChars ? `${text.slice(0, previewChars)}…` : text;
   return `reminder  "${preview.replace(/\s+/g, ' ')}"`;
 }
 
@@ -259,13 +309,19 @@ export function renderArmed(
         ` · armed ${stamp(condition.armedAt)}`,
     );
   }
-  if (active.length > MAX_LISTED_ACTIVE) {
+  const overflow = active.slice(MAX_LISTED_ACTIVE);
+  if (overflow.length > 0) {
     lines.push('');
     lines.push(
-      `(${active.length - MAX_LISTED_ACTIVE} further armed condition(s), due later than ` +
-        'those above, are not listed. Disarm some of these first if you are looking for one ' +
-        'of them.)',
+      `── ${overflow.length} more armed, due later than those above. One line each, no ` +
+        'moments — disarm takes the id.',
     );
+    for (const condition of overflow.slice(0, MAX_LISTED_COMPACT)) {
+      lines.push(`  #${condition.id}  ${summarise(condition, OVERFLOW_PREVIEW_CHARS)}`);
+    }
+    if (overflow.length > MAX_LISTED_COMPACT) {
+      lines.push(`  (and ${overflow.length - MAX_LISTED_COMPACT} more, not listed at all.)`);
+    }
   }
 
   if (spent.recent.length > 0) {
@@ -525,16 +581,7 @@ export function buildArmedTools(
       // whether *you* already watch it, which is the only question it can
       // answer — see the header for why a colleague's watch is not this bug.
       const existing = options.store.findPrWatch(agentId, target, number);
-      if (existing) {
-        const spec = existing.spec as PrWatchSpec;
-        return refuse(
-          `Not armed — you are already watching ${spec.repo}#${spec.pr}: that is watch ` +
-            `${existing.id}, armed ${stamp(existing.armedAt)}, on ${spec.on.join(', ')}. A ` +
-            'second watch would mail you every event on that pull request twice until it ' +
-            'merges or closes. Nothing was written. If you want different terms, ' +
-            `disarm(${existing.id}) and arm again; listArmed() shows the rest.`,
-        );
-      }
+      if (existing) return alreadyWatching(existing);
 
       // The first poll, in the tool call. See the header: this is the token
       // check, the existence check and the baseline, in one round trip that
@@ -567,6 +614,31 @@ export function buildArmedTools(
             `${String(error).slice(0, 400)}`,
         );
       }
+
+      // ── AND AGAIN, WITH NOTHING BETWEEN THIS AND THE INSERT ─────────────
+      //
+      // The check above happens before three round trips to GitHub, so it
+      // answers a question about a table as it was some seconds ago. Two calls
+      // that overlap in those awaits both find nothing and both write, which
+      // is the duplicate this tool exists to refuse, arrived at from the one
+      // direction the early check cannot see.
+      //
+      // Whether the SDK ever dispatches two tool calls from one session at
+      // once is not something this code can find out. What is known is that
+      // the mechanism behind #50 was a SUBAGENT — the one thing here that runs
+      // as separate work while sharing the parent's closure, and therefore the
+      // likeliest source of an overlap if one is possible at all.
+      //
+      // This pair of statements is the defence: `findPrWatch` and `arm` are
+      // both synchronous, with no `await` between them, and a single event
+      // loop cannot interleave two synchronous statements. That is also why
+      // this is not a `UNIQUE` index over a JSON column — the guarantee is
+      // already available for free at the only point that needs it.
+      //
+      // The early check stays. It is what makes a duplicate cost nothing: this
+      // one only ever fires after the network work has been paid for.
+      const raced = options.store.findPrWatch(agentId, target, number);
+      if (raced) return alreadyWatching(raced, true);
 
       const armed = options.store.arm(
         agentId,
