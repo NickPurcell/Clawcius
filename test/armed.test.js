@@ -996,7 +996,7 @@ test('the duplicate check is per owner: two agents may watch one pull request, a
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
-test('remindMe and watchPr join the clawsky server rather than starting a second one', () => {
+test('the arming tools join the clawsky server rather than starting a second one', () => {
   const { registry, mail, store } = board();
 
   const servers = buildMailServer(

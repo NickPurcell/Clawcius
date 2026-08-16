@@ -1,0 +1,591 @@
+/**
+ * Recurring schedules: when does "every Monday at 9am" next happen?
+ *
+ * Everything here is pure. Given a cron expression, an IANA timezone and a
+ * moment, it says which moment comes next — no database, no clock, no mail. The
+ * database half is `armed.ts` and the firing half is `armed-wake.ts`; this is
+ * the arithmetic, alone, because the arithmetic is the part that is wrong twice
+ * a year and the only way to know it is not is to test it against named days.
+ *
+ * ── The whole problem is that a schedule is not an instant ──────────────────
+ *
+ * "Every Monday at 9am" is a WALL CLOCK. `remindMe` stores an instant, which is
+ * correct for a one-shot: you asked for a moment and it is that moment forever.
+ * A repeat cannot work that way. Store "next Monday 9am" as a UTC instant, add
+ * seven days to it each time it fires, and the schedule is right until the
+ * clocks change and then it is an hour out for six months — 9am becomes 8am in
+ * March and stays there. Nobody notices for a week, because being an hour early
+ * looks like nothing at all.
+ *
+ * So the cron fields are matched against the wall clock IN THE SCHEDULE'S OWN
+ * TIMEZONE, and the instant is derived from that every single time. The stored
+ * state is the timezone and the expression; the instant in `due_at` is a cache
+ * that is recomputed from them after every fire. Get this the wrong way round
+ * and the code looks identical in June.
+ *
+ * The conversion is `Intl.DateTimeFormat` with a `timeZone`, which is the only
+ * tz database Node has and the reason nothing is added to package.json. The
+ * offsets come out of the same ICU data `date` on the host uses.
+ *
+ * ── Iterating wall-clock candidates is what makes DST come out right ────────
+ *
+ * `nextAfter` walks CALENDAR DAYS in the timezone, and inside a matching day it
+ * walks the hour and minute values from the expression, in order. Each candidate
+ * is a wall clock, converted to an instant exactly once. Two properties fall out
+ * of that shape rather than out of special cases, which is why it is the shape:
+ *
+ *   SPRING FORWARD — 02:30 on 8 March 2026 in Los Angeles does not exist; the
+ *   clocks go 01:59:59 → 03:00:00. `epochFromWall` detects it (see below) and
+ *   returns null, the candidate is skipped, and the occurrence DOES NOT RUN
+ *   THAT DAY. It is not moved to 03:00.
+ *
+ *   Skipping rather than shifting, argued: a schedule that silently moves is
+ *   worse than one that visibly does not run. If it ran at 03:00 it would
+ *   collide with whatever the agent has at 03:00, once a year, invisibly. The
+ *   skip is not invisible — `scheduleRecurring` prints the next three fire
+ *   times in the receipt and `listArmed` prints the next one, so an agent that
+ *   asks for 02:30 daily can see the missing day before it happens. That
+ *   visibility is what makes skipping the safe answer rather than the strict
+ *   one. A schedule that must survive the gap should not sit inside it: 02:30
+ *   is one minute of the year and 09:00 is not.
+ *
+ *   FALL BACK — 01:30 on 1 November 2026 happens twice, at 08:30Z (PDT) and
+ *   again at 09:30Z (PST). There is ONE candidate for that wall clock, so it
+ *   produces one instant and fires ONCE. `epochFromWall` resolves an ambiguous
+ *   wall clock to the earlier of the two, so the fire is at 08:30Z and the
+ *   repeated hour is passed over — an hourly schedule runs 24 times across that
+ *   25-hour day, not 25. A repeat that fires twice is worse than one that fires
+ *   once at the earlier reading, because "twice" is indistinguishable from a
+ *   duplicate row, which this codebase has already paid for once (Clawcius #50).
+ *
+ * ── Short months are skipped, for the same reason as the gap ────────────────
+ *
+ * `0 9 31 * *` runs on the 31st of August, October and December, and does not
+ * run in September. The day iteration only ever produces days that exist, so
+ * this is not a rule — it is the absence of one. Clamping to the last day of the
+ * month was the alternative and it is worse: "the 31st" quietly becoming "the
+ * 30th" is a schedule that moved without being asked, and the two readings are
+ * indistinguishable afterwards. `0 9 28 * *` is what somebody who meant "every
+ * month" should write, and the three-occurrence preview in the receipt is where
+ * they find out they did not write it.
+ *
+ * ── Day-of-month and day-of-week are OR, which is standard and is a trap ────
+ *
+ * `0 9 1 * 1` means "the 1st of the month OR every Monday" in Vixie cron, not
+ * "the 1st, if it is a Monday". That is genuinely the standard and it is
+ * genuinely surprising, so it is implemented (this is not the place to invent a
+ * dialect) and `scheduleRecurring` says so out loud in the receipt when both
+ * fields are restricted. The preview underneath the warning is the proof.
+ */
+
+/**
+ * The zone every schedule gets unless it says otherwise.
+ *
+ * The operator's, and it is stored per row rather than read from here at fire
+ * time. A default that is consulted when the schedule fires is a schedule that
+ * changes meaning when the default changes; a default that is consulted when
+ * the schedule is armed is a schedule that means what it meant when it was
+ * written down. Only the second is auditable a year later.
+ */
+export const DEFAULT_TIMEZONE = 'America/Los_Angeles';
+
+/** How far `nextAfter` will scan for a matching day before calling it never. */
+const MAX_SCAN_DAYS = 3000;
+
+/**
+ * How many missed occurrences the catch-up loop will count before giving up on
+ * preserving the every-N phase.
+ *
+ * A minute-by-minute schedule and a service down for two months is the only way
+ * to reach this, and past that point the phase of an every-other-minute job is
+ * not worth the walk. It is reported rather than silently reset — see
+ * `SchedulePlan.phaseReset`.
+ */
+const MAX_CATCHUP = 100_000;
+
+/** Sorted, deduplicated field values, plus whether the field was narrowed. */
+export type CronFields = {
+  minutes: number[];
+  hours: number[];
+  daysOfMonth: number[];
+  months: number[];
+  daysOfWeek: number[];
+  /** `*` in day-of-month? The OR rule below turns on when both are false. */
+  domRestricted: boolean;
+  dowRestricted: boolean;
+  /** The expression as written, normalised to single spaces. */
+  text: string;
+};
+
+export type CronParse = { ok: true; fields: CronFields } | { ok: false; error: string };
+
+const MONTH_NAMES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+/** `@daily` and friends are cron, but they are not this cron. Say the equivalent. */
+const NICKNAMES: Record<string, string> = {
+  '@yearly': '0 0 1 1 *',
+  '@annually': '0 0 1 1 *',
+  '@monthly': '0 0 1 * *',
+  '@weekly': '0 0 * * 0',
+  '@daily': '0 0 * * *',
+  '@midnight': '0 0 * * *',
+  '@hourly': '0 * * * *',
+};
+
+type FieldSpec = { name: string; min: number; max: number; names?: string[] };
+
+/**
+ * One field: a star, `a`, `a-b`, either of those with a `/n` step, or any of
+ * them in a comma list. (Star-slash-n is not written out here because a block
+ * comment cannot contain it.)
+ *
+ * Returns the error text rather than throwing, because every caller of this is
+ * ultimately a tool result an agent reads, and "the day-of-week field: 9 is
+ * above 7" is worth strictly more than a stack trace.
+ */
+function parseField(raw: string, spec: FieldSpec): { values: number[]; restricted: boolean } | string {
+  const text = raw.trim().toLowerCase();
+  if (text === '') return `the ${spec.name} field is empty`;
+
+  const named = (token: string): string => {
+    if (!spec.names) return token;
+    const index = spec.names.indexOf(token);
+    return index === -1 ? token : String(index + spec.min);
+  };
+
+  const values = new Set<number>();
+  let restricted = false;
+
+  for (const part of text.split(',')) {
+    const halves = part.split('/');
+    if (halves.length > 2) return `the ${spec.name} field: "${part}" has two step markers`;
+    const rangeText = halves[0] ?? '';
+    const stepText = halves[1];
+
+    let step = 1;
+    if (stepText !== undefined) {
+      step = Number(stepText);
+      if (!Number.isInteger(step) || step < 1) {
+        return `the ${spec.name} field: "${stepText}" is not a step (expected a whole number above 0)`;
+      }
+      // `*/2` is a narrowing even though the range half is `*`. Getting this
+      // wrong would make `0 9 */2 * 1` an OR against every Monday. Never
+      // assigned false: this accumulates over the comma list, and one narrowed
+      // part narrows the field however the others are written.
+      if (rangeText !== '*' || step !== 1) restricted = true;
+    }
+
+    let from: number;
+    let to: number;
+    if (rangeText === '*') {
+      from = spec.min;
+      to = spec.max;
+    } else {
+      const bounds = rangeText.split('-').map(named);
+      if (bounds.length > 2) return `the ${spec.name} field: "${rangeText}" is not a range`;
+      from = Number(bounds[0]);
+      to = bounds.length === 2 ? Number(bounds[1]) : from;
+      if (!Number.isInteger(from) || !Number.isInteger(to)) {
+        return `the ${spec.name} field: "${rangeText}" is not a number or a range of numbers`;
+      }
+      if (from < spec.min || from > spec.max || to < spec.min || to > spec.max) {
+        return `the ${spec.name} field: "${rangeText}" is outside ${spec.min}-${spec.max}`;
+      }
+      if (to < from) return `the ${spec.name} field: "${rangeText}" runs backwards`;
+      restricted = true;
+    }
+
+    for (let value = from; value <= to; value += step) values.add(value);
+  }
+
+  return { values: [...values].sort((a, b) => a - b), restricted };
+}
+
+export function parseCron(expression: string): CronParse {
+  const raw = String(expression ?? '').trim();
+  if (raw === '') return { ok: false, error: 'the expression is empty' };
+
+  const nickname = NICKNAMES[raw.toLowerCase()];
+  if (nickname) {
+    return {
+      ok: false,
+      error: `"${raw}" is a cron nickname and this takes the five fields — write "${nickname}"`,
+    };
+  }
+
+  const parts = raw.split(/\s+/);
+  if (parts.length === 6) {
+    return {
+      ok: false,
+      error:
+        `"${raw}" has six fields. This is five-field cron with no seconds column — a schedule ` +
+        'that can fire every second is not something this delivers as mail. Drop the first field',
+    };
+  }
+  if (parts.length !== 5) {
+    return {
+      ok: false,
+      error: `"${raw}" has ${parts.length} field(s); expected five: minute hour day-of-month month day-of-week`,
+    };
+  }
+
+  const specs: FieldSpec[] = [
+    { name: 'minute', min: 0, max: 59 },
+    { name: 'hour', min: 0, max: 23 },
+    { name: 'day-of-month', min: 1, max: 31 },
+    { name: 'month', min: 1, max: 12, names: MONTH_NAMES },
+    { name: 'day-of-week', min: 0, max: 7, names: DAY_NAMES },
+  ];
+
+  const parsed = parts.map((part, index) => parseField(part, specs[index]!));
+  for (const result of parsed) {
+    if (typeof result === 'string') return { ok: false, error: result };
+  }
+  const [minute, hour, dom, month, dow] = parsed as Array<{ values: number[]; restricted: boolean }>;
+
+  // Both 0 and 7 are Sunday in every cron there has ever been.
+  const daysOfWeek = [...new Set(dow!.values.map((d) => (d === 7 ? 0 : d)))].sort((a, b) => a - b);
+
+  return {
+    ok: true,
+    fields: {
+      minutes: minute!.values,
+      hours: hour!.values,
+      daysOfMonth: dom!.values,
+      months: month!.values,
+      daysOfWeek,
+      domRestricted: dom!.restricted,
+      dowRestricted: dow!.restricted,
+      text: parts.join(' '),
+    },
+  };
+}
+
+// ── Timezone arithmetic ────────────────────────────────────────────────────
+
+/**
+ * Formatters are expensive to build and this builds one per timezone, once.
+ *
+ * `nextAfter` can call into here tens of thousands of times when it walks an
+ * anchor that is a year in the past, and an `Intl.DateTimeFormat` constructed
+ * inside that loop turns a millisecond into a minute.
+ */
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+function formatterFor(timeZone: string): Intl.DateTimeFormat {
+  let formatter = formatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    formatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
+/**
+ * A usable zone is `Area/Location`, or exactly UTC. An abbreviation is not one.
+ *
+ * ICU ACCEPTS `EST` AND IT IS A TRAP, which is the entire reason this is not
+ * three lines around a try/catch. `EST` in the tz database is a fixed offset of
+ * UTC-5 whose clocks NEVER CHANGE — a 9am schedule in `EST` runs at 9am in
+ * January and at 8am local from March to November, every year, and looks
+ * completely correct in the row. `MST` and `HST` are the same. `PST`, by pure
+ * accident of the alias table, is not: it is a link to America/Los_Angeles and
+ * does observe daylight saving. So the abbreviations are not even wrong
+ * consistently, which is worse than being wrong.
+ *
+ * Requiring a slash refuses all of them, in the turn the agent asked, with a
+ * message naming the zone it should have written. It also refuses `NZ`, `GB`
+ * and the other legacy single-word aliases, which are real zones and are simply
+ * spelled the modern way instead. That is a small cost against a silent hour.
+ */
+export function isTimezone(timeZone: string): boolean {
+  if (typeof timeZone !== 'string' || timeZone.trim() === '') return false;
+  const name = timeZone.trim();
+  if (name.toUpperCase() !== 'UTC' && !name.includes('/')) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: name });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type Wall = { y: number; m: number; d: number; h: number; mi: number; s: number };
+
+/** What clock a given instant shows in a given zone. */
+function wallOf(at: number, timeZone: string): Wall {
+  const parts = formatterFor(timeZone).formatToParts(new Date(at));
+  const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  return {
+    y: get('year'),
+    m: get('month'),
+    d: get('day'),
+    h: get('hour'),
+    mi: get('minute'),
+    s: get('second'),
+  };
+}
+
+/** The zone's offset from UTC at a given instant, in milliseconds. */
+function offsetAt(at: number, timeZone: string): number {
+  const w = wallOf(at, timeZone);
+  return Date.UTC(w.y, w.m - 1, w.d, w.h, w.mi, w.s) - Math.floor(at / 1000) * 1000;
+}
+
+/**
+ * The instant at which a zone's clock reads exactly this — or null if it never
+ * does.
+ *
+ * Two passes, because the offset that applies is a function of the answer. The
+ * first guess uses the offset in force at the same numbers read as UTC, which
+ * is right except within a day of a transition; the second uses the offset in
+ * force at the first guess, which is right. Then the result is CONVERTED BACK
+ * AND CHECKED, and that check is the whole spring-forward story: 02:30 on 8
+ * March in Los Angeles converts back to 01:30, the numbers disagree, and the
+ * answer is null rather than a plausible instant an hour out.
+ *
+ * When a wall clock happens twice — the fall-back hour — this returns the
+ * EARLIER instant, because the first pass lands on the pre-transition offset
+ * and the second agrees with it. That is a decision and it is why an hourly
+ * schedule fires once in the repeated hour instead of twice. See the header.
+ */
+export function epochFromWall(
+  y: number,
+  m: number,
+  d: number,
+  h: number,
+  mi: number,
+  timeZone: string,
+): number | null {
+  const asUtc = Date.UTC(y, m - 1, d, h, mi);
+  const first = offsetAt(asUtc, timeZone);
+  let at = asUtc - first;
+  const second = offsetAt(at, timeZone);
+  if (second !== first) at = asUtc - second;
+
+  const check = wallOf(at, timeZone);
+  if (check.y !== y || check.m !== m || check.d !== d || check.h !== h || check.mi !== mi) {
+    return null;
+  }
+  return at;
+}
+
+/** "2026-08-17 09:00 PDT" — the only rendering in which a schedule is legible. */
+export function zonedStamp(at: number, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).formatToParts(new Date(at));
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? '';
+  return (
+    `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')} ` +
+    `${get('timeZoneName')}`
+  );
+}
+
+// ── Walking occurrences ────────────────────────────────────────────────────
+
+type Civil = { y: number; m: number; d: number };
+
+function nextCivilDay({ y, m, d }: Civil): Civil {
+  const at = new Date(Date.UTC(y, m - 1, d) + 86_400_000);
+  return { y: at.getUTCFullYear(), m: at.getUTCMonth() + 1, d: at.getUTCDate() };
+}
+
+function civilDayOfWeek({ y, m, d }: Civil): number {
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+/**
+ * Does the expression select this calendar day?
+ *
+ * The day-of-month/day-of-week OR is here, in three lines, and it is the
+ * standard's rule rather than a preference: when both fields are narrowed a day
+ * matching EITHER is selected. `scheduleRecurring` warns when it applies.
+ */
+function matchesDay(fields: CronFields, civil: Civil): boolean {
+  if (!fields.months.includes(civil.m)) return false;
+  const dom = fields.daysOfMonth.includes(civil.d);
+  const dow = fields.daysOfWeek.includes(civilDayOfWeek(civil));
+  if (fields.domRestricted && fields.dowRestricted) return dom || dow;
+  if (fields.domRestricted) return dom;
+  if (fields.dowRestricted) return dow;
+  return true;
+}
+
+/**
+ * The first instant strictly after `after` at which the expression matches.
+ *
+ * Null means it never does inside the scan horizon, which for a well-formed
+ * expression means never at all — `0 0 30 2 *` is the 30th of February. That is
+ * refused at arm time rather than becoming a row that waits forever.
+ */
+export function nextAfter(fields: CronFields, timeZone: string, after: number): number | null {
+  let civil: Civil = wallOf(after, timeZone);
+
+  for (let scanned = 0; scanned <= MAX_SCAN_DAYS; scanned += 1) {
+    if (matchesDay(fields, civil)) {
+      for (const hour of fields.hours) {
+        for (const minute of fields.minutes) {
+          const at = epochFromWall(civil.y, civil.m, civil.d, hour, minute, timeZone);
+          // null is the spring-forward gap: that clock reading does not happen
+          // today, so the occurrence does not happen today.
+          if (at !== null && at > after) return at;
+        }
+      }
+    }
+    civil = nextCivilDay(civil);
+  }
+  return null;
+}
+
+/** The `steps`th occurrence strictly after `after`. `steps` is at least 1. */
+export function advance(
+  fields: CronFields,
+  timeZone: string,
+  after: number,
+  steps: number,
+): number | null {
+  let at: number | null = after;
+  for (let taken = 0; taken < steps; taken += 1) {
+    at = nextAfter(fields, timeZone, at as number);
+    if (at === null) return null;
+  }
+  return at;
+}
+
+export type SchedulePlan = {
+  /** Null when the expression has no further occurrence at all. */
+  nextAt: number | null;
+  /** Occurrences that came and went with nothing running. Never delivered. */
+  skipped: number;
+  /**
+   * Set when so many occurrences were missed that the every-N phase was
+   * abandoned and now counts from this firing. Reported in the mail, not hidden.
+   * Meaningless — and always false — when `everyN` is 1, where every occurrence
+   * is selected and there is no phase to lose.
+   */
+  phaseReset: boolean;
+};
+
+/**
+ * Where the schedule goes next, given where it last was and what time it is.
+ *
+ * `from` is the occurrence being fired now, NOT the current time, and that is
+ * the whole of how the phase survives an outage. Every step is `everyN`
+ * occurrences forward from a selected one, so a schedule anchored to the 17th
+ * of August and down for a fortnight resumes on the 14th of September — the
+ * same day it would have reached had nothing gone wrong — rather than on the
+ * 7th, which is what recomputing from `now` would give.
+ *
+ * The loop counts what it steps over, because the count is the thing the
+ * operator asked to be told: fire once, late, and say how many were missed.
+ * Never a burst.
+ */
+export function planNextFire(
+  fields: CronFields,
+  timeZone: string,
+  everyN: number,
+  from: number,
+  now: number,
+): SchedulePlan {
+  let next = advance(fields, timeZone, from, everyN);
+  let skipped = 0;
+
+  while (next !== null && next <= now) {
+    if (skipped >= MAX_CATCHUP) {
+      return { nextAt: nextAfter(fields, timeZone, now), skipped, phaseReset: everyN > 1 };
+    }
+    skipped += 1;
+    next = advance(fields, timeZone, next, everyN);
+  }
+
+  return { nextAt: next, skipped, phaseReset: false };
+}
+
+export type FirstFire =
+  | { ok: true; at: number }
+  | { ok: false; error: string };
+
+/**
+ * The first fire of a newly armed schedule, and where the anchor comes in.
+ *
+ * Occurrence zero is the first match at or after the anchor; every selected
+ * occurrence is `everyN` steps from it. Arming walks from the anchor to the
+ * present so that "every other Monday from the 17th" means the same thing
+ * whether it is armed on the 16th or in November. Nothing is stored per step:
+ * the phase lives in `due_at` always being a selected occurrence, so this walk
+ * happens once, at arm time, and never again.
+ *
+ * An anchor far enough in the past to exceed the walk is refused HERE, in the
+ * turn that asked, rather than turned into a row with a plausible-looking next
+ * fire.
+ */
+export function firstFire(
+  fields: CronFields,
+  timeZone: string,
+  everyN: number,
+  anchorAt: number,
+  now: number,
+): FirstFire {
+  // `anchorAt - 1` so an anchor that lands exactly on an occurrence selects
+  // that occurrence as number zero rather than the one after it.
+  let at = nextAfter(fields, timeZone, anchorAt - 1);
+  if (at === null) {
+    return {
+      ok: false,
+      error: 'that expression has no occurrence at all — check the day-of-month against the month',
+    };
+  }
+
+  for (let steps = 0; at !== null && at <= now; steps += 1) {
+    if (steps >= MAX_CATCHUP) {
+      return {
+        ok: false,
+        error:
+          `the anchor is too far in the past for this expression — over ${MAX_CATCHUP} ` +
+          'occurrences lie between it and now. Move the anchor forward',
+      };
+    }
+    at = advance(fields, timeZone, at, everyN);
+  }
+  if (at === null) {
+    return { ok: false, error: 'that expression has no occurrence left inside the scan horizon' };
+  }
+
+  return { ok: true, at };
+}
+
+/** The next few fires, which is the only readable proof of what an expression means. */
+export function preview(
+  fields: CronFields,
+  timeZone: string,
+  everyN: number,
+  first: number,
+  count: number,
+): number[] {
+  const fires = [first];
+  let at: number | null = first;
+  while (fires.length < count) {
+    at = advance(fields, timeZone, at as number, everyN);
+    if (at === null) break;
+    fires.push(at);
+  }
+  return fires;
+}

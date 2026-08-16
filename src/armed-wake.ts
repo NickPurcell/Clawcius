@@ -1,13 +1,26 @@
 /**
  * The process that makes an armed condition come true.
  *
- * One loop, one table, two kinds of condition. Every tick it asks the store for
- * everything armed and past its moment, and for each row either fires it (a
- * reminder) or looks (a PR watch). What it produces is always the same thing:
- * mail, from the owner to the owner. Nothing here starts a turn, because
- * nothing here needs to — `MailStore.deliver` fires `onDelivered`, the mail
- * waker sweeps, and an idle agent wakes with the mail already read. A reminder
- * arriving and a colleague's DM arriving are the same event downstream.
+ * One loop, one table, three kinds of condition. Every tick it asks the store
+ * for everything armed and past its moment, and for each row fires it (a
+ * reminder, a schedule) or looks (a PR watch). What it produces is always the
+ * same thing: mail, from the owner to the owner. Nothing here starts a turn,
+ * because nothing here needs to — `MailStore.deliver` fires `onDelivered`, the
+ * mail waker sweeps, and an idle agent wakes with the mail already read. A
+ * reminder arriving and a colleague's DM arriving are the same event downstream.
+ *
+ * ── A missed schedule fires ONCE, late, and says how many it skipped ────────
+ *
+ * A daily 9am schedule and a three-day outage is three occurrences that did not
+ * happen. What arrives on the next start is ONE mail, saying it is two days
+ * late and that two occurrences were skipped — not three mails, and not
+ * silence. A burst is worse than either: it is three wakes for one piece of
+ * work, arriving together, all of them stale, and the agent has no way to tell
+ * they are the same job. The count is the honest version of the burst.
+ *
+ * The next fire after a late one is computed from the OCCURRENCE, not from the
+ * moment it actually fired, which is what keeps "every other Monday" on the
+ * right Mondays after an outage. `planNextFire` in schedule.ts holds that.
  *
  * ── Mail from you, to you ───────────────────────────────────────────────────
  *
@@ -63,7 +76,10 @@ import type {
   PrWatchSeen,
   PrWatchSpec,
   ReminderSpec,
+  ScheduleSeen,
+  ScheduleSpec,
 } from './armed.js';
+import { parseCron, planNextFire, zonedStamp } from './schedule.js';
 import type { AgentRegistry } from './store.js';
 
 /** UTC, spelled out. Same format `renderMail` uses. */
@@ -120,6 +136,100 @@ export function composeReminderMail(condition: ArmedCondition, firedAt: number):
     subject: `Reminder: ${firstLine.slice(0, 80)}`,
     body: lines.join('\n'),
   };
+}
+
+/**
+ * What a fired recurring schedule says.
+ *
+ * Three things a reminder does not have to say, and each of them is here
+ * because its absence is a silent failure:
+ *
+ *   - THIS WILL HAPPEN AGAIN, and here is when, in the schedule's own timezone
+ *     rather than only in UTC. "Every Monday at 9am" rendered as 16:00Z is a
+ *     fact the reader has to do arithmetic on to check;
+ *   - IT IS LATE AND N WERE SKIPPED, when the service was down. The operator
+ *     asked to be made aware of missed alerts and this is the sentence that
+ *     does it. One mail, one count, never a burst;
+ *   - HERE IS HOW TO STOP IT. The id is in every mail, not only in `listArmed`,
+ *     because the moment an agent decides a repeat has outlived its purpose is
+ *     the moment it is reading one — not some later moment when it remembers to
+ *     go looking. A repeat that is hard to stop is the rot `remindMe` was made
+ *     one-shot to avoid.
+ *
+ * And what it is NOT: an instruction to post anything anywhere. The payload is
+ * a note that wakes the agent, exactly as a reminder is, and what to do about
+ * it is a decision the agent makes each time with everything it knows then.
+ */
+export function composeScheduleMail(
+  condition: ArmedCondition,
+  firedAt: number,
+  plan: { nextAt: number | null; skipped: number; phaseReset: boolean },
+): ComposedMail {
+  const spec = condition.spec as ScheduleSpec;
+  const seen = condition.seen as ScheduleSeen | null;
+  const lateBy = firedAt - condition.dueAt;
+  const firstLine = spec.note.split('\n')[0] ?? '';
+  const fires = (seen?.fires ?? 0) + 1;
+
+  const lines = [
+    `A recurring schedule you armed on ${stamp(condition.armedAt)}: \`${spec.cron}\`` +
+      `${spec.everyN > 1 ? `, every ${spec.everyN}${ordinalSuffix(spec.everyN)} occurrence` : ''}` +
+      ` in ${spec.timezone}.`,
+    `This is occurrence ${fires}. It was due ${zonedStamp(condition.dueAt, spec.timezone)} ` +
+      `(${stamp(condition.dueAt)}).`,
+  ];
+
+  if (lateBy > LATE_AFTER_MS) {
+    lines.push(
+      `IT FIRED ${minutes(lateBy).toUpperCase()} LATE. Nothing was running when it came due, ` +
+        'and it was picked up on the next start.',
+    );
+  }
+  if (plan.skipped > 0) {
+    lines.push(
+      `${plan.skipped} further occurrence${plan.skipped === 1 ? '' : 's'} came and went while ` +
+        `nothing was running, and ${plan.skipped === 1 ? 'was' : 'were'} NOT delivered — you are ` +
+        'being told the count instead. A schedule fires once when it comes back, however long ' +
+        'it was away, because a burst of stale wakes is not the same work done later.',
+    );
+  }
+  if (plan.phaseReset) {
+    lines.push(
+      `So many occurrences were missed that the every-${spec.everyN} count could not be walked ` +
+        'forward from where it was. It now counts from this firing, so which occurrences are ' +
+        'selected has changed. Disarm and re-arm with the anchor you want if that matters.',
+    );
+  }
+
+  lines.push('');
+  lines.push('Your own note to yourself, written when you armed this:');
+  lines.push('');
+  lines.push(spec.note);
+  lines.push('');
+
+  if (plan.nextAt === null) {
+    lines.push(
+      `THIS SCHEDULE HAS NOW DISARMED — \`${spec.cron}\` has no further occurrence, so there is ` +
+        'nothing left to wait for. Nothing more will arrive from it.',
+    );
+  } else {
+    lines.push(
+      `Next: ${zonedStamp(plan.nextAt, spec.timezone)} (${stamp(plan.nextAt)}). This repeats ` +
+        `until you stop it — disarm(${condition.id}) — and listArmed() shows it with when it ` +
+        'last fired and when it fires next.',
+    );
+  }
+  lines.push(
+    'It is a note, not an errand. Nothing was posted anywhere on your behalf; what this ' +
+      'warrants is your decision now, with what you know now.',
+  );
+
+  return { subject: `Schedule: ${firstLine.slice(0, 80)}`, body: lines.join('\n') };
+}
+
+function ordinalSuffix(n: number): string {
+  if (n % 100 >= 11 && n % 100 <= 13) return 'th';
+  return ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th';
 }
 
 /** What one poll found that the agent has not been told about yet. */
@@ -298,6 +408,8 @@ export class ArmedWaker {
           }
           if (condition.kind === 'reminder') {
             this.#fireReminder(condition);
+          } else if (condition.kind === 'schedule') {
+            this.#fireSchedule(condition);
           } else {
             await this.#pollWatch(condition);
           }
@@ -322,9 +434,70 @@ export class ArmedWaker {
     this.#deliver(condition, subject, body);
   }
 
+  /**
+   * Fire one occurrence and book the next one.
+   *
+   * The order is rescheduled-then-delivered, for the same reason a reminder is
+   * disarmed before it is delivered: `deliver` fires `onDelivered`
+   * synchronously, which can start a turn, and a turn that called `listArmed`
+   * would otherwise be reading a row that still claimed to be due in the past.
+   *
+   * A row whose expression no longer parses is disarmed rather than left to
+   * throw on every tick. That can only happen to a row written by a build whose
+   * parser accepted something this one does not, which is a schema change; it
+   * is handled here because the alternative is an agent's schedule silently
+   * doing nothing while the journal fills up.
+   */
+  #fireSchedule(condition: ArmedCondition): void {
+    const spec = condition.spec as ScheduleSpec;
+    const seen = condition.seen as ScheduleSeen | null;
+    const now = Date.now();
+
+    const parsed = parseCron(spec.cron);
+    if (!parsed.ok) {
+      this.#options.store.disarm(condition.id);
+      this.#deliver(
+        condition,
+        `Schedule ${condition.id} DISARMED — its expression is unreadable`,
+        [
+          `The schedule you armed on ${stamp(condition.armedAt)} holds \`${spec.cron}\`, which ` +
+            `this build cannot parse: ${parsed.error}.`,
+          '',
+          'It is disarmed rather than left in the table, because a schedule that throws on ' +
+            'every tick is a schedule that will never fire and would look like one that simply ' +
+            'has nothing to say. Arm it again with an expression this build accepts.',
+          '',
+          'Your note on it was:',
+          '',
+          spec.note,
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const plan = planNextFire(parsed.fields, spec.timezone, spec.everyN, condition.dueAt, now);
+    const { subject, body } = composeScheduleMail(condition, now, plan);
+
+    const next: ScheduleSeen = {
+      lastFiredAt: now,
+      fires: (seen?.fires ?? 0) + 1,
+      missed: (seen?.missed ?? 0) + plan.skipped,
+    };
+    if (plan.nextAt === null) {
+      // An expression with no next occurrence — `0 0 29 2 *` past the horizon,
+      // or a month that will not come round again. Arming refuses these, so
+      // reaching here means the row outlived what its expression can express.
+      this.#options.store.disarm(condition.id);
+    } else {
+      this.#options.store.reschedule(condition.id, plan.nextAt, next);
+    }
+
+    this.#deliver(condition, subject, body);
+  }
+
   async #pollWatch(condition: ArmedCondition): Promise<void> {
     const spec = condition.spec as PrWatchSpec;
-    const seen: PrWatchSeen = condition.seen ?? {
+    const seen: PrWatchSeen = (condition.seen as PrWatchSeen | null) ?? {
       reviewId: 0,
       issueCommentId: 0,
       reviewCommentId: 0,
