@@ -143,16 +143,28 @@ const OVERFLOW_PREVIEW_CHARS = 32;
  * Ended conditions get the smaller share because they are context rather than
  * the point.
  *
- * What is past the cap is not cut to a number. The first draft said only how
- * many there were and advised disarming some to find the rest, which is
+ * What is just past the cap is not cut to a number. The first draft said only
+ * how many there were and advised disarming some to find the rest, which is
  * destructive advice for a read-only question, and a count is precisely the
  * shape of answer this whole change exists to stop giving — an absence that
- * cannot be acted on. So the remainder is rendered one line each — id, kind,
+ * cannot be acted on. So the next fifty are rendered one line each — id, kind,
  * and enough of the subject to tell two apart — with no moments and a shorter
- * preview: about a third of a full entry, and the id `disarm` wants is present
- * for every condition an agent holds. A bare list of ids would have been
+ * preview: about a third of a full entry. A bare list of ids would have been
  * cheaper still and would not answer "which of these is the watch on OJ#13",
  * which is the question somebody scrolling actually has.
+ *
+ * PAST SEVENTY IT IS A COUNT AGAIN, and the output says exactly that. An
+ * earlier draft of this comment claimed the id was there "for every condition
+ * an agent holds", which is true to seventy and false above it; the cap it
+ * described did not exist. It is stated precisely here because a limit is
+ * useless if the prose around it implies there is none — that is how a reader
+ * ends up trusting a listing that has quietly stopped being complete.
+ *
+ * Seventy rather than no limit at all: making the absolute claim true means
+ * rendering every row, which is the unbounded listing this constant exists to
+ * prevent. Something has to be the last one shown. Seventy live conditions on
+ * one agent is already far past anything observed, they self-terminate, and the
+ * count below them is honest about what it is not showing.
  *
  * Measured rather than estimated, because the first two numbers written here
  * were both wrong. Three armed — the ordinary case, and the only one most
@@ -312,15 +324,23 @@ export function renderArmed(
   const overflow = active.slice(MAX_LISTED_ACTIVE);
   if (overflow.length > 0) {
     lines.push('');
+    const compact = overflow.slice(0, MAX_LISTED_COMPACT);
     lines.push(
-      `── ${overflow.length} more armed, due later than those above. One line each, no ` +
-        'moments — disarm takes the id.',
+      `── ${overflow.length} more armed, due later than those above. ` +
+        (compact.length < overflow.length
+          ? `The next ${compact.length}, one line each`
+          : 'One line each') +
+        ', no moments — disarm takes the id.',
     );
-    for (const condition of overflow.slice(0, MAX_LISTED_COMPACT)) {
+    for (const condition of compact) {
       lines.push(`  #${condition.id}  ${summarise(condition, OVERFLOW_PREVIEW_CHARS)}`);
     }
-    if (overflow.length > MAX_LISTED_COMPACT) {
-      lines.push(`  (and ${overflow.length - MAX_LISTED_COMPACT} more, not listed at all.)`);
+    const unlisted = overflow.length - compact.length;
+    if (unlisted > 0) {
+      lines.push(
+        `  (and ${unlisted} more, not listed at all — ` +
+          `${unlisted === 1 ? 'its id is' : 'their ids are'} not recoverable from this tool.)`,
+      );
     }
   }
 

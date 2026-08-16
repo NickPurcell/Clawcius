@@ -38,7 +38,7 @@ import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
 import { ArmedWaker, composeWatchMail, composeReminderMail } from '../dist/armed-wake.js';
-import { buildArmedTools } from '../dist/armed-tool.js';
+import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
 import { quoteExternal, MAX_EXTERNAL_CHARS } from '../dist/github.js';
 
@@ -828,7 +828,7 @@ test('a condition disarmed after the tick\'s query, but before its turn, does no
   registry.close();
 });
 
-test('listArmed is bounded, and every armed id is still reachable past the cap', async () => {
+test('listArmed is bounded, and ids stay reachable well past the point it stops rendering in full', async () => {
   const { registry, store } = board();
   const now = Date.now();
   const armed = [];
@@ -850,10 +850,12 @@ test('listArmed is bounded, and every armed id is still reachable past the cap',
   assert.match(listing, /and 5 more that ended in the last 24 hours/);
   assert.ok(listing.length < 8000, `32KB of listing goes into a context window: ${listing.length}`);
 
-  // Bounded is not the same as unreachable. `disarm` takes an id, so every id
-  // an agent still holds has to be somewhere in this output — a listing that
-  // said "and 5 others" would be an absence you cannot act on, which is the
-  // failure this tool exists to remove, one level down.
+  // Bounded is not the same as unreachable. `disarm` takes an id, so an id an
+  // agent still holds is rendered wherever that is affordable, and twenty-five
+  // is well inside the seventy this manages. What made the original failure
+  // was an absence presented as though it were the whole answer; a count that
+  // says it is a count, and says where the rendering stopped, is not that. The
+  // test below fixes where it stops.
   for (const condition of armed) {
     assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
   }
@@ -863,6 +865,53 @@ test('listArmed is bounded, and every armed id is still reachable past the cap',
 
   // Nothing destructive is suggested for finding one of them.
   assert.doesNotMatch(listing, /Disarm some/i);
+  registry.close();
+});
+
+test('past seventy the listing says the remaining ids are not recoverable, rather than implying they are', async () => {
+  const { registry, store } = board();
+  const now = Date.now();
+  const armed = [];
+  for (let i = 0; i < 75; i += 1) {
+    armed.push(store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, {
+      note: `reminder ${i}`,
+    }));
+  }
+
+  const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
+
+  // 20 in full + 50 compact = 70. The other five are a count, and the point of
+  // this test is the boundary rather than the arithmetic: the previous test
+  // sits at 25, safely inside the reachable range, so nothing held the section
+  // heading honest. Three rounds of review found prose claiming a little more
+  // than the code did, and this is the assertion that stops the fourth.
+  assert.equal(listing.match(/^ {2}#\d+ {2}reminder/gm).length, 70);
+  assert.match(listing, /^75 armed for hamachi-engineer1\./m, 'the count stays true');
+  assert.match(listing, /The next 50, one line each/, 'not "one line each" of 55');
+  assert.match(listing, /and 5 more, not listed at all — their ids are not recoverable/);
+
+  for (const condition of armed.slice(0, 70)) {
+    assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
+  }
+  for (const condition of armed.slice(70)) {
+    assert.doesNotMatch(listing, new RegExp(`#${condition.id}\\b`), 'and it does not pretend');
+  }
+
+  // Under the compact cap the heading is the unqualified one, and true.
+  const all = store.listFor('hamachi-engineer1');
+  const fewer = renderArmed('hamachi-engineer1', all.slice(0, 30), { recent: [], older: 0 }, now);
+  assert.match(fewer, /10 more armed, due later than those above\. One line each, no moments/);
+  assert.doesNotMatch(fewer, /not listed at all/);
+
+  // Seventy is the last one that fits. Seventy-one is the first that does not,
+  // and the tail is about a single condition there — the string it replaced
+  // read correctly at one, so the new one has to as well.
+  assert.doesNotMatch(
+    renderArmed('hamachi-engineer1', all.slice(0, 70), { recent: [], older: 0 }, now),
+    /not listed at all/,
+  );
+  const one = renderArmed('hamachi-engineer1', all.slice(0, 71), { recent: [], older: 0 }, now);
+  assert.match(one, /\(and 1 more, not listed at all — its id is not recoverable from this tool\.\)/);
   registry.close();
 });
 
