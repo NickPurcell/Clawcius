@@ -551,6 +551,30 @@ if it is violated. Missing, stale, malformed or future-dated all read as
 *busy*, which is the safe direction; a waker that crashed leaves a stale
 `liveCount: 0` behind, and that is the one value that must never be believed.
 
+### Where each turn's environment is written
+
+The same reasoning, one directory over. Every turn is a `docker exec`, and the
+session environment it carries includes `DISCORD_TOKEN` and `GITHUB_TOKEN`.
+Those used to be `-e KEY=VALUE` arguments, which put both credentials in a
+world-readable `/proc/<pid>/cmdline` for the length of every turn — readable by
+`clawcius-ops`, by anything in `clawcius-dev`, by any account with a shell. They
+now go in a file:
+
+```
+/var/lib/clawcius/exec-env/      # container.execEnvDir in agent-config.yaml
+/var/lib/hamachi/exec-env/       # ditto, agent-config.hamachi.yaml
+```
+
+Mode `0600` in a `0700` directory, written per turn and unlinked when the exec
+ends; orphans from a hard kill are swept when the waker next starts. Nothing
+needs creating by hand — the waker makes the directory on first use.
+
+**Note the path, again.** A sibling of `run/`, and outside every `-v` in
+`docker/run-container.sh`. Two of those mounts (`.claude`, `discord-cli`) are
+shared by *both* instances, so a file placed there would hand one deployment's
+bot token to the other deployment's agent. The config loader refuses to start if
+`container.execEnvDir` lands inside any mount it can see.
+
 Restart the wakers after adding the `status:` block so they begin publishing:
 
 ```sh

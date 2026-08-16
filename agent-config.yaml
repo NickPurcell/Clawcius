@@ -136,6 +136,15 @@ prompts:
 container:
   name: clawcius-agent
   claudePath: /usr/local/bin/claude
+  # Where each turn's environment is written for `docker exec --env-file`, so
+  # that DISCORD_TOKEN and GITHUB_TOKEN are not command-line arguments in a
+  # world-readable /proc/<pid>/cmdline. The file is 0600 and unlinked when the
+  # turn ends.
+  #
+  # A sibling of run/, never a child: run/ is bind-mounted into the container,
+  # and so are the skills and discord-cli directories — which BOTH deployments
+  # share. The loader refuses to start if this lands inside any of them.
+  execEnvDir: /var/lib/clawcius/exec-env
 
 model: claude-opus-5[1m]
 
