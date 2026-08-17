@@ -24,6 +24,7 @@
 
 import { stat } from 'node:fs/promises';
 import type { AgentRoot, LivenessConfig, StatusConfig } from './config.js';
+import { readRegistry, type RegistryAgent } from './registry.js';
 import {
   describeFsError,
   type SessionRef,
@@ -48,6 +49,22 @@ export type AgentOverview = {
   /** Sessions whose transcript was written within the running window. */
   activeSessionCount: number;
   subagentCount: number;
+  /** Rows in this instance's registry. The count of AGENTS, not directories. */
+  registeredAgentCount: number;
+  /** Of those, how many declare `live`. Declared, never observed — see below. */
+  declaredLiveCount: number;
+  /**
+   * Sessions in a directory no registry row claims.
+   *
+   * Not an error and not hidden: they are real transcripts and may be worth
+   * reading. On this host they are the `/tmp` scratch paths where engineers ran
+   * permission probes. They are simply not agents.
+   */
+  unattributedSessionCount: number;
+  /** Non-null when the board could not be read. Rendered as a warning row. */
+  registryError: string | null;
+  /** False when this instance has no `boardDb` configured. */
+  registryConfigured: boolean;
   /** Non-null when the root could not be read. Rendered as a warning row. */
   error: string | null;
 };
@@ -162,11 +179,19 @@ export async function buildAgentOverview(
 ): Promise<AgentOverview> {
   const { sessions, error } = await store.sessions(agent);
 
+  // The registry read is a handful of rows and costs nothing next to the stats
+  // below, so the front page can afford to say how many AGENTS there are
+  // rather than only how many directories.
+  const registry = readRegistry(agent.boardDb);
+  const claimedSlugs = new Set(registry.agents.map((row) => row.projectSlug));
+
   let newestMtime: number | null = null;
   let activeSessionCount = 0;
   let subagentCount = 0;
+  let unattributedSessionCount = 0;
 
   for (const session of sessions) {
+    if (!claimedSlugs.has(session.projectSlug)) unattributedSessionCount += 1;
     let mtimeMs: number | null = null;
     try {
       mtimeMs = (await stat(session.transcriptPath)).mtimeMs;
@@ -199,7 +224,150 @@ export async function buildAgentOverview(
     sessionCount: sessions.length,
     activeSessionCount,
     subagentCount,
+    registeredAgentCount: registry.agents.length,
+    declaredLiveCount: registry.agents.filter((row) => row.declaredStatus === 'live').length,
+    unattributedSessionCount,
+    registryError: registry.error,
+    registryConfigured: registry.configured,
     error,
+  };
+}
+
+// ── The roster ──────────────────────────────────────────────────────────────
+
+/**
+ * One registry agent, with every session it has ever had.
+ *
+ * `liveness` here is the same mtime-derived band the rest of the page uses and
+ * is a DIFFERENT claim from `declaredStatus`: one is "a file was written 4
+ * minutes ago", the other is "nobody has declared this agent dead". Both are
+ * carried because neither is sufficient. Nothing writes `dead` today —
+ * `setStatus` has no caller outside a test, since kill is CLAWSKY.md phase 5 —
+ * so a status column on its own would be the same word on every row forever.
+ */
+export type RosterAgent = RegistryAgent & {
+  /** Every session in this agent's transcript directory. Current first. */
+  sessions: SessionSummary[];
+  /** True when `sessionId` names a transcript that is actually on disk. */
+  currentSessionPresent: boolean;
+  /** From the newest transcript write across those sessions. */
+  liveness: Liveness;
+  /** ISO of that write, or null when the agent has never written one. */
+  lastTranscriptActivity: string | null;
+  subagentCount: number;
+};
+
+/** Sessions in a directory no registry row claims. Browsable, not an agent. */
+export type OtherGroup = {
+  projectSlug: string;
+  sessions: SessionSummary[];
+  liveness: Liveness;
+  lastActivity: string;
+};
+
+export type Roster = {
+  agent: string;
+  label: string;
+  agents: RosterAgent[];
+  other: OtherGroup[];
+  registryConfigured: boolean;
+  /** Non-null when the board could not be read. Rendered, never swallowed. */
+  registryError: string | null;
+  /** Non-null when the projects root could not be read. */
+  error: string | null;
+  sessionCount: number;
+};
+
+/**
+ * Everything one instance has: its agents, and what is left over.
+ *
+ * ── Why this replaced a flat session list ──────────────────────────────────
+ *
+ * The page used to render one row per `.jsonl` under the root, newest first,
+ * and that is Clawcius #14: 49 rows for Clawcius, and for Hamachi five
+ * "agents" of which three were `/tmp` directories from permission probes. A
+ * transcript file is an artefact of a session; the thing a person is looking
+ * for is the agent that had it.
+ *
+ * So the list comes from the registry and the transcripts hang off it, joined
+ * on `slug(workspace_path)` — see `registry.ts` for why that join needs no
+ * schema change. Two rows sharing a workspace path would both show the same
+ * sessions; the waker gives every agent its own directory
+ * (`join(workspaceRoot, id)`), so that does not happen today, and if it ever
+ * does, showing the sessions twice is better than deciding which agent loses
+ * them.
+ *
+ * Anything left over is filed under `other`, still browsable and still linking
+ * to its transcripts. It is not an error and it is not hidden — those `/tmp`
+ * sessions are real and may be worth reading. They are just not agents.
+ */
+export async function buildRoster(
+  store: TranscriptStore,
+  agent: AgentRoot,
+  config: StatusConfig,
+  now: number,
+): Promise<Roster> {
+  const { sessions, error } = await buildSessionList(store, agent, config, now);
+  const registry = readRegistry(agent.boardDb);
+
+  // Sessions keep the newest-activity-first order buildSessionList gave them,
+  // so every group below is already sorted without sorting again.
+  const bySlug = new Map<string, SessionSummary[]>();
+  for (const session of sessions) {
+    const group = bySlug.get(session.projectSlug);
+    if (group) group.push(session);
+    else bySlug.set(session.projectSlug, [session]);
+  }
+
+  const agents: RosterAgent[] = registry.agents.map((row) => {
+    const own = [...(bySlug.get(row.projectSlug) ?? [])];
+
+    // The session the agent resumes goes first, whatever its mtime says. It is
+    // the one a reader means by "what is it doing", and a subagent writing
+    // under an older session would otherwise push it down the list.
+    const currentAt = own.findIndex((session) => session.sessionId === row.sessionId);
+    if (currentAt > 0) own.unshift(...own.splice(currentAt, 1));
+
+    const newest = own.reduce<number | null>((newestMs, session) => {
+      const ms = Date.parse(session.lastActivity);
+      if (!Number.isFinite(ms)) return newestMs;
+      return newestMs === null || ms > newestMs ? ms : newestMs;
+    }, null);
+
+    return {
+      ...row,
+      sessions: own,
+      currentSessionPresent: currentAt !== -1,
+      liveness: livenessFromMtime(newest, now, config.liveness),
+      lastTranscriptActivity: toIso(newest),
+      subagentCount: own.reduce((sum, session) => sum + session.subagentCount, 0),
+    };
+  });
+
+  const claimed = new Set(registry.agents.map((row) => row.projectSlug));
+  const other: OtherGroup[] = [];
+  for (const [slug, group] of bySlug) {
+    if (claimed.has(slug)) continue;
+    const first = group[0];
+    if (!first) continue;
+    other.push({
+      projectSlug: slug,
+      sessions: group,
+      liveness: first.liveness,
+      lastActivity: first.lastActivity,
+    });
+  }
+  other.sort((a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity));
+
+  return {
+    agent: agent.id,
+    label: agent.label,
+    agents,
+    other,
+    registryConfigured: registry.configured,
+    registryError: registry.error,
+    error,
+    sessionCount: sessions.length,
   };
 }
 

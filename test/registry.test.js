@@ -166,3 +166,49 @@ test('status is declared, not inferred', () => {
   assert.equal(registry.get('hamachi-engineer1').status, 'dead');
   registry.close();
 });
+
+/**
+ * The status page says `dead` is a word nothing writes yet. This is the pin.
+ *
+ * `status/` renders the declared status beside `lastActive` and explains, in
+ * the UI and in `status/README.md`, that a column of it alone would be the
+ * same word on every row — because kill is CLAWSKY.md phase 5 and `setStatus`
+ * has no caller outside this suite. That is a claim about code in a different
+ * package, made in prose, which is exactly the kind of sentence that goes
+ * quietly false when the code beside it changes (Clawcius #69).
+ *
+ * So it is asserted here, next to the method. When phase 5 lands and something
+ * finally calls `setStatus`, this fails and names the copy to go and fix
+ * rather than leaving a status page confidently explaining that a feature it
+ * is now rendering does not exist.
+ */
+test('nothing outside this suite writes a status — the status page says so', async () => {
+  const { readdir, readFile } = await import('node:fs/promises');
+  const { join: joinPath } = await import('node:path');
+
+  // `src/` only. The registry class lives in `src/store.ts` and nothing else
+  // holds one — `ops/` reaches the same table through its own `Board`, which
+  // has no setStatus at all. Widening this to ops/ would catch the unrelated
+  // `setStatus` on the waker-status stub in ops/src/selftest.ts.
+  const callers = [];
+  const entries = await readdir('src', { withFileTypes: true, recursive: true });
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
+    const path = joinPath(entry.parentPath ?? 'src', entry.name);
+    const source = await readFile(path, 'utf8');
+    source.split('\n').forEach((line, index) => {
+      // A call is always `<something>.setStatus(`; the declaration in store.ts
+      // has no receiver, so it does not match itself.
+      if (/\.setStatus\(/.test(line)) callers.push(`${path}:${index + 1}`);
+    });
+  }
+
+  assert.equal(entries.length > 0, true, 'scanned nothing — this test would pass vacuously');
+  assert.deepEqual(
+    callers,
+    [],
+    'Something now writes a dead status. status/src/views.ts, status/public/app.js and ' +
+      'status/README.md all say nothing does — update them in the same change.',
+  );
+});

@@ -272,11 +272,20 @@ async function viewOverview() {
   const stale = data.agents.filter((agent) => agent.liveness === 'stale').length;
   const sessions = data.agents.reduce((sum, agent) => sum + agent.sessionCount, 0);
   const subagents = data.agents.reduce((sum, agent) => sum + agent.subagentCount, 0);
+  const registered = data.agents.reduce((sum, agent) => sum + agent.registeredAgentCount, 0);
+  const declaredLive = data.agents.reduce((sum, agent) => sum + agent.declaredLiveCount, 0);
+  const unattributed = data.agents.reduce(
+    (sum, agent) => sum + agent.unattributedSessionCount,
+    0,
+  );
 
   frag.append(
     el('div', { class: 'tiles' }, [
-      tile('Agents', String(data.agents.length), `${running} running · ${stale} stale`),
-      tile('Sessions', fmtCount(sessions), 'across all roots'),
+      // Agents come from the registry; instances are the configured roots.
+      // Conflating the two is what made this page report 49 of something.
+      tile('Agents', fmtCount(registered), `${declaredLive} declared live · across all crews`),
+      tile('Instances', String(data.agents.length), `${running} running · ${stale} stale`),
+      tile('Sessions', fmtCount(sessions), `${unattributed} not attributable to an agent`),
       tile('Subagents', fmtCount(subagents), 'transcripts on disk'),
     ]),
   );
@@ -292,6 +301,10 @@ async function viewOverview() {
       ]),
       text('div', 'card-path mono', agent.projectsRoot),
       el('div', { class: 'card-stats' }, [
+        el('div', {}, [
+          text('div', 'card-stat-label', 'Agents'),
+          text('div', 'card-stat-value', fmtCount(agent.registeredAgentCount)),
+        ]),
         el('div', {}, [
           text('div', 'card-stat-label', 'Sessions'),
           text('div', 'card-stat-value', fmtCount(agent.sessionCount)),
@@ -312,6 +325,7 @@ async function viewOverview() {
     ]);
 
     if (agent.error) card.append(text('div', 'warning-row', agent.error));
+    if (agent.registryError) card.append(text('div', 'warning-row', agent.registryError));
     cards.append(card);
   }
 
@@ -319,24 +333,16 @@ async function viewOverview() {
   main.replaceChildren(frag);
 }
 
-async function viewAgent(agentId) {
-  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
-  const frag = document.createDocumentFragment();
-
-  frag.append(
-    crumbs([{ label: 'Agents', href: '#/overview' }, { label: data.label }]),
-    el('h1', {}, [data.label]),
-    text('p', 'subtitle', `${data.sessions.length} session(s), newest activity first`),
-  );
-
-  if (data.error) frag.append(text('div', 'warning-row', data.error));
-
-  if (data.sessions.length === 0) {
-    frag.append(text('p', 'placeholder', 'No sessions under this root yet.'));
-    main.replaceChildren(frag);
-    return;
-  }
-
+/**
+ * The session table, used for a registry agent's sessions and for the
+ * unattributed ones alike.
+ *
+ * `currentSessionId` marks the one the registry says this agent is resuming.
+ * Without the marker the top row is only "the file written most recently",
+ * which is a different claim and is wrong whenever a subagent of an older
+ * session wrote last.
+ */
+function sessionTable(agentId, sessions, currentSessionId) {
   const table = el('table', { class: 'table' }, [
     el('thead', {}, [
       el('tr', {}, [
@@ -356,21 +362,24 @@ async function viewAgent(agentId) {
   ]);
 
   const body = el('tbody');
-  for (const session of data.sessions) {
+  for (const session of sessions) {
     const link = el(
       'a',
       {
-        href: `#/session/${encodeURIComponent(data.agent)}/${encodeURIComponent(session.sessionId)}`,
+        href: `#/session/${encodeURIComponent(agentId)}/${encodeURIComponent(session.sessionId)}`,
         class: 'mono',
       },
       [session.sessionId.slice(0, 8)],
     );
 
+    const first = el('td', { class: 'strong' }, [link]);
+    if (currentSessionId && session.sessionId === currentSessionId) {
+      first.append(el('span', { class: 'tag', dataset: { current: 'true' } }, ['current']));
+    }
+    if (session.gitBranch) first.append(el('div', { class: 'mono' }, [session.gitBranch]));
+
     const row = el('tr', {}, [
-      el('td', { class: 'strong' }, [
-        link,
-        session.gitBranch ? el('div', { class: 'mono' }, [session.gitBranch]) : null,
-      ]),
+      first,
       el('td', {}, [liveness(session.liveness)]),
       el('td', {}, [fmtClock(session.startedAt)]),
       el('td', { class: 'num' }, [fmtDuration(session.durationSeconds)]),
@@ -392,7 +401,155 @@ async function viewAgent(agentId) {
   }
 
   table.append(body);
-  frag.append(table);
+  return table;
+}
+
+/**
+ * Declared status and last-active, always together.
+ *
+ * `status` in the registry is written, never observed — a kill writes `dead`,
+ * and an agent that died mid-turn writes nothing at all. Today nothing writes
+ * `dead` even in principle, because kill is CLAWSKY.md phase 5, so the word on
+ * its own would be the same on every row forever. Beside "last spoke 4m ago"
+ * it reads correctly now and stays correct the day spawn/kill lands.
+ */
+function declaredStatus(agent) {
+  return el('span', { class: 'declared' }, [
+    el('span', { class: 'declared-word', dataset: { status: agent.declaredStatus } }, [
+      agent.declaredStatus || 'unknown',
+    ]),
+    el('span', { class: 'declared-sep' }, ['·']),
+    `last spoke ${fmtAgo(agent.lastActiveAt)}`,
+  ]);
+}
+
+/**
+ * One instance: its agents from the registry, then everything else.
+ *
+ * The list is NOT the directories under the projects root. That was Clawcius
+ * #14 — Clawcius showed 49 of them, and three of Hamachi's five were `/tmp`
+ * paths where an engineer ran permission probes. Those still appear, under
+ * "Other transcripts", because they are real and readable; they are just not
+ * agents.
+ */
+async function viewAgent(agentId) {
+  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
+  const frag = document.createDocumentFragment();
+
+  const otherSessions = data.other.reduce((sum, group) => sum + group.sessions.length, 0);
+
+  frag.append(
+    crumbs([{ label: 'Agents', href: '#/overview' }, { label: data.label }]),
+    el('h1', {}, [data.label]),
+    text(
+      'p',
+      'subtitle',
+      `${data.agents.length} agent(s) in the registry · ${data.sessionCount} session(s) on disk · ` +
+        `${otherSessions} not attributable to an agent`,
+    ),
+  );
+
+  if (data.error) frag.append(text('div', 'warning-row', data.error));
+  if (data.registryError) frag.append(text('div', 'warning-row', data.registryError));
+  if (!data.registryConfigured) {
+    frag.append(
+      text(
+        'div',
+        'warning-row',
+        'No boardDb configured for this instance in status-config.yaml, so there is no registry ' +
+          'to list agents from — only the directories below.',
+      ),
+    );
+  }
+
+  if (data.agents.length === 0 && data.other.length === 0) {
+    frag.append(text('p', 'placeholder', 'No agents and no sessions under this root yet.'));
+    main.replaceChildren(frag);
+    return;
+  }
+
+  if (data.agents.length > 0) {
+    frag.append(
+      el('h2', {}, ['Agents']),
+      text(
+        'p',
+        'subtitle',
+        'From the registry — id, crew and role as the board knows them. `status` is declared, ' +
+          'not observed, so it is shown beside the time the agent last spoke.',
+      ),
+    );
+  }
+
+  for (const agent of data.agents) {
+    const card = el('div', { class: 'card' }, [
+      el('div', { class: 'card-head' }, [
+        el('div', { class: 'card-head-left' }, [
+          text('span', 'card-title mono', agent.id),
+          el('span', { class: 'chip' }, [agent.role]),
+          el('span', { class: 'chip' }, [agent.crew]),
+        ]),
+        liveness(agent.liveness),
+      ]),
+      el('div', { class: 'card-sub' }, [declaredStatus(agent)]),
+      text('div', 'card-path mono', `${agent.workspacePath}  →  ${agent.projectSlug}`),
+    ]);
+
+    if (agent.spawnedBy) {
+      card.append(el('div', { class: 'chips' }, [
+        el('span', { class: 'chip' }, [`spawned by ${agent.spawnedBy}`]),
+      ]));
+    }
+
+    if (agent.sessions.length === 0) {
+      card.append(
+        text(
+          'p',
+          'placeholder',
+          'This agent has a registry row and no transcripts. It has a mailbox and an identity; ' +
+            'it has not run a turn.',
+        ),
+      );
+    } else {
+      card.append(sessionTable(data.agent, agent.sessions, agent.sessionId));
+      if (agent.sessionId && !agent.currentSessionPresent) {
+        card.append(
+          text(
+            'div',
+            'warning-row',
+            `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
+              'transcript with that id is under its directory.',
+          ),
+        );
+      }
+    }
+
+    frag.append(card);
+  }
+
+  if (data.other.length > 0) {
+    frag.append(
+      el('h2', {}, ['Other transcripts']),
+      text(
+        'p',
+        'subtitle',
+        'Project directories no registry row claims. Real transcripts, still readable — a cwd ' +
+          'somebody ran Claude Code in, not an agent with an identity.',
+      ),
+    );
+
+    for (const group of data.other) {
+      frag.append(
+        el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            text('span', 'card-title mono', group.projectSlug),
+            liveness(group.liveness),
+          ]),
+          sessionTable(data.agent, group.sessions, null),
+        ]),
+      );
+    }
+  }
+
   main.replaceChildren(frag);
 }
 

@@ -16,7 +16,11 @@
  *
  *   2. It is READ-ONLY. Every route is GET or HEAD; anything else is refused
  *      before routing. Nothing here writes, deletes, or spawns a process, and
- *      no request parameter reaches a shell — there is no shell.
+ *      no request parameter reaches a shell — there is no shell. The agent
+ *      registry is a live SQLite database owned by another process, so it is
+ *      opened in SQLite's readonly mode: that half of the claim is enforced by
+ *      the library rather than by there happening to be no INSERT in the file.
+ *      See `registry.ts`.
  *
  *   3. Ids from URLs are validated against a strict pattern AND resolved
  *      inside their configured root, independently. See `transcripts.ts`.
@@ -41,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { isLoopback, loadStatusConfig } from './config.js';
 import { readOjSnapshot } from './oj.js';
 import { isValidSubagentId, TranscriptStore } from './transcripts.js';
-import { buildAgentOverview, buildSessionDetail, buildSessionList } from './views.js';
+import { buildAgentOverview, buildRoster, buildSessionDetail } from './views.js';
 import { RootWatcher, type ChangeEvent } from './watch.js';
 
 const config = loadStatusConfig();
@@ -200,9 +204,13 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
     // nothing to enumerate here, but the habit costs nothing.
     if (!agent) return fail(response, 404, 'no such agent');
 
+    // The instance's roster: its registry agents, each with every session it
+    // has had, plus whatever no registry row claims. Still reached at
+    // `/sessions` because that is where the sessions are — they now arrive
+    // grouped by the agent that had them rather than as one flat list of
+    // files (Clawcius #14).
     if (parts[3] === 'sessions' && parts.length === 4) {
-      const { sessions, error } = await buildSessionList(store, agent, config, now);
-      sendJson(response, 200, { agent: agent.id, label: agent.label, sessions, error });
+      sendJson(response, 200, await buildRoster(store, agent, config, now));
       return;
     }
 

@@ -25,9 +25,11 @@ Two halves:
 
 And one thing that only watches:
 
-- **`status/`** — a read-only observability page for every agent instance on
-  the host. Reads transcripts off local disk; shows liveness, session timelines
-  and the subagent tree over a time axis. Binds loopback only and is published
+- **`status/`** — a read-only observability page for every agent on the host.
+  Lists the agents from each instance's registry and hangs their transcripts —
+  current and historical — off them; shows liveness, session timelines and the
+  subagent tree over a time axis. Reads both the transcripts and the registry
+  off local disk, and writes to neither. Binds loopback only and is published
   to the tailnet with `tailscale serve`. See [`status/README.md`](status/README.md).
 
 ## How it behaves
@@ -109,7 +111,7 @@ the session has no shell at all.
 | `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do | yes |
 | `ops/clawcius-sudoers` | What the host agent may do with sudo, by exact command and exact unit name, and why | yes |
 | `MIGRATION.md` | Creating the host agent's service account, the shared group, the deploy key — with a rollback path. **Not yet executed.** | yes |
-| `status/status-config.yaml` | Transcript roots, port, liveness thresholds | yes |
+| `status/status-config.yaml` | Transcript roots, per-instance board databases, port, liveness thresholds | yes |
 | `.env` | Discord token, guild id, optional API key | **no** |
 
 Behaviour and persona live in `systemPrompt.append`. The code contributes only

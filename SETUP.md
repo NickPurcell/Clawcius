@@ -693,9 +693,19 @@ tailscaled dies, the page becomes *unreachable* instead of becoming *public*.
 
 Transcript roots default to the host side of the agent-home mount —
 `/var/lib/clawcius/agent-home/projects` and `/var/lib/hamachi/agent-home/projects`.
-Adding an instance means a new entry under `agents:` in
-`status/status-config.yaml` **and** a matching `ReadOnlyPaths=` line in the
-unit. Full detail, including the security model, is in
+Each instance also names its Clawsky board — its `CLAWCIUS_DB_PATH` — as
+`boardDb`, opened read-only. That is where the *agents* are; the transcript
+root only holds directories, and a directory is not an agent. Adding an
+instance means a new entry under `agents:` in `status/status-config.yaml`
+**and** matching `ReadOnlyPaths=` lines in the unit, one for the root and one
+for the board.
+
+One thing to know before you go looking: the boards are in WAL mode, and a
+read-only reader needs the `-shm` wal-index that SQLite deletes on the last
+clean close. The status unit runs `ProtectSystem=strict` and cannot create one,
+so **while a waker is stopped, that instance's agent list is unreadable** and
+the page says so, naming the waker. Transcripts are unaffected — they never go
+through SQLite. Full detail, including the security model, is in
 [`status/README.md`](status/README.md).
 
 ---

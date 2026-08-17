@@ -700,6 +700,78 @@ a.chip:hover {
   border-color: var(--warning);
 }
 
+/* The session the registry says this agent is resuming. */
+.tag[data-current="true"] {
+  color: var(--series-1);
+  border-color: var(--series-1);
+  margin-left: 6px;
+}
+
+/* ── Registry ────────────────────────────────────────────────────────────── */
+
+/*
+ * Declared status and last-active, on one line, because neither is worth much
+ * alone. `status` is written by a kill and by nothing else — see the comment
+ * on declaredStatus() in app.js — so the word is deliberately NOT given the
+ * green of the liveness dot. It is a claim about intent, not an observation,
+ * and colouring it like an observation would be the whole bug in a swatch.
+ */
+.declared {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.declared-word {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 10px;
+  color: var(--ink-secondary);
+  border: 1px solid var(--grid);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.declared-word[data-status="dead"] {
+  color: var(--serious);
+  border-color: var(--serious);
+}
+
+.declared-sep {
+  color: var(--baseline);
+}
+
+.card-head-left {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.card-sub {
+  margin-top: 4px;
+}
+
+/*
+ * An agent's sessions sit inside its card, so the table needs room to breathe
+ * and the card needs to stop being a 330px grid cell.
+ */
+.card > .table {
+  margin-top: 12px;
+}
+
+/*
+ * Agent cards on the instance view are stacked full width rather than laid out
+ * in the `.cards` grid — each one carries a table of its sessions, and a 330px
+ * grid cell cannot hold eleven columns.
+ */
+.main > .card {
+  margin-top: 12px;
+}
+
 /* ── Tooltip ─────────────────────────────────────────────────────────────── */
 
 .tooltip {

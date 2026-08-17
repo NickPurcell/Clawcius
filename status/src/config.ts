@@ -36,6 +36,20 @@ export type AgentRoot = {
   label: string;
   /** Absolute path to the instance's `projects/` directory. */
   projectsRoot: string;
+  /**
+   * The instance's board database — its `CLAWCIUS_DB_PATH` — or null.
+   *
+   * This is where the agents are. Without it the page can only list the
+   * directories under `projectsRoot`, which is what it used to do and which
+   * counted `/tmp` scratch paths as agents (Clawcius #14). Opened READ-ONLY;
+   * see `registry.ts`.
+   *
+   * Optional rather than required, and absent is shown on the page rather than
+   * being a boot failure. An instance legitimately without a board is a real
+   * configuration — CLAWSKY.md § Topology keeps Osmosis Jones off the board on
+   * purpose, since its workers read pull requests written by strangers.
+   */
+  boardDb: string | null;
 };
 
 export type LivenessConfig = {
@@ -173,11 +187,16 @@ const DEFAULTS: StatusConfig = {
       id: 'clawcius',
       label: 'Clawcius',
       projectsRoot: '/var/lib/clawcius/agent-home/projects',
+      boardDb: '/var/lib/clawcius/clawcius.db',
     },
     {
       id: 'hamachi',
       label: 'Hamachi',
       projectsRoot: '/var/lib/hamachi/agent-home/projects',
+      // Named for the instance, not for the variable. `CLAWCIUS_DB_PATH` in
+      // .env.hamachi is /var/lib/hamachi/hamachi.db — ops-config.yaml records
+      // that the obvious guess, clawcius.db, was wrong here.
+      boardDb: '/var/lib/hamachi/hamachi.db',
     },
   ],
   liveness: {
@@ -277,6 +296,14 @@ function agents(raw: unknown): AgentRoot[] {
       throw new ConfigError(`${path}.projectsRoot`, 'must be an absolute path');
     }
 
+    // The board is opened by name and read-only, and a relative path would
+    // resolve against the service's working directory — which under systemd is
+    // not the one whoever wrote the line had in mind.
+    const boardDb = str(entry['boardDb'], `${path}.boardDb`, '');
+    if (boardDb && !isAbsolute(boardDb)) {
+      throw new ConfigError(`${path}.boardDb`, 'must be an absolute path');
+    }
+
     return {
       id,
       label: str(entry['label'], `${path}.label`, id),
@@ -284,6 +311,7 @@ function agents(raw: unknown): AgentRoot[] {
       // the traversal guard in transcripts.ts compares against a canonical
       // prefix rather than something like `/var/lib/x/../..`.
       projectsRoot: resolve(projectsRoot),
+      boardDb: boardDb ? resolve(boardDb) : null,
     };
   });
 }

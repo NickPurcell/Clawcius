@@ -122,6 +122,36 @@ ReadOnlyPaths=/var/lib/clawcius/agent-home
 ReadOnlyPaths=/var/lib/hamachi/agent-home
 ReadOnlyPaths=-/var/lib/oj
 
+# The Clawsky boards — each instance's CLAWCIUS_DB_PATH. This is where the
+# AGENTS are; without them the page can only list the directories under the
+# transcript roots, which is the bug in Clawcius #14. Opened readOnly, which
+# SQLite enforces; the waker owns these files and is writing to them live.
+ReadOnlyPaths=/var/lib/clawcius/clawcius.db
+ReadOnlyPaths=/var/lib/hamachi/hamachi.db
+
+# ── The boards are in WAL, and that interacts with the line above ─────────
+#
+# A reader of a WAL database needs the `-shm` wal-index. If one exists it can
+# be mapped read-only; if it does NOT, SQLite has to create it, which needs
+# write access to the directory — and under ProtectSystem=strict this service
+# has write access to nothing.
+#
+# While the waker is up the `-shm` exists and the registry reads fine. On a
+# clean `systemctl stop` of the waker SQLite deletes `-wal` and `-shm`, and the
+# registry then becomes unreadable until the waker is back. Measured on
+# 2026-08-16, not inferred.
+#
+# That state is reported on the page, naming the waker. It is NOT worked around
+# here, and specifically there is no ReadWritePaths= line: the whole claim of
+# this unit is that it writes nothing, and a writable path to the board would
+# put a second writer next to the one that owns it. If this is ever worth
+# fixing, a dedicated read-only account with a supplementary group, or taking
+# the board out of WAL, are the two changes that do not make this service a
+# writer — and both belong to the operator, not to this file.
+#
+# Note that the transcript views are unaffected either way. They are read off
+# disk and never go through SQLite.
+
 # ── Network ───────────────────────────────────────────────────────────────
 # This service accepts connections on loopback and makes none of its own. The
 # address filter enforces that at the kernel level, which is a second,
