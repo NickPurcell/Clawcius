@@ -41,19 +41,24 @@
  *   the directory. `clawcius-status.service` runs `ProtectSystem=strict`, so
  *   its whole filesystem is read-only and it can create nothing.
  *
- *   While the waker is running the `-shm` exists and reads succeed. When the
- *   waker has exited CLEANLY, SQLite deletes `-wal` and `-shm` on the last
- *   close, and the next read here fails with "attempt to write a readonly
- *   database". Measured, not inferred: reproduced on 2026-08-16 with node 22's
- *   `node:sqlite` against a WAL database in a directory with mode 555 —
- *   writer live, read succeeds; writer cleanly gone, `SELECT` fails; writer
- *   SIGKILLed so the sidecars survive, read succeeds.
+ *   While SOME writer holds the board open the `-shm` exists and reads
+ *   succeed. When the last one has exited CLEANLY, SQLite deletes `-wal` and
+ *   `-shm` on that close, and the next read here fails with "attempt to write
+ *   a readonly database". Measured, not inferred: reproduced on 2026-08-16
+ *   with node 22's `node:sqlite` against a WAL database in a directory with
+ *   mode 555 — writer live, read succeeds; writer cleanly gone, `SELECT`
+ *   fails; writer SIGKILLed so the sidecars survive, read succeeds.
+ *
+ *   "Some writer" and not "the waker": `ops/src/host-mailbox.ts` holds a Board
+ *   open for the ops daemon's lifetime wherever a `board:` block is
+ *   configured, which is both instances. Only the two waker processes hold the
+ *   boards today, so the behaviour above is what this host does — but the page
+ *   reports the observation rather than concluding which daemon is missing.
  *
  * That is the one state where this page most wants to be useful, so the
- * failure is reported in words on the page — naming the waker — instead of
- * rendering an empty roster that looks like a host with no agents. See the
- * `-shm` check in `describeRegistryError`. Clawcius issue filed alongside this
- * change; the fix is the operator's to choose, because every candidate
+ * failure is reported in words on the page instead of rendering an empty
+ * roster that looks like a host with no agents. See `describeRegistryError`.
+ * Clawcius #72; the fix is the operator's to choose, because every candidate
  * (a `ReadWritePaths=` line, a dedicated read-only account, taking the board
  * out of WAL) changes something outside this service.
  *
@@ -62,9 +67,9 @@
  * A registry is a handful of rows and opening SQLite is a couple of syscalls,
  * so there is no cache and no long-lived handle. That buys two things worth
  * more than the microseconds: every read re-reports the current truth,
- * including "the waker is down and this is no longer readable", and a waker
- * restart — which deletes and recreates the `-shm` underneath us — cannot
- * leave this process holding a mapping of a file that no longer exists.
+ * including "nothing holds this open any more and it is no longer readable",
+ * and a writer restart — which deletes and recreates the `-shm` underneath us
+ * — cannot leave this process holding a mapping of a file that is gone.
  *
  * Unlike `ops/src/board.ts` there is no `lstat` guard on the path here. That
  * one runs as root and refuses to follow a symlink for that reason; this runs
@@ -74,7 +79,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 
 /** One row of the `agents` table, as the page needs it. */
 export type RegistryAgent = {
@@ -115,11 +120,54 @@ export type RegistrySnapshot = {
  * Every character outside `[A-Za-z0-9]` becomes `-`, including the leading
  * slash — which is why every real slug on this host starts with a dash, and
  * why `isValidProjectSlug` in transcripts.ts allows one. There is no escaping
- * and no collision avoidance in it: `/a/b` and `/a-b` slugify identically.
- * That is upstream's rule and this has to match it exactly, not improve on it.
+ * and no collision avoidance below 200 characters: `/a/b` and `/a-b` slugify
+ * identically. That is upstream's rule and this has to match it exactly, not
+ * improve on it.
+ *
+ * Above 200 characters upstream truncates and appends a hash, and this does
+ * too. Ported from `@anthropic-ai/claude-agent-sdk`, which is the dependency
+ * that writes these directories:
+ *
+ *     var dc = 200;
+ *     function lE(e){let t=0;for(let r=0;r<e.length;r++)t=(t<<5)-t+e.charCodeAt(r)|0;return t}
+ *     function lEe(e){return Math.abs(lE(e)).toString(36)}
+ *     function us(e){let t=e.replace(/[^a-zA-Z0-9]/g,"-");
+ *                    if(t.length<=dc)return t;
+ *                    return `${t.slice(0,dc)}-${lEe(e)}`}
+ *
+ * Three details that are easy to get wrong and are load-bearing: the hash is
+ * of the ORIGINAL path, not of the dashed string; it is a signed 32-bit
+ * accumulator (`|0`) rendered in base 36 through `Math.abs`; and it runs over
+ * UTF-16 code units, so `charCodeAt` in a loop is the faithful port rather
+ * than iterating code points. The output was compared against the bundled
+ * implementation over ordinary, boundary, over-length and non-ASCII paths on
+ * 2026-08-16 and agreed on all of them.
+ *
+ * Nothing on this host is near 200 characters —
+ * `/var/lib/clawcius/workspaces/<channelId>` is about 47 — so the branch is
+ * latent here. It is ported anyway because the alternative is a function that
+ * silently returns a directory name that does not exist, and the symptom of
+ * that is an agent whose sessions all appear under "other".
+ *
+ * NOTE that no test in this repository can detect upstream CHANGING this rule:
+ * both sides of the comparison live here, and `status/` does not depend on the
+ * SDK. The tests pin the reimplementation against known-good constants and
+ * nothing more. Clawcius #78, with the options and what each costs.
  */
+const SLUG_MAX_LENGTH = 200;
+
+function slugHash(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  }
+  return hash;
+}
+
 export function slugifyWorkspace(workspacePath: string): string {
-  return workspacePath.replace(/[^A-Za-z0-9]/g, '-');
+  const dashed = workspacePath.replace(/[^A-Za-z0-9]/g, '-');
+  if (dashed.length <= SLUG_MAX_LENGTH) return dashed;
+  return `${dashed.slice(0, SLUG_MAX_LENGTH)}-${Math.abs(slugHash(workspacePath)).toString(36)}`;
 }
 
 function toIso(value: unknown): string | null {
@@ -133,31 +181,93 @@ function asString(value: unknown): string {
 }
 
 /**
+ * SQLite primary result codes, the ones this file distinguishes.
+ *
+ * `node:sqlite` puts the EXTENDED code on `error.errcode` — the WAL failure in
+ * the header arrives as 1544, `SQLITE_READONLY_DIRECTORY` — so the low byte is
+ * what identifies the family. Reading a number is the point: the message text
+ * is prose, and the first version of this function branched on the presence of
+ * a `-shm` file alone and therefore told an operator that the waker was down
+ * when the real answer was "that file is not a database".
+ */
+const SQLITE_READONLY = 8;
+
+/** Whatever is wrong with the path itself, or null if nothing is. */
+function describePathTrouble(dbPath: string): string | null {
+  try {
+    if (!statSync(dbPath).isFile()) {
+      return `${dbPath} is not a regular file, so it is not a board. Nothing was opened.`;
+    }
+    // `statSync` alone does not answer this: stat succeeds on a mode-000 file,
+    // because what it needs is search permission on the directory. Readability
+    // has to be asked for directly or an unreadable board falls through to
+    // SQLite's "unable to open database file", which is the same message a
+    // missing one produces.
+    accessSync(dbPath, fsConstants.R_OK);
+    return null;
+  } catch (error) {
+    // `existsSync` is not enough to tell these apart: it answers false for a
+    // file that is there and unreadable, which would send someone off to fix a
+    // path that was correct all along.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return (
+        `${dbPath} does not exist. It must be the same file as that instance's ` +
+        'CLAWCIUS_DB_PATH — the board is never created here, because an empty second ' +
+        'database would render as a crew with no agents.'
+      );
+    }
+    if (code === 'EACCES' || code === 'EPERM') {
+      return (
+        `${dbPath} exists and is not readable by this service (${code}). The board is ` +
+        "owned by the instance's waker account; this service runs as the same user on " +
+        'this deployment, so this means the ownership or the mode has changed.'
+      );
+    }
+    return `${dbPath} could not be examined: ${error instanceof Error ? error.message : error}`;
+  }
+}
+
+/**
  * Turn a failed read into something a person can act on.
  *
- * The `-shm` check is what distinguishes the deployment hazard in the header
- * from an ordinary permissions problem, and it is a file test rather than a
- * match on SQLite's message text — "attempt to write a readonly database" is
- * prose and is not the only wording that reaches here.
+ * The waker is only named when the failure is actually consistent with the
+ * waker being down: SQLite said READONLY, which on a database this service can
+ * read means it could not get at the WAL index. Everything else keeps its own
+ * diagnosis — "file is not a database" and "no such table: agents" are
+ * different problems with different fixes, and collapsing them into "the waker
+ * is down" sends someone to restart a service that is fine.
  */
 function describeRegistryError(dbPath: string, error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  const extended = (error as { errcode?: unknown }).errcode;
+  const primary = typeof extended === 'number' ? extended & 0xff : null;
 
-  if (!existsSync(dbPath)) {
-    return (
-      `${dbPath} does not exist. It must be the same file as that instance's ` +
-      'CLAWCIUS_DB_PATH — the board is never created here, because an empty second ' +
-      'database would render as a crew with no agents.'
-    );
-  }
+  // Asked first whatever SQLite said, because a path that is missing,
+  // unreadable or not a file explains every error code better than the code
+  // does — SQLITE_CANTOPEN above all, which is one message for all three.
+  const trouble = describePathTrouble(dbPath);
+  if (trouble !== null) return trouble;
 
-  if (!existsSync(`${dbPath}-shm`)) {
+  if (primary === SQLITE_READONLY) {
+    const shm = existsSync(`${dbPath}-shm`);
+    // Reports the observation and names the candidates; it does not conclude
+    // which process is missing. "The -shm is gone, therefore the waker is
+    // down" holds only while the waker is the sole writer, and this repository
+    // already contains a second one — ops/src/host-mailbox.ts holds a Board
+    // open for the ops daemon's lifetime wherever a `board:` block is
+    // configured, which is both instances. Naming a specific service here
+    // would send someone to restart the wrong one the day that ships.
     return (
-      `${dbPath} could not be read (${message}). Its -shm wal-index is absent, which ` +
-      'means no process currently holds the board open — the waker for this instance is ' +
-      'down. This service runs under ProtectSystem=strict and cannot create the -shm ' +
-      'itself, so the registry is unreadable until the waker is back. Transcripts below ' +
-      'are unaffected; they are read straight off disk.'
+      `${dbPath} could not be read (${message}). ` +
+      (shm
+        ? 'Its -shm wal-index exists but could not be used, so no live writer holds this ' +
+          'board open and recovering the index would need a write. '
+        : 'Its -shm wal-index is absent, so no process currently holds this board open. ') +
+      'This service runs under ProtectSystem=strict and cannot create or repair the -shm ' +
+      'itself, so the registry stays unreadable until something that can write beside the ' +
+      "board opens it — normally that instance's waker, and the ops daemon too where one " +
+      'is configured. Transcripts below are unaffected; they are read straight off disk.'
     );
   }
 
@@ -168,8 +278,8 @@ function describeRegistryError(dbPath: string, error: unknown): string {
  * A read of one instance's board.
  *
  * Never throws. Every failure becomes `error` on the snapshot, because one
- * instance whose waker is down must not blank the page for the one that is
- * running — the same rule the transcript roots already follow.
+ * instance whose board cannot be read must not blank the page for the one
+ * whose can — the same rule the transcript roots already follow.
  */
 export function readRegistry(dbPath: string | null): RegistrySnapshot {
   if (dbPath === null) {

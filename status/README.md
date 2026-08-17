@@ -47,24 +47,32 @@ cannot render. It is never created, either: an empty second database next to
 the real one would render as a crew with no agents, which looks exactly like a
 working page.
 
-### The one thing that does not work while a waker is down
+### The one thing that does not work while nothing holds the board open
 
 The boards are in WAL mode. A reader of a WAL database needs the `-shm`
 wal-index; if one exists it can be mapped read-only, and if it does not, SQLite
 must create it — which needs write access to the directory. This service runs
 under `ProtectSystem=strict` and can write nowhere.
 
-While the waker is running the `-shm` exists and the registry reads fine. After
-a clean `systemctl stop` of the waker, SQLite has deleted `-wal` and `-shm`,
-and the registry is unreadable until it comes back. Measured on 2026-08-16, not
-inferred.
+While something holds the board open the `-shm` exists and the registry reads
+fine. After the last writer closes cleanly — `systemctl stop clawcius` — SQLite
+has deleted `-wal` and `-shm`, and the registry is unreadable until a writer is
+back. Measured on 2026-08-16, not inferred.
 
-The page reports that in words, naming the waker, rather than rendering an
-empty roster. It is not worked around, and there is deliberately no
-`ReadWritePaths=` in the unit: this service writing to the board would cost the
-property the whole design rests on. **Transcripts are unaffected** — they are
-read off disk and never go near SQLite — so the session and subagent views keep
-working exactly as before.
+The page reports the *observation* — "no process currently holds this board
+open" — and names the usual holders without concluding which one is missing.
+That distinction matters: the waker is the normal writer and it is not the only
+one, since `ops/src/host-mailbox.ts` keeps a `Board` open for the ops daemon's
+lifetime on every instance with a `board:` block. Today only the two wakers
+hold them, so the table above is what this host does; an error message that
+said "the waker is down" would start sending people to restart a running
+service the moment that changes.
+
+It is not worked around, and there is deliberately no `ReadWritePaths=` in the
+unit: this service writing to the board would cost the property the whole
+design rests on. **Transcripts are unaffected** — they are read off disk and
+never go near SQLite — so the session and subagent views keep working exactly
+as before.
 
 ## What it shows
 
@@ -88,9 +96,19 @@ Beside a last-active time it reads correctly now and stays correct the day
 phase 5 lands. (`test/registry.test.js` in the root package fails if something
 starts writing a status, so this paragraph cannot quietly go stale.)
 
-A registry row with no transcripts is shown as an agent with no sessions, which
-is a real and useful state: it has an identity and a mailbox and has never run
-a turn.
+A registry row with no transcripts is shown as an agent with no sessions, and
+the page says exactly that — *no transcripts under this instance's projects
+root* — rather than concluding that the agent has never run. It cannot know
+that, and on this host it would be wrong twice over. `<crew>-host` is on both
+boards with a `last_active_at` the ops daemon stamps on every boot, and it does
+run turns: `ops/src/host-agent.ts` mints a session per task, as root, under a
+config dir this service does not read. Its card names that, because "no
+transcripts here" is permanent for the host agent rather than a symptom.
+
+The other reason to state the absence rather than infer from it: an agent whose
+`session_id` is set and whose transcripts are missing is the registry's own
+record that it *did* run, and it is what every card would look like if the slug
+join ever stopped matching. That contradiction gets its own warning.
 
 **Sessions** — every session an agent has had, current one first and the rest
 newest-activity first, with start time, duration, turn count, tool calls,
@@ -278,7 +296,9 @@ The LRU cache size, page size and byte ceiling are all in `status-config.yaml`.
 | Root unreadable (permissions) | Same, with the reason. Other agents still render. |
 | Board missing, or the wrong path | Named on the page, with the reminder that it must match `CLAWCIUS_DB_PATH`. Never created. |
 | Board has no `agents` table | Reported. Not rendered as a crew with no agents. |
-| Waker down, so the WAL `-shm` is gone | Registry unreadable; the page says so and names the waker. Transcripts unaffected. |
+| Nothing holds the board open, so the WAL `-shm` is gone | Registry unreadable; the page reports the observation and names the usual holders without picking one. Transcripts unaffected. |
+| Board exists and is unreadable | Reported as a permission problem, not as "does not exist" — `access(R_OK)`, since `stat` succeeds on a mode-000 file. |
+| Agent whose transcripts live outside every projects root | The absence is stated; no claim is made about whether it has run. The host agent is the standing example. |
 | Instance has no `boardDb` | Said in words, and every directory falls through to "other" — with no registry there is nothing that says which is an agent. |
 | Registry row with no transcripts | Listed as an agent with no sessions. It has an identity and a mailbox and has not run. |
 | Registry names a session that is not on disk | Both are shown: the sessions that are there, and a warning naming the one that is not. |
@@ -327,8 +347,10 @@ status/
   public/
     index.html  style.css  app.js
   test/
-    registry.test.js     the slug join, and both WAL failure modes
-    roster.test.js       agents from the registry, leftovers under "other"
+    registry.test.js     the slug join (including truncation), error diagnosis,
+                         and both WAL failure modes
+    roster.test.js       agents from the registry, leftovers under "other",
+                         and the rows the page must not draw a conclusion about
 ```
 
 ## API

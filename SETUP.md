@@ -703,10 +703,12 @@ for the board.
 One thing to know before you go looking: the boards are in WAL mode, and a
 read-only reader needs the `-shm` wal-index that SQLite deletes on the last
 clean close. The status unit runs `ProtectSystem=strict` and cannot create one,
-so **while a waker is stopped, that instance's agent list is unreadable** and
-the page says so, naming the waker. Transcripts are unaffected — they never go
-through SQLite. Full detail, including the security model, is in
-[`status/README.md`](status/README.md).
+so **while nothing holds a board open, that instance's agent list is
+unreadable** and the page says so. In practice that means its waker is stopped
+— but the ops daemon holds the same file wherever a `board:` block is
+configured, so the page reports what it observed rather than naming a service.
+Transcripts are unaffected; they never go through SQLite. Full detail,
+including the security model, is in [`status/README.md`](status/README.md).
 
 ---
 

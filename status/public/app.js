@@ -279,16 +279,46 @@ async function viewOverview() {
     0,
   );
 
+  // Instances whose registry could not be read, or that have none configured.
+  // Their agents are not counted in the tiles and every one of their sessions
+  // falls into "unattributable", so a tile that did not say so would be the
+  // "empty roster reads as a host with no agents" failure this page is built
+  // to avoid — in the one place that summarises everything.
+  const blind = data.agents.filter((agent) => agent.registryError || !agent.registryConfigured);
+  const blindNote = blind.length > 0 ? ` · ${blind.length} instance(s) not counted` : '';
+
   frag.append(
     el('div', { class: 'tiles' }, [
       // Agents come from the registry; instances are the configured roots.
       // Conflating the two is what made this page report 49 of something.
-      tile('Agents', fmtCount(registered), `${declaredLive} declared live · across all crews`),
+      tile(
+        'Agents',
+        blind.length === data.agents.length ? '—' : fmtCount(registered),
+        `${declaredLive} declared live${blindNote || ' · across all crews'}`,
+      ),
       tile('Instances', String(data.agents.length), `${running} running · ${stale} stale`),
-      tile('Sessions', fmtCount(sessions), `${unattributed} not attributable to an agent`),
+      tile(
+        'Sessions',
+        fmtCount(sessions),
+        blind.length > 0
+          ? `${unattributed} unattributed, including every session of ${blind.length} instance(s)`
+          : `${unattributed} not attributable to an agent`,
+      ),
       tile('Subagents', fmtCount(subagents), 'transcripts on disk'),
     ]),
   );
+
+  for (const agent of blind) {
+    frag.append(
+      text(
+        'div',
+        'warning-row',
+        agent.registryError ??
+          `${agent.label} has no boardDb in status-config.yaml, so it has no registry here and ` +
+            'none of its agents are counted above.',
+      ),
+    );
+  }
 
   frag.append(el('h2', {}, ['Instances']));
   const cards = el('div', { class: 'cards' });
@@ -325,7 +355,13 @@ async function viewOverview() {
     ]);
 
     if (agent.error) card.append(text('div', 'warning-row', agent.error));
-    if (agent.registryError) card.append(text('div', 'warning-row', agent.registryError));
+    // Short here, because the full sentence is already a warning row under the
+    // tiles it qualifies. This is only so you can tell WHICH card it was about.
+    if (agent.registryError) {
+      card.append(text('div', 'warning-row', 'Registry unreadable — see above.'));
+    } else if (!agent.registryConfigured) {
+      card.append(text('div', 'warning-row', 'No registry configured — directories only.'));
+    }
     cards.append(card);
   }
 
@@ -500,27 +536,61 @@ async function viewAgent(agentId) {
       ]));
     }
 
-    if (agent.sessions.length === 0) {
+    if (agent.sessions.length > 0) {
+      card.append(sessionTable(data.agent, agent.sessions, agent.sessionId));
+    } else {
+      // What this says is what it can check. The previous copy concluded "it
+      // has not run a turn", which this page has no way of knowing and which
+      // is false today for both boards on this host: `<crew>-host` has a
+      // registry row whose `last_active_at` the ops daemon stamps on every
+      // boot, so the card said "last spoke 4m ago" directly above "it has not
+      // run a turn". Its transcripts are real and are written by root under a
+      // different config dir entirely.
+      //
+      // So: report the absence, which is true and checkable, and let the
+      // reason be a separate sentence that only claims what is known.
       card.append(
         text(
           'p',
           'placeholder',
-          'This agent has a registry row and no transcripts. It has a mailbox and an identity; ' +
-            'it has not run a turn.',
+          `No transcripts under this instance's projects root for ${agent.projectSlug}.`,
         ),
       );
-    } else {
-      card.append(sessionTable(data.agent, agent.sessions, agent.sessionId));
-      if (agent.sessionId && !agent.currentSessionPresent) {
-        card.append(
-          text(
-            'div',
-            'warning-row',
-            `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
-              'transcript with that id is under its directory.',
-          ),
-        );
-      }
+      card.append(
+        text(
+          'p',
+          'placeholder',
+          agent.role === 'host'
+            ? 'The host agent runs on the VPS itself rather than in this instance\'s container, ' +
+              'and writes its sessions outside every projects root this page reads. Expect this ' +
+              'card to have no transcripts however busy it is; its last-active time above is the ' +
+              'board\'s own record and is the honest signal for it.'
+            : 'It has an identity and a mailbox here. Whether it has ever run is not something ' +
+              'this page can see from an empty directory.',
+        ),
+      );
+    }
+
+    // Outside the branch above, not inside it. A row with a session id and no
+    // matching transcripts is the registry's own record that the agent DID run
+    // — so it is exactly the case that must not be told it has not — and it is
+    // also what this whole page degrades into if the slug join ever stops
+    // matching. Having the contradiction visible on the card is the difference
+    // between finding that out here and finding it out from a page confidently
+    // reporting that every agent has never run.
+    if (agent.sessionId && !agent.currentSessionPresent) {
+      card.append(
+        text(
+          'div',
+          'warning-row',
+          `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
+            `transcript with that id is under ${agent.projectSlug}. ` +
+            (agent.sessions.length === 0
+              ? 'It has no transcripts there at all — if that is true of every agent here, the ' +
+                'slug join has stopped matching and the sessions are under "other" below.'
+              : 'Its other sessions are listed above.'),
+        ),
+      );
     }
 
     frag.append(card);

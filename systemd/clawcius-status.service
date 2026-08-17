@@ -126,22 +126,41 @@ ReadOnlyPaths=-/var/lib/oj
 # AGENTS are; without them the page can only list the directories under the
 # transcript roots, which is the bug in Clawcius #14. Opened readOnly, which
 # SQLite enforces; the waker owns these files and is writing to them live.
-ReadOnlyPaths=/var/lib/clawcius/clawcius.db
-ReadOnlyPaths=/var/lib/hamachi/hamachi.db
+#
+# `-` PREFIXED, and it is not optional. A path without it that does not exist
+# fails the namespace setup and the unit never starts — and with
+# StartLimitIntervalSec=0 and Restart=always above, it never stops trying
+# either. These name files that a DIFFERENT service creates: a board comes into
+# existence when that instance's waker first constructs its AgentRegistry, so
+# on a host where a waker has never run, or after a board is renamed, this
+# would take down the one service whose whole argument is that it keeps working
+# when the thing it watches does not. registry.ts has a carefully written
+# message for a board that is not there; without the dash, systemd refuses to
+# start the process before that branch can ever run.
+ReadOnlyPaths=-/var/lib/clawcius/clawcius.db
+ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
 
 # ── The boards are in WAL, and that interacts with the line above ─────────
 #
 # A reader of a WAL database needs the `-shm` wal-index. If one exists it can
 # be mapped read-only; if it does NOT, SQLite has to create it, which needs
-# write access to the directory — and under ProtectSystem=strict this service
-# has write access to nothing.
+# write access to the directory the board is in — and ProtectSystem=strict
+# makes that directory read-only. (PrivateTmp=true above does give this service
+# a writable /tmp of its own. That does not help: the `-shm` has to be created
+# beside the board, not somewhere else.)
 #
-# While the waker is up the `-shm` exists and the registry reads fine. On a
-# clean `systemctl stop` of the waker SQLite deletes `-wal` and `-shm`, and the
-# registry then becomes unreadable until the waker is back. Measured on
+# While any writer holds a board open the `-shm` exists and the registry reads
+# fine. When the last one closes cleanly SQLite deletes `-wal` and `-shm`, and
+# the registry becomes unreadable until a writer is back. Measured on
 # 2026-08-16, not inferred.
 #
-# That state is reported on the page, naming the waker. It is NOT worked around
+# "Any writer", not "the waker": ops/src/host-mailbox.ts holds a Board open for
+# the ops daemon's lifetime on every instance with a `board:` block. Only the
+# two wakers hold them today, so a `systemctl stop clawcius` is what produces
+# this state as deployed — the page still reports the observation rather than
+# concluding which service is missing.
+#
+# That state is reported on the page. It is NOT worked around
 # here, and specifically there is no ReadWritePaths= line: the whole claim of
 # this unit is that it writes nothing, and a writable path to the board would
 # put a second writer next to the one that owns it. If this is ever worth

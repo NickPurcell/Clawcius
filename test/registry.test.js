@@ -185,17 +185,24 @@ test('status is declared, not inferred', () => {
 test('nothing outside this suite writes a status — the status page says so', async () => {
   const { readdir, readFile } = await import('node:fs/promises');
   const { join: joinPath } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+
+  // Resolved against this file, not against `process.cwd()`. A relative 'src'
+  // silently scans whichever package the runner happened to start in — and
+  // `status/` has one too, so the test would pass green having checked the
+  // wrong tree entirely.
+  const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
 
   // `src/` only. The registry class lives in `src/store.ts` and nothing else
   // holds one — `ops/` reaches the same table through its own `Board`, which
   // has no setStatus at all. Widening this to ops/ would catch the unrelated
   // `setStatus` on the waker-status stub in ops/src/selftest.ts.
   const callers = [];
-  const entries = await readdir('src', { withFileTypes: true, recursive: true });
+  const entries = await readdir(srcDir, { withFileTypes: true, recursive: true });
 
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-    const path = joinPath(entry.parentPath ?? 'src', entry.name);
+    const path = joinPath(entry.parentPath ?? srcDir, entry.name);
     const source = await readFile(path, 'utf8');
     source.split('\n').forEach((line, index) => {
       // A call is always `<something>.setStatus(`; the declaration in store.ts
