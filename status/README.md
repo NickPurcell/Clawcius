@@ -300,7 +300,7 @@ The LRU cache size, page size and byte ceiling are all in `status-config.yaml`.
 | Board exists and is unreadable | Reported as a permission problem, not as "does not exist" — `access(R_OK)`, since `stat` succeeds on a mode-000 file. |
 | Agent whose transcripts live outside every projects root | The absence is stated; no claim is made about whether it has run. The host agent is the standing example. |
 | Instance has no `boardDb` | Said in words, and every directory falls through to "other" — with no registry there is nothing that says which is an agent. |
-| Registry row with no transcripts | Listed as an agent with no sessions. It has an identity and a mailbox and has not run. |
+| Registry row with no transcripts | Listed as an agent with no sessions, and the absence is stated without a conclusion about whether it has run. |
 | Registry names a session that is not on disk | Both are shown: the sessions that are there, and a warning naming the one that is not. |
 | Malformed JSONL line | Skipped, counted, and the count is shown. |
 | Half-written trailing line | Not indexed, not counted as malformed. Picked up when complete. |

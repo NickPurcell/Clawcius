@@ -437,7 +437,23 @@ function sessionTable(agentId, sessions, currentSessionId) {
   }
 
   table.append(body);
-  return table;
+
+  // Wrapped, because these tables now live INSIDE an agent's card and eleven
+  // columns of session stats do not fit in a phone. Unwrapped, the table's
+  // min-content width wins: at 380px it rendered straight through the card's
+  // border and set the width of the whole document, so every other element on
+  // the page sat in a 380px column beside a 900px scroll region. The wrapper
+  // takes the width it is given and scrolls inside itself instead.
+  //
+  // `tabindex` and `role` are what make that scroll region reachable without a
+  // mouse. A div with overflow and no focusable child is a part of the page a
+  // keyboard cannot get to in every browser, and the columns that end up off
+  // the right edge here are tokens, cost and last activity — not decoration.
+  return el(
+    'div',
+    { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': 'Sessions' },
+    [table],
+  );
 }
 
 /**
