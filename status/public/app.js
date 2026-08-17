@@ -501,6 +501,16 @@ async function viewAgent(agentId) {
     ),
   );
 
+  frag.append(
+    el('div', { class: 'chips' }, [
+      el(
+        'a',
+        { class: 'chip', href: `#/subagents/${encodeURIComponent(agentId)}` },
+        ['Subagents by role →'],
+      ),
+    ]),
+  );
+
   if (data.error) frag.append(text('div', 'warning-row', data.error));
   if (data.registryError) frag.append(text('div', 'warning-row', data.registryError));
   if (!data.registryConfigured) {
@@ -773,6 +783,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
       ['turns', `${fmtCount(node.assistantTurns)} · ${fmtCount(node.toolCalls)} tool calls`],
       ['transcript', fmtBytes(node.sizeBytes)],
       ['linkage', node.linkage],
+      ['workflow', node.workflowName ?? node.workflowRunId],
       ['agent id', node.agentId],
     ]);
 
@@ -792,7 +803,13 @@ function renderLanes(detail, nodes, agentId, sessionId) {
         },
         [node.role],
       ),
-      text('span', 'lane-desc', node.description || node.agentId),
+      // A workflow subagent carries no description; the run's name is what it
+      // was for, and an anonymous bar is what this view exists not to draw.
+      text(
+        'span',
+        'lane-desc',
+        node.description || (node.workflowName ? `run ${node.workflowName}` : node.agentId),
+      ),
     );
     if (node.linkage === 'orphan') {
       label.append(el('span', { class: 'tag', dataset: { linkage: 'orphan' } }, ['unlinked']));
@@ -938,6 +955,324 @@ async function viewTranscript(agentId, sessionId, subagentId) {
   main.replaceChildren(frag);
 }
 
+// ── Subagents ───────────────────────────────────────────────────────────────
+
+/**
+ * Every subagent an instance has run, grouped by role.
+ *
+ * The session view draws one run's tree over a time axis and answers "what
+ * happened here". It cannot answer "where is the transcript of the thing that
+ * died at 4am" unless you already know which session it belonged to — which is
+ * Clawcius #22, and is what this list is for. Roles are ordered by count
+ * because "what does this system spend its subagents on" is the question you
+ * arrive with; within a role, newest first, because the next question is
+ * always "what was the last one doing".
+ */
+async function viewSubagents(agentId) {
+  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/subagents`);
+  const frag = document.createDocumentFragment();
+
+  frag.append(
+    crumbs([
+      { label: 'Agents', href: '#/overview' },
+      { label: data.label, href: `#/agent/${encodeURIComponent(agentId)}` },
+      { label: 'Subagents' },
+    ]),
+    el('h1', {}, ['Subagents']),
+    text(
+      'p',
+      'subtitle',
+      `${fmtCount(data.total)} transcript(s) across ${data.roles.length} role(s) · ` +
+        `${fmtCount(data.fromWorkflows)} from workflow runs`,
+    ),
+  );
+
+  if (data.error) frag.append(text('div', 'warning-row', data.error));
+
+  if (data.total === 0) {
+    frag.append(text('p', 'placeholder', 'No subagent transcripts under this root yet.'));
+    main.replaceChildren(frag);
+    return;
+  }
+
+  const colors = roleColors(data.roles.map((group) => group.role));
+
+  frag.append(
+    el('div', { class: 'tiles' }, [
+      tile('Subagents', fmtCount(data.total), `${data.roles.length} distinct role(s)`),
+      tile(
+        'From workflows',
+        fmtCount(data.fromWorkflows),
+        `${fmtCount(data.total - data.fromWorkflows)} spawned directly`,
+      ),
+      tile('Workflow runs', fmtCount(data.workflows.length), 'recorded on disk'),
+    ]),
+  );
+
+  if (data.workflows.length > 0) {
+    frag.append(
+      el('h2', {}, ['Workflow runs']),
+      text(
+        'p',
+        'subtitle',
+        'A run\u2019s subagents carry no description of their own — their sidecar says only ' +
+          '"workflow-subagent". This is where the run says what they were for.',
+      ),
+    );
+
+    for (const run of data.workflows) {
+      const card = el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          el('div', { class: 'card-head-left' }, [
+            text('span', 'card-title', run.name || run.runId),
+            run.status ? el('span', { class: 'chip' }, [run.status]) : null,
+          ]),
+          text('span', 'tile-sub', fmtAgo(run.startedAt)),
+        ]),
+        text('div', 'card-path mono', run.runId),
+      ]);
+
+      if (run.summary) card.append(text('p', 'block-prose', run.summary));
+
+      const stats = el('div', { class: 'card-stats' }, [
+        el('div', {}, [
+          text('div', 'card-stat-label', 'Agents'),
+          text('div', 'card-stat-value', fmtCount(run.observedAgents)),
+        ]),
+        el('div', {}, [
+          text('div', 'card-stat-label', 'Duration'),
+          text('div', 'card-stat-value', fmtDuration(run.durationSeconds)),
+        ]),
+        el('div', {}, [
+          text('div', 'card-stat-label', 'Phases'),
+          text('div', 'card-stat-value', fmtCount(run.phases.length)),
+        ]),
+      ]);
+      card.append(stats);
+
+      // The descriptor records how many agents the run believed it spawned;
+      // `observedAgents` is how many transcripts are actually on disk. They
+      // agree today. Saying so when they do not is cheaper than wondering.
+      if (typeof run.agentCount === 'number' && run.agentCount !== run.observedAgents) {
+        card.append(
+          text(
+            'div',
+            'warning-row',
+            `The run recorded ${run.agentCount} agent(s); ${run.observedAgents} transcript(s) ` +
+              'are on disk for it.',
+          ),
+        );
+      }
+
+      if (run.phases.length > 0) {
+        const list = el('ul', { class: 'phases' });
+        for (const phase of run.phases) {
+          list.append(
+            el('li', {}, [
+              text('span', 'strong', phase.title || '—'),
+              phase.detail ? text('span', 'lane-desc', phase.detail) : null,
+            ]),
+          );
+        }
+        card.append(list);
+      }
+
+      frag.append(card);
+    }
+  }
+
+  frag.append(el('h2', {}, ['By role']));
+
+  for (const group of data.roles) {
+    const color = colors.get(group.role) ?? OTHER_COLOR;
+    const card = el('div', { class: 'card' }, [
+      el('div', { class: 'card-head' }, [
+        el('div', { class: 'card-head-left' }, [
+          el('span', { class: 'lane-swatch', style: { background: color } }),
+          text('span', 'card-title', group.role),
+        ]),
+        text('span', 'tile-sub', `${fmtCount(group.count)} transcript(s)`),
+      ]),
+    ]);
+
+    const list = el('div', { class: 'subagent-list' });
+    for (const entry of group.subagents) {
+      const row = el('div', { class: 'subagent', dataset: { active: String(entry.active) } }, [
+        el('div', { class: 'subagent-head' }, [
+          el(
+            'a',
+            {
+              class: 'mono',
+              href:
+                `#/transcript/${encodeURIComponent(agentId)}/` +
+                `${encodeURIComponent(entry.sessionId)}/${encodeURIComponent(entry.agentId)}`,
+            },
+            [entry.agentId.slice(0, 10)],
+          ),
+          entry.active ? el('span', { class: 'tag', dataset: { current: 'true' } }, ['live']) : null,
+          entry.model ? el('span', { class: 'tag' }, [entry.model]) : null,
+          entry.depth !== null ? el('span', { class: 'tag' }, [`depth ${entry.depth}`]) : null,
+          entry.workflowRunId ? el('span', { class: 'tag' }, [entry.workflowRunId]) : null,
+        ]),
+        // A workflow subagent has no description of its own — the sidecar is
+        // `{agentType, spawnDepth}` and identical on all of them — so what is
+        // shown is the RUN's name, labelled as the run's rather than passed off
+        // as this agent's. Saying "no description recorded" 58 times when the
+        // answer is one join away is technically true and no use to anybody.
+        entry.description
+          ? text('div', 'subagent-desc', entry.description)
+          : entry.workflowName
+            ? el('div', { class: 'subagent-desc' }, [
+                el('span', { class: 'lane-desc' }, ['part of run ']),
+                el('span', { class: 'strong' }, [entry.workflowName]),
+              ])
+            : text(
+                'div',
+                'subagent-desc lane-desc',
+                entry.workflowRunId
+                  ? 'part of a workflow run whose descriptor is not on disk yet'
+                  : 'no description recorded',
+              ),
+        text('div', 'tile-sub', `${fmtBytes(entry.sizeBytes)} · ${fmtAgo(entry.lastActivity)}`),
+      ]);
+      list.append(row);
+    }
+
+    card.append(list);
+    frag.append(card);
+  }
+
+  main.replaceChildren(frag);
+}
+
+// ── Clawsky ─────────────────────────────────────────────────────────────────
+
+/** One message. Author and recipient are columns, never parsed from the text. */
+function mailCard(message) {
+  const card = el('div', { class: 'mail' }, [
+    el('div', { class: 'mail-head' }, [
+      text('span', 'mail-author mono', message.author || 'unknown'),
+      el('span', { class: 'mail-arrow' }, ['→']),
+      text('span', 'mail-to mono', message.recipient === '*' ? 'feed' : message.recipient),
+      text('span', 'tile-sub', fmtAgo(message.sentAt)),
+    ]),
+  ]);
+
+  if (message.subject) card.append(text('div', 'mail-subject', message.subject));
+
+  // `pre` with a scroll cap rather than a clamp-and-expand: a body can be
+  // 20,000 characters and the point of this view is to read them. tabindex,
+  // because a scroll region with no focusable child is unreachable by keyboard
+  // — the same lesson as the session tables.
+  card.append(
+    el('pre', { class: 'mail-body', tabindex: '0', role: 'region', 'aria-label': 'Message body' }, [
+      message.body,
+    ]),
+  );
+
+  if (message.bodyTruncated) {
+    card.append(text('div', 'truncated', '… truncated — the board holds the whole message'));
+  }
+  if (message.readBy.length > 0) {
+    card.append(text('div', 'tile-sub', `read by ${message.readBy.join(', ')}`));
+  }
+  return card;
+}
+
+async function viewClawsky() {
+  const data = await api('/api/clawsky');
+  const frag = document.createDocumentFragment();
+
+  frag.append(
+    el('h1', {}, ['Clawsky']),
+    text(
+      'p',
+      'subtitle',
+      'The board: who is on it, and everything they have said. One row per message — ' +
+        'a DM and a feed post are the same table, and the recipient is what tells them apart.',
+    ),
+  );
+
+  for (const instance of data.instances) {
+    frag.append(el('h2', {}, [instance.label]));
+
+    if (!instance.registryConfigured) {
+      frag.append(
+        text(
+          'div',
+          'warning-row',
+          `${instance.label} has no boardDb in status-config.yaml, so it has no board here.`,
+        ),
+      );
+      continue;
+    }
+    if (instance.registryError) frag.append(text('div', 'warning-row', instance.registryError));
+    if (instance.mailError && instance.mailError !== instance.registryError) {
+      frag.append(text('div', 'warning-row', instance.mailError));
+    }
+
+    frag.append(
+      el('div', { class: 'tiles' }, [
+        tile(
+          'Participants',
+          fmtCount(instance.participants.length),
+          `${instance.posterCount} poster(s)`,
+        ),
+        tile('Posts', fmtCount(instance.feed.length), 'on the feed'),
+        tile(
+          'DMs',
+          fmtCount(instance.dms.length),
+          instance.totalMessages > instance.shownMessages
+            ? `showing ${instance.shownMessages} of ${instance.totalMessages} messages`
+            : 'agent to agent',
+        ),
+      ]),
+    );
+
+    if (instance.participants.length > 0) {
+      const chips = el('div', { class: 'chips' });
+      for (const participant of instance.participants) {
+        chips.append(
+          el('span', { class: 'chip' }, [
+            `${participant.id} · ${participant.role} · ${participant.sent} sent`,
+          ]),
+        );
+      }
+      frag.append(chips);
+    }
+
+    frag.append(el('h3', {}, ['Feed']));
+    if (instance.feed.length === 0) {
+      // Not an empty box. Only a poster may write to the feed (src/mail.ts),
+      // and `posterCount` is read from the registry — so when it is zero this
+      // says the feed CANNOT have posts rather than that it happens not to.
+      frag.append(
+        text(
+          'p',
+          'placeholder',
+          instance.posterCount === 0
+            ? 'Empty, and that is correct: only an agent with the poster role may write to the ' +
+                'feed, and this crew has none. Spawn is CLAWSKY.md phase 5, so there is no way ' +
+                'to create one yet. Nothing is broken and nothing needs enabling.'
+            : `Empty. This crew has ${instance.posterCount} poster(s), so posts are possible — ` +
+                'none has been written.',
+        ),
+      );
+    } else {
+      for (const message of instance.feed) frag.append(mailCard(message));
+    }
+
+    frag.append(el('h3', {}, ['Direct messages']));
+    if (instance.dms.length === 0) {
+      frag.append(text('p', 'placeholder', 'No DMs on this board yet.'));
+    } else {
+      for (const message of instance.dms) frag.append(mailCard(message));
+    }
+  }
+
+  main.replaceChildren(frag);
+}
+
 // ── Osmosis Jones ───────────────────────────────────────────────────────────
 
 async function viewOj() {
@@ -1064,6 +1399,8 @@ async function render() {
 
   try {
     if (route.name === 'agent' && route.args[0]) await viewAgent(route.args[0]);
+    else if (route.name === 'subagents' && route.args[0]) await viewSubagents(route.args[0]);
+    else if (route.name === 'clawsky') await viewClawsky();
     else if (route.name === 'session' && route.args[0] && route.args[1])
       await viewSession(route.args[0], route.args[1]);
     else if (route.name === 'transcript' && route.args[0] && route.args[1])

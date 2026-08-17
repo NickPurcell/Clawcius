@@ -57,7 +57,7 @@
  *
  * That is the one state where this page most wants to be useful, so the
  * failure is reported in words on the page instead of rendering an empty
- * roster that looks like a host with no agents. See `describeRegistryError`.
+ * roster that looks like a host with no agents. See `describeBoardError`.
  * Clawcius #72; the fix is the operator's to choose, because every candidate
  * (a `ReadWritePaths=` line, a dedicated read-only account, taking the board
  * out of WAL) changes something outside this service.
@@ -231,6 +231,11 @@ function describePathTrouble(dbPath: string): string | null {
 /**
  * Turn a failed read into something a person can act on.
  *
+ * Exported because the board holds more than the registry: `mail.ts` opens the
+ * same file with the same discipline and fails in exactly the same ways, and
+ * two copies of this triage would drift into disagreeing about what a missing
+ * `-shm` means.
+ *
  * The waker is only named when the failure is actually consistent with the
  * waker being down: SQLite said READONLY, which on a database this service can
  * read means it could not get at the WAL index. Everything else keeps its own
@@ -238,7 +243,7 @@ function describePathTrouble(dbPath: string): string | null {
  * different problems with different fixes, and collapsing them into "the waker
  * is down" sends someone to restart a service that is fine.
  */
-function describeRegistryError(dbPath: string, error: unknown): string {
+export function describeBoardError(dbPath: string, error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const extended = (error as { errcode?: unknown }).errcode;
   const primary = typeof extended === 'number' ? extended & 0xff : null;
@@ -265,9 +270,9 @@ function describeRegistryError(dbPath: string, error: unknown): string {
           'board open and recovering the index would need a write. '
         : 'Its -shm wal-index is absent, so no process currently holds this board open. ') +
       'This service runs under ProtectSystem=strict and cannot create or repair the -shm ' +
-      'itself, so the registry stays unreadable until something that can write beside the ' +
-      "board opens it — normally that instance's waker, and the ops daemon too where one " +
-      'is configured. Transcripts below are unaffected; they are read straight off disk.'
+      'itself, so the board stays unreadable until something that can write beside it ' +
+      "opens it — normally that instance's waker, and the ops daemon too where one is " +
+      'configured. Transcripts are unaffected; they are read straight off disk.'
     );
   }
 
@@ -322,7 +327,7 @@ export function readRegistry(dbPath: string | null): RegistrySnapshot {
       }),
     };
   } catch (error) {
-    return { configured: true, agents: [], error: describeRegistryError(dbPath, error) };
+    return { configured: true, agents: [], error: describeBoardError(dbPath, error) };
   } finally {
     try {
       db?.close();
