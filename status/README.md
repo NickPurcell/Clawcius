@@ -1,32 +1,124 @@
 # status
 
-A read-only window onto the agents running on this host. It reads Claude Code
-transcripts off local disk and shows you what each agent has been doing — which
-are alive, which sessions ran when, and, for any session, the tree of subagents
-it spawned laid out over a time axis.
+A read-only window onto the agents running on this host. It lists the agents
+from each instance's registry, hangs every transcript they have written off
+them, and shows you what each has been doing — which are alive, which sessions
+ran when, and, for any session, the tree of subagents it spawned laid out over
+a time axis.
 
 It watches every agent instance on the box: Clawcius, Hamachi, whatever comes
 next, and Osmosis Jones once that exists.
 
 ```
-  transcripts on disk                this service              your laptop
-  /var/lib/*/agent-home/projects ─→  index + watch  ─loopback─→ tailscale serve ─→ tailnet
-                                     (never writes)             (TLS, MagicDNS)
+  the registry                       this service              your laptop
+  /var/lib/*/<instance>.db  ────┐
+                                ├──→  index + watch  ─loopback─→ tailscale serve ─→ tailnet
+  transcripts on disk           │     (never writes)             (TLS, MagicDNS)
+  /var/lib/*/agent-home/projects┘
 ```
+
+## Where the agent list comes from
+
+**From the registry, not from the filesystem.** This is worth stating plainly
+because it used to be the other way round, and that was Clawcius #14: the page
+enumerated `<projectsRoot>/<slug>/` and called every directory an agent, so
+Clawcius showed 49 "sessions" and three of Hamachi's five "agents" were `/tmp`
+paths where an engineer had run permission probes. A directory is a cwd
+somebody once ran Claude Code in. An agent is a row in a board.
+
+The join needs no schema change. Claude Code names a project directory by
+slugifying the cwd — every character outside `[A-Za-z0-9]` becomes `-` — and
+the registry already stores `workspace_path`, which is the cwd the waker spawns
+that agent with. So:
+
+```
+workspace_path  /var/lib/hamachi/workspaces/1467070145343258628
+slug            -var-lib-hamachi-workspaces-1467070145343258628
+```
+
+names that agent's transcript directory, and every `.jsonl` in it is one of its
+sessions, current or historical. Anything left over is filed under **other**:
+still listed, still readable, not pretending to be an agent.
+
+The board is opened **read-only**, with SQLite's readonly mode rather than by
+convention — the waker owns that file and is writing to it live, and a second
+writer or a lock that stalled it mid-turn would be far worse than a page that
+cannot render. It is never created, either: an empty second database next to
+the real one would render as a crew with no agents, which looks exactly like a
+working page.
+
+### The one thing that does not work while nothing holds the board open
+
+The boards are in WAL mode. A reader of a WAL database needs the `-shm`
+wal-index; if one exists it can be mapped read-only, and if it does not, SQLite
+must create it — which needs write access to the directory. This service runs
+under `ProtectSystem=strict` and can write nowhere.
+
+While something holds the board open the `-shm` exists and the registry reads
+fine. After the last writer closes cleanly — `systemctl stop clawcius` — SQLite
+has deleted `-wal` and `-shm`, and the registry is unreadable until a writer is
+back. Measured on 2026-08-16, not inferred.
+
+The page reports the *observation* — "no process currently holds this board
+open" — and names the usual holders without concluding which one is missing.
+That distinction matters: the waker is the normal writer and it is not the only
+one, since `ops/src/host-mailbox.ts` keeps a `Board` open for the ops daemon's
+lifetime on every instance with a `board:` block. Today only the two wakers
+hold them, so the table above is what this host does; an error message that
+said "the waker is down" would start sending people to restart a running
+service the moment that changes.
+
+It is not worked around, and there is deliberately no `ReadWritePaths=` in the
+unit: this service writing to the board would cost the property the whole
+design rests on. **Transcripts are unaffected** — they are read off disk and
+never go near SQLite — so the session and subagent views keep working exactly
+as before.
 
 ## What it shows
 
-**Overview** — every configured agent with a liveness state. `running` if
-something was written in the last few minutes, `idle` if it is merely quiet,
-`stale` beyond an hour. The distinction is the point: an agent nobody has
-spoken to and an agent wedged mid-turn look identical from outside, and this
-is the line between them. Plus last activity, session count, subagent count.
+**Overview** — how many agents there are, how many instances, how many sessions
+and how many of those no agent claims; then a card per instance with a liveness
+state. `running` if something was written in the last few minutes, `idle` if it
+is merely quiet, `stale` beyond an hour. The distinction is the point: an agent
+nobody has spoken to and an agent wedged mid-turn look identical from outside,
+and this is the line between them.
 
-**Sessions** — every session for an agent, newest first, with start time,
-duration, turn count, tool calls, tokens, transcript size, and cost when the
-transcript records one. It usually does not — the SDK-driven sessions on this
-host log token usage and no cost at all, and the page shows a dash rather than
-inventing `$0.00`.
+**Agents** — per instance, one card per registry row: id, crew, role, the
+workspace path and the slug it maps to, and the declared status beside the time
+the agent last spoke — `live · last spoke 4m ago`.
+
+Both, and not one of them, because they are different claims. `status` in the
+registry is *declared*: a kill writes `dead`, and an agent that dies mid-turn
+from a crash writes nothing at all. Today nothing writes it even in principle —
+`setStatus` has no caller outside a test, because spawn and kill are CLAWSKY.md
+phase 5 — so a column of it alone would be the same word on every row forever.
+Beside a last-active time it reads correctly now and stays correct the day
+phase 5 lands. (`test/registry.test.js` in the root package fails if something
+starts writing a status, so this paragraph cannot quietly go stale.)
+
+A registry row with no transcripts is shown as an agent with no sessions, and
+the page says exactly that — *no transcripts under this instance's projects
+root* — rather than concluding that the agent has never run. It cannot know
+that, and on this host it would be wrong twice over. `<crew>-host` is on both
+boards with a `last_active_at` the ops daemon stamps on every boot, and it does
+run turns: `ops/src/host-agent.ts` mints a session per task, as root, under a
+config dir this service does not read. Its card names that, because "no
+transcripts here" is permanent for the host agent rather than a symptom.
+
+The other reason to state the absence rather than infer from it: an agent whose
+`session_id` is set and whose transcripts are missing is the registry's own
+record that it *did* run, and it is what every card would look like if the slug
+join ever stopped matching. That contradiction gets its own warning.
+
+**Sessions** — every session an agent has had, current one first and the rest
+newest-activity first, with start time, duration, turn count, tool calls,
+tokens, transcript size, and cost when the transcript records one. It usually
+does not — the SDK-driven sessions on this host log token usage and no cost at
+all, and the page shows a dash rather than inventing `$0.00`.
+
+The current session is the one the registry says the agent resumes, and it is
+marked as such rather than being inferred from mtime. Those are not the same
+row: a subagent of an older session can easily be the most recent write.
 
 **Subagent branching** — the headline view. Every subagent a session spawned,
 as a tree indented by depth and drawn as a swimlane over the session's time
@@ -66,7 +158,9 @@ opposite failure mode, and you learn about it from a stranger. `0.0.0.0`, `::`,
 
 **Read-only.** Every route is GET or HEAD; anything else gets a 405 before
 routing. Nothing writes, deletes, or spawns a process, and no request parameter
-reaches a shell — there is no shell.
+reaches a shell — there is no shell. The registry is opened in SQLite's
+readonly mode, so that claim covers the boards too and is enforced by SQLite
+rather than by there happening to be no `INSERT` in the file.
 
 **Path traversal.** Session, subagent and project ids come from URLs. They are
 validated against strict patterns *and* resolved inside their configured root,
@@ -102,6 +196,7 @@ cd status
 npm install
 npm run build
 npm start                      # reads ./status-config.yaml
+npm test                       # builds, then runs test/*.test.js
 ```
 
 Or, without a build step, for development:
@@ -112,10 +207,10 @@ npm run dev
 
 Then `curl http://127.0.0.1:8477/healthz`.
 
-Configuration is `status-config.yaml` — roots, port, liveness thresholds, OJ
-paths, read limits, watch tuning. Every key has a default and the loader
-validates types, so a typo fails the boot with the offending key named rather
-than rendering a plausible empty page. Override the path with
+Configuration is `status-config.yaml` — roots, board databases, port, liveness
+thresholds, OJ paths, read limits, watch tuning. Every key has a default and the
+loader validates types, so a typo fails the boot with the offending key named
+rather than rendering a plausible empty page. Override the path with
 `STATUS_CONFIG_PATH`.
 
 The roots default to the host side of the mount in `docker/run-container.sh`:
@@ -127,8 +222,15 @@ AGENT_HOME=$CLAWCIUS_STATE_DIR/agent-home
 ```
 
 so instance `X` writes its transcripts to `/var/lib/X/agent-home/projects` on
-the host. Adding a third instance is a new entry under `agents:` and a matching
-`ReadOnlyPaths=` line in the systemd unit.
+the host. `boardDb` is that instance's `CLAWCIUS_DB_PATH`, from its env file,
+and it is *not* derivable from the instance name — Hamachi's is
+`/var/lib/hamachi/hamachi.db`, named for the instance rather than for the
+variable. `boardDb` is optional: an instance without one renders as directories
+and says on the page that it has no registry, which is the right answer for
+Osmosis Jones, whom CLAWSKY.md deliberately keeps off the board.
+
+Adding a third instance is a new entry under `agents:` and two matching
+`ReadOnlyPaths=` lines in the systemd unit — the root and the board.
 
 ## SETUP — exposing it on the tailnet
 
@@ -192,6 +294,14 @@ The LRU cache size, page size and byte ceiling are all in `status-config.yaml`.
 |---|---|
 | Root does not exist yet | Row shows `no data` with an explanation. Not an error — new instances have no projects dir until their first turn. |
 | Root unreadable (permissions) | Same, with the reason. Other agents still render. |
+| Board missing, or the wrong path | Named on the page, with the reminder that it must match `CLAWCIUS_DB_PATH`. Never created. |
+| Board has no `agents` table | Reported. Not rendered as a crew with no agents. |
+| Nothing holds the board open, so the WAL `-shm` is gone | Registry unreadable; the page reports the observation and names the usual holders without picking one. Transcripts unaffected. |
+| Board exists and is unreadable | Reported as a permission problem, not as "does not exist" — `access(R_OK)`, since `stat` succeeds on a mode-000 file. |
+| Agent whose transcripts live outside every projects root | The absence is stated; no claim is made about whether it has run. The host agent is the standing example. |
+| Instance has no `boardDb` | Said in words, and every directory falls through to "other" — with no registry there is nothing that says which is an agent. |
+| Registry row with no transcripts | Listed as an agent with no sessions, and the absence is stated without a conclusion about whether it has run. |
+| Registry names a session that is not on disk | Both are shown: the sessions that are there, and a warning naming the one that is not. |
 | Malformed JSONL line | Skipped, counted, and the count is shown. |
 | Half-written trailing line | Not indexed, not counted as malformed. Picked up when complete. |
 | Session with no subagents | Says so, in words. |
@@ -213,20 +323,34 @@ So `watch.rescanSeconds` defaults to 10 and should be understood as the primary
 mechanism here, with `fs.watch` as the fast path when it happens to fire.
 Updates are therefore worst-case ~10s, not instant, and that is deliberate.
 
+**The boards are not watched.** Only the transcript roots are. A registry row
+that changes without any transcript being written — a new agent seeded and not
+yet run — is picked up on the next render, which in practice is the next time
+anything on the host writes a line. Watching the board's directory instead
+would mean an event per WAL write, which is a firehose for a table that changes
+a handful of times a day; the registry is re-read from disk on every request
+either way, so nothing here is cached stale.
+
 ## Layout
 
 ```
 status/
-  status-config.yaml     roots, port, thresholds, OJ paths
+  status-config.yaml     roots, boards, port, thresholds, OJ paths
   src/
     index.ts             server, routes, SSE, security headers
     config.ts            typed YAML loader with defaults + validation
+    registry.ts          the board, read-only — who the agents are
     transcripts.ts       discovery, indexing, subagent linkage, redaction
     views.ts             assembles the JSON the UI draws
     oj.ts                Osmosis Jones, absence-tolerant
     watch.ts             fs watching, debounce, rescan fallback
   public/
     index.html  style.css  app.js
+  test/
+    registry.test.js     the slug join (including truncation), error diagnosis,
+                         and both WAL failure modes
+    roster.test.js       agents from the registry, leftovers under "other",
+                         and the rows the page must not draw a conclusion about
 ```
 
 ## API
@@ -235,8 +359,8 @@ All read-only, all JSON except the assets.
 
 | Route | Returns |
 |---|---|
-| `GET /api/overview` | Every agent with liveness and counts |
-| `GET /api/agents/:agent/sessions` | Session summaries, newest activity first |
+| `GET /api/overview` | Every instance with liveness, agent counts and session counts |
+| `GET /api/agents/:agent/sessions` | The instance's roster: registry agents each with their sessions, plus `other` for directories no agent claims |
 | `GET /api/agents/:agent/sessions/:id` | One session plus its subagent tree |
 | `GET /api/agents/:agent/sessions/:id/transcript?from&limit&subagent` | A page of lines |
 | `GET /api/oj` | Workers, rounds, verdicts — or the "not yet" message |

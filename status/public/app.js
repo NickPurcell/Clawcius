@@ -272,14 +272,53 @@ async function viewOverview() {
   const stale = data.agents.filter((agent) => agent.liveness === 'stale').length;
   const sessions = data.agents.reduce((sum, agent) => sum + agent.sessionCount, 0);
   const subagents = data.agents.reduce((sum, agent) => sum + agent.subagentCount, 0);
+  const registered = data.agents.reduce((sum, agent) => sum + agent.registeredAgentCount, 0);
+  const declaredLive = data.agents.reduce((sum, agent) => sum + agent.declaredLiveCount, 0);
+  const unattributed = data.agents.reduce(
+    (sum, agent) => sum + agent.unattributedSessionCount,
+    0,
+  );
+
+  // Instances whose registry could not be read, or that have none configured.
+  // Their agents are not counted in the tiles and every one of their sessions
+  // falls into "unattributable", so a tile that did not say so would be the
+  // "empty roster reads as a host with no agents" failure this page is built
+  // to avoid — in the one place that summarises everything.
+  const blind = data.agents.filter((agent) => agent.registryError || !agent.registryConfigured);
+  const blindNote = blind.length > 0 ? ` · ${blind.length} instance(s) not counted` : '';
 
   frag.append(
     el('div', { class: 'tiles' }, [
-      tile('Agents', String(data.agents.length), `${running} running · ${stale} stale`),
-      tile('Sessions', fmtCount(sessions), 'across all roots'),
+      // Agents come from the registry; instances are the configured roots.
+      // Conflating the two is what made this page report 49 of something.
+      tile(
+        'Agents',
+        blind.length === data.agents.length ? '—' : fmtCount(registered),
+        `${declaredLive} declared live${blindNote || ' · across all crews'}`,
+      ),
+      tile('Instances', String(data.agents.length), `${running} running · ${stale} stale`),
+      tile(
+        'Sessions',
+        fmtCount(sessions),
+        blind.length > 0
+          ? `${unattributed} unattributed, including every session of ${blind.length} instance(s)`
+          : `${unattributed} not attributable to an agent`,
+      ),
       tile('Subagents', fmtCount(subagents), 'transcripts on disk'),
     ]),
   );
+
+  for (const agent of blind) {
+    frag.append(
+      text(
+        'div',
+        'warning-row',
+        agent.registryError ??
+          `${agent.label} has no boardDb in status-config.yaml, so it has no registry here and ` +
+            'none of its agents are counted above.',
+      ),
+    );
+  }
 
   frag.append(el('h2', {}, ['Instances']));
   const cards = el('div', { class: 'cards' });
@@ -292,6 +331,10 @@ async function viewOverview() {
       ]),
       text('div', 'card-path mono', agent.projectsRoot),
       el('div', { class: 'card-stats' }, [
+        el('div', {}, [
+          text('div', 'card-stat-label', 'Agents'),
+          text('div', 'card-stat-value', fmtCount(agent.registeredAgentCount)),
+        ]),
         el('div', {}, [
           text('div', 'card-stat-label', 'Sessions'),
           text('div', 'card-stat-value', fmtCount(agent.sessionCount)),
@@ -312,6 +355,13 @@ async function viewOverview() {
     ]);
 
     if (agent.error) card.append(text('div', 'warning-row', agent.error));
+    // Short here, because the full sentence is already a warning row under the
+    // tiles it qualifies. This is only so you can tell WHICH card it was about.
+    if (agent.registryError) {
+      card.append(text('div', 'warning-row', 'Registry unreadable — see above.'));
+    } else if (!agent.registryConfigured) {
+      card.append(text('div', 'warning-row', 'No registry configured — directories only.'));
+    }
     cards.append(card);
   }
 
@@ -319,24 +369,16 @@ async function viewOverview() {
   main.replaceChildren(frag);
 }
 
-async function viewAgent(agentId) {
-  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
-  const frag = document.createDocumentFragment();
-
-  frag.append(
-    crumbs([{ label: 'Agents', href: '#/overview' }, { label: data.label }]),
-    el('h1', {}, [data.label]),
-    text('p', 'subtitle', `${data.sessions.length} session(s), newest activity first`),
-  );
-
-  if (data.error) frag.append(text('div', 'warning-row', data.error));
-
-  if (data.sessions.length === 0) {
-    frag.append(text('p', 'placeholder', 'No sessions under this root yet.'));
-    main.replaceChildren(frag);
-    return;
-  }
-
+/**
+ * The session table, used for a registry agent's sessions and for the
+ * unattributed ones alike.
+ *
+ * `currentSessionId` marks the one the registry says this agent is resuming.
+ * Without the marker the top row is only "the file written most recently",
+ * which is a different claim and is wrong whenever a subagent of an older
+ * session wrote last.
+ */
+function sessionTable(agentId, sessions, currentSessionId) {
   const table = el('table', { class: 'table' }, [
     el('thead', {}, [
       el('tr', {}, [
@@ -356,21 +398,24 @@ async function viewAgent(agentId) {
   ]);
 
   const body = el('tbody');
-  for (const session of data.sessions) {
+  for (const session of sessions) {
     const link = el(
       'a',
       {
-        href: `#/session/${encodeURIComponent(data.agent)}/${encodeURIComponent(session.sessionId)}`,
+        href: `#/session/${encodeURIComponent(agentId)}/${encodeURIComponent(session.sessionId)}`,
         class: 'mono',
       },
       [session.sessionId.slice(0, 8)],
     );
 
+    const first = el('td', { class: 'strong' }, [link]);
+    if (currentSessionId && session.sessionId === currentSessionId) {
+      first.append(el('span', { class: 'tag', dataset: { current: 'true' } }, ['current']));
+    }
+    if (session.gitBranch) first.append(el('div', { class: 'mono' }, [session.gitBranch]));
+
     const row = el('tr', {}, [
-      el('td', { class: 'strong' }, [
-        link,
-        session.gitBranch ? el('div', { class: 'mono' }, [session.gitBranch]) : null,
-      ]),
+      first,
       el('td', {}, [liveness(session.liveness)]),
       el('td', {}, [fmtClock(session.startedAt)]),
       el('td', { class: 'num' }, [fmtDuration(session.durationSeconds)]),
@@ -392,7 +437,205 @@ async function viewAgent(agentId) {
   }
 
   table.append(body);
-  frag.append(table);
+
+  // Wrapped, because these tables now live INSIDE an agent's card and eleven
+  // columns of session stats do not fit in a phone. Unwrapped, the table's
+  // min-content width wins: at 380px it rendered straight through the card's
+  // border and set the width of the whole document, so every other element on
+  // the page sat in a 380px column beside a 900px scroll region. The wrapper
+  // takes the width it is given and scrolls inside itself instead.
+  //
+  // `tabindex` and `role` are what make that scroll region reachable without a
+  // mouse. A div with overflow and no focusable child is a part of the page a
+  // keyboard cannot get to in every browser, and the columns that end up off
+  // the right edge here are tokens, cost and last activity — not decoration.
+  return el(
+    'div',
+    { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': 'Sessions' },
+    [table],
+  );
+}
+
+/**
+ * Declared status and last-active, always together.
+ *
+ * `status` in the registry is written, never observed — a kill writes `dead`,
+ * and an agent that died mid-turn writes nothing at all. Today nothing writes
+ * `dead` even in principle, because kill is CLAWSKY.md phase 5, so the word on
+ * its own would be the same on every row forever. Beside "last spoke 4m ago"
+ * it reads correctly now and stays correct the day spawn/kill lands.
+ */
+function declaredStatus(agent) {
+  return el('span', { class: 'declared' }, [
+    el('span', { class: 'declared-word', dataset: { status: agent.declaredStatus } }, [
+      agent.declaredStatus || 'unknown',
+    ]),
+    el('span', { class: 'declared-sep' }, ['·']),
+    `last spoke ${fmtAgo(agent.lastActiveAt)}`,
+  ]);
+}
+
+/**
+ * One instance: its agents from the registry, then everything else.
+ *
+ * The list is NOT the directories under the projects root. That was Clawcius
+ * #14 — Clawcius showed 49 of them, and three of Hamachi's five were `/tmp`
+ * paths where an engineer ran permission probes. Those still appear, under
+ * "Other transcripts", because they are real and readable; they are just not
+ * agents.
+ */
+async function viewAgent(agentId) {
+  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
+  const frag = document.createDocumentFragment();
+
+  const otherSessions = data.other.reduce((sum, group) => sum + group.sessions.length, 0);
+
+  frag.append(
+    crumbs([{ label: 'Agents', href: '#/overview' }, { label: data.label }]),
+    el('h1', {}, [data.label]),
+    text(
+      'p',
+      'subtitle',
+      `${data.agents.length} agent(s) in the registry · ${data.sessionCount} session(s) on disk · ` +
+        `${otherSessions} not attributable to an agent`,
+    ),
+  );
+
+  if (data.error) frag.append(text('div', 'warning-row', data.error));
+  if (data.registryError) frag.append(text('div', 'warning-row', data.registryError));
+  if (!data.registryConfigured) {
+    frag.append(
+      text(
+        'div',
+        'warning-row',
+        'No boardDb configured for this instance in status-config.yaml, so there is no registry ' +
+          'to list agents from — only the directories below.',
+      ),
+    );
+  }
+
+  if (data.agents.length === 0 && data.other.length === 0) {
+    frag.append(text('p', 'placeholder', 'No agents and no sessions under this root yet.'));
+    main.replaceChildren(frag);
+    return;
+  }
+
+  if (data.agents.length > 0) {
+    frag.append(
+      el('h2', {}, ['Agents']),
+      text(
+        'p',
+        'subtitle',
+        'From the registry — id, crew and role as the board knows them. `status` is declared, ' +
+          'not observed, so it is shown beside the time the agent last spoke.',
+      ),
+    );
+  }
+
+  for (const agent of data.agents) {
+    const card = el('div', { class: 'card' }, [
+      el('div', { class: 'card-head' }, [
+        el('div', { class: 'card-head-left' }, [
+          text('span', 'card-title mono', agent.id),
+          el('span', { class: 'chip' }, [agent.role]),
+          el('span', { class: 'chip' }, [agent.crew]),
+        ]),
+        liveness(agent.liveness),
+      ]),
+      el('div', { class: 'card-sub' }, [declaredStatus(agent)]),
+      text('div', 'card-path mono', `${agent.workspacePath}  →  ${agent.projectSlug}`),
+    ]);
+
+    if (agent.spawnedBy) {
+      card.append(el('div', { class: 'chips' }, [
+        el('span', { class: 'chip' }, [`spawned by ${agent.spawnedBy}`]),
+      ]));
+    }
+
+    if (agent.sessions.length > 0) {
+      card.append(sessionTable(data.agent, agent.sessions, agent.sessionId));
+    } else {
+      // What this says is what it can check. The previous copy concluded "it
+      // has not run a turn", which this page has no way of knowing and which
+      // is false today for both boards on this host: `<crew>-host` has a
+      // registry row whose `last_active_at` the ops daemon stamps on every
+      // boot, so the card said "last spoke 4m ago" directly above "it has not
+      // run a turn". Its transcripts are real and are written by root under a
+      // different config dir entirely.
+      //
+      // So: report the absence, which is true and checkable, and let the
+      // reason be a separate sentence that only claims what is known.
+      card.append(
+        text(
+          'p',
+          'placeholder',
+          `No transcripts under this instance's projects root for ${agent.projectSlug}.`,
+        ),
+      );
+      card.append(
+        text(
+          'p',
+          'placeholder',
+          agent.role === 'host'
+            ? 'The host agent runs on the VPS itself rather than in this instance\'s container, ' +
+              'and writes its sessions outside every projects root this page reads. Expect this ' +
+              'card to have no transcripts however busy it is; its last-active time above is the ' +
+              'board\'s own record and is the honest signal for it.'
+            : 'It has an identity and a mailbox here. Whether it has ever run is not something ' +
+              'this page can see from an empty directory.',
+        ),
+      );
+    }
+
+    // Outside the branch above, not inside it. A row with a session id and no
+    // matching transcripts is the registry's own record that the agent DID run
+    // — so it is exactly the case that must not be told it has not — and it is
+    // also what this whole page degrades into if the slug join ever stops
+    // matching. Having the contradiction visible on the card is the difference
+    // between finding that out here and finding it out from a page confidently
+    // reporting that every agent has never run.
+    if (agent.sessionId && !agent.currentSessionPresent) {
+      card.append(
+        text(
+          'div',
+          'warning-row',
+          `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
+            `transcript with that id is under ${agent.projectSlug}. ` +
+            (agent.sessions.length === 0
+              ? 'It has no transcripts there at all — if that is true of every agent here, the ' +
+                'slug join has stopped matching and the sessions are under "other" below.'
+              : 'Its other sessions are listed above.'),
+        ),
+      );
+    }
+
+    frag.append(card);
+  }
+
+  if (data.other.length > 0) {
+    frag.append(
+      el('h2', {}, ['Other transcripts']),
+      text(
+        'p',
+        'subtitle',
+        'Project directories no registry row claims. Real transcripts, still readable — a cwd ' +
+          'somebody ran Claude Code in, not an agent with an identity.',
+      ),
+    );
+
+    for (const group of data.other) {
+      frag.append(
+        el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            text('span', 'card-title mono', group.projectSlug),
+            liveness(group.liveness),
+          ]),
+          sessionTable(data.agent, group.sessions, null),
+        ]),
+      );
+    }
+  }
+
   main.replaceChildren(frag);
 }
 

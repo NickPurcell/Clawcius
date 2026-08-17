@@ -293,9 +293,25 @@ a.card:hover {
   word-break: break-all;
 }
 
+/*
+ * A grid that reflows, not a flex row that cannot.
+ *
+ * This was `display: flex` with no wrap, which held four items and stopped
+ * holding five. `Agents` was the fifth (Clawcius #14) and at 380px — a phone,
+ * which is the width this page exists to be read at — the last item's value
+ * rendered outside the card's padding, because flex can shrink a track but not
+ * the text in it.
+ *
+ * `auto-fit` puts as many columns on a row as fit and expands them to fill, so
+ * a wide card still shows one row and a narrow one wraps instead of clipping.
+ * The minimum is set to hold the longest label, `LAST ACTIVITY`, on one line:
+ * below that the labels break mid-phrase and the row goes ragged, which was
+ * the other half of what this looked like.
+ */
 .card-stats {
-  display: flex;
-  gap: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 12px 18px;
   margin-top: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -698,6 +714,103 @@ a.chip:hover {
 .tag[data-linkage="orphan"] {
   color: var(--warning);
   border-color: var(--warning);
+}
+
+/* The session the registry says this agent is resuming. */
+.tag[data-current="true"] {
+  color: var(--series-1);
+  border-color: var(--series-1);
+  margin-left: 6px;
+}
+
+/* ── Registry ────────────────────────────────────────────────────────────── */
+
+/*
+ * Declared status and last-active, on one line, because neither is worth much
+ * alone. `status` is written by a kill and by nothing else — see the comment
+ * on declaredStatus() in app.js — so the word is deliberately NOT given the
+ * green of the liveness dot. It is a claim about intent, not an observation,
+ * and colouring it like an observation would be the whole bug in a swatch.
+ */
+.declared {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.declared-word {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 10px;
+  color: var(--ink-secondary);
+  border: 1px solid var(--grid);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.declared-word[data-status="dead"] {
+  color: var(--serious);
+  border-color: var(--serious);
+}
+
+.declared-sep {
+  color: var(--baseline);
+}
+
+.card-head-left {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.card-sub {
+  margin-top: 4px;
+}
+
+/*
+ * An agent's sessions sit inside its card, so the table needs room to breathe.
+ *
+ * And it needs somewhere to overflow TO. Eleven columns do not fit in a phone,
+ * and a table's min-content width is not negotiable — left to itself it sets
+ * the width of the document, which at 380px meant the table running clean
+ * through the card's border while the header, the headings and every other
+ * card stayed in a 380px column beside it. The wrapper scrolls; the min-width
+ * keeps the columns legible rather than crushing "Aug 17, 00:16:13" into a
+ * three-line stack to make room.
+ */
+.card > .table-scroll {
+  margin-top: 12px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+/*
+ * The wrapper carries tabindex="0" so the scroll region is reachable by
+ * keyboard; this is what makes that focus visible instead of silent.
+ */
+.table-scroll:focus-visible {
+  outline: 2px solid var(--series-1);
+  outline-offset: 2px;
+}
+
+.table-scroll > .table {
+  min-width: 720px;
+}
+
+/*
+ * Agent cards on the instance view are stacked full width rather than laid out
+ * in the `.cards` grid — each one carries a table of its sessions, and a 330px
+ * grid cell cannot hold eleven columns.
+ */
+.main > .card {
+  margin-top: 12px;
 }
 
 /* ── Tooltip ─────────────────────────────────────────────────────────────── */

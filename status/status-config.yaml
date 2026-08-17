@@ -33,18 +33,38 @@ server:
 #
 # A root that does not exist yet is fine and is shown as such. A brand-new
 # instance legitimately has no projects directory until its first turn.
+#
+# `boardDb` is that instance's Clawsky board — its CLAWCIUS_DB_PATH, from its
+# env file. THIS IS WHERE THE AGENTS ARE. Without it the page can only list the
+# directories under projectsRoot, and a directory is not an agent: three of the
+# five under Hamachi's root are /tmp paths where an engineer ran permission
+# probes. It is opened READ-ONLY — the waker owns this file and is writing to
+# it live — and it is never created here, because an empty second database
+# would render as a crew with no agents.
+#
+# The value has to MATCH the env file. A wrong path is reported on the page
+# rather than guessed at.
 agents:
   - id: clawcius
     label: Clawcius
     projectsRoot: /var/lib/clawcius/agent-home/projects
+    boardDb: /var/lib/clawcius/clawcius.db
 
   - id: hamachi
     label: Hamachi
     projectsRoot: /var/lib/hamachi/agent-home/projects
+    # Named for the instance, not for the variable — ops-config.yaml records
+    # that the obvious guess, clawcius.db, was wrong here.
+    boardDb: /var/lib/hamachi/hamachi.db
 
   # Osmosis Jones, once it runs as a Claude Code instance of its own. Left
   # commented rather than pointing at a non-existent path so the overview does
   # not carry a permanently broken row.
+  #
+  # No boardDb, and that is deliberate rather than an omission: CLAWSKY.md
+  # § Topology keeps OJ off the board, because its workers read pull request
+  # diffs written by strangers. OJ would render as directories, which is all
+  # there is to render.
   # - id: oj
   #   label: Osmosis Jones
   #   projectsRoot: /var/lib/oj/agent-home/projects
