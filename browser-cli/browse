@@ -41,22 +41,38 @@ Every invocation, every navigation and every distinct host the page pulled from
 is appended to a JSONL file with a timestamp, line-buffered so a killed process
 still leaves the record. `--log` moves it; `BROWSE_LOG` moves it for good.
 
-This is not for debugging. It is the audit that stands in for an egress
-restriction.
+This is not for debugging.
 
 The proxy stopped being a containment boundary on 2026-08-01, when egress went
 default-allow — `squid/squid.conf` §5 says so in as many words: it is now a
 kill switch for named destinations and nothing more. A browser widens what
 "the agent reached a page" can mean, because a page fetches whatever it likes,
 from wherever it likes, on the agent's behalf, and none of that appears in
-anything the agent typed. If the operator ever wants that narrowed again, the
-argument will need evidence of what was actually contacted, and only a record
-kept at the time can supply it.
+anything the agent typed. A screenshot of one URL can contact thirty hosts.
+That second-order reach is what this file records, and only a record kept at
+the time can supply it.
 
-So this makes the same trade the project already made for the host agent: no
-rollback, but a complete record of everything that happened. A log that is
-written only when something goes wrong is not an audit, so this one is written
-always, in full, before the process can exit.
+The trade is the one the project already made for the host agent: no rollback,
+but a full record. So it is written always and in full, line-buffered, before
+the process can exit — a run killed mid-page still leaves the hosts it had
+already contacted on disk, and a log that cannot be opened refuses the run
+rather than browsing unlogged.
+
+BE PRECISE ABOUT WHAT THIS IS EVIDENCE OF. It is a complete record of what
+*this tool* contacted. It is NOT a record of what the agent reached, and it is
+not an enforcement boundary standing in for one:
+
+  * `--log` is an ordinary flag and BROWSE_LOG an ordinary variable, so the
+    party being recorded picks the destination. `--log /dev/null` browses
+    silently.
+  * the file lives in the workspace, which the agent owns read-write.
+  * `curl` exists. An agent that wanted no record would not reach for `browse`.
+
+What it gives you is a durable, fail-closed record of where a COOPERATING
+agent's browser went, which is worth the volume mount and is genuinely the
+evidence a later decision about egress would want. It is not proof that
+nothing else happened, and a decision not to narrow egress should not be taken
+on the belief that it is.
 
 -- Why --no-sandbox is not a red flag here ---------------------------------
 
@@ -66,8 +82,10 @@ See CHROMIUM_ARGS below. Short version: the container is the sandbox.
 
   * No mutable context. Every command names its URL explicitly.
   * Output format follows the TTY: text for humans, JSON for pipes and agents.
-  * Data on stdout, diagnostics on stderr. `browse text URL > page.txt` must
-    produce a file containing the page and nothing else.
+  * Data on stdout, diagnostics on stderr. `browse text URL > page.txt`
+    produces a file containing the page and nothing else — which is why `text`
+    and `html` do not switch themselves to JSON when stdout is not a terminal,
+    the way `screenshot` and `probe` do. See main().
   * Exit codes are a contract (see below) and are not reassigned once released.
   * One browser at a time, refused rather than queued. A prompt is a hang and
     so is a queue.
@@ -86,6 +104,7 @@ import shlex
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -97,6 +116,16 @@ NAV_ERROR = 1        # the page would not load: DNS, TLS, timeout, refused
 BROWSER_ERROR = 2    # chromium or playwright missing, or would not start
 VALIDATION_ERROR = 3
 BUSY = 4             # another browse holds the single-browser lock
+INTERNAL_ERROR = 5   # a bug in browse: unexpected exception, with a traceback
+
+# 5 is its own code rather than being folded into BROWSER_ERROR, which is the
+# cheaper option and the wrong one. Every other code tells the caller something
+# true about the world it can act on; an unexpected exception tells it only
+# that this tool is broken, and retrying, changing the URL or rebuilding the
+# image will not help. Reusing 2 would have made *that* code lie instead, and
+# without this the default was worse again: an unhandled exception left a
+# traceback and exit 1, which the contract defines as "the page would not
+# load". The code easiest to reach by accident must not be the one that lies.
 
 # -- chromium flags ---------------------------------------------------------
 #
@@ -132,6 +161,17 @@ VIEWPORTS = {
     "desktop": (1280, 800),
     "wide": (1920, 1080),
 }
+
+# The largest viewport either dimension may be asked for. Not a policy, an
+# allocation guard: a full-page shot allocates roughly width*height*4 bytes,
+# so a fat-fingered 100000 is an OOM in a 2 GB container rather than an error.
+MAX_VIEWPORT = 16384
+
+# Resource types whose failure changes what the page LOOKS like. Used only to
+# decide how loudly to complain — every problem is recorded either way.
+RENDERING_TYPES = frozenset(
+    {"document", "stylesheet", "image", "font", "script", "media"}
+)
 
 DEFAULT_LOG = Path(
     os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
@@ -368,6 +408,15 @@ def single_browser_lock():
     the honest failure: the caller learns immediately and can retry, where a
     queue would look like a hang with no way to tell how long.
     """
+    # ACQUISITION ONLY inside this try. The `yield` is deliberately outside it.
+    #
+    # It used to be inside, and that made every OSError raised by the command
+    # body — which runs at the yield — come back out as "cannot take the
+    # browser lock", with a hint pointing at /tmp and exit 3 for "bad
+    # arguments". A screenshot to an unwritable path reported the lock as
+    # broken and sent the reader to the wrong file entirely. Both the pre-flight
+    # mkdir and playwright's own `page.screenshot(path=...)` write from Python
+    # and raise OSError, so this was the common case, not an exotic one.
     fd = None
     try:
         # O_NOFOLLOW: /tmp is world-writable, so refuse to follow a symlink
@@ -386,20 +435,22 @@ def single_browser_lock():
             )
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
-        yield
     except OSError as exc:
-        if isinstance(exc, BrowseError):
-            raise
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         raise BrowseError(
             f"cannot take the browser lock at {LOCK_PATH}: {exc.strerror}",
             VALIDATION_ERROR,
             "set BROWSE_LOCK to a writable path.",
         )
+
+    try:
+        yield
     finally:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def proxy_settings():
@@ -495,7 +546,7 @@ class Load:
         self.problems = []
 
 
-def _record_problem(load, audit, url, reason, kind):
+def _record_problem(load, audit, url, reason, kind, resource_type=None):
     """A blocked subresource must be visible in the output.
 
     A page whose CSS was refused renders as unstyled text and looks like a bug
@@ -508,7 +559,8 @@ def _record_problem(load, audit, url, reason, kind):
     # First reason wins: the HTTP status says more than "aborted".
     if any(p["url"] == url for p in load.problems):
         return
-    entry = {"url": url, "reason": reason, "kind": kind}
+    entry = {"url": url, "reason": reason, "kind": kind,
+             "resource_type": resource_type}
     load.problems.append(entry)
     audit.event("subresource_problem", **entry)
 
@@ -530,15 +582,27 @@ def navigate(page, url, args, audit, load):
     page.on(
         "requestfailed",
         lambda r: _record_problem(
-            load, audit, r.url, (r.failure or "request failed"), "failed"
+            load, audit, r.url, (r.failure or "request failed"), "failed",
+            r.resource_type,
         ),
     )
 
     def on_response(response):
-        if response.status >= 400 and response.request.resource_type != "document":
-            _record_problem(
-                load, audit, response.url, f"HTTP {response.status}", "http_error"
-            )
+        if response.status < 400:
+            return
+        # Skip the MAIN document only. Its status is already reported as
+        # `status`, so recording it again would be noise — but `resource_type
+        # != "document"` was the wrong way to say that, because a sub-frame's
+        # navigation is a "document" too. It silently dropped a 403 served
+        # into an iframe, which is precisely the plain-HTTP denial this
+        # listener exists to catch. Ask which frame requested it instead.
+        request = response.request
+        if request.resource_type == "document" and request.frame == page.main_frame:
+            return
+        _record_problem(
+            load, audit, response.url, f"HTTP {response.status}",
+            "http_error", request.resource_type,
+        )
 
     page.on("response", on_response)
 
@@ -592,17 +656,38 @@ def load_summary(load):
     return out
 
 
-def warn_about_problems(load):
-    """Same information as the JSON, on stderr, for the text-mode caller."""
+def warn_about_problems(load, show_redirect=True):
+    """Same information as the JSON, on stderr, for the text-mode caller.
+
+    Everything is listed, but only a failure that changes what the page LOOKS
+    like earns the loud line. A healthy page may 404 a beacon or an optional
+    XHR by design, and "do not read this as the finished page" printed over
+    those is a warning an agent learns to skip — which costs exactly the case
+    the warning was written for.
+    """
     if not load.problems:
         return
+    visual = [p for p in load.problems
+              if p.get("resource_type") in RENDERING_TYPES]
     note(f"warning: {len(load.problems)} subresource(s) did not load:")
     for entry in load.problems[:10]:
-        note(f"  {entry['reason']:<34} {entry['url'][:110]}")
+        marker = "*" if entry.get("resource_type") in RENDERING_TYPES else " "
+        kind = entry.get("resource_type") or "?"
+        note(f" {marker} {kind:<11} {entry['reason']:<34} {entry['url'][:96]}")
     if len(load.problems) > 10:
-        note(f"  ... and {len(load.problems) - 10} more (see --output json)")
-    note("The rendering above is incomplete. Do not read it as the finished page.")
-    if load.redirects:
+        note(f"   ... and {len(load.problems) - 10} more (see --output json)")
+    if visual:
+        note(
+            f"The {len(visual)} marked * affected what the page looks like. "
+            "The rendering above is incomplete — do not read it as the "
+            "finished page."
+        )
+    else:
+        note(
+            "None of these affect what the page looks like; the rendering "
+            "above should be complete."
+        )
+    if show_redirect and load.redirects:
         note(f"note: redirected from {load.redirects[0]}")
 
 
@@ -615,12 +700,42 @@ def parse_viewport(spec):
     if "x" in spec:
         width, _, height = spec.partition("x")
         if width.isdigit() and height.isdigit():
-            return spec, (int(width), int(height))
+            # Both bounds are real. `isdigit()` is true of "0", and a 0x0
+            # viewport is not a validation error deeper in, it is a playwright
+            # exception with a traceback; MAX_VIEWPORT stops a typo asking for
+            # a several-gigabyte bitmap.
+            if 0 < int(width) <= MAX_VIEWPORT and 0 < int(height) <= MAX_VIEWPORT:
+                return spec, (int(width), int(height))
+            raise BrowseError(
+                f"viewport {spec!r} is out of range",
+                VALIDATION_ERROR,
+                f"each dimension must be between 1 and {MAX_VIEWPORT}.",
+            )
     raise BrowseError(
         f"unrecognised viewport {spec!r}",
         VALIDATION_ERROR,
         "use WIDTHxHEIGHT, or one of: " + ", ".join(VIEWPORTS),
     )
+
+
+def guard_write(path, action):
+    """Run a write, and name the file the caller asked for if it fails.
+
+    Both the pre-flight `mkdir` and playwright's own `page.screenshot(path=…)`
+    write from Python and raise OSError. Without this the caller gets a
+    traceback and exit 5 — "a bug in browse" — for what is plainly a bad
+    argument, and before the lock's scope was fixed it got something worse:
+    "cannot take the browser lock", pointing at /tmp.
+    """
+    try:
+        return action()
+    except OSError as exc:
+        raise BrowseError(
+            f"cannot write {path}: {exc.strerror}",
+            VALIDATION_ERROR,
+            "choose a writable output path. Note that browser-cli itself is "
+            "bind-mounted read-only.",
+        )
 
 
 def suffixed(path, name):
@@ -631,7 +746,17 @@ def suffixed(path, name):
 
 
 def cmd_screenshot(args, audit):
-    viewports = [parse_viewport(v) for v in (args.viewport or ["desktop"])]
+    if args.scale <= 0 or args.scale > 4:
+        raise BrowseError(
+            f"--scale {args.scale} is out of range", VALIDATION_ERROR,
+            "use a factor between 0 and 4; 1 is normal, 2 is retina density.",
+        )
+    # Deduplicated, keeping the order given. `--viewport phone --viewport
+    # phone` otherwise renders the page twice into the same filename, which
+    # costs a page load to produce a file it already had.
+    viewports = list(
+        dict(parse_viewport(v) for v in (args.viewport or ["desktop"])).items()
+    )
     out = Path(args.out)
     if out.suffix.lower() not in (".png", ".jpg", ".jpeg"):
         raise BrowseError(
@@ -639,7 +764,8 @@ def cmd_screenshot(args, audit):
             VALIDATION_ERROR,
             "name the output .png — an agent reads it back as an image.",
         )
-    out.parent.mkdir(parents=True, exist_ok=True)
+    # Before the browser starts, so a bad path costs no page load.
+    guard_write(out, lambda: out.parent.mkdir(parents=True, exist_ok=True))
 
     shots = []
     with chromium(audit) as browser:
@@ -652,7 +778,8 @@ def cmd_screenshot(args, audit):
             try:
                 page = context.new_page()
                 load = navigate(page, args.url, args, audit, Load(args.url))
-                page.screenshot(path=str(target), full_page=args.full_page)
+                guard_write(target, lambda: page.screenshot(
+                    path=str(target), full_page=args.full_page))
             finally:
                 # Per viewport, not at the end. Three contexts held open at
                 # once is three page's worth of resident memory for no reason.
@@ -748,7 +875,9 @@ def cmd_probe(args, audit):
     summary["hosts"] = sorted(audit.hosts)
     if args.json:
         return summary
-    warn_about_problems(load)
+    # probe prints the whole redirect chain a few lines below, so the note is
+    # suppressed here rather than said twice in different words.
+    warn_about_problems(load, show_redirect=False)
     lines = [
         f"status      {summary['status']} {summary['status_text'] or ''}".rstrip(),
         f"final_url   {summary['final_url']}",
@@ -767,6 +896,31 @@ COMMANDS = {
     "html": cmd_html,
     "probe": cmd_probe,
 }
+
+# Commands whose output is a record about a page, and which therefore switch to
+# JSON on their own when stdout is not a terminal. `text` and `html` are absent
+# deliberately: their output IS the page.
+AUTO_JSON_COMMANDS = frozenset({"screenshot", "probe"})
+
+
+def wants_json(command, output_flag, stdout_isatty):
+    """Resolve `--output auto`.
+
+    `auto` means JSON into a pipe for the commands whose output is a RECORD,
+    and never for the two whose output is a DOCUMENT.
+
+    `browse text URL > page.txt` is the single most likely thing anyone will
+    type, and under a plain isatty() rule a redirect looks like a pipe, so it
+    wrote a JSON object with the page inside an escaped string field. That is
+    the opposite of what this tool is for, and of what the README promised.
+    The page is not a projection of a record that JSON would frame usefully; it
+    IS the payload, and there is nothing for the wrapper to add that stderr is
+    not already saying. `--output json` still gets the wrapper, with
+    `final_url`, `status` and `blocked` alongside the text.
+    """
+    if output_flag in ("json", "text"):
+        return output_flag == "json"
+    return command in AUTO_JSON_COMMANDS and not stdout_isatty
 
 
 # -- argument parsing -------------------------------------------------------
@@ -800,7 +954,8 @@ def build_parser():
     )
     parser.add_argument(
         "--output", choices=["auto", "json", "text"], default="auto",
-        help="default auto: text at a terminal, JSON into a pipe",
+        help="default auto: screenshot and probe print a table at a terminal "
+             "and JSON into a pipe; text and html always print the page",
     )
     parser.add_argument(
         "--log", default=os.environ.get("BROWSE_LOG", str(DEFAULT_LOG)),
@@ -835,11 +990,7 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.json = (
-        args.output == "json"
-        if args.output in ("json", "text")
-        else not sys.stdout.isatty()
-    )
+    args.json = wants_json(args.command, args.output, sys.stdout.isatty())
 
     audit = None
     started = time.monotonic()
@@ -865,6 +1016,18 @@ def main(argv=None):
         return exc.code
     except KeyboardInterrupt:
         return 130
+    except Exception:
+        # The traceback still goes to stderr in full — this is a bug report and
+        # truncating it would only make the bug harder to fix. What changes is
+        # the exit code, so a caller branching on it is not told "the page
+        # would not load" about a fault in this tool.
+        traceback.print_exc()
+        note(f"error: internal error in browse (exit {INTERNAL_ERROR}) — "
+             "the traceback above is a bug, please report it.")
+        if audit is not None:
+            audit.event("internal_error", command=args.command,
+                        traceback=traceback.format_exc())
+        return INTERNAL_ERROR
     finally:
         if audit is not None:
             audit.event(

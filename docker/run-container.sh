@@ -74,11 +74,22 @@ BROWSER_CLI=/home/npurcell/clawcius/browser-cli
 # and the reason is durability, not taste.
 #
 # That default is under $HOME, which is the container's writable layer, and
-# --recreate destroys the writable layer. The navigation log is the audit that
-# stands in for an egress restriction now that Squid is a blocklist rather than
-# an allowlist — see browser-cli/README.md — and an audit a redeploy silently
-# erases is not one. $WORKSPACES is a mounted volume, so this survives both
-# restart and recreate.
+# --recreate destroys the writable layer. $WORKSPACES is a mounted volume, so
+# this survives both restart and recreate.
+#
+# What the log is worth keeping for: a browser is the first tool here whose
+# reach is second-order — a screenshot of one URL can contact thirty hosts, and
+# none of them appear in anything the agent typed. Now that Squid is a
+# blocklist rather than an allowlist, that record is the only account of where
+# a page went, and one a redeploy silently erased would be no account at all.
+#
+# BE PRECISE ABOUT WHAT IT PROVES. It is a complete record of what `browse`
+# contacted, not of what the agent reached: --log is an ordinary flag, this
+# variable is an ordinary variable, the file sits in a directory the agent owns
+# read-write, and curl exists. It is evidence about a cooperating agent's
+# browser, which is genuinely worth the mount — it is not an enforcement
+# boundary and a decision about egress should not treat it as one.
+# browser-cli/README.md carries the full version.
 #
 # One file for the whole container, shared by every agent in the crew, which is
 # the right grain: what is being recorded is what left this sandbox, and the
@@ -231,8 +242,9 @@ esac
 #
 # What Squid then DECIDES is a smaller thing than that topology suggests, and
 # has been since 2026-08-01: egress is default-allow, filtered by a blocklist
-# that is currently empty (squid/squid.conf §5). The route is still the only
-# route; it is no longer a gate.
+# whose only entry is `.invalid`, which can never resolve and is there to keep
+# the config parseable — so nothing is blocked today (squid/squid.conf §5).
+# The route is still the only route; it is no longer a gate.
 PROXY=http://172.31.250.2:3128
 
 # The agent's wall clock. A named zone, never a fixed offset: the agent

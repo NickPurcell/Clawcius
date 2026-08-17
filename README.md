@@ -67,7 +67,9 @@ route to find.
 
 What Squid *decides* is a much smaller thing than the topology implies, and has
 been since 2026-08-01: egress is **default-allow**, filtered by a blocklist of
-named destinations that is currently empty. It is a kill switch, not a
+named destinations that blocks nothing today — its one entry is `.invalid`,
+which can never resolve and is there only to keep the config parseable. It is a
+kill switch, not a
 containment boundary. `squid/squid.conf` §5 is the authority and explains what
 that moved.
 

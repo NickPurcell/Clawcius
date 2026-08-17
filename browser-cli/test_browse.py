@@ -12,7 +12,9 @@ The repo's `npm test` runs `node --test`, so this is not wired into it. Run it
 by hand when touching `browse`; it takes well under a second.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -144,6 +146,22 @@ class ViewportTest(unittest.TestCase):
                     browse.parse_viewport(spec)
                 self.assertEqual(caught.exception.code, browse.VALIDATION_ERROR)
 
+    def test_rejects_degenerate_and_absurd_sizes(self):
+        """`isdigit()` is true of "0", so 0x0 parsed happily and became a
+        playwright traceback; a fat-fingered 100000 is an OOM in a 2 GB
+        container rather than an error."""
+        for spec in ("0x0", "1024x0", "0x768", "100000x100", "100x100000"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(browse.BrowseError) as caught:
+                    browse.parse_viewport(spec)
+                self.assertEqual(caught.exception.code, browse.VALIDATION_ERROR)
+
+    def test_accepts_the_bounds(self):
+        self.assertEqual(browse.parse_viewport("1x1")[1], (1, 1))
+        big = f"{browse.MAX_VIEWPORT}x{browse.MAX_VIEWPORT}"
+        self.assertEqual(browse.parse_viewport(big)[1],
+                         (browse.MAX_VIEWPORT, browse.MAX_VIEWPORT))
+
     def test_suffix_keeps_the_extension(self):
         self.assertEqual(
             browse.suffixed("/tmp/shot.png", "phone"), Path("/tmp/shot.phone.png")
@@ -213,17 +231,167 @@ class ProcessTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.0)
 
 
+class LockScopeTest(unittest.TestCase):
+    """Regression. `single_browser_lock()` used to `yield` inside the `try`
+    whose `except OSError` diagnoses the lock, so every OSError raised by the
+    command body came back as "cannot take the browser lock" with a hint
+    pointing at /tmp and exit 3 for "bad arguments". A screenshot to an
+    unwritable path blamed the lock and sent the reader to the wrong file.
+    Both the pre-flight mkdir and playwright's own `page.screenshot(path=...)`
+    raise OSError, so this was the common case."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.saved = browse.LOCK_PATH
+        browse.LOCK_PATH = Path(self.dir.name) / "lock"
+
+    def tearDown(self):
+        browse.LOCK_PATH = self.saved
+        self.dir.cleanup()
+
+    def test_oserror_from_the_body_is_not_swallowed(self):
+        with self.assertRaises(FileNotFoundError):
+            with browse.single_browser_lock():
+                raise FileNotFoundError(2, "No such file or directory")
+
+    def test_browse_error_from_the_body_keeps_its_code(self):
+        with self.assertRaises(browse.BrowseError) as caught:
+            with browse.single_browser_lock():
+                raise browse.BrowseError("nope", browse.NAV_ERROR)
+        self.assertEqual(caught.exception.code, browse.NAV_ERROR)
+
+    def test_lock_is_released_even_when_the_body_raises(self):
+        with contextlib.suppress(FileNotFoundError):
+            with browse.single_browser_lock():
+                raise FileNotFoundError(2, "boom")
+        with browse.single_browser_lock():
+            pass  # re-acquirable, so the fd was closed
+
+    def test_unopenable_lock_is_still_diagnosed(self):
+        browse.LOCK_PATH = Path("/proc/definitely/not/writable/lock")
+        with self.assertRaises(browse.BrowseError) as caught:
+            with browse.single_browser_lock():
+                pass
+        self.assertIn("browser lock", caught.exception.message)
+
+
+class OutputModeTest(unittest.TestCase):
+    """Regression. `--output auto` resolved on isatty() alone, so
+    `browse text URL > page.txt` wrote a JSON object with the page inside an
+    escaped string field — the opposite of what the README promises and the
+    single most likely thing anyone will type."""
+
+    def test_text_never_auto_switches_to_json(self):
+        for command in ("text", "html"):
+            with self.subTest(command=command):
+                self.assertFalse(browse.wants_json(command, "auto", False))
+                self.assertFalse(browse.wants_json(command, "auto", True))
+
+    def test_records_do_auto_switch_into_a_pipe(self):
+        for command in ("probe", "screenshot"):
+            with self.subTest(command=command):
+                self.assertTrue(browse.wants_json(command, "auto", False))
+                self.assertFalse(browse.wants_json(command, "auto", True))
+
+    def test_explicit_flag_wins_everywhere(self):
+        for command in ("text", "html", "probe", "screenshot"):
+            for isatty in (True, False):
+                with self.subTest(command=command, isatty=isatty):
+                    self.assertTrue(browse.wants_json(command, "json", isatty))
+                    self.assertFalse(browse.wants_json(command, "text", isatty))
+
+    def test_every_command_is_classified(self):
+        """A new command must be a deliberate choice, not a default."""
+        documents = {"text", "html"}
+        self.assertEqual(
+            set(browse.COMMANDS), browse.AUTO_JSON_COMMANDS | documents
+        )
+
+
+class WarningVolumeTest(unittest.TestCase):
+    """A warning that fires on healthy pages is one an agent learns to skip,
+    which costs exactly the case the warning was written for."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.audit = browse.Audit(Path(self.dir.name) / "nav.jsonl")
+        self.load = browse.Load("https://example.com")
+
+    def tearDown(self):
+        self.audit.close()
+        self.dir.cleanup()
+
+    def warn(self, **kwargs):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            browse.warn_about_problems(self.load, **kwargs)
+        return buf.getvalue()
+
+    def test_a_broken_stylesheet_is_loud(self):
+        browse._record_problem(self.load, self.audit, "/a.css", "HTTP 404",
+                               "http_error", "stylesheet")
+        self.assertIn("do not read it as the finished page", self.warn().lower())
+
+    def test_a_failed_beacon_is_reported_but_not_loud(self):
+        browse._record_problem(self.load, self.audit, "/beacon", "HTTP 404",
+                               "http_error", "xhr")
+        out = self.warn()
+        self.assertIn("/beacon", out)
+        self.assertNotIn("do not read it as the finished page", out.lower())
+        self.assertIn("should be complete", out)
+
+    def test_nothing_at_all_says_nothing(self):
+        self.assertEqual(self.warn(), "")
+
+    def test_redirect_note_can_be_suppressed(self):
+        """probe prints the whole chain itself a few lines later."""
+        self.load.redirects = ["https://example.com/old"]
+        browse._record_problem(self.load, self.audit, "/a.css", "HTTP 404",
+                               "http_error", "stylesheet")
+        self.assertIn("redirected from", self.warn(show_redirect=True))
+        self.assertNotIn("redirected from", self.warn(show_redirect=False))
+
+    def test_resource_type_is_carried_into_the_record(self):
+        browse._record_problem(self.load, self.audit, "/a.css", "HTTP 404",
+                               "http_error", "stylesheet")
+        self.assertEqual(self.load.problems[0]["resource_type"], "stylesheet")
+
+    def test_subframe_documents_count_as_rendering(self):
+        """An iframe's 403 is a plain-HTTP denial that changes the page."""
+        self.assertIn("document", browse.RENDERING_TYPES)
+
+
 class ContractTest(unittest.TestCase):
     def test_exit_codes_are_distinct(self):
         codes = [browse.OK, browse.NAV_ERROR, browse.BROWSER_ERROR,
-                 browse.VALIDATION_ERROR, browse.BUSY]
+                 browse.VALIDATION_ERROR, browse.BUSY, browse.INTERNAL_ERROR]
         self.assertEqual(len(set(codes)), len(codes))
 
     def test_exit_codes_are_the_published_values(self):
         """A stable contract: an agent branches on these without parsing prose,
         so they must not be reassigned. Change these and change the README."""
         self.assertEqual((browse.OK, browse.NAV_ERROR, browse.BROWSER_ERROR,
-                          browse.VALIDATION_ERROR, browse.BUSY), (0, 1, 2, 3, 4))
+                          browse.VALIDATION_ERROR, browse.BUSY,
+                          browse.INTERNAL_ERROR), (0, 1, 2, 3, 4, 5))
+
+    def test_an_unexpected_error_does_not_masquerade_as_a_failed_page(self):
+        """Regression. Only BrowseError and KeyboardInterrupt were handled, so
+        any other exception left a traceback and exit 1 — which the contract
+        defines as "the page would not load". The code easiest to reach by
+        accident must not be the one that lies."""
+        boom = lambda args, audit: 1 / 0            # noqa: E731
+        saved = browse.COMMANDS["probe"]
+        browse.COMMANDS["probe"] = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = browse.main(
+                    ["--output", "text", "--log", os.devnull,
+                     "probe", "https://example.com"]
+                )
+        finally:
+            browse.COMMANDS["probe"] = saved
+        self.assertEqual(code, browse.INTERNAL_ERROR)
+        self.assertIn("ZeroDivisionError", err.getvalue())
 
     def test_no_sandbox_is_present_and_deliberate(self):
         """Chromium's own sandbox cannot start under gVisor. If someone removes
@@ -248,6 +416,24 @@ class ContractTest(unittest.TestCase):
         with self.assertRaises(browse.BrowseError) as caught:
             browse.cmd_screenshot(args, None)
         self.assertEqual(caught.exception.code, browse.VALIDATION_ERROR)
+
+    def test_screenshot_refuses_a_degenerate_scale(self):
+        for scale in ("0", "-1", "99"):
+            with self.subTest(scale=scale):
+                args = browse.build_parser().parse_args(
+                    ["screenshot", "https://example.com", "o.png",
+                     "--scale", scale]
+                )
+                args.json = False
+                with self.assertRaises(browse.BrowseError) as caught:
+                    browse.cmd_screenshot(args, None)
+                self.assertEqual(caught.exception.code, browse.VALIDATION_ERROR)
+
+    def test_a_repeated_viewport_renders_once(self):
+        """Otherwise it loads the page twice to write the same filename."""
+        specs = ["phone", "desktop", "phone"]
+        deduped = list(dict(browse.parse_viewport(v) for v in specs).items())
+        self.assertEqual([name for name, _ in deduped], ["phone", "desktop"])
 
 
 if __name__ == "__main__":

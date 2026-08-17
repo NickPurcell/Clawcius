@@ -57,9 +57,20 @@ than one is given, the output name gains the viewport name:
 
 ### Output
 
-Text at a terminal, JSON into a pipe, both overridable with `--output`. Data
-goes to stdout and diagnostics to stderr, always — `browse text URL > page.txt`
-produces a file containing the page and nothing else.
+Data goes to stdout and diagnostics to stderr, always.
+
+`screenshot` and `probe` return a **record about** a page, so they print a
+table at a terminal and switch to JSON when stdout is not one — an agent gets
+structured output without passing a flag.
+
+`text` and `html` return the page **itself**, so they never switch: they print
+the document whether stdout is a terminal, a pipe or a file. `browse text URL >
+page.txt` produces a file containing the page and nothing else. A JSON object
+with the page inside an escaped string field is not what anyone redirecting
+`text` wants, and that is what an `isatty()`-only rule used to give them.
+
+`--output json` overrides either way, and for `text`/`html` it is how you get
+`final_url`, `status` and `blocked` alongside the document.
 
 ### Exit codes
 
@@ -72,6 +83,7 @@ A stable contract. An agent branches on these without parsing prose.
 | 2 | chromium or playwright missing, or would not start |
 | 3 | bad arguments |
 | 4 | another `browse` is already running |
+| 5 | a bug in `browse` itself; a traceback is on stderr. Retrying will not help |
 
 Note that **exit 0 does not mean the page was whole.** A 404 stylesheet is a
 successful navigation. See below.
@@ -92,17 +104,29 @@ that Squid refuses never becomes an HTTP response at all and appears as
 the browser is perfectly happy with.
 
 ```
-$ browse probe http://127.0.0.1:8731/
-warning: 2 subresource(s) did not load:
-  net::ERR_TUNNEL_CONNECTION_FAILED  https://nonexistent.invalid/x.css
-  HTTP 404                           http://127.0.0.1:8731/missing.css
-The rendering above is incomplete. Do not read it as the finished page.
+$ browse probe http://127.0.0.1:8742/
+warning: 3 subresource(s) did not load:
+ * stylesheet  net::ERR_TUNNEL_CONNECTION_FAILED  https://nonexistent.invalid/x.css
+ * stylesheet  HTTP 404                           http://127.0.0.1:8742/missing.css
+   fetch       HTTP 404                           http://127.0.0.1:8742/beacon.json
+The 2 marked * affected what the page looks like. The rendering above is
+incomplete — do not read it as the finished page.
 status      200 OK
-final_url   http://127.0.0.1:8731/
+final_url   http://127.0.0.1:8742/
 title       Local page
-hosts       127.0.0.1:8731, nonexistent.invalid
-blocked     2
+hosts       127.0.0.1:8742, nonexistent.invalid
+blocked     3
 ```
+
+**Only the `*` lines earn the loud sentence.** A healthy page may 404 a beacon
+or an optional XHR by design, and "do not read this as the finished page"
+printed over those is a warning an agent learns to skip — which costs exactly
+the case the warning was written for. Everything is still listed, and
+everything is still in the JSON with its `resource_type`.
+
+A sub-frame counts. An iframe's navigation is a `document` request just as the
+main page's is, so a `403` served into an iframe is reported; only the *main*
+document is excluded, because its status is already reported as `status`.
 
 ## The navigation log
 
@@ -112,8 +136,7 @@ is appended to a JSONL file with a timestamp. `--log` moves it for one run;
 `$WORKSPACES/.browse/navigation.jsonl`, which is a mounted volume, so it
 survives a container recreate.
 
-**This is not for debugging. It is the audit that stands in for an egress
-restriction.**
+**This is not for debugging.**
 
 Squid stopped being a containment boundary on 2026-08-01, when egress went
 default-allow; `squid/squid.conf` §5 says so in as many words — it is a kill
@@ -121,13 +144,31 @@ switch for named destinations and nothing more. (Most of the repo's prose has
 not caught up with that and still says "allowlist" — Clawcius #75.) A browser
 widens what "the agent reached a page" can mean, because a page fetches
 whatever it likes, from wherever it likes, on the agent's behalf, and none of
-that appears in anything the agent typed.
+that appears in anything the agent typed. A screenshot of one URL can contact
+thirty hosts, and that second-order reach is what this file records.
 
-This makes the same trade the project already made for the host agent: **no
-rollback, but a complete record.** A log written only when something goes wrong
-is not an audit, so this one is written always, in full, line-buffered, before
-the process can exit — a run killed mid-page still leaves the hosts it had
-already contacted on disk.
+The trade is the one the project already made for the host agent: **no
+rollback, but a full record.** So it is written always, in full, line-buffered,
+before the process can exit — a run killed mid-page still leaves the hosts it
+had already contacted on disk, and a log that cannot be opened refuses the run
+rather than browsing unlogged.
+
+### What it is evidence of, exactly
+
+A complete record of what **this tool** contacted. **Not** a record of what the
+agent reached, and not an enforcement boundary standing in for one:
+
+- `--log` is an ordinary flag and `BROWSE_LOG` an ordinary variable, so the
+  party being recorded picks the destination. `--log /dev/null` browses
+  silently.
+- the file lives in the workspace, which the agent owns read-write.
+- `curl` exists. An agent that wanted no record would not reach for `browse`.
+
+What it gives you is a durable, fail-closed record of where a *cooperating*
+agent's browser went. That is worth the volume mount, and it is genuinely the
+evidence a later decision about egress would want. It is not proof that nothing
+else happened, and **a decision not to narrow egress should not be taken on the
+belief that it is.**
 
 ```
 $ jq -r 'select(.event=="host") | "\(.ts)  \(.host)"' navigation.jsonl
