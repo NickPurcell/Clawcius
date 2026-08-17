@@ -482,6 +482,16 @@ async function summariseSession(
  * is reported as an orphan and still listed — a tree that quietly drops
  * branches it cannot explain is worse than one that admits to a loose end.
  */
+/**
+ * Sessions already warned about, so the log below fires once each per process.
+ *
+ * A cliff that is silent is a cliff nobody fixes. Not a Map with timestamps:
+ * this is a boot-time configuration problem, and saying it once per session is
+ * what makes it findable in the journal without becoming noise the next reader
+ * filters out.
+ */
+const oversizeWarned = new Set<string>();
+
 export async function buildSessionDetail(
   store: TranscriptStore,
   session: SessionRef,
@@ -491,6 +501,27 @@ export async function buildSessionDetail(
   const summary = await summariseSession(store, session, config, now);
   const sessionIndex = await store.index(session.transcriptPath);
   const subagentRefs = await store.subagents(session);
+
+  // One session is its own transcript plus one per subagent, and this walk
+  // touches all of them in order. If that exceeds the LRU, every pass evicts
+  // exactly what the next pass asks for first and the cache stops working
+  // rather than working less well — measured at 786ms per rebuild instead of
+  // 107ms, on a page that rebuilds on every change event.
+  //
+  // Reported rather than worked around: raising the ceiling is a config change
+  // with a memory cost, which is the operator's, and a page that quietly ran
+  // seven times slower is how this went unnoticed in the first place.
+  const needed = subagentRefs.length + 1;
+  if (needed > config.read.maxCachedSessions && !oversizeWarned.has(session.sessionId)) {
+    oversizeWarned.add(session.sessionId);
+    console.warn(
+      `[status] session ${session.sessionId} has ${needed} transcripts and ` +
+        `read.maxCachedSessions is ${config.read.maxCachedSessions}. Every rebuild of this ` +
+        'session will re-parse all of them — the cache cannot hold one pass, so it evicts ' +
+        'what the next pass needs. Raise read.maxCachedSessions above ' +
+        `${needed} in status-config.yaml.`,
+    );
+  }
 
   // toolUseId -> the spawn, plus which transcript made the call. The session's
   // own spawns are attributed to the root (null).
@@ -839,8 +870,16 @@ export type ClawskyInstance = {
   posterCount: number;
   feed: MailMessage[];
   dms: MailMessage[];
-  totalMessages: number;
-  shownMessages: number;
+  /**
+   * Rows in the table per list, whether or not they were returned.
+   *
+   * Per list, because the ceiling is per list. A single overall total could
+   * not tell the page whether the feed it is about to call empty is empty or
+   * merely off the end of a window — which is the difference between the copy
+   * being true and being a lie with a reassuring tone.
+   */
+  totalFeed: number;
+  totalDms: number;
   registryConfigured: boolean;
   registryError: string | null;
   mailError: string | null;
@@ -857,11 +896,6 @@ export function buildClawsky(agent: AgentRoot, config: StatusConfig): ClawskyIns
   const registry = readRegistry(agent.boardDb);
   const mail = readMail(agent.boardDb, config.read.maxBlockChars);
 
-  const sent = new Map<string, number>();
-  for (const message of [...mail.feed, ...mail.dms]) {
-    sent.set(message.author, (sent.get(message.author) ?? 0) + 1);
-  }
-
   return {
     agent: agent.id,
     label: agent.label,
@@ -871,13 +905,15 @@ export function buildClawsky(agent: AgentRoot, config: StatusConfig): ClawskyIns
       role: row.role,
       declaredStatus: row.declaredStatus,
       lastActiveAt: row.lastActiveAt,
-      sent: sent.get(row.id) ?? 0,
+      // From the board's own GROUP BY, not from the returned window — a count
+      // taken from a capped list undercounts silently the moment the cap bites.
+      sent: mail.sentByAuthor[row.id] ?? 0,
     })),
     posterCount: registry.agents.filter((row) => row.role === 'poster').length,
     feed: mail.feed,
     dms: mail.dms,
-    totalMessages: mail.totalMessages,
-    shownMessages: mail.shownMessages,
+    totalFeed: mail.totalFeed,
+    totalDms: mail.totalDms,
     registryConfigured: registry.configured,
     registryError: registry.error,
     mailError: mail.error,

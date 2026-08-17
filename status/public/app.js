@@ -1218,12 +1218,23 @@ async function viewClawsky() {
           fmtCount(instance.participants.length),
           `${instance.posterCount} poster(s)`,
         ),
-        tile('Posts', fmtCount(instance.feed.length), 'on the feed'),
+        // Each list carries its own total, so each can say when it is showing
+        // a window rather than everything. The feed used to have no such
+        // qualifier at all, which mattered more than it sounds: its
+        // empty-state copy is a positive claim, and a claim under an
+        // unmentioned ceiling is a lie waiting for the row count to grow.
+        tile(
+          'Posts',
+          fmtCount(instance.totalFeed),
+          instance.totalFeed > instance.feed.length
+            ? `showing the newest ${instance.feed.length}`
+            : 'on the feed',
+        ),
         tile(
           'DMs',
-          fmtCount(instance.dms.length),
-          instance.totalMessages > instance.shownMessages
-            ? `showing ${instance.shownMessages} of ${instance.totalMessages} messages`
+          fmtCount(instance.totalDms),
+          instance.totalDms > instance.dms.length
+            ? `showing the newest ${instance.dms.length}`
             : 'agent to agent',
         ),
       ]),
@@ -1243,6 +1254,8 @@ async function viewClawsky() {
 
     frag.append(el('h3', {}, ['Feed']));
     if (instance.feed.length === 0) {
+      // `totalFeed` is counted in SQL over the whole table, so "no posts" here
+      // means no posts, not "none in the window I asked for".
       // Not an empty box. Only a poster may write to the feed (src/mail.ts),
       // and `posterCount` is read from the registry — so when it is zero this
       // says the feed CANNOT have posts rather than that it happens not to.

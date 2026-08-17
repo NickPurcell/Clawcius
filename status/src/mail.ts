@@ -73,22 +73,39 @@ export type MailSnapshot = {
   feed: MailMessage[];
   /** DMs, newest first. */
   dms: MailMessage[];
-  /** Total rows in the table, so a truncated view can say what it is missing. */
-  totalMessages: number;
-  /** How many rows were actually returned across both lists. */
-  shownMessages: number;
+  /** Rows in the table with recipient `*`, whether or not they were returned. */
+  totalFeed: number;
+  /** Rows in the table addressed to an agent, likewise. */
+  totalDms: number;
+  /**
+   * Messages sent per author, counted across the WHOLE table.
+   *
+   * Not derived from the two lists above, and that is the point: a count taken
+   * from a capped window undercounts the moment the cap bites, and it would do
+   * so silently, on a number the page prints beside an agent's name.
+   */
+  sentByAuthor: Record<string, number>;
   error: string | null;
 };
 
 /**
- * How many messages to return.
+ * How many messages to return, PER LIST.
  *
- * A ceiling rather than pagination, because the whole of this board today is a
- * handful of rows and a paginated conversation view would be more machinery
- * than the data justifies. It is NOT a silent truncation: `totalMessages` is
- * counted separately with `COUNT(*)` and the page says "showing N of M" when
- * they differ, so the limit is visible rather than something a reader has to
- * infer from a list that stops.
+ * Per list, not overall, and that distinction is the whole of this constant's
+ * history. The first version took the newest 500 rows of `mail` and then
+ * partitioned them on recipient — so once the board passed 500 rows, a burst of
+ * DMs could push every post out of the window and the feed would render empty.
+ * The page's copy for an empty feed is a positive claim ("posts are possible —
+ * none has been written"), so the ceiling would not have degraded the view, it
+ * would have made it say something false.
+ *
+ * Two queries instead, each with its own limit and its own total, both served
+ * by `idx_mail_recipient (recipient, id)` which `src/mail.ts` already creates.
+ *
+ * A ceiling rather than pagination because a paginated conversation view is
+ * more machinery than 110 rows justify. It is not a silent truncation either:
+ * each list carries its own `COUNT(*)` and the page says "showing N of M" when
+ * they differ.
  */
 const MESSAGE_LIMIT = 500;
 
@@ -108,33 +125,72 @@ function toIso(value: unknown): string | null {
  * Never throws, for the same reason `readRegistry` does not: one instance
  * whose board cannot be read must not blank the page for the one whose can.
  */
-export function readMail(dbPath: string | null, maxBodyChars: number): MailSnapshot {
-  const empty = { feed: [], dms: [], totalMessages: 0, shownMessages: 0 };
+export function readMail(
+  dbPath: string | null,
+  maxBodyChars: number,
+  // Overridable so a test can drive the ceiling with a handful of rows instead
+  // of a thousand. Nothing in the service passes it.
+  limit: number = MESSAGE_LIMIT,
+): MailSnapshot {
+  const empty = { feed: [], dms: [], totalFeed: 0, totalDms: 0, sentByAuthor: {} };
   if (dbPath === null) return { configured: false, ...empty, error: null };
 
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
 
-    const total = db.prepare('SELECT COUNT(*) AS n FROM mail').get() as Record<string, unknown>;
-
-    const rows = db
+    const counts = db
       .prepare(
-        `SELECT id, author, recipient, subject, body, sent_at
-           FROM mail
-          ORDER BY id DESC
-          LIMIT ?`,
+        `SELECT SUM(recipient =  ?) AS feed,
+                SUM(recipient <> ?) AS dms
+           FROM mail`,
       )
-      .all(MESSAGE_LIMIT) as Array<Record<string, unknown>>;
+      .get(FEED, FEED) as Record<string, unknown>;
+
+    const select = (predicate: string) =>
+      db!
+        .prepare(
+          `SELECT id, author, recipient, subject, body, sent_at
+             FROM mail
+            WHERE recipient ${predicate} ?
+            ORDER BY id DESC
+            LIMIT ?`,
+        )
+        .all(FEED, limit) as Array<Record<string, unknown>>;
+
+    const rows = [...select('='), ...select('<>')];
+
+    // Sender counts over the whole table, not over the window above. One
+    // GROUP BY rather than tallying the rows we happened to return, so the
+    // number beside an agent's name is its real one.
+    const sentByAuthor: Record<string, number> = {};
+    for (const row of db
+      .prepare('SELECT author, COUNT(*) AS n FROM mail GROUP BY author')
+      .all() as Array<Record<string, unknown>>) {
+      sentByAuthor[asString(row['author'])] = typeof row['n'] === 'number' ? row['n'] : 0;
+    }
 
     // One query for the read receipts rather than one per message. The table is
     // (mail_id, reader) and a feed post has as many rows as there are agents,
     // so the per-message version would be N+1 queries against a database
     // another process is writing to.
+    //
+    // Bounded by the oldest id we actually returned: `mail` is capped and this
+    // table is not, so an unbounded scan here reads the whole receipt history
+    // to use at most two windows of it.
+    const oldestReturned = rows.reduce<number>(
+      (oldest, row) => (typeof row['id'] === 'number' && row['id'] < oldest ? row['id'] : oldest),
+      Number.MAX_SAFE_INTEGER,
+    );
     const readsByMail = new Map<number, string[]>();
-    const reads = db
-      .prepare('SELECT mail_id, reader FROM mail_reads ORDER BY mail_id, reader')
-      .all() as Array<Record<string, unknown>>;
+    const reads =
+      rows.length === 0
+        ? []
+        : (db
+            .prepare(
+              'SELECT mail_id, reader FROM mail_reads WHERE mail_id >= ? ORDER BY mail_id, reader',
+            )
+            .all(oldestReturned) as Array<Record<string, unknown>>);
     for (const row of reads) {
       const mailId = row['mail_id'];
       if (typeof mailId !== 'number') continue;
@@ -174,8 +230,9 @@ export function readMail(dbPath: string | null, maxBodyChars: number): MailSnaps
       configured: true,
       feed,
       dms,
-      totalMessages: typeof total['n'] === 'number' ? total['n'] : rows.length,
-      shownMessages: rows.length,
+      totalFeed: typeof counts['feed'] === 'number' ? counts['feed'] : feed.length,
+      totalDms: typeof counts['dms'] === 'number' ? counts['dms'] : dms.length,
+      sentByAuthor,
       error: null,
     };
   } catch (error) {

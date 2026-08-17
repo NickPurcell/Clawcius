@@ -40,7 +40,7 @@ function line(type, atMs, textValue) {
  * The proportions are the point: a reader who only walks the first directory
  * gets 2 and believes it, and 2 is wrong by more than half.
  */
-function fixture({ descriptor = true, badRunDir = false } = {}) {
+function fixture({ descriptor = true, badRunDir = false, secrets = false, hugeSummary = false } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'status-subagents-'));
   const projectsRoot = join(base, 'agent-home', 'projects');
   const sessionDir = join(projectsRoot, SLUG, SESSION);
@@ -55,7 +55,15 @@ function fixture({ descriptor = true, badRunDir = false } = {}) {
   const subagents = join(sessionDir, 'subagents');
   mkdirSync(subagents, { recursive: true });
   const direct = [
-    { id: 'a000000000000001', agentType: 'general-purpose', description: 'sweep the tree', model: 'opus', spawnDepth: 1 },
+    {
+      id: 'a000000000000001',
+      agentType: 'general-purpose',
+      description: secrets
+        ? 'sweep the tree using ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+        : 'sweep the tree',
+      model: 'opus',
+      spawnDepth: 1,
+    },
     { id: 'a000000000000002', agentType: 'Explore', description: 'find every caller', model: 'haiku', spawnDepth: 1 },
   ];
   for (const meta of direct) {
@@ -84,13 +92,20 @@ function fixture({ descriptor = true, badRunDir = false } = {}) {
       JSON.stringify({
         runId: RUN,
         workflowName: 'sudoers-audit',
-        summary: 'Audit the sudoers file across lenses, then verify adversarially.',
+        summary: hugeSummary
+          ? 'y'.repeat(5000)
+          : secrets
+            ? 'Audit found ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA in the log'
+            : 'Audit the sudoers file across lenses, then verify adversarially.',
         status: 'completed',
         agentCount: 3,
         durationMs: 2_337_635,
         startTime: now - 9_000_000,
         phases: [
-          { title: 'Audit', detail: 'six lenses' },
+          {
+            title: 'Audit',
+            detail: secrets ? 'six lenses, key sk-ant-AAAAAAAAAAAAAAAAAAAA' : 'six lenses',
+          },
           { title: 'Verify', detail: 'three refuters per finding' },
         ],
       }),
@@ -215,6 +230,42 @@ test('without a descriptor the run name is null rather than guessed at', async (
   for (const entry of group.subagents) assert.equal(entry.workflowName, null);
 });
 
+/**
+ * Metadata prose is rendered, so it goes through `redact()` like everything
+ * else that is.
+ *
+ * `index.ts` states the redaction as a property of the service, without
+ * qualification, and until now `description`, `workflowName`, `summary` and
+ * `phases[].detail` were the exception — all four are free prose written by a
+ * model that has just been reading files, and the real workflow summary on
+ * this host is the report of a sudoers audit.
+ */
+test('descriptions and workflow prose are redacted, like every other rendered string', async () => {
+  const { config, store, agent, now } = fixture({ secrets: true });
+  const { sessions } = await store.sessions(agent);
+
+  const runs = await store.workflowRuns(sessions[0]);
+  const run = runs.get(RUN);
+  assert.match(run.summary, /\[redacted\]/);
+  assert.doesNotMatch(run.summary, /ghp_A{36}/);
+  assert.doesNotMatch(run.phases[0].detail, /sk-ant-A{20}/);
+
+  const rollup = await buildSubagentRollup(store, agent, config, now);
+  const described = rollup.roles
+    .flatMap((group) => group.subagents)
+    .find((entry) => entry.description.includes('[redacted]'));
+  assert.notEqual(described, undefined, 'a subagent description was redacted');
+  assert.doesNotMatch(described.description, /ghp_A{36}/);
+});
+
+test('metadata prose is capped, so a label cannot be a document', async () => {
+  const { store, agent } = fixture({ hugeSummary: true });
+  const { sessions } = await store.sessions(agent);
+  const run = (await store.workflowRuns(sessions[0])).get(RUN);
+
+  assert.equal(run.summary.length, 2000);
+});
+
 test('the session tree carries the workflow agents too, labelled by their run', async () => {
   const { config, store, agent, now } = fixture();
   const { sessions } = await store.sessions(agent);
@@ -228,4 +279,57 @@ test('the session tree carries the workflow agents too, labelled by their run', 
   // They are not orphans. Nothing spawned them by a tool call we can see, but
   // we know exactly what they belong to, and "orphan" would say we do not.
   assert.equal(detail.orphans.length, 0);
+});
+
+/**
+ * The cache limit has to stay above one session, and the cliff has to be loud.
+ *
+ * `buildSessionDetail` walks a session's own transcript plus every subagent,
+ * in order. If that exceeds the LRU, each pass evicts exactly what the next
+ * pass asks for first — so the cache does not degrade, it stops working.
+ * Measured on this host when finding the other 58 subagents took one session
+ * to 104 transcripts against a limit of 64: warm rebuilds went from 107ms to
+ * 786ms, on a page that rebuilds on every change event.
+ *
+ * The default is pinned because the failure is invisible from the outside: the
+ * page renders correctly and slowly, which is how 64 survived.
+ */
+test('the default index cache is larger than the largest session on this host', async () => {
+  const { loadStatusConfig: load } = await import('../dist/config.js');
+  const { mkdtempSync: mk, writeFileSync: write } = await import('node:fs');
+  const path = join(mk(join(tmpdir(), 'status-cache-')), 'status-config.yaml');
+  write(path, ['agents:', '  - id: hamachi', '    projectsRoot: /tmp/x', ''].join('\n'));
+
+  // 104 transcripts: one session plus 103 subagents, counted under Hamachi's
+  // root on 2026-08-17. Raise this number when a bigger session appears — and
+  // raise the default with it.
+  assert.equal(
+    load(path).read.maxCachedSessions > 104,
+    true,
+    'read.maxCachedSessions must exceed the transcript count of one session, or every ' +
+      'rebuild of that session re-parses all of it. It counts TRANSCRIPTS, not sessions.',
+  );
+});
+
+test('a session that does not fit the cache says so, once, naming the number to raise', async () => {
+  const { config, store, agent, now } = fixture();
+  const { sessions } = await store.sessions(agent);
+  const tiny = { ...config, read: { ...config.read, maxCachedSessions: 2 } };
+
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (line) => warnings.push(line);
+  try {
+    await buildSessionDetail(store, sessions[0], tiny, now);
+    await buildSessionDetail(store, sessions[0], tiny, now);
+  } finally {
+    console.warn = original;
+  }
+
+  // Once per session, not once per rebuild: this is a configuration problem,
+  // and a line per change event is noise the next reader filters out.
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /6 transcripts/);
+  assert.match(warnings[0], /read\.maxCachedSessions is 2/);
+  assert.match(warnings[0], /Raise read\.maxCachedSessions above 6/);
 });

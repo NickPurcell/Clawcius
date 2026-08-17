@@ -98,9 +98,16 @@ read:
   # Characters kept per content block before truncation. The file on disk is
   # the archive; this is a reader.
   maxBlockChars: 20000
-  # Session indexes held in memory (offsets and per-line metadata, never
+  # TRANSCRIPT indexes held in memory (offsets and per-line metadata, never
   # message bodies). LRU beyond this.
-  maxCachedSessions: 64
+  #
+  # Counts transcripts, not sessions, despite the name: a session is its own
+  # transcript plus one per subagent, and the largest on this host is 104. The
+  # old value was 64, which is BELOW that — and a session bigger than the cache
+  # evicts exactly what the next pass wants, so warm rebuilds of it took 786ms
+  # instead of 107ms. Keep this comfortably above the largest session; the
+  # service logs a warning naming any session that does not fit.
+  maxCachedSessions: 256
 
 watch:
   # Coalescing window for filesystem events. One agent turn is many writes.

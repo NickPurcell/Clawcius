@@ -20,7 +20,8 @@
  *                 journal.jsonl               the run's own log, not an agent
  *           workflows/
  *             <runId>.json                    {workflowName, summary, status,
- *                                              agentCount, durationMs, phases[]}
+ *                                              agentCount, durationMs, startTime,
+ *                                              phases[{title, detail}]}
  *           tool-results/                     spilled tool output, not read here
  *
  * The `subagents/workflows/` level is easy to miss and is where MOST of them
@@ -115,6 +116,32 @@ export function redact(text: string): string {
     );
   }
   return out;
+}
+
+/**
+ * Prose out of a sidecar or a workflow descriptor, made safe to render.
+ *
+ * `redact` plus a cap, in one place, for the same reason `truncate` exists
+ * below: there should be one function that turns metadata into renderable text
+ * so "did we remember to redact that one" has a single answer.
+ *
+ * It did not have one. A subagent's `description` and a workflow's
+ * `workflowName`, `summary` and `phases[].detail` went out untouched while
+ * mail bodies, transcript blocks and every OJ string were redacted — and
+ * `index.ts` states the redaction as a property of the service without
+ * qualification. All four are free prose written by a model that has just been
+ * reading files; the real workflow summary on this host is the report of a
+ * sudoers audit, which is precisely where a pasted credential would survive.
+ *
+ * The cap is fixed rather than configurable. These are labels — a description
+ * and a one-line summary — not documents, and `read.maxBlockChars` is about a
+ * transcript page. Anything longer than this is not a label any more.
+ */
+const MAX_META_CHARS = 2000;
+
+function metaText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return redact(value).slice(0, MAX_META_CHARS);
 }
 
 /**
@@ -886,9 +913,9 @@ export class TranscriptStore {
         if (!record) continue;
         runs.set(runId, {
           runId,
-          name: asString(record['workflowName']),
-          summary: asString(record['summary']),
-          status: asString(record['status']),
+          name: metaText(record['workflowName']),
+          summary: metaText(record['summary']),
+          status: metaText(record['status']),
           agentCount: numberOrNull(record['agentCount']),
           durationSeconds: (() => {
             const ms = numberOrNull(record['durationMs']);
@@ -903,7 +930,7 @@ export class TranscriptStore {
                 const phase = asRecord(raw);
                 if (!phase) return [];
                 return [
-                  { title: asString(phase['title']), detail: asString(phase['detail']) },
+                  { title: metaText(phase['title']), detail: metaText(phase['detail']) },
                 ];
               })
             : [],
@@ -968,8 +995,11 @@ async function readSubagentMeta(dir: string, jsonlName: string): Promise<Subagen
     const record = asRecord(parsed);
     if (!record) return null;
     return {
-      agentType: asString(record['agentType']),
-      description: asString(record['description']),
+      // agentType is a role name and reaches the page as a heading and a colour
+      // key; description is free prose. Both are rendered, so both go through
+      // the same door.
+      agentType: metaText(record['agentType']),
+      description: metaText(record['description']),
       toolUseId: asString(record['toolUseId']),
       parentAgentId: asString(record['parentAgentId']),
       spawnDepth:

@@ -151,6 +151,12 @@ rather than left to be discovered here. In short: that rule governs what one
 claim about the person who owns the host, who has the database on their own
 disk either way.
 
+That last sentence holds while the tailnet is one person's devices. **Adding
+someone to the tailnet, or sharing the node, hands them every DM on the board**
+— they need never have had shell on this host. The caution below about
+`tailscale funnel` applies to that too, and CLAWSKY.md § Mail is where the
+reasoning is kept.
+
 Mail bodies carry quoted external content by design — pull request reviews, OJ's
 findings on a stranger's diff. They go out as JSON, reach the page through the
 same `textContent` path as a transcript line, and are redacted server-side like
@@ -354,6 +360,8 @@ The LRU cache size, page size and byte ceiling are all in `status-config.yaml`.
 | Instance has no `boardDb` | Said in words, and every directory falls through to "other" — with no registry there is nothing that says which is an agent. |
 | Registry row with no transcripts | Listed as an agent with no sessions, and the absence is stated without a conclusion about whether it has run. |
 | Board has no `mail` table | Reported. The registry half still renders. |
+| More messages than the per-list ceiling | Each list says "showing the newest N" against its own total, counted in SQL. The ceiling is per list, so a burst of DMs cannot empty the feed. |
+| Session with more transcripts than the index cache | Rendered correctly and slowly; a warning naming the session and the number to raise goes to the journal. |
 | Feed with no posts | Says only a poster may write to it and how many the crew has. Not an empty box. |
 | Workflow run still in flight | Its agents list; the descriptor is written at the end, so the run's name is null rather than guessed. |
 | Run descriptor disagrees with the transcripts on disk | Both numbers shown, side by side. |

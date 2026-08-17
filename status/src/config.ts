@@ -113,12 +113,26 @@ export type ReadConfig = {
    */
   maxBlockChars: number;
   /**
-   * How many indexed sessions to hold in memory at once.
+   * How many indexed TRANSCRIPTS to hold in memory at once.
    *
-   * Indexes are small next to the transcripts they describe (offsets and
-   * per-line metadata, never message bodies), but a host with a year of
-   * sessions would still accumulate. Least-recently-used beyond this is
-   * dropped and rebuilt on demand.
+   * Named for sessions and counts transcripts, and that gap is what made the
+   * old default of 64 look comfortable: one session is its own transcript plus
+   * one per subagent, so the session on this host with 103 subagents needs 104
+   * entries, not one. The name is kept because it is in the deployed YAML;
+   * this comment is the correction.
+   *
+   * The failure when it is too small is a cliff, not a slope. `buildSessionDetail`
+   * walks every transcript of a session in order, so a session larger than the
+   * cache evicts exactly what the next pass asks for first — a cyclic scan
+   * through a too-small LRU has a hit rate of approximately zero. Measured on
+   * this host at 103 subagents against a 64-entry cache: warm rebuilds went
+   * from 107ms to 786ms, and the page rebuilds on every change event. At 256
+   * it was 183ms. It is the limit that costs the time, not the bytes.
+   *
+   * Indexes are small next to what they describe — 103 of them measured at
+   * about 5 MB of heap — so headroom here is cheap and running out of it is
+   * not. Size it above the largest session's subagent count, with room; the
+   * service logs a warning naming the session when one does not fit.
    */
   maxCachedSessions: number;
 };
@@ -211,7 +225,10 @@ const DEFAULTS: StatusConfig = {
     pageSize: 60,
     maxPageBytes: 2_000_000,
     maxBlockChars: 20_000,
-    maxCachedSessions: 64,
+    // 2.5x the largest session on this host (104 transcripts). See the comment
+    // on the field: below the size of one session this degrades sharply rather
+    // than gradually.
+    maxCachedSessions: 256,
   },
   watch: {
     debounceMs: 400,

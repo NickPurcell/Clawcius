@@ -92,7 +92,8 @@ test('a DM and a post are one table, separated by the recipient', () => {
   assert.equal(snapshot.feed.length, 1);
   assert.equal(snapshot.dms.length, 2);
   assert.equal(snapshot.feed[0].recipient, '*');
-  assert.equal(snapshot.totalMessages, 3);
+  assert.equal(snapshot.totalFeed, 1);
+  assert.equal(snapshot.totalDms, 2);
   // Newest first, by id — the column the table orders by, not by parsing a date
   // out of a body.
   assert.deepEqual(snapshot.dms.map((message) => message.subject), ['done', 'run it']);
@@ -133,6 +134,46 @@ test('bodies are redacted on the way out, like transcript text', () => {
   assert.doesNotMatch(message.subject, /ghp_A{36}/);
   // The scheme survives so a reader can still see what kind of auth was in play.
   assert.match(message.body, /Authorization: Bearer \[redacted\]/);
+});
+
+/**
+ * The ceiling is per list, and that is not a detail.
+ *
+ * It used to take the newest N rows of `mail` and partition them afterwards,
+ * so a burst of DMs could push every post out of the window and the feed would
+ * render empty. The page's empty-feed copy is a POSITIVE claim — "posts are
+ * possible, none has been written" — so the ceiling would not have degraded
+ * the view, it would have made it state something false.
+ *
+ * Six DMs newer than the only post, with room for two of each.
+ */
+test('a burst of DMs cannot push the posts out of the feed', () => {
+  const messages = [{ author: 'hamachi-poster', recipient: FEED, subject: 'shipped', body: 'PR merged' }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ author: 'hamachi-coordinator', recipient: 'hamachi-host', subject: `dm ${i}`, body: 'x' });
+  }
+
+  const snapshot = readMail(board({ messages }), 20_000, 2);
+  assert.equal(snapshot.feed.length, 1, 'the post survives six newer DMs');
+  assert.equal(snapshot.feed[0].subject, 'shipped');
+  assert.equal(snapshot.dms.length, 2);
+  // And each list reports its own total, so the page can say it is showing a
+  // window rather than implying it is showing everything.
+  assert.equal(snapshot.totalFeed, 1);
+  assert.equal(snapshot.totalDms, 6);
+});
+
+test('sender counts come from the whole table, not from the returned window', () => {
+  const messages = [];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ author: 'hamachi-host', recipient: 'hamachi-coordinator', body: 'x' });
+  }
+
+  const snapshot = readMail(board({ messages }), 20_000, 2);
+  assert.equal(snapshot.dms.length, 2, 'the window is doing its job');
+  // Counted with GROUP BY over all six. Tallying the two returned rows would
+  // print "2 sent" beside an agent that sent six, and print it confidently.
+  assert.equal(snapshot.sentByAuthor['hamachi-host'], 6);
 });
 
 test('a long body is cut and says so, rather than stopping silently', () => {
