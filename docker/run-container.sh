@@ -36,9 +36,9 @@ done
 # did before any of this was parameterised.
 #
 # A second instance shares the image, the Squid proxy and the clawcius-internal
-# network — the allowlist is a property of the egress policy, not of who is
-# using it. What it must NOT share is the container, the workspaces or the
-# state directory; those are the sandbox.
+# network — the egress policy is a property of the proxy, not of who is using
+# it, so there is no per-instance version of it. What it must NOT share is the
+# container, the workspaces or the state directory; those are the sandbox.
 NAME=${CLAWCIUS_CONTAINER:-clawcius-agent}
 IMAGE=${CLAWCIUS_IMAGE:-clawcius-agent:latest}
 ENV_FILE=${CLAWCIUS_ENV_FILE:-/home/npurcell/clawcius/.env}
@@ -68,6 +68,23 @@ STATE_RUN=$CLAWCIUS_STATE/run
 SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 GWS_CLI=/home/npurcell/clawcius/gws-cli
+BROWSER_CLI=/home/npurcell/clawcius/browser-cli
+
+# BROWSE_LOG is set on the container rather than left to browse's own default,
+# and the reason is durability, not taste.
+#
+# That default is under $HOME, which is the container's writable layer, and
+# --recreate destroys the writable layer. The navigation log is the audit that
+# stands in for an egress restriction now that Squid is a blocklist rather than
+# an allowlist — see browser-cli/README.md — and an audit a redeploy silently
+# erases is not one. $WORKSPACES is a mounted volume, so this survives both
+# restart and recreate.
+#
+# One file for the whole container, shared by every agent in the crew, which is
+# the right grain: what is being recorded is what left this sandbox, and the
+# sandbox is the container. The file is opened O_APPEND and written one line
+# per write(), so concurrent writers cannot overwrite each other's records.
+# `browse` creates the directory on first use.
 
 # Google Workspace service account key, mounted only if it exists.
 #
@@ -208,9 +225,14 @@ case "$STATE" in
 esac
 
 # clawcius-internal has NO gateway to the outside. The only reachable thing
-# with a route out is Squid, which enforces the domain allowlist. That is what
-# makes the proxy enforcement rather than a suggestion: unsetting HTTPS_PROXY
-# does not reveal a second path, it just removes the only one.
+# with a route out is Squid. That is what makes the proxy enforcement rather
+# than a suggestion: unsetting HTTPS_PROXY does not reveal a second path, it
+# just removes the only one.
+#
+# What Squid then DECIDES is a smaller thing than that topology suggests, and
+# has been since 2026-08-01: egress is default-allow, filtered by a blocklist
+# that is currently empty (squid/squid.conf §5). The route is still the only
+# route; it is no longer a gate.
 PROXY=http://172.31.250.2:3128
 
 # The agent's wall clock. A named zone, never a fixed offset: the agent
@@ -254,6 +276,8 @@ docker run -d \
   -v "$SKILLS:$SKILLS:ro" \
   -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
   -v "$GWS_CLI:$GWS_CLI:ro" \
+  -v "$BROWSER_CLI:$BROWSER_CLI:ro" \
+  -e BROWSE_LOG="$WORKSPACES/.browse/navigation.jsonl" \
   "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \
   --memory="$MEMORY" \

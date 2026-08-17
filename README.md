@@ -11,7 +11,7 @@ self-wake ┘   (gateway, tokens)      ┆    │
                                      ┆    ├─→ discord CLI ─┐
                                      ┆    └─→ cron, daemons ┤
                                      ┆                      ▼
-                                     ┆              Squid allowlist ─→ Discord
+                                     ┆              Squid blocklist ─→ Discord
 ```
 
 Two halves:
@@ -22,6 +22,11 @@ Two halves:
 - **`discord-cli/`** — the CLI the agent runs (Python, stdlib only, no install
   step). Read, send, search, react, edit, delete. Structured exit codes so the
   agent branches on status rather than parsing prose.
+- **`browser-cli/`** — `browse`, a headless Chromium the agent drives: a
+  screenshot to a PNG it can read back, the text of a page after its
+  JavaScript has run, and the URL a request actually finished on. Every
+  navigation and every host contacted is logged. Needs an image rebuild;
+  `browser-cli/README.md` says why.
 
 And one thing that only watches:
 
@@ -56,10 +61,15 @@ tool rather than only shell commands.
 
 Egress is enforced by topology rather than configuration. The container sits on
 a Docker `--internal` network with no route to the outside; **Squid** is the
-only reachable thing that has one, and it enforces a domain allowlist on the
-CONNECT target with no TLS interception. Unsetting the proxy variables, passing
+only reachable thing that has one. Unsetting the proxy variables, passing
 `--noproxy '*'`, or connecting by raw IP all simply fail — there is no second
 route to find.
+
+What Squid *decides* is a much smaller thing than the topology implies, and has
+been since 2026-08-01: egress is **default-allow**, filtered by a blocklist of
+named destinations that is currently empty. It is a kill switch, not a
+containment boundary. `squid/squid.conf` §5 is the authority and explains what
+that moved.
 
 The container is long-lived on purpose: cron jobs, daemons and Discord bots the
 agent writes keep running between turns, with no model in the loop.
@@ -105,7 +115,7 @@ the session has no shell at all.
 | File | Holds | Committed |
 |---|---|---|
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
-| `squid/squid.conf` | The egress allowlist — the only copy | yes |
+| `squid/squid.conf` | The egress policy — the only copy. A blocklist, not an allowlist, since 2026-08-01 | yes |
 | `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do | yes |
 | `ops/clawcius-sudoers` | What the host agent may do with sudo, by exact command and exact unit name, and why | yes |
 | `MIGRATION.md` | Creating the host agent's service account, the shared group, the deploy key — with a rollback path. **Not yet executed.** | yes |

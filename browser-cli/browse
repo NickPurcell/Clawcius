@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""
+browse — drive a headless Chromium from the command line, for the agent.
+
+    browse screenshot https://example.com shot.png --viewport phone --full-page
+    browse text       https://example.com
+    browse probe      https://example.com
+
+The point is the PNG. An agent can read an image file directly, so a screenshot
+on disk is legible to the thing that asked for it — this is output, not a
+debugging artefact. Clawcius #11 is the whole argument: `status/` was built end
+to end without anyone looking at it, and the one real defect was found by the
+operator sending a picture back.
+
+`text` is the second reason this exists. WebFetch returns the HTML the server
+sent; anything rendered by JavaScript afterwards is invisible to it. `text`
+returns what a person would actually see.
+
+`probe` is the third, and it is the one that stops a lie. A redirect to a login
+page renders beautifully and means nothing, so every command reports the URL it
+finished on and the status it finished with, and `probe` reports only that.
+
+-- Dependencies ------------------------------------------------------------
+
+This tool breaks the rule discord-cli and gws-cli keep. Those are stdlib-only
+on purpose: they are bind-mounted read-only into the container and the mount is
+the install. That is not available here. Chromium is 400 MB of native binary
+and cannot be a Python file, so `browse` needs two things baked into the image:
+
+    pip3 install playwright==1.62.0
+    playwright install --with-deps chromium     # into PLAYWRIGHT_BROWSERS_PATH
+
+Both are in `docker/Dockerfile`. An edit to this file takes effect on the next
+mount; an edit to the Dockerfile takes effect on the next image rebuild, which
+is an operator action. If chromium is missing, this exits 2 and says so rather
+than failing somewhere further in.
+
+-- The navigation log ------------------------------------------------------
+
+Every invocation, every navigation and every distinct host the page pulled from
+is appended to a JSONL file with a timestamp, line-buffered so a killed process
+still leaves the record. `--log` moves it; `BROWSE_LOG` moves it for good.
+
+This is not for debugging. It is the audit that stands in for an egress
+restriction.
+
+The proxy stopped being a containment boundary on 2026-08-01, when egress went
+default-allow — `squid/squid.conf` §5 says so in as many words: it is now a
+kill switch for named destinations and nothing more. A browser widens what
+"the agent reached a page" can mean, because a page fetches whatever it likes,
+from wherever it likes, on the agent's behalf, and none of that appears in
+anything the agent typed. If the operator ever wants that narrowed again, the
+argument will need evidence of what was actually contacted, and only a record
+kept at the time can supply it.
+
+So this makes the same trade the project already made for the host agent: no
+rollback, but a complete record of everything that happened. A log that is
+written only when something goes wrong is not an audit, so this one is written
+always, in full, before the process can exit.
+
+-- Why --no-sandbox is not a red flag here ---------------------------------
+
+See CHROMIUM_ARGS below. Short version: the container is the sandbox.
+
+-- Design rules, following discord-cli -------------------------------------
+
+  * No mutable context. Every command names its URL explicitly.
+  * Output format follows the TTY: text for humans, JSON for pipes and agents.
+  * Data on stdout, diagnostics on stderr. `browse text URL > page.txt` must
+    produce a file containing the page and nothing else.
+  * Exit codes are a contract (see below) and are not reassigned once released.
+  * One browser at a time, refused rather than queued. A prompt is a hang and
+    so is a queue.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import shlex
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+# -- exit codes, a stable contract ------------------------------------------
+
+OK = 0
+NAV_ERROR = 1        # the page would not load: DNS, TLS, timeout, refused
+BROWSER_ERROR = 2    # chromium or playwright missing, or would not start
+VALIDATION_ERROR = 3
+BUSY = 4             # another browse holds the single-browser lock
+
+# -- chromium flags ---------------------------------------------------------
+#
+# --no-sandbox is normally the flag you stop and argue about, and here it is
+# not one. Chromium's own sandbox needs user namespaces and seccomp filters
+# that gVisor does not offer a nested process, so with it on, chromium dies at
+# startup under runsc. What it would have bought is already bought, one layer
+# out and more thoroughly: this whole container is a gVisor sandbox on a
+# network with no gateway, so a compromised renderer escapes into a place that
+# was already assumed hostile. Turning it off here does not widen anything.
+# Leave it, and do not "fix" it by giving the container SYS_ADMIN.
+#
+# --disable-dev-shm-usage is not a tuning knob, it is required. /dev/shm is
+# 64 MB in this container (Docker's default) and chromium puts its renderer
+# shared memory there; without this flag it does not report a small tmpfs, it
+# crashes the tab with a blank page or ERR_FAILED. This flag moves that to
+# /tmp, which has room.
+#
+# --disable-gpu: there is no GPU and no X server. Without it chromium spends
+# startup time probing for both and logs the failures.
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+# Named viewports, because "does it work on a phone" is the question that has
+# never once been checked (Clawcius #11) and nobody should have to remember
+# that an iPhone 14 is 390 points wide.
+VIEWPORTS = {
+    "phone": (390, 844),
+    "tablet": (820, 1180),
+    "desktop": (1280, 800),
+    "wide": (1920, 1080),
+}
+
+DEFAULT_LOG = Path(
+    os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+) / "browser-cli" / "navigation.jsonl"
+
+# Per-container, because the memory cap this defends is per-container. /tmp is
+# right for a lock whose meaning ends when the container does.
+LOCK_PATH = Path(os.environ.get("BROWSE_LOCK", "/tmp/browser-cli.lock"))
+
+
+class BrowseError(Exception):
+    def __init__(self, message, code=NAV_ERROR, remediation=None, details=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.remediation = remediation
+        self.details = details or {}
+
+    def to_dict(self):
+        out = {"error": self.message, "exit_code": self.code}
+        if self.remediation:
+            out["remediation"] = self.remediation
+        if self.details:
+            out["details"] = self.details
+        return out
+
+
+class Parser(argparse.ArgumentParser):
+    """Usage errors exit 3, not argparse's default of 2, which is reserved for
+    a browser that will not start."""
+
+    def error(self, message):
+        sys.stderr.write(f"error: {message}\n")
+        sys.stderr.write(f"hint:  run '{self.prog} --help' for usage.\n")
+        sys.exit(VALIDATION_ERROR)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def note(message):
+    """Diagnostics belong on stderr so they never contaminate piped data."""
+    sys.stderr.write(message.rstrip("\n") + "\n")
+
+
+# -- the navigation log -----------------------------------------------------
+
+
+class Audit:
+    """Append-only JSONL. See the module header for why this is not optional.
+
+    Line-buffered and never batched: if this process is killed mid-page, the
+    hosts it had already contacted are on disk. A log flushed at exit would
+    lose exactly the runs worth auditing.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.hosts = {}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, "a", buffering=1, encoding="utf-8")
+        except OSError as exc:
+            raise BrowseError(
+                f"cannot open the navigation log at {self.path}: {exc.strerror}",
+                VALIDATION_ERROR,
+                "pass --log with a writable path, or set BROWSE_LOG.",
+            )
+
+    def event(self, name, /, **fields):
+        # `name` is positional-ONLY, and that slash is load-bearing. Callers
+        # pass arbitrary field names through **fields, and one of them is
+        # `kind`; without the slash, `event("subresource_problem", kind=...)`
+        # raises "got multiple values for argument 'kind'" from inside a
+        # Playwright event listener, which surfaces as a TypeError on the next
+        # unrelated page call. Found that way, so it is written down here.
+        record = dict(fields)
+        # Framing last: the log's own fields are not overridable by a caller.
+        record.update({"ts": now_iso(), "pid": os.getpid(), "event": name})
+        self.fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    def saw_host(self, url, kind="subresource"):
+        """One line the first time each distinct host is contacted, then a
+        count. Every request would make the log unreadable and no more
+        complete: the set of hosts is the thing being audited."""
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return
+        if not parsed.netloc:
+            return  # data:, blob:, about: — nothing left the container
+        host = parsed.netloc
+        if host not in self.hosts:
+            self.hosts[host] = 0
+            self.event("host", host=host, scheme=parsed.scheme, first_seen_as=kind)
+        self.hosts[host] += 1
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.fh.close()
+
+
+# -- process hygiene --------------------------------------------------------
+#
+# A leaked browser process is this project's favourite bug: OJ #9 was a
+# surviving child holding a session id for three days. Under a 2 GB container
+# cap a leaked chromium is not untidy, it is the next task failing to allocate.
+#
+# So: close in `finally`, and then check. Everything below is descendant-scoped
+# on purpose. A crew shares this container and this uid, so "kill every
+# chromium owned by uid 1000" would kill a colleague's browser mid-page.
+#
+# Measured on 2026-08-16, before any of this existed: every single invocation
+# left exactly two `chrome-headless` processes behind as ZOMBIES, reparented to
+# pid 1. Not a memory leak — a zombie holds no pages, and MemAvailable came
+# back every time — but a PID leak, and this container runs with
+# --pids-limit=512. Two per run is the tool becoming unusable after a couple of
+# hundred screenshots, in a way that would present as some unrelated fork
+# failing weeks later.
+#
+# The cause is structural. Chromium's browser process spawns helpers; when the
+# Playwright node driver exits, those helpers are orphaned and reparented to
+# pid 1, and pid 1 in this container is `sleep infinity` (docker/Dockerfile),
+# which never calls wait(). Nothing reaps them, ever.
+#
+# The fix is PR_SET_CHILD_SUBREAPER: it makes THIS process the reparenting
+# target for its orphaned descendants instead of pid 1, so they become our
+# children and we can wait() them. Verified supported under gVisor/runsc.
+# Without it a process simply cannot reap another process's children, and no
+# amount of care in `finally` would help.
+
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_subreaper():
+    """Adopt our own orphaned descendants so we can reap them. See above."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        return libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        # Not fatal. Zombies accumulate as they did before, which is a slow
+        # problem, where refusing to run at all is an immediate one.
+        return False
+
+
+def _ppid(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm can contain spaces and parentheses, so ppid is found from the last
+    # ')' rather than by splitting the whole line.
+    try:
+        return int(stat[stat.rindex(")") + 1:].split()[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def descendants(root):
+    """Every live pid whose parent chain reaches `root`."""
+    parents = {}
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            parents[int(entry.name)] = _ppid(int(entry.name))
+    out = []
+    for pid in parents:
+        seen, cur = 0, pid
+        while cur and cur != 1 and seen < 64:
+            cur = parents.get(cur)
+            seen += 1
+            if cur == root:
+                out.append(pid)
+                break
+    return out
+
+
+def drain_zombies(deadline_s=2.0):
+    """wait() every exited child until none is left.
+
+    Bounded, because chromium's helpers exit a beat after the browser does and
+    an immediate WNOHANG sweep would miss them, leaving exactly the zombies
+    this exists to prevent. ChildProcessError means there is nothing left to
+    wait for at all, which is the normal exit and returns at once — the
+    deadline is only ever spent while a child is genuinely still running.
+    """
+    reaped, end = [], time.monotonic() + deadline_s
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return reaped
+        except OSError:
+            return reaped
+        if pid == 0:
+            if time.monotonic() >= end:
+                return reaped
+            time.sleep(0.05)
+            continue
+        reaped.append(pid)
+
+
+def reap(before, audit):
+    """Leave no descendant of this run behind, alive or dead.
+
+    Loud about the live ones on purpose. A process that outlived close() is a
+    bug worth chasing, and one cleaned up silently is one nobody chases. The
+    zombies are noted in the log but not on stderr: they are expected, they are
+    the reason drain_zombies exists, and a warning on every successful run is a
+    warning nobody reads.
+    """
+    reaped = drain_zombies()
+    survivors = [p for p in descendants(os.getpid()) if p not in before]
+    if survivors:
+        for pid in survivors:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        reaped += drain_zombies(deadline_s=1.0)
+        audit.event("leaked_children", pids=survivors)
+        note(
+            f"warning: {len(survivors)} browser process(es) outlived close() and "
+            f"were killed: {survivors}. This is a bug — please report it."
+        )
+    if reaped:
+        audit.event("reaped", pids=reaped)
+
+
+@contextlib.contextmanager
+def single_browser_lock():
+    """One browser per container, refused rather than queued.
+
+    Chromium's resident set is a large fraction of this container's 2 GB, so
+    two at once is not slow, it is an OOM kill somewhere unrelated. Refusing is
+    the honest failure: the caller learns immediately and can retry, where a
+    queue would look like a hang with no way to tell how long.
+    """
+    fd = None
+    try:
+        # O_NOFOLLOW: /tmp is world-writable, so refuse to follow a symlink
+        # planted where the lock should be rather than open whatever it names.
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            holder = os.read(fd, 32).decode("utf-8", "replace").strip() or "unknown"
+            raise BrowseError(
+                f"another browse is already running (pid {holder})",
+                BUSY,
+                "one browser at a time — wait for it to finish and retry.",
+            )
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        yield
+    except OSError as exc:
+        if isinstance(exc, BrowseError):
+            raise
+        raise BrowseError(
+            f"cannot take the browser lock at {LOCK_PATH}: {exc.strerror}",
+            VALIDATION_ERROR,
+            "set BROWSE_LOCK to a writable path.",
+        )
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+
+def proxy_settings():
+    """Chromium does not read http_proxy the way urllib does, so pass it.
+
+    gws-cli's header records the same class of bug from the other side:
+    httplib2 ignores the proxy environment and fails with "unable to find the
+    server" on a host where curl works. The agent container has no route out
+    except this proxy — DNS included — so getting this wrong does not degrade,
+    it fails totally and confusingly.
+
+    NO_PROXY matters as much. Squid denies 127.0.0.0/8 outright (squid.conf
+    §4), so a loopback page sent through the proxy is refused even though it is
+    served three inches away.
+    """
+    server = (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    )
+    if not server:
+        return None
+    settings = {"server": server}
+    bypass = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+    if bypass:
+        settings["bypass"] = bypass
+    return settings
+
+
+@contextlib.contextmanager
+def chromium(audit, headed_note=True):
+    """Launch exactly one browser and close it deterministically."""
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise BrowseError(
+            "playwright is not installed in this container",
+            BROWSER_ERROR,
+            "it is baked into the image by docker/Dockerfile — the image needs "
+            "rebuilding, which is an operator action.",
+        )
+
+    # Before the launch, so every process the launch creates reparents to us
+    # rather than to an init that never reaps. See the process-hygiene block.
+    subreaper = become_subreaper()
+    if not subreaper:
+        audit.event("subreaper_unavailable")
+    before = set(descendants(os.getpid()))
+    playwright = None
+    browser = None
+    try:
+        playwright = sync_playwright().start()
+        try:
+            browser = playwright.chromium.launch(
+                headless=True, args=CHROMIUM_ARGS, proxy=proxy_settings()
+            )
+        except PlaywrightError as exc:
+            raise BrowseError(
+                f"chromium would not start: {str(exc).splitlines()[0]}",
+                BROWSER_ERROR,
+                "check PLAYWRIGHT_BROWSERS_PATH and that the image was built "
+                "with `playwright install --with-deps chromium`.",
+            )
+        audit.event("browser_started", args=CHROMIUM_ARGS, proxy=bool(proxy_settings()))
+        yield browser
+    finally:
+        # Both of these, both suppressed. close() failing must not stop stop(),
+        # and neither must stop reap(), which is the only one that can prove
+        # nothing survived.
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                browser.close()
+        if playwright is not None:
+            with contextlib.suppress(Exception):
+                playwright.stop()
+        reap(before, audit)
+        audit.event("browser_closed")
+
+
+# -- one page load ----------------------------------------------------------
+
+
+class Load:
+    """The result of navigating once: where it ended up, and what broke."""
+
+    def __init__(self, url):
+        self.requested = url
+        self.final_url = None
+        self.status = None
+        self.status_text = None
+        self.title = None
+        self.redirects = []
+        self.problems = []
+
+
+def _record_problem(load, audit, url, reason, kind):
+    """A blocked subresource must be visible in the output.
+
+    A page whose CSS was refused renders as unstyled text and looks like a bug
+    in the page. That is the failure mode worth spending code on: not the
+    screenshot that fails, the screenshot that succeeds and misleads.
+    """
+    # One entry per URL. A 404 stylesheet reports twice — once as the HTTP
+    # response and again as ERR_ABORTED when the browser gives up on it — and
+    # counting that as two broken resources overstates how broken the page is.
+    # First reason wins: the HTTP status says more than "aborted".
+    if any(p["url"] == url for p in load.problems):
+        return
+    entry = {"url": url, "reason": reason, "kind": kind}
+    load.problems.append(entry)
+    audit.event("subresource_problem", **entry)
+
+
+def navigate(page, url, args, audit, load):
+    page.on("request", lambda r: audit.saw_host(r.url, "request"))
+
+    def on_navigated(frame):
+        if frame is page.main_frame:
+            audit.event("navigation", url=frame.url)
+
+    page.on("framenavigated", on_navigated)
+
+    # Two different shapes of failure, and a page can produce either. A CONNECT
+    # that Squid refuses never becomes an HTTP response at all — it surfaces
+    # here as net::ERR_TUNNEL_CONNECTION_FAILED — while a plain-HTTP denial
+    # comes back as a 403 the browser is perfectly happy with. Catching only
+    # one of them would leave half of "the page is missing things" invisible.
+    page.on(
+        "requestfailed",
+        lambda r: _record_problem(
+            load, audit, r.url, (r.failure or "request failed"), "failed"
+        ),
+    )
+
+    def on_response(response):
+        if response.status >= 400 and response.request.resource_type != "document":
+            _record_problem(
+                load, audit, response.url, f"HTTP {response.status}", "http_error"
+            )
+
+    page.on("response", on_response)
+
+    audit.event("navigate", url=url, wait_until=args.wait_until, timeout_ms=args.timeout)
+
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    try:
+        response = page.goto(url, wait_until=args.wait_until, timeout=args.timeout)
+    except PlaywrightTimeout:
+        raise BrowseError(
+            f"timed out after {args.timeout} ms loading {url}",
+            NAV_ERROR,
+            "raise --timeout, or use --wait-until domcontentloaded for a page "
+            "that never goes quiet.",
+        )
+    except PlaywrightError as exc:
+        raise BrowseError(
+            f"could not load {url}: {str(exc).splitlines()[0]}", NAV_ERROR
+        )
+
+    if args.settle:
+        page.wait_for_timeout(args.settle)
+
+    load.final_url = page.url
+    load.title = page.title()
+    if response is not None:
+        load.status = response.status
+        load.status_text = response.status_text
+        # Walk the chain backwards so a redirect into a login page is a fact in
+        # the output rather than something you notice by reading the pixels.
+        req = response.request.redirected_from
+        while req is not None:
+            load.redirects.insert(0, req.url)
+            req = req.redirected_from
+    return load
+
+
+def load_summary(load):
+    out = {
+        "requested_url": load.requested,
+        "final_url": load.final_url,
+        "status": load.status,
+        "status_text": load.status_text,
+        "title": load.title,
+    }
+    if load.redirects:
+        out["redirects"] = load.redirects
+    out["blocked"] = load.problems
+    return out
+
+
+def warn_about_problems(load):
+    """Same information as the JSON, on stderr, for the text-mode caller."""
+    if not load.problems:
+        return
+    note(f"warning: {len(load.problems)} subresource(s) did not load:")
+    for entry in load.problems[:10]:
+        note(f"  {entry['reason']:<34} {entry['url'][:110]}")
+    if len(load.problems) > 10:
+        note(f"  ... and {len(load.problems) - 10} more (see --output json)")
+    note("The rendering above is incomplete. Do not read it as the finished page.")
+    if load.redirects:
+        note(f"note: redirected from {load.redirects[0]}")
+
+
+# -- commands ---------------------------------------------------------------
+
+
+def parse_viewport(spec):
+    if spec in VIEWPORTS:
+        return spec, VIEWPORTS[spec]
+    if "x" in spec:
+        width, _, height = spec.partition("x")
+        if width.isdigit() and height.isdigit():
+            return spec, (int(width), int(height))
+    raise BrowseError(
+        f"unrecognised viewport {spec!r}",
+        VALIDATION_ERROR,
+        "use WIDTHxHEIGHT, or one of: " + ", ".join(VIEWPORTS),
+    )
+
+
+def suffixed(path, name):
+    """shot.png + 'phone' -> shot.phone.png, so several widths in one run do
+    not overwrite each other and the file names say which is which."""
+    path = Path(path)
+    return path.with_name(f"{path.stem}.{name}{path.suffix}")
+
+
+def cmd_screenshot(args, audit):
+    viewports = [parse_viewport(v) for v in (args.viewport or ["desktop"])]
+    out = Path(args.out)
+    if out.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        raise BrowseError(
+            f"{out} does not look like an image file",
+            VALIDATION_ERROR,
+            "name the output .png — an agent reads it back as an image.",
+        )
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    shots = []
+    with chromium(audit) as browser:
+        for name, (width, height) in viewports:
+            target = out if len(viewports) == 1 else suffixed(out, name)
+            context = browser.new_context(
+                viewport={"width": width, "height": height},
+                device_scale_factor=args.scale,
+            )
+            try:
+                page = context.new_page()
+                load = navigate(page, args.url, args, audit, Load(args.url))
+                page.screenshot(path=str(target), full_page=args.full_page)
+            finally:
+                # Per viewport, not at the end. Three contexts held open at
+                # once is three page's worth of resident memory for no reason.
+                with contextlib.suppress(Exception):
+                    context.close()
+            entry = load_summary(load)
+            entry.update(
+                {
+                    "path": str(target.resolve()),
+                    "viewport": f"{width}x{height}",
+                    "viewport_name": name,
+                    "full_page": bool(args.full_page),
+                    "bytes": target.stat().st_size if target.exists() else 0,
+                }
+            )
+            shots.append(entry)
+            audit.event(
+                "screenshot", path=str(target), viewport=f"{width}x{height}",
+                final_url=load.final_url, status=load.status,
+            )
+            if not args.json:
+                warn_about_problems(load)
+
+    if args.json:
+        return {"shots": shots}
+    lines = []
+    for shot in shots:
+        lines.append(
+            f"{shot['path']}  {shot['viewport']}"
+            f"{' full-page' if shot['full_page'] else ''}  "
+            f"{shot['bytes']} bytes"
+        )
+        lines.append(f"  {shot['status']} {shot['final_url']}")
+        if shot["blocked"]:
+            lines.append(f"  {len(shot['blocked'])} subresource(s) blocked")
+    return "\n".join(lines)
+
+
+def cmd_text(args, audit):
+    with chromium(audit) as browser:
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        try:
+            page = context.new_page()
+            load = navigate(page, args.url, args, audit, Load(args.url))
+            # innerText, not textContent: innerText is what the layout engine
+            # decided is visible, so it drops <script>, <style> and anything
+            # display:none, and keeps the line breaks a reader would see.
+            body = page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                context.close()
+
+    if args.json:
+        out = load_summary(load)
+        out["text"] = body
+        return out
+    warn_about_problems(load)
+    return body
+
+
+def cmd_html(args, audit):
+    with chromium(audit) as browser:
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        try:
+            page = context.new_page()
+            load = navigate(page, args.url, args, audit, Load(args.url))
+            markup = page.content()
+        finally:
+            with contextlib.suppress(Exception):
+                context.close()
+
+    if args.json:
+        out = load_summary(load)
+        out["html"] = markup
+        return out
+    warn_about_problems(load)
+    return markup
+
+
+def cmd_probe(args, audit):
+    with chromium(audit) as browser:
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        try:
+            page = context.new_page()
+            load = navigate(page, args.url, args, audit, Load(args.url))
+        finally:
+            with contextlib.suppress(Exception):
+                context.close()
+
+    summary = load_summary(load)
+    summary["hosts"] = sorted(audit.hosts)
+    if args.json:
+        return summary
+    warn_about_problems(load)
+    lines = [
+        f"status      {summary['status']} {summary['status_text'] or ''}".rstrip(),
+        f"final_url   {summary['final_url']}",
+        f"title       {summary['title'] or ''}",
+    ]
+    if summary.get("redirects"):
+        lines.append("redirects   " + " -> ".join(summary["redirects"] + [summary["final_url"]]))
+    lines.append("hosts       " + ", ".join(summary["hosts"]))
+    lines.append(f"blocked     {len(summary['blocked'])}")
+    return "\n".join(lines)
+
+
+COMMANDS = {
+    "screenshot": cmd_screenshot,
+    "text": cmd_text,
+    "html": cmd_html,
+    "probe": cmd_probe,
+}
+
+
+# -- argument parsing -------------------------------------------------------
+
+
+def add_common(sub, settle_default):
+    sub.add_argument("url")
+    sub.add_argument(
+        "--wait-until",
+        choices=["load", "domcontentloaded", "networkidle", "commit"],
+        default="load",
+        help=(
+            "default 'load'. NOT 'networkidle': a page with a blocked "
+            "subresource or a polling script never goes idle, so networkidle "
+            "turns a partial render into a timeout."
+        ),
+    )
+    sub.add_argument("--timeout", type=int, default=30000, metavar="MS")
+    sub.add_argument(
+        "--settle", type=int, default=settle_default, metavar="MS",
+        help="pause after load, for web fonts and entry animations",
+    )
+
+
+def build_parser():
+    parser = Parser(
+        prog="browse",
+        description="Drive a headless Chromium: screenshots, rendered text, "
+        "and where a URL actually ended up.",
+        epilog="Every navigation and every host contacted is logged. See --log.",
+    )
+    parser.add_argument(
+        "--output", choices=["auto", "json", "text"], default="auto",
+        help="default auto: text at a terminal, JSON into a pipe",
+    )
+    parser.add_argument(
+        "--log", default=os.environ.get("BROWSE_LOG", str(DEFAULT_LOG)),
+        metavar="PATH", help=f"navigation log, JSONL (default {DEFAULT_LOG})",
+    )
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    shot = subs.add_parser("screenshot", help="render a page to a PNG on disk")
+    add_common(shot, settle_default=500)
+    shot.add_argument("out", help="output image path, .png")
+    shot.add_argument(
+        "--viewport", action="append", metavar="SPEC",
+        help=(
+            "WIDTHxHEIGHT or a name (" + ", ".join(VIEWPORTS) + "). Repeatable: "
+            "several widths render in ONE browser and are written as "
+            "out.<name>.png. Default desktop."
+        ),
+    )
+    shot.add_argument(
+        "--full-page", action="store_true",
+        help="the whole scrollable document, not just the viewport",
+    )
+    shot.add_argument("--scale", type=float, default=1.0, metavar="N",
+                      help="device scale factor; 2 for retina-density text")
+
+    add_common(subs.add_parser("text", help="rendered text, after JavaScript"), 0)
+    add_common(subs.add_parser("html", help="serialised DOM, after JavaScript"), 0)
+    add_common(subs.add_parser("probe", help="final URL, status and hosts contacted"), 0)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.json = (
+        args.output == "json"
+        if args.output in ("json", "text")
+        else not sys.stdout.isatty()
+    )
+
+    audit = None
+    started = time.monotonic()
+    try:
+        audit = Audit(args.log)
+        audit.event(
+            "start", command=args.command, url=args.url,
+            argv=shlex.join(sys.argv[1:]), cwd=os.getcwd(),
+        )
+        with single_browser_lock():
+            result = COMMANDS[args.command](args, audit)
+    except BrowseError as exc:
+        if audit is not None:
+            audit.event("error", command=args.command, message=exc.message,
+                        exit_code=exc.code)
+        if args.json:
+            json.dump(exc.to_dict(), sys.stderr, indent=2, ensure_ascii=False)
+            sys.stderr.write("\n")
+        else:
+            note(f"error: {exc.message}")
+            if exc.remediation:
+                note(f"hint:  {exc.remediation}")
+        return exc.code
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if audit is not None:
+            audit.event(
+                "finish", command=args.command,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                hosts=audit.hosts,
+            )
+            audit.close()
+
+    if args.json:
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+    elif result:
+        sys.stdout.write(result.rstrip("\n") + "\n")
+    return OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
