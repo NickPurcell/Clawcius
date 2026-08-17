@@ -83,8 +83,13 @@ export type MailSnapshot = {
    * Not derived from the two lists above, and that is the point: a count taken
    * from a capped window undercounts the moment the cap bites, and it would do
    * so silently, on a number the page prints beside an agent's name.
+   *
+   * A `Map`, not an object literal: agent ids come from the board, and `{}`
+   * inherits from `Object.prototype`, so an id of `constructor` would answer a
+   * function to `?? 0`. No id looks like that today; a `Map` costs nothing and
+   * removes the question.
    */
-  sentByAuthor: Record<string, number>;
+  sentByAuthor: Map<string, number>;
   error: string | null;
 };
 
@@ -106,6 +111,12 @@ export type MailSnapshot = {
  * more machinery than 110 rows justify. It is not a silent truncation either:
  * each list carries its own `COUNT(*)` and the page says "showing N of M" when
  * they differ.
+ *
+ * Note that per-list means the worst case is 500 + 500 messages, so the ceiling
+ * on one instance's response is twice what one limit suggests: 1000 bodies at
+ * `maxBlockChars` is ~20 MB. Hamachi's whole board is 110 rows and 308 KB, so
+ * this is a direction-of-travel number rather than a live one — but it is the
+ * honest one.
  */
 const MESSAGE_LIMIT = 500;
 
@@ -132,7 +143,7 @@ export function readMail(
   // of a thousand. Nothing in the service passes it.
   limit: number = MESSAGE_LIMIT,
 ): MailSnapshot {
-  const empty = { feed: [], dms: [], totalFeed: 0, totalDms: 0, sentByAuthor: {} };
+  const empty = { feed: [], dms: [], totalFeed: 0, totalDms: 0, sentByAuthor: new Map() };
   if (dbPath === null) return { configured: false, ...empty, error: null };
 
   let db: DatabaseSync | undefined;
@@ -163,11 +174,11 @@ export function readMail(
     // Sender counts over the whole table, not over the window above. One
     // GROUP BY rather than tallying the rows we happened to return, so the
     // number beside an agent's name is its real one.
-    const sentByAuthor: Record<string, number> = {};
+    const sentByAuthor = new Map<string, number>();
     for (const row of db
       .prepare('SELECT author, COUNT(*) AS n FROM mail GROUP BY author')
       .all() as Array<Record<string, unknown>>) {
-      sentByAuthor[asString(row['author'])] = typeof row['n'] === 'number' ? row['n'] : 0;
+      sentByAuthor.set(asString(row['author']), typeof row['n'] === 'number' ? row['n'] : 0);
     }
 
     // One query for the read receipts rather than one per message. The table is

@@ -125,3 +125,18 @@ watch:
   # fs.watch is still set up: when it fires the update is instant and free.
   # It is just not trusted on its own. 0 disables the rescan.
   rescanSeconds: 10
+
+  # Seconds between board polls. 0 disables.
+  #
+  # The board is a single SQLite file and is in none of the watched directories,
+  # so without this the Clawsky page refreshes only when some unrelated
+  # transcript changes — and the host agent writes no transcripts under any
+  # projects root, so a DM to or from it would leave the page stale under a
+  # header correctly saying "live".
+  #
+  # Polled rather than watched on purpose. fs.watch would work here (the board
+  # is written by a host process, not from inside gVisor) but the board is in
+  # WAL mode and the waker touches last_active_at every turn, so a directory
+  # watch fires on writes rather than on changes. This asks the database for
+  # four integers instead.
+  boardPollSeconds: 10

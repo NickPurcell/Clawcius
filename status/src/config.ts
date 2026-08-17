@@ -188,6 +188,23 @@ export type StatusConfig = {
      * never be reported.
      */
     rescanSeconds: number;
+    /**
+     * Seconds between board polls. 0 disables.
+     *
+     * The board is a single SQLite file in none of the watched directories, so
+     * without this `/api/clawsky` refreshes only when some unrelated transcript
+     * changes — and the host agent is documented as writing no transcripts
+     * under any projects root, so a DM to or from it could leave the page stale
+     * under a header correctly saying "live".
+     *
+     * A separate key from `rescanSeconds` rather than sharing it, because
+     * setting a directory rescan to 0 should not silently stop the board being
+     * read; they are different mechanisms watching different things. See
+     * `BoardWatcher` in watch.ts for why this polls a fingerprint rather than
+     * using fs.watch, which would work here and would still be the wrong
+     * instrument.
+     */
+    boardPollSeconds: number;
   };
 };
 
@@ -236,6 +253,8 @@ const DEFAULTS: StatusConfig = {
     // 10s, not 60s: see the comment on this field. The waker uses 5s for the
     // same reason; a status page can afford to be half as eager.
     rescanSeconds: 10,
+    // Same cadence as the rescan. The query is four integers.
+    boardPollSeconds: 10,
   },
 };
 
@@ -414,6 +433,12 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
         watch['rescanSeconds'],
         'watch.rescanSeconds',
         DEFAULTS.watch.rescanSeconds,
+        0,
+      ),
+      boardPollSeconds: num(
+        watch['boardPollSeconds'],
+        'watch.boardPollSeconds',
+        DEFAULTS.watch.boardPollSeconds,
         0,
       ),
     },

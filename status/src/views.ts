@@ -492,6 +492,20 @@ async function summariseSession(
  */
 const oversizeWarned = new Set<string>();
 
+/**
+ * Forget which sessions have been warned about.
+ *
+ * Exported for tests only. The set is module state deliberately — the warning
+ * is once per process per session — but that makes any test asserting on it
+ * depend on no earlier test in the file having warned for the same fixture
+ * session id, and a fixture's session id is a constant. Without this, adding a
+ * test above that one turns its assertion into `warnings.length === 0` and the
+ * failure reads as the warning being broken rather than as ordering.
+ */
+export function resetOversizeWarnings(): void {
+  oversizeWarned.clear();
+}
+
 export async function buildSessionDetail(
   store: TranscriptStore,
   session: SessionRef,
@@ -868,6 +882,25 @@ export type ClawskyInstance = {
    * expected state — a checkable statement rather than a reassuring one.
    */
   posterCount: number;
+  /**
+   * True only when BOTH halves of the board were read.
+   *
+   * The gate on every positive statement the page makes about this board, and
+   * it exists because `posterCount: 0` has two meanings — "this crew has no
+   * poster" and "the registry could not be read" — and only the first licenses
+   * the sentence the page prints under an empty feed. Same for `dms: []`.
+   *
+   * It is decided here rather than in the client because it is the claim, not
+   * the layout: "there are no posts" and "we do not know whether there are
+   * posts" are different facts about the world, and a fact belongs on the wire
+   * where a test can see it.
+   *
+   * This is not a rare state. It is the one this page names itself — mail goes
+   * dark at exactly the moments the roster does, Clawcius #72 — so the reader
+   * met a careful explanation of why the board was unreadable followed by a
+   * confident "nothing is broken and nothing needs enabling".
+   */
+  boardReadable: boolean;
   feed: MailMessage[];
   dms: MailMessage[];
   /**
@@ -907,9 +940,10 @@ export function buildClawsky(agent: AgentRoot, config: StatusConfig): ClawskyIns
       lastActiveAt: row.lastActiveAt,
       // From the board's own GROUP BY, not from the returned window — a count
       // taken from a capped list undercounts silently the moment the cap bites.
-      sent: mail.sentByAuthor[row.id] ?? 0,
+      sent: mail.sentByAuthor.get(row.id) ?? 0,
     })),
     posterCount: registry.agents.filter((row) => row.role === 'poster').length,
+    boardReadable: registry.error === null && mail.error === null && registry.configured,
     feed: mail.feed,
     dms: mail.dms,
     totalFeed: mail.totalFeed,

@@ -48,6 +48,7 @@
 
 import { watch, type FSWatcher } from 'node:fs';
 import { existsSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 
 export type ChangeEvent = {
   /** Configured agent id whose root changed, or `oj`. */
@@ -203,6 +204,125 @@ export class RootWatcher {
         // One subscriber throwing — a client socket that died between the
         // write and the flush — must not stop the others being told.
       }
+    }
+  }
+}
+
+// ── The board ───────────────────────────────────────────────────────────────
+
+/**
+ * Noticing that the BOARD changed, which is a different problem.
+ *
+ * `RootWatcher` above watches directories, and the board is a single SQLite
+ * file in neither of them — so until this existed `/api/clawsky` refreshed only
+ * when some unrelated transcript happened to change. Mail delivery usually
+ * causes one, because it wakes an agent, but the host agent is documented as
+ * having no transcripts under any projects root at all: a DM to or from
+ * `<crew>-host` could leave the page stale under a header correctly reporting
+ * "live". A page whose data source is not watched is a stale page that looks
+ * current, which is Clawcius #14's complaint wearing different clothes.
+ *
+ * ── Polled, not watched, and the reason is not inotify ──────────────────────
+ *
+ * `fs.watch` would work here — unlike the transcript roots, the board is
+ * written by a host process rather than from inside gVisor, so events would
+ * actually arrive. It is still the wrong instrument. The board is in WAL mode,
+ * so every touch of `last_active_at` writes the `-wal` file, and the waker
+ * touches it on every turn: watching the directory means an event per write,
+ * where what the page needs to know is whether the TABLES changed. Those are
+ * not the same question, and one is a proxy for the other only by luck.
+ *
+ * So this asks the database instead. Four integers — the newest mail id, the
+ * mail row count, the agent row count and the newest `last_active_at` — which
+ * is exact rather than indicative, cheap enough to run on a timer, and covers
+ * the cases a file watch would miss for the same reason it covers the ones it
+ * would over-report: a row deleted and another inserted changes the count pair,
+ * and a `-wal` write that changed nothing this page shows changes none of them.
+ *
+ * Read-only and open-per-poll, exactly as `registry.ts` and `mail.ts` are, and
+ * failing the same way: an unreadable board yields no fingerprint and simply
+ * does not fire. The page is already able to say it could not read the board.
+ */
+export class BoardWatcher {
+  #boards: Array<{ scope: string; dbPath: string }>;
+  #seconds: number;
+  #timer: NodeJS.Timeout | null = null;
+  #last = new Map<string, string>();
+  #subscribers: Array<(event: ChangeEvent) => void> = [];
+
+  constructor(boards: Array<{ scope: string; dbPath: string }>, seconds: number) {
+    this.#boards = boards;
+    this.#seconds = seconds;
+  }
+
+  subscribe(handler: (event: ChangeEvent) => void): void {
+    this.#subscribers.push(handler);
+  }
+
+  start(): void {
+    if (this.#seconds <= 0 || this.#boards.length === 0) return;
+    // Fingerprint everything once without publishing, so the first poll after
+    // startup reports what changed since startup rather than announcing every
+    // board as changed to whoever is already watching.
+    for (const board of this.#boards) {
+      const seen = fingerprint(board.dbPath);
+      if (seen !== null) this.#last.set(board.scope, seen);
+    }
+    this.#timer = setInterval(() => this.#poll(), this.#seconds * 1000);
+    this.#timer.unref();
+  }
+
+  #poll(): void {
+    for (const board of this.#boards) {
+      const seen = fingerprint(board.dbPath);
+      if (seen === null) continue;
+      if (this.#last.get(board.scope) === seen) continue;
+      this.#last.set(board.scope, seen);
+      const event: ChangeEvent = {
+        scope: board.scope,
+        path: 'board',
+        at: Date.now(),
+        fromRescan: true,
+      };
+      for (const handler of this.#subscribers) handler(event);
+    }
+  }
+
+  stop(): void {
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = null;
+  }
+}
+
+/**
+ * Four integers that change when anything this page renders changes, or null
+ * when the board cannot be read.
+ *
+ * Counts as well as maxima on purpose: a maximum alone cannot see a deletion,
+ * and `MAX(id)` alone cannot see a row deleted and reinserted.
+ */
+function fingerprint(dbPath: string): string | null {
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db
+      .prepare(
+        `SELECT (SELECT COUNT(*)             FROM mail)   AS mailRows,
+                (SELECT IFNULL(MAX(id), 0)   FROM mail)   AS mailMax,
+                (SELECT COUNT(*)             FROM agents) AS agentRows,
+                (SELECT IFNULL(MAX(last_active_at), 0) FROM agents) AS agentSeen`,
+      )
+      .get() as Record<string, unknown>;
+    return [row['mailRows'], row['mailMax'], row['agentRows'], row['agentSeen']].join(':');
+  } catch {
+    // Unreadable, missing, or a board without these tables. Not this class's
+    // job to explain — the page already does, from its own read.
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* nothing useful to do about a failed close */
     }
   }
 }

@@ -258,12 +258,20 @@ test('descriptions and workflow prose are redacted, like every other rendered st
   assert.doesNotMatch(described.description, /ghp_A{36}/);
 });
 
-test('metadata prose is capped, so a label cannot be a document', async () => {
+test('metadata prose is capped, and says where it cut', async () => {
   const { store, agent } = fixture({ hugeSummary: true });
   const { sessions } = await store.sessions(agent);
   const run = (await store.workflowRuns(sessions[0])).get(RUN);
 
-  assert.equal(run.summary.length, 2000);
+  assert.equal(run.summary.length, 2001);
+  // Marked, not silent. Everything else here that shortens says so, and a body
+  // cut without a marker is one the reader believes is complete.
+  assert.equal(run.summary.endsWith('…'), true);
+
+  // And a label under the cap is left exactly alone — no marker on prose that
+  // was not cut.
+  const short = (await store.workflowRuns((await store.sessions(agent)).sessions[0])).get(RUN);
+  assert.equal(short.name, 'sudoers-audit');
 });
 
 test('the session tree carries the workflow agents too, labelled by their run', async () => {
@@ -312,6 +320,13 @@ test('the default index cache is larger than the largest session on this host', 
 });
 
 test('a session that does not fit the cache says so, once, naming the number to raise', async () => {
+  const { resetOversizeWarnings } = await import('../dist/views.js');
+  // Module state, shared by every test in this file. Without this reset the
+  // assertion below depends on no earlier test having warned for the same
+  // fixture session id — which is a constant — and the failure would read as
+  // the warning being broken rather than as ordering.
+  resetOversizeWarnings();
+
   const { config, store, agent, now } = fixture();
   const { sessions } = await store.sessions(agent);
   const tiny = { ...config, read: { ...config.read, maxCachedSessions: 2 } };

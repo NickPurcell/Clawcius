@@ -136,12 +136,19 @@ export function redact(text: string): string {
  * The cap is fixed rather than configurable. These are labels — a description
  * and a one-line summary — not documents, and `read.maxBlockChars` is about a
  * transcript page. Anything longer than this is not a label any more.
+ *
+ * It marks where it cut. Generous as the cap is — the longest description
+ * across all 104 sidecars on this host is 49 characters and the real workflow
+ * summary is 90 — a body that is shortened silently is a body the reader
+ * believes is complete, and everything else here that shortens says so:
+ * transcript blocks render "… truncated", mail carries `bodyTruncated`.
  */
 const MAX_META_CHARS = 2000;
 
 function metaText(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  return redact(value).slice(0, MAX_META_CHARS);
+  const safe = redact(value);
+  return safe.length <= MAX_META_CHARS ? safe : `${safe.slice(0, MAX_META_CHARS)}…`;
 }
 
 /**

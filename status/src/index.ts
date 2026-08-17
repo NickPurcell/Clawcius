@@ -52,7 +52,7 @@ import {
   buildSessionDetail,
   buildSubagentRollup,
 } from './views.js';
-import { RootWatcher, type ChangeEvent } from './watch.js';
+import { BoardWatcher, RootWatcher, type ChangeEvent } from './watch.js';
 
 const config = loadStatusConfig();
 const store = new TranscriptStore(config);
@@ -137,10 +137,26 @@ const watcher = new RootWatcher(
 );
 watcher.start();
 
+/**
+ * The boards, which no directory watch covers.
+ *
+ * Separate from `RootWatcher` because it answers a different question with a
+ * different instrument — see the header on `BoardWatcher`. Its events go to the
+ * same subscribers, so a change on the board refreshes the page exactly as a
+ * transcript write does.
+ */
+const boardWatcher = new BoardWatcher(
+  config.agents
+    .filter((agent) => agent.boardDb !== null)
+    .map((agent) => ({ scope: agent.id, dbPath: agent.boardDb as string })),
+  config.watch.boardPollSeconds,
+);
+boardWatcher.start();
+
 /** Open SSE clients. Held so shutdown can close them rather than drop them. */
 const streams = new Set<ServerResponse>();
 
-watcher.subscribe((event: ChangeEvent) => {
+const publishChange = (event: ChangeEvent): void => {
   const frame = `event: change\ndata: ${JSON.stringify(event)}\n\n`;
   for (const stream of streams) {
     // No error handling around the write on purpose: a client that has gone
@@ -148,7 +164,10 @@ watcher.subscribe((event: ChangeEvent) => {
     // socket is a no-op, not a throw.
     stream.write(frame);
   }
-});
+};
+
+watcher.subscribe(publishChange);
+boardWatcher.subscribe(publishChange);
 
 /**
  * The heartbeat.
@@ -427,6 +446,7 @@ function shutdown(signal: string): void {
   console.log(`[status] ${signal} — closing`);
   clearInterval(heartbeat);
   watcher.stop();
+  boardWatcher.stop();
   // SSE connections are long-lived by definition, so `server.close()` alone
   // would wait forever for them. Ending them explicitly is what makes a
   // `systemctl restart` take a moment rather than a TimeoutStopSec.

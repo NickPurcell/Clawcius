@@ -1211,12 +1211,20 @@ async function viewClawsky() {
       frag.append(text('div', 'warning-row', instance.mailError));
     }
 
+    // Every number and every sentence below is gated on this. `posterCount: 0`
+    // means "no poster" when the board was read and "we did not get to look"
+    // when it was not, and only the first licenses the copy under an empty
+    // feed. The server decides it — see `boardReadable` in views.ts — so the
+    // claim is on the wire where a test can see it, rather than being a shape
+    // this file happens to draw.
+    const readable = instance.boardReadable;
+
     frag.append(
       el('div', { class: 'tiles' }, [
         tile(
           'Participants',
-          fmtCount(instance.participants.length),
-          `${instance.posterCount} poster(s)`,
+          readable ? fmtCount(instance.participants.length) : '—',
+          readable ? `${instance.posterCount} poster(s)` : 'board unreadable',
         ),
         // Each list carries its own total, so each can say when it is showing
         // a window rather than everything. The feed used to have no such
@@ -1225,22 +1233,26 @@ async function viewClawsky() {
         // unmentioned ceiling is a lie waiting for the row count to grow.
         tile(
           'Posts',
-          fmtCount(instance.totalFeed),
-          instance.totalFeed > instance.feed.length
-            ? `showing the newest ${instance.feed.length}`
-            : 'on the feed',
+          readable ? fmtCount(instance.totalFeed) : '—',
+          !readable
+            ? 'not read'
+            : instance.totalFeed > instance.feed.length
+              ? `showing the newest ${instance.feed.length}`
+              : 'on the feed',
         ),
         tile(
           'DMs',
-          fmtCount(instance.totalDms),
-          instance.totalDms > instance.dms.length
-            ? `showing the newest ${instance.dms.length}`
-            : 'agent to agent',
+          readable ? fmtCount(instance.totalDms) : '—',
+          !readable
+            ? 'not read'
+            : instance.totalDms > instance.dms.length
+              ? `showing the newest ${instance.dms.length}`
+              : 'agent to agent',
         ),
       ]),
     );
 
-    if (instance.participants.length > 0) {
+    if (readable && instance.participants.length > 0) {
       const chips = el('div', { class: 'chips' });
       for (const participant of instance.participants) {
         chips.append(
@@ -1253,12 +1265,26 @@ async function viewClawsky() {
     }
 
     frag.append(el('h3', {}, ['Feed']));
-    if (instance.feed.length === 0) {
-      // `totalFeed` is counted in SQL over the whole table, so "no posts" here
-      // means no posts, not "none in the window I asked for".
-      // Not an empty box. Only a poster may write to the feed (src/mail.ts),
-      // and `posterCount` is read from the registry — so when it is zero this
-      // says the feed CANNOT have posts rather than that it happens not to.
+    if (!readable) {
+      // The explanation is gated on having read the thing it explains. This is
+      // the state the page names itself — mail goes dark exactly when the
+      // roster does (#72) — so it is where a confident "nothing is broken"
+      // would be read, and it is the one place it must not appear.
+      frag.append(
+        text(
+          'p',
+          'placeholder',
+          'Unknown: the board could not be read, so whether this crew has posted is not ' +
+            'something this page knows. The reason is in the warning above.',
+        ),
+      );
+    } else if (instance.feed.length === 0) {
+      // `totalFeed` is counted in SQL over the whole table and the feed query
+      // has its own limit, so "no posts" here means no posts — not "none in
+      // the window I asked for". Only a poster may write to the feed
+      // (src/mail.ts), and `posterCount` came from a successful registry read,
+      // so this says the feed CANNOT have posts rather than that it happens
+      // not to.
       frag.append(
         text(
           'p',
@@ -1276,7 +1302,17 @@ async function viewClawsky() {
     }
 
     frag.append(el('h3', {}, ['Direct messages']));
-    if (instance.dms.length === 0) {
+    if (!readable) {
+      // "No DMs yet" and "the board could not be read" are different sentences.
+      frag.append(
+        text(
+          'p',
+          'placeholder',
+          'Unknown: the board could not be read, so this page cannot say whether there are ' +
+            'any.',
+        ),
+      );
+    } else if (instance.dms.length === 0) {
       frag.append(text('p', 'placeholder', 'No DMs on this board yet.'));
     } else {
       for (const message of instance.dms) frag.append(mailCard(message));

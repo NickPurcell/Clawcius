@@ -173,7 +173,9 @@ test('sender counts come from the whole table, not from the returned window', ()
   assert.equal(snapshot.dms.length, 2, 'the window is doing its job');
   // Counted with GROUP BY over all six. Tallying the two returned rows would
   // print "2 sent" beside an agent that sent six, and print it confidently.
-  assert.equal(snapshot.sentByAuthor['hamachi-host'], 6);
+  // A Map, not an object literal — an agent id of `constructor` would answer
+  // a function to `?? 0` from a `{}`.
+  assert.equal(snapshot.sentByAuthor.get('hamachi-host'), 6);
 });
 
 test('a long body is cut and says so, rather than stopping silently', () => {
@@ -266,4 +268,65 @@ test('a crew with a poster and no posts is a different statement', () => {
   const clawsky = buildClawsky(agent, config);
   assert.equal(clawsky.posterCount, 1);
   assert.deepEqual(clawsky.feed, []);
+});
+
+/**
+ * The gate on every positive statement the Clawsky page makes.
+ *
+ * `posterCount: 0` has two meanings — "this crew has no poster" and "the
+ * registry could not be read" — and only the first licenses the copy the page
+ * prints under an empty feed:
+ *
+ *   "Empty, and that is correct… this crew has none… Nothing is broken and
+ *    nothing needs enabling."
+ *
+ * Under an unreadable board that is three claims, none of them known, printed
+ * directly beneath a warning row explaining that the board could not be read.
+ * And it is not a rare state: it is the one this page names itself, since mail
+ * goes dark at exactly the moments the roster does (Clawcius #72).
+ *
+ * So the decision is a field on the wire rather than a shape the client
+ * happens to draw, and it is asserted here.
+ */
+test('a board that cannot be read is not reported as a board with nothing on it', () => {
+  const config = statusConfig();
+  const path = join(mkdtempSync(join(tmpdir(), 'status-mail-')), 'notadb.db');
+  writeFileSync(path, 'this is not a database, it is a file with words in it, at some length');
+
+  const clawsky = buildClawsky({ ...config.agents[0], boardDb: path }, config);
+
+  assert.equal(clawsky.boardReadable, false);
+  assert.notEqual(clawsky.mailError, null);
+  // The counts are all zero, and every one of them is meaningless. That is the
+  // whole point: the numbers alone cannot tell the page which state it is in.
+  assert.equal(clawsky.posterCount, 0);
+  assert.deepEqual(clawsky.feed, []);
+  assert.deepEqual(clawsky.dms, []);
+});
+
+test('a board with no boardDb at all is also not readable', () => {
+  const config = statusConfig();
+  const clawsky = buildClawsky({ ...config.agents[0], boardDb: null }, config);
+
+  assert.equal(clawsky.boardReadable, false);
+  assert.equal(clawsky.registryConfigured, false);
+  // No error, because nothing failed — it was never configured. Still not a
+  // licence to say the feed is empty.
+  assert.equal(clawsky.mailError, null);
+});
+
+test('a board that reads is readable, and only then', () => {
+  const config = statusConfig();
+  const agent = {
+    ...config.agents[0],
+    boardDb: board({
+      agents: [{ id: 'hamachi-coordinator', role: 'coordinator' }],
+      messages: [{ author: 'hamachi-coordinator', recipient: 'hamachi-host', body: 'run it' }],
+    }),
+  };
+
+  const clawsky = buildClawsky(agent, config);
+  assert.equal(clawsky.boardReadable, true);
+  assert.equal(clawsky.registryError, null);
+  assert.equal(clawsky.mailError, null);
 });
