@@ -24,6 +24,7 @@
 
 import { stat } from 'node:fs/promises';
 import type { AgentRoot, LivenessConfig, StatusConfig } from './config.js';
+import { readMail, type MailMessage } from './mail.js';
 import { readRegistry, type RegistryAgent } from './registry.js';
 import {
   describeFsError,
@@ -32,6 +33,7 @@ import {
   type SubagentRef,
   type TranscriptIndex,
   type TranscriptStore,
+  type WorkflowRun,
 } from './transcripts.js';
 
 export type Liveness = 'running' | 'idle' | 'stale' | 'unknown';
@@ -115,6 +117,15 @@ export type SubagentNode = {
    * different claims and the reader deserves to know which one they have.
    */
   linkage: 'meta' | 'tool-result' | 'orphan';
+  /**
+   * The workflow run this came from, and that run's name.
+   *
+   * A workflow subagent has no `description` at all, so without these the
+   * swimlane draws an anonymous bar per agent — six of them here, fifty-eight
+   * on the real session. The run is what they were for, and the lane says so.
+   */
+  workflowRunId: string | null;
+  workflowName: string | null;
   children: SubagentNode[];
 };
 
@@ -471,6 +482,30 @@ async function summariseSession(
  * is reported as an orphan and still listed — a tree that quietly drops
  * branches it cannot explain is worse than one that admits to a loose end.
  */
+/**
+ * Sessions already warned about, so the log below fires once each per process.
+ *
+ * A cliff that is silent is a cliff nobody fixes. Not a Map with timestamps:
+ * this is a boot-time configuration problem, and saying it once per session is
+ * what makes it findable in the journal without becoming noise the next reader
+ * filters out.
+ */
+const oversizeWarned = new Set<string>();
+
+/**
+ * Forget which sessions have been warned about.
+ *
+ * Exported for tests only. The set is module state deliberately — the warning
+ * is once per process per session — but that makes any test asserting on it
+ * depend on no earlier test in the file having warned for the same fixture
+ * session id, and a fixture's session id is a constant. Without this, adding a
+ * test above that one turns its assertion into `warnings.length === 0` and the
+ * failure reads as the warning being broken rather than as ordering.
+ */
+export function resetOversizeWarnings(): void {
+  oversizeWarned.clear();
+}
+
 export async function buildSessionDetail(
   store: TranscriptStore,
   session: SessionRef,
@@ -480,6 +515,27 @@ export async function buildSessionDetail(
   const summary = await summariseSession(store, session, config, now);
   const sessionIndex = await store.index(session.transcriptPath);
   const subagentRefs = await store.subagents(session);
+
+  // One session is its own transcript plus one per subagent, and this walk
+  // touches all of them in order. If that exceeds the LRU, every pass evicts
+  // exactly what the next pass asks for first and the cache stops working
+  // rather than working less well — measured at 786ms per rebuild instead of
+  // 107ms, on a page that rebuilds on every change event.
+  //
+  // Reported rather than worked around: raising the ceiling is a config change
+  // with a memory cost, which is the operator's, and a page that quietly ran
+  // seven times slower is how this went unnoticed in the first place.
+  const needed = subagentRefs.length + 1;
+  if (needed > config.read.maxCachedSessions && !oversizeWarned.has(session.sessionId)) {
+    oversizeWarned.add(session.sessionId);
+    console.warn(
+      `[status] session ${session.sessionId} has ${needed} transcripts and ` +
+        `read.maxCachedSessions is ${config.read.maxCachedSessions}. Every rebuild of this ` +
+        'session will re-parse all of them — the cache cannot hold one pass, so it evicts ' +
+        'what the next pass needs. Raise read.maxCachedSessions above ' +
+        `${needed} in status-config.yaml.`,
+    );
+  }
 
   // toolUseId -> the spawn, plus which transcript made the call. The session's
   // own spawns are attributed to the root (null).
@@ -521,9 +577,13 @@ export async function buildSessionDetail(
     (ref.meta?.toolUseId ? spawnsByToolUse.get(ref.meta.toolUseId) : undefined) ??
     spawnsByAgentId.get(ref.agentId);
 
+  const runs = await store.workflowRuns(session);
   const nodes = new Map<string, SubagentNode>();
   for (const ref of subagentRefs) {
-    nodes.set(ref.agentId, buildNode(ref, indexes.get(ref.agentId), spawnFor(ref), now, config));
+    nodes.set(
+      ref.agentId,
+      buildNode(ref, indexes.get(ref.agentId), spawnFor(ref), now, config, runs),
+    );
   }
 
   // Second pass for parents, so a child indexed before its parent still links.
@@ -613,6 +673,7 @@ function buildNode(
   fromToolUse: OwnedSpawn | undefined,
   now: number,
   config: StatusConfig,
+  runs: Map<string, WorkflowRun>,
 ): SubagentNode {
   const role = ref.meta?.agentType ?? fromToolUse?.spawn.subagentType ?? 'unknown';
   const description = ref.meta?.description ?? fromToolUse?.spawn.description ?? '';
@@ -640,8 +701,255 @@ function buildNode(
     sizeBytes: ref.size,
     malformedLines: index?.malformedLines ?? 0,
     linkage: ref.meta ? 'meta' : 'orphan',
+    workflowRunId: ref.workflowRunId,
+    workflowName: ref.workflowRunId ? (runs.get(ref.workflowRunId)?.name ?? null) : null,
     children: [],
   };
 }
 
 export { describeFsError };
+
+// ── Subagents ───────────────────────────────────────────────────────────────
+
+/**
+ * One subagent, as a thing in its own right rather than a node in one session's
+ * tree.
+ *
+ * The session view already draws the tree — who spawned whom, over a time axis
+ * — and answers "what happened in this run". It cannot answer "what kinds of
+ * agent does this system run, and where is the transcript of the one that died
+ * at 4am", because you have to know which session to open first. That is
+ * Clawcius #22, and it is what this roll-up is for.
+ *
+ * DELIBERATELY NOT INDEXED. Every field here comes from a `readdir`, a `stat`
+ * and a sidecar JSON read. There are 104 subagent transcripts under Hamachi's
+ * root today and parsing all of them to put turn counts on a list view would
+ * make the cheapest question the most expensive one — the same reasoning as
+ * `buildAgentOverview`. Open one and the session view indexes it properly.
+ */
+export type SubagentEntry = {
+  agentId: string;
+  sessionId: string;
+  /** `agentType` from the sidecar — the ROLE. `unknown` when there is none. */
+  role: string;
+  description: string;
+  model: string | null;
+  depth: number | null;
+  parentAgentId: string | null;
+  /** Non-null when this came from `subagents/workflows/<runId>/`. */
+  workflowRunId: string | null;
+  /**
+   * The run's name, when its descriptor is on disk.
+   *
+   * Carried because a workflow subagent's sidecar has no description at all —
+   * it is `{agentType: "workflow-subagent", spawnDepth: 1}` and identical on
+   * every one of them. Without this the list renders 58 rows reading "no
+   * description recorded", which is true of the sidecar and useless to a
+   * reader when the answer is one join away. It is the RUN's name, and the UI
+   * labels it as such rather than passing it off as this agent's own.
+   */
+  workflowName: string | null;
+  sizeBytes: number;
+  lastActivity: string;
+  /** Still being written to, by mtime. */
+  active: boolean;
+};
+
+export type RoleGroup = {
+  role: string;
+  count: number;
+  subagents: SubagentEntry[];
+};
+
+export type WorkflowSummary = WorkflowRun & {
+  sessionId: string;
+  /** Transcripts actually on disk for this run — not the descriptor's claim. */
+  observedAgents: number;
+};
+
+export type SubagentRollup = {
+  agent: string;
+  label: string;
+  total: number;
+  /** Of those, how many came from a workflow run rather than a direct spawn. */
+  fromWorkflows: number;
+  roles: RoleGroup[];
+  workflows: WorkflowSummary[];
+  error: string | null;
+};
+
+/**
+ * Every subagent this instance has ever run, grouped by role.
+ *
+ * Roles are ordered by how many there are, because the question the page is
+ * answering is "what does this system spend its subagents on". Within a role
+ * the newest is first, because the question after that is always "what was the
+ * last one doing".
+ */
+export async function buildSubagentRollup(
+  store: TranscriptStore,
+  agent: AgentRoot,
+  config: StatusConfig,
+  now: number,
+): Promise<SubagentRollup> {
+  const { sessions, error } = await store.sessions(agent);
+
+  const entries: SubagentEntry[] = [];
+  const workflows: WorkflowSummary[] = [];
+  const observed = new Map<string, number>();
+  const runNames = new Map<string, string | null>();
+
+  for (const session of sessions) {
+    const refs = await store.subagents(session);
+    const runs = await store.workflowRuns(session);
+    for (const run of runs.values()) {
+      runNames.set(run.runId, run.name);
+      workflows.push({ ...run, sessionId: session.sessionId, observedAgents: 0 });
+    }
+
+    for (const ref of refs) {
+      if (ref.workflowRunId) {
+        observed.set(ref.workflowRunId, (observed.get(ref.workflowRunId) ?? 0) + 1);
+      }
+      entries.push({
+        agentId: ref.agentId,
+        sessionId: session.sessionId,
+        role: ref.meta?.agentType ?? 'unknown',
+        description: ref.meta?.description ?? '',
+        model: ref.meta?.model ?? null,
+        depth: ref.meta?.spawnDepth ?? null,
+        parentAgentId: ref.meta?.parentAgentId ?? null,
+        workflowRunId: ref.workflowRunId,
+        workflowName: ref.workflowRunId ? (runNames.get(ref.workflowRunId) ?? null) : null,
+        sizeBytes: ref.size,
+        lastActivity: new Date(ref.mtimeMs).toISOString(),
+        active: clampSeconds(ref.mtimeMs, now) <= config.liveness.runningSeconds,
+      });
+    }
+  }
+
+  for (const run of workflows) run.observedAgents = observed.get(run.runId) ?? 0;
+
+  const byRole = new Map<string, SubagentEntry[]>();
+  for (const entry of entries) {
+    const group = byRole.get(entry.role);
+    if (group) group.push(entry);
+    else byRole.set(entry.role, [entry]);
+  }
+
+  const roles: RoleGroup[] = [...byRole.entries()]
+    .map(([role, group]) => {
+      group.sort((a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity));
+      return { role, count: group.length, subagents: group };
+    })
+    .sort((a, b) => b.count - a.count || a.role.localeCompare(b.role));
+
+  workflows.sort((a, b) => Date.parse(b.startedAt ?? '') - Date.parse(a.startedAt ?? ''));
+
+  return {
+    agent: agent.id,
+    label: agent.label,
+    total: entries.length,
+    fromWorkflows: entries.filter((entry) => entry.workflowRunId !== null).length,
+    roles,
+    workflows,
+    error,
+  };
+}
+
+// ── Clawsky ─────────────────────────────────────────────────────────────────
+
+export type ClawskyParticipant = {
+  id: string;
+  crew: string;
+  role: string;
+  declaredStatus: string;
+  lastActiveAt: string | null;
+  /** Messages this agent has sent, across DMs and the feed. */
+  sent: number;
+};
+
+export type ClawskyInstance = {
+  agent: string;
+  label: string;
+  participants: ClawskyParticipant[];
+  /**
+   * Registry rows whose role is `poster`.
+   *
+   * Carried so the page can say WHY the feed is empty rather than showing an
+   * empty box that reads as a fault. Only a poster may write to the feed
+   * (`src/mail.ts`), so zero posters means an empty feed is the correct and
+   * expected state — a checkable statement rather than a reassuring one.
+   */
+  posterCount: number;
+  /**
+   * True only when BOTH halves of the board were read.
+   *
+   * The gate on every positive statement the page makes about this board, and
+   * it exists because `posterCount: 0` has two meanings — "this crew has no
+   * poster" and "the registry could not be read" — and only the first licenses
+   * the sentence the page prints under an empty feed. Same for `dms: []`.
+   *
+   * It is decided here rather than in the client because it is the claim, not
+   * the layout: "there are no posts" and "we do not know whether there are
+   * posts" are different facts about the world, and a fact belongs on the wire
+   * where a test can see it.
+   *
+   * This is not a rare state. It is the one this page names itself — mail goes
+   * dark at exactly the moments the roster does, Clawcius #72 — so the reader
+   * met a careful explanation of why the board was unreadable followed by a
+   * confident "nothing is broken and nothing needs enabling".
+   */
+  boardReadable: boolean;
+  feed: MailMessage[];
+  dms: MailMessage[];
+  /**
+   * Rows in the table per list, whether or not they were returned.
+   *
+   * Per list, because the ceiling is per list. A single overall total could
+   * not tell the page whether the feed it is about to call empty is empty or
+   * merely off the end of a window — which is the difference between the copy
+   * being true and being a lie with a reassuring tone.
+   */
+  totalFeed: number;
+  totalDms: number;
+  registryConfigured: boolean;
+  registryError: string | null;
+  mailError: string | null;
+};
+
+/**
+ * The board, for one instance: who is on it and everything they have said.
+ *
+ * Two reads of the same file, because they are two questions and either can
+ * fail on its own — a board whose `mail` table is missing still has a useful
+ * registry, and the page should say which half it lost.
+ */
+export function buildClawsky(agent: AgentRoot, config: StatusConfig): ClawskyInstance {
+  const registry = readRegistry(agent.boardDb);
+  const mail = readMail(agent.boardDb, config.read.maxBlockChars);
+
+  return {
+    agent: agent.id,
+    label: agent.label,
+    participants: registry.agents.map((row) => ({
+      id: row.id,
+      crew: row.crew,
+      role: row.role,
+      declaredStatus: row.declaredStatus,
+      lastActiveAt: row.lastActiveAt,
+      // From the board's own GROUP BY, not from the returned window — a count
+      // taken from a capped list undercounts silently the moment the cap bites.
+      sent: mail.sentByAuthor.get(row.id) ?? 0,
+    })),
+    posterCount: registry.agents.filter((row) => row.role === 'poster').length,
+    boardReadable: registry.error === null && mail.error === null && registry.configured,
+    feed: mail.feed,
+    dms: mail.dms,
+    totalFeed: mail.totalFeed,
+    totalDms: mail.totalDms,
+    registryConfigured: registry.configured,
+    registryError: registry.error,
+    mailError: mail.error,
+  };
+}

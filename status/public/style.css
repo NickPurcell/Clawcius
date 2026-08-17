@@ -74,10 +74,23 @@ a:hover {
 
 /* ── Chrome ──────────────────────────────────────────────────────────────── */
 
+/*
+ * Wraps, because the tab list grows.
+ *
+ * This was a nowrap flex row with a fixed 24px gap, sized when there were two
+ * tabs. Adding a third — Clawsky — pushed it 13px past a 380px viewport: the
+ * liveness indicator was clipped mid-word and the whole DOCUMENT became 393px
+ * wide, so every view inherited a horizontal scrollbar from the header alone.
+ * Exactly what the fifth stat tile did to the overview card, one level up.
+ *
+ * A header that grows a tab per view is a header that has to reflow, so the
+ * gap collapses before anything is allowed to overflow.
+ */
 .topbar {
   display: flex;
   align-items: center;
-  gap: 24px;
+  flex-wrap: wrap;
+  gap: 10px 24px;
   padding: 10px 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--grid);
@@ -108,7 +121,11 @@ a:hover {
 .tabs {
   display: flex;
   gap: 4px;
-  flex: 1;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  /* Without this a flex item refuses to shrink below its content, which is how
+     the row overflowed rather than wrapping in the first place. */
+  min-width: 0;
 }
 
 .tab {
@@ -132,6 +149,7 @@ a:hover {
 .stream {
   display: flex;
   align-items: center;
+  flex: none;
   gap: 7px;
   font-size: 12px;
   color: var(--ink-secondary);
@@ -848,4 +866,119 @@ a.chip:hover {
 
 .tooltip dd:last-child {
   margin-bottom: 0;
+}
+
+/* ── Subagents ───────────────────────────────────────────────────────────── */
+
+.subagent-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.subagent {
+  border-left: 2px solid var(--grid);
+  padding: 4px 0 4px 10px;
+}
+
+.subagent[data-active="true"] {
+  border-left-color: var(--good);
+}
+
+.subagent-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.subagent-desc {
+  color: var(--ink-secondary);
+  margin-top: 2px;
+  /* Task descriptions are a sentence, not a token; they must wrap rather than
+     do what the session table did and set the width of the document. */
+  overflow-wrap: anywhere;
+}
+
+.phases {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--ink-secondary);
+}
+
+.phases li {
+  margin-bottom: 4px;
+}
+
+.phases .lane-desc {
+  margin-left: 8px;
+  color: var(--ink-muted);
+}
+
+/* ── Clawsky ─────────────────────────────────────────────────────────────── */
+
+.mail {
+  background: var(--surface);
+  border: 1px solid var(--grid);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-top: 10px;
+}
+
+.mail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.mail-author {
+  font-weight: 620;
+  color: var(--ink);
+}
+
+.mail-arrow {
+  color: var(--baseline);
+}
+
+.mail-to {
+  color: var(--ink-secondary);
+}
+
+.mail-subject {
+  margin-top: 6px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * A message body is the longest untrusted string on the page and the reason
+ * this view exists is to read it.
+ *
+ * `pre-wrap` + `overflow-wrap: anywhere` so an unbroken 400-character URL from
+ * a pull request wraps instead of setting the width of the document — the
+ * failure the session tables had at 380px. `max-height` keeps one long message
+ * from burying the next; the region scrolls and carries tabindex so a keyboard
+ * can reach it.
+ */
+.mail-body {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: var(--plane);
+  border-radius: var(--radius);
+  color: var(--ink-secondary);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22em;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.mail-body:focus-visible {
+  outline: 2px solid var(--series-1);
+  outline-offset: 2px;
 }

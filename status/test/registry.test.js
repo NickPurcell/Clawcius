@@ -294,7 +294,12 @@ test('a WAL board nothing holds open reports that, without naming a daemon', { s
     assert.match(snapshot.error, /ProtectSystem=strict/);
     // And it says the transcripts are unaffected, because they are: they are
     // read off disk and do not go through SQLite at all.
-    assert.match(snapshot.error, /Transcripts below are unaffected/);
+    //
+    // "Transcripts are", not "Transcripts below are": this sentence is now
+    // also shown on the Clawsky page, where there is nothing below it. A
+    // message that describes the layout it is rendered in is a message that
+    // goes wrong the first time it is rendered somewhere else.
+    assert.match(snapshot.error, /Transcripts are unaffected/);
     // The observation, not a conclusion about which daemon. `normally` is
     // allowed — asserting one is down is not.
     assert.doesNotMatch(snapshot.error, /waker (for this instance )?is down/);

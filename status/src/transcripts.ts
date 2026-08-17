@@ -1,18 +1,33 @@
 /**
  * Reading Claude Code transcripts off local disk.
  *
- * The on-disk shape, as it actually is on this host (verified 2026-08-08
- * against /var/lib/hamachi/agent-home/projects):
+ * The on-disk shape, as it actually is on this host (verified 2026-08-08 and
+ * re-counted 2026-08-17 against /var/lib/hamachi/agent-home/projects):
  *
  *     <projectsRoot>/
  *       <slugified-cwd>/                      e.g. -var-lib-hamachi-workspaces-146707…
  *         <sessionId>.jsonl                   the main transcript
  *         <sessionId>/
  *           subagents/
- *             agent-<agentId>.jsonl           one per spawned subagent
+ *             agent-<agentId>.jsonl           one per directly spawned subagent
  *             agent-<agentId>.meta.json       {agentType, description, toolUseId,
  *                                              parentAgentId?, spawnDepth, model?}
+ *             workflows/
+ *               <runId>/                      wf_4f93cd23-af9
+ *                 agent-<agentId>.jsonl       one per subagent of that RUN
+ *                 agent-<agentId>.meta.json   {agentType: "workflow-subagent",
+ *                                              spawnDepth} — and nothing else
+ *                 journal.jsonl               the run's own log, not an agent
+ *           workflows/
+ *             <runId>.json                    {workflowName, summary, status,
+ *                                              agentCount, durationMs, startTime,
+ *                                              phases[{title, detail}]}
  *           tool-results/                     spilled tool output, not read here
+ *
+ * The `subagents/workflows/` level is easy to miss and is where MOST of them
+ * are: 58 of the 104 subagent transcripts under Hamachi's root on 2026-08-17.
+ * This file read only the first level until then, so every subagent count it
+ * printed was a little over half the real one.
  *
  * Every line is one JSON object. Most carry the conversation
  * (`type: user | assistant | attachment`), some are operational records with a
@@ -41,7 +56,7 @@
  * produce an index that is silently wrong about every offset in it.
  */
 
-import { createReadStream } from 'node:fs';
+import { createReadStream, type Dirent } from 'node:fs';
 import { open, readdir, readFile, stat } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 import type { AgentRoot, ReadConfig, StatusConfig } from './config.js';
@@ -104,6 +119,39 @@ export function redact(text: string): string {
 }
 
 /**
+ * Prose out of a sidecar or a workflow descriptor, made safe to render.
+ *
+ * `redact` plus a cap, in one place, for the same reason `truncate` exists
+ * below: there should be one function that turns metadata into renderable text
+ * so "did we remember to redact that one" has a single answer.
+ *
+ * It did not have one. A subagent's `description` and a workflow's
+ * `workflowName`, `summary` and `phases[].detail` went out untouched while
+ * mail bodies, transcript blocks and every OJ string were redacted — and
+ * `index.ts` states the redaction as a property of the service without
+ * qualification. All four are free prose written by a model that has just been
+ * reading files; the real workflow summary on this host is the report of a
+ * sudoers audit, which is precisely where a pasted credential would survive.
+ *
+ * The cap is fixed rather than configurable. These are labels — a description
+ * and a one-line summary — not documents, and `read.maxBlockChars` is about a
+ * transcript page. Anything longer than this is not a label any more.
+ *
+ * It marks where it cut. Generous as the cap is — the longest description
+ * across all 104 sidecars on this host is 49 characters and the real workflow
+ * summary is 90 — a body that is shortened silently is a body the reader
+ * believes is complete, and everything else here that shortens says so:
+ * transcript blocks render "… truncated", mail carries `bodyTruncated`.
+ */
+const MAX_META_CHARS = 2000;
+
+function metaText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const safe = redact(value);
+  return safe.length <= MAX_META_CHARS ? safe : `${safe.slice(0, MAX_META_CHARS)}…`;
+}
+
+/**
  * Session and agent ids arrive from the URL. They are used to build file
  * paths, so they are validated against a shape rather than sanitised — a
  * denylist of `..` and `/` invites the next encoding trick, whereas "hex and
@@ -138,6 +186,20 @@ export function isValidSessionId(value: string): boolean {
 }
 export function isValidSubagentId(value: string): boolean {
   return SUBAGENT_ID_PATTERN.test(value);
+}
+/**
+ * Workflow run ids, `wf_4f93cd23-af9` as written on this host.
+ *
+ * Named separately from the session pattern because it names a DIRECTORY that
+ * gets joined onto a root, and because the underscore is not accidental —
+ * every run id carries one and the session pattern would accept it silently
+ * either way. `.` is excluded outright rather than by enumerating `.` and
+ * `..`: nothing in a run id needs one.
+ */
+const WORKFLOW_RUN_PATTERN = /^wf_[A-Za-z0-9_-]{1,120}$/;
+
+export function isValidWorkflowRunId(value: string): boolean {
+  return WORKFLOW_RUN_PATTERN.test(value);
 }
 export function isValidProjectSlug(value: string): boolean {
   if (value === '.' || value === '..') return false;
@@ -442,6 +504,10 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 /** Flatten a content block to plain text, for search and for rendering. */
 function flattenBlockText(block: Record<string, unknown>, limit: number): string {
   const direct = block['content'] ?? block['text'];
@@ -534,6 +600,26 @@ export type SubagentRef = {
   meta: SubagentMeta | null;
   size: number;
   mtimeMs: number;
+  /**
+   * The workflow run this subagent belongs to, or null for a direct spawn.
+   *
+   * Non-null means it came from `subagents/workflows/<runId>/`, where the
+   * sidecar carries only `{agentType: "workflow-subagent", spawnDepth: 1}` —
+   * so this id is the only route to a description, via `workflowRuns()`.
+   */
+  workflowRunId: string | null;
+};
+
+/** One recorded workflow run. Every field optional; a run in flight has none. */
+export type WorkflowRun = {
+  runId: string;
+  name: string | null;
+  summary: string | null;
+  status: string | null;
+  agentCount: number | null;
+  durationSeconds: number | null;
+  startedAt: string | null;
+  phases: Array<{ title: string | null; detail: string | null }>;
 };
 
 /**
@@ -691,26 +777,96 @@ export class TranscriptStore {
     return sessions.find((candidate) => candidate.sessionId === sessionId) ?? null;
   }
 
-  /** Subagent transcripts belonging to a session, with their sidecar metadata. */
+  /**
+   * Subagent transcripts belonging to a session, with their sidecar metadata.
+   *
+   * TWO PLACES, not one, and the second is where most of them are. Counted on
+   * this host on 2026-08-17: of 104 `agent-*.jsonl` under Hamachi's root, 45
+   * sit directly in `<sessionId>/subagents/` and **58 sit one level deeper**,
+   * in `<sessionId>/subagents/workflows/wf_<runId>/`. This method used to
+   * `readdir` the first directory and filter for files, so the 58 were not
+   * merely undiscoverable — they were invisible, and every count of subagents
+   * this service has ever printed was a little over half the real number.
+   *
+   * The two populations have different metadata and want handling accordingly:
+   *
+   *   direct      {agentType, description, toolUseId, spawnDepth, model?,
+   *                parentAgentId?}  — named, and self-describing
+   *   workflow    {agentType: "workflow-subagent", spawnDepth: 1}  — thin,
+   *                identical on all 58, and no description at all
+   *
+   * A workflow subagent's description is not missing, it is somewhere else:
+   * `<sessionId>/workflows/<runId>.json` holds one record per run with
+   * `workflowName`, `summary`, `phases[]` and `agentCount`. So the run is what
+   * names them, and `workflowRunId` on the ref is the join to it — see
+   * `workflowRuns` below.
+   */
   async subagents(session: SessionRef): Promise<SubagentRef[]> {
-    const dir = join(session.sessionDir, 'subagents');
-    let entries: string[];
+    const root = join(session.sessionDir, 'subagents');
+    const refs: SubagentRef[] = [];
+
+    let entries: Dirent[];
     try {
-      const found = await readdir(dir, { withFileTypes: true });
-      entries = found
-        .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
-        .map((entry) => entry.name);
+      entries = await readdir(root, { withFileTypes: true });
     } catch {
       // No subagents directory at all is the normal case for a session that
       // never delegated. Not an error, not worth reporting.
       return [];
     }
 
-    const refs: SubagentRef[] = [];
-    for (const file of entries) {
-      const agentId = file.replace(/^agent-/, '').slice(0, -'.jsonl'.length);
+    await this.#collectSubagents(root, entries, null, refs);
+
+    // `subagents/workflows/<runId>/` — one directory per workflow run.
+    const workflowsDir = join(root, 'workflows');
+    let runDirs: Dirent[] = [];
+    try {
+      runDirs = await readdir(workflowsDir, { withFileTypes: true });
+    } catch {
+      return refs;
+    }
+
+    for (const runDir of runDirs) {
+      if (!runDir.isDirectory()) continue;
+      // Same discipline as the project slug: validated against a shape, and
+      // then resolved inside its root independently. This name reaches a path
+      // join, and it comes off a directory an agent can write into.
+      if (!isValidWorkflowRunId(runDir.name)) continue;
+      const resolved = resolveWithin(workflowsDir, runDir.name);
+      if (!resolved) continue;
+
+      try {
+        await this.#collectSubagents(
+          resolved,
+          await readdir(resolved, { withFileTypes: true }),
+          runDir.name,
+          refs,
+        );
+      } catch {
+        // A run directory that vanished between the two readdirs. The rest of
+        // the run's siblings still list.
+      }
+    }
+
+    return refs;
+  }
+
+  async #collectSubagents(
+    dir: string,
+    entries: Dirent[],
+    workflowRunId: string | null,
+    into: SubagentRef[],
+  ): Promise<void> {
+    for (const entry of entries) {
+      // `journal.jsonl` sits beside the agents in a run directory and is the
+      // run's own log, not a subagent. Requiring the `agent-` prefix rather
+      // than excluding that one name by hand: an unknown file appearing here
+      // later should be skipped, not rendered as an agent with a strange id.
+      if (!entry.isFile()) continue;
+      if (!entry.name.startsWith('agent-') || !entry.name.endsWith('.jsonl')) continue;
+
+      const agentId = entry.name.slice('agent-'.length, -'.jsonl'.length);
       if (!isValidSubagentId(agentId)) continue;
-      const path = join(dir, file);
+      const path = join(dir, entry.name);
 
       let size = 0;
       let mtimeMs = 0;
@@ -722,9 +878,77 @@ export class TranscriptStore {
         continue;
       }
 
-      refs.push({ agentId, path, meta: await readSubagentMeta(dir, file), size, mtimeMs });
+      into.push({
+        agentId,
+        path,
+        meta: await readSubagentMeta(dir, entry.name),
+        size,
+        mtimeMs,
+        workflowRunId,
+      });
     }
-    return refs;
+  }
+
+  /**
+   * The workflow runs a session recorded, by run id.
+   *
+   * These are what give the 58 thin-metadata subagents above a name. One JSON
+   * file per run in `<sessionId>/workflows/`, written when the run ends — so a
+   * run in progress has agents on disk and no descriptor yet, which is why
+   * every field here is optional and a missing record is not an error.
+   */
+  async workflowRuns(session: SessionRef): Promise<Map<string, WorkflowRun>> {
+    const dir = join(session.sessionDir, 'workflows');
+    const runs = new Map<string, WorkflowRun>();
+
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return runs;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const runId = entry.name.slice(0, -'.json'.length);
+      if (!isValidWorkflowRunId(runId)) continue;
+      const path = resolveWithin(dir, entry.name);
+      if (!path) continue;
+
+      try {
+        const record = asRecord(JSON.parse(await readFile(path, 'utf8')) as unknown);
+        if (!record) continue;
+        runs.set(runId, {
+          runId,
+          name: metaText(record['workflowName']),
+          summary: metaText(record['summary']),
+          status: metaText(record['status']),
+          agentCount: numberOrNull(record['agentCount']),
+          durationSeconds: (() => {
+            const ms = numberOrNull(record['durationMs']);
+            return ms === null ? null : Math.max(0, Math.round(ms / 1000));
+          })(),
+          startedAt: (() => {
+            const ms = numberOrNull(record['startTime']);
+            return ms === null ? null : new Date(ms).toISOString();
+          })(),
+          phases: Array.isArray(record['phases'])
+            ? record['phases'].flatMap((raw) => {
+                const phase = asRecord(raw);
+                if (!phase) return [];
+                return [
+                  { title: metaText(phase['title']), detail: metaText(phase['detail']) },
+                ];
+              })
+            : [],
+        });
+      } catch {
+        // Unparseable or half-written. The run's agents still list, with the
+        // run id as their only label, which is the honest degradation.
+      }
+    }
+
+    return runs;
   }
 
   /**
@@ -778,8 +1002,11 @@ async function readSubagentMeta(dir: string, jsonlName: string): Promise<Subagen
     const record = asRecord(parsed);
     if (!record) return null;
     return {
-      agentType: asString(record['agentType']),
-      description: asString(record['description']),
+      // agentType is a role name and reaches the page as a heading and a colour
+      // key; description is free prose. Both are rendered, so both go through
+      // the same door.
+      agentType: metaText(record['agentType']),
+      description: metaText(record['description']),
       toolUseId: asString(record['toolUseId']),
       parentAgentId: asString(record['parentAgentId']),
       spawnDepth:

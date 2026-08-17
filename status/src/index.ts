@@ -45,8 +45,14 @@ import { fileURLToPath } from 'node:url';
 import { isLoopback, loadStatusConfig } from './config.js';
 import { readOjSnapshot } from './oj.js';
 import { isValidSubagentId, TranscriptStore } from './transcripts.js';
-import { buildAgentOverview, buildRoster, buildSessionDetail } from './views.js';
-import { RootWatcher, type ChangeEvent } from './watch.js';
+import {
+  buildAgentOverview,
+  buildClawsky,
+  buildRoster,
+  buildSessionDetail,
+  buildSubagentRollup,
+} from './views.js';
+import { BoardWatcher, RootWatcher, type ChangeEvent } from './watch.js';
 
 const config = loadStatusConfig();
 const store = new TranscriptStore(config);
@@ -131,10 +137,26 @@ const watcher = new RootWatcher(
 );
 watcher.start();
 
+/**
+ * The boards, which no directory watch covers.
+ *
+ * Separate from `RootWatcher` because it answers a different question with a
+ * different instrument — see the header on `BoardWatcher`. Its events go to the
+ * same subscribers, so a change on the board refreshes the page exactly as a
+ * transcript write does.
+ */
+const boardWatcher = new BoardWatcher(
+  config.agents
+    .filter((agent) => agent.boardDb !== null)
+    .map((agent) => ({ scope: agent.id, dbPath: agent.boardDb as string })),
+  config.watch.boardPollSeconds,
+);
+boardWatcher.start();
+
 /** Open SSE clients. Held so shutdown can close them rather than drop them. */
 const streams = new Set<ServerResponse>();
 
-watcher.subscribe((event: ChangeEvent) => {
+const publishChange = (event: ChangeEvent): void => {
   const frame = `event: change\ndata: ${JSON.stringify(event)}\n\n`;
   for (const stream of streams) {
     // No error handling around the write on purpose: a client that has gone
@@ -142,7 +164,10 @@ watcher.subscribe((event: ChangeEvent) => {
     // socket is a no-op, not a throw.
     stream.write(frame);
   }
-});
+};
+
+watcher.subscribe(publishChange);
+boardWatcher.subscribe(publishChange);
 
 /**
  * The heartbeat.
@@ -191,6 +216,21 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
     return;
   }
 
+  // The board, across every instance: who is on it, and every DM and post.
+  //
+  // Showing all DMs reverses CLAWSKY.md's "sender + recipient" row, which is a
+  // decision the operator took and which is recorded there rather than only
+  // here. See the header of `mail.ts` for why it is not a contradiction: that
+  // rule constrains what one AGENT may read, and it is enforced in `checkMail`
+  // where agents read.
+  if (path === '/api/clawsky') {
+    sendJson(response, 200, {
+      generatedAt: new Date(now).toISOString(),
+      instances: store.agents.map((agent) => buildClawsky(agent, config)),
+    });
+    return;
+  }
+
   if (path === '/api/oj') {
     sendJson(response, 200, await readOjSnapshot(config.oj));
     return;
@@ -211,6 +251,15 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
     // files (Clawcius #14).
     if (parts[3] === 'sessions' && parts.length === 4) {
       sendJson(response, 200, await buildRoster(store, agent, config, now));
+      return;
+    }
+
+    // Every subagent this instance has run, grouped by role. Flat and
+    // cross-session on purpose — the session view already draws the tree, and
+    // the thing it cannot do is find a transcript when you do not know which
+    // run it belonged to (Clawcius #22).
+    if (parts[3] === 'subagents' && parts.length === 4) {
+      sendJson(response, 200, await buildSubagentRollup(store, agent, config, now));
       return;
     }
 
@@ -397,6 +446,7 @@ function shutdown(signal: string): void {
   console.log(`[status] ${signal} — closing`);
   clearInterval(heartbeat);
   watcher.stop();
+  boardWatcher.stop();
   // SSE connections are long-lived by definition, so `server.close()` alone
   // would wait forever for them. Ending them explicitly is what makes a
   // `systemctl restart` take a moment rather than a TimeoutStopSec.
