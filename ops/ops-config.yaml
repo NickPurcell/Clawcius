@@ -56,22 +56,24 @@ dryRun: true
 
 # ── Directories ───────────────────────────────────────────────────────────
 #
-# THERE IS NO TOP-LEVEL spoolDir ANY MORE. Each instance has its own, under
-# `instances:` below, defaulting to <stateDir>/run/ops. See the long note there
-# for why — the short version is that docker/run-container.sh bind-mounts
-# $CLAWCIUS_STATE/run per instance, so one shared spool was reachable from
-# exactly one of the two containers.
+# THERE ARE NO SPOOL DIRECTORIES ANY MORE. `spoolDir`, `opsSpoolDir`,
+# `wakeSpoolDir`, `wakeChannelId` and `mayRequest` were retired on 2026-08-16
+# with the spools themselves. If your file still carries any of them the loader
+# ignores them and says so, once, in the boot journal — it does not refuse to
+# start, because this unit is Restart=always with no start limit and a config it
+# rejects is a root daemon in a five-second restart loop rather than one loud
+# error. Delete them once you have read the notice; nothing has been removed
+# from disk on their account.
 #
-# If you still have `spoolDir:` here from before 2026-08-10, the loader accepts
-# it as a deprecated alias for the instance whose stateDir contains it, says so
-# loudly in the boot journal, and gives every other instance its own. It
-# refuses to boot only if the old path cannot be attributed to exactly one
-# instance. Delete the key once you have read the notice.
+# What replaced them: a task arrives as a DM to `<crew>-host` from that crew's
+# coordinator, and the answer comes back as a DM. See `board:` under each
+# instance.
 
-# State is NOT reachable from any container: the journal, the circuit breaker,
-# and any armed rollback deadline live here. A breaker the quarantined party
-# can edit is not a breaker, so the loader refuses to start if this ends up
-# inside the spool or inside any instance's wake spool.
+# State is NOT reachable from any container: the journal and the audit live
+# here. A record of what was done to this host, writable by the party it was
+# done on behalf of, is not a record — so the loader refuses to start if this
+# ends up inside <stateDir>/run for any instance, which is the one directory
+# docker/run-container.sh bind-mounts read-write into a container.
 stateDir: /var/lib/clawcius-ops
 
 # Sweep interval. fs.watch is set up too, but the sweep is the primary
@@ -239,40 +241,37 @@ repos:
 # would kill someone's live turn; the agent must not be able to write it. Both
 # loaders check the containment and refuse to start.
 #
-# ── ONE SPOOL PER INSTANCE, AND WHY (2026-08-10) ──────────────────────────
-# This used to be a single top-level `spoolDir: /var/lib/clawcius/run/ops`, and
-# it was wrong for a week in a way that was only wrong for one of the two
-# agents — which is why nobody noticed.
-#
-# docker/run-container.sh mounts each instance its OWN state directory and
-# nothing else:
+# ── The three bind mounts, and what may not be inside them ────────────────
+# docker/run-container.sh gives each instance THREE read-write windows onto this
+# host, all three derived from one variable:
 #
 #     CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
-#     WAKE_DIR=$CLAWCIUS_STATE/run
-#     -v "$WAKE_DIR:$WAKE_DIR:rw"
+#     -v "$CLAWCIUS_STATE/workspaces:…:rw"    the agent's worktrees
+#     -v "$CLAWCIUS_STATE/run:…:rw"           what the spools lived in
+#     -v "$CLAWCIUS_STATE/agent-home:…:rw"    its Claude config and login
 #
-# systemd/hamachi-container.service sets CLAWCIUS_STATE_DIR=/var/lib/hamachi.
-# So Clawcius's container could reach /var/lib/clawcius/run/ops and Hamachi's
-# could not: that path DOES NOT EXIST inside Hamachi's container, verified from
-# inside it on 2026-08-10. The agent the operator talks to most was the one
-# agent that could not file a request, and it failed silently on both sides —
-# the agent's `mv` into a shell nobody reads, the executor seeing an empty
-# directory, which is what a quiet night looks like.
+# systemd/hamachi-container.service sets CLAWCIUS_STATE_DIR=/var/lib/hamachi, so
+# each container can write its own three and nothing else. `stateDir` above,
+# every `board.db` and every `wakerStatusFile` must live OUTSIDE all six, and
+# the loader refuses to start if one does not — checked against every instance's
+# mounts rather than only against the file's own, because two state directories
+# are siblings under /var/lib and a fat-fingered path lands in the neighbour
+# rather than nowhere.
 #
-# The second reason is the one that turned out to matter more. A shared
-# directory carries no evidence of who wrote a file, so `redeploy hamachi`
-# filed by Hamachi and the same request filed by Clawcius were indistinguishable
-# in the journal. Per-instance spools make provenance structural: a container
-# can only write into its own bind mount, so the directory a request arrives in
-# is a fact about the writer that the writer cannot forge. Every journal entry
-# and every log line now names the requester.
+# This paragraph said "exactly one" until 2026-08-16, and so did the loader: it
+# checked `run/` alone, because that is where the two spools lived. A `board.db`
+# under `workspaces/` therefore passed — and that file holds the role column
+# that is the only access control left on running commands on this host. The
+# read-only mounts (the skills directory, discord-cli, gws-cli, the
+# service-account key) are deliberately NOT checked here: a file the agent
+# cannot write is not a file it can lie with.
 #
-# `opsSpoolDir` therefore defaults to <stateDir>/run/ops and is best left
-# unset — the default is the only value that is right by construction, and a
-# new instance is reachable without anybody remembering a second key. The
-# loader refuses to start if two instances share one, if one nests inside
-# another (that would be forgery with extra steps), if a spool would swallow a
-# wake spool, or if the state directory ends up inside any of them.
+# agent-config.yaml checks TWO of those four — the skills directory and
+# discord-cli — and names gws-cli and the service-account key as known gaps in
+# the comment above its own list. It checks any of them because what it is
+# protecting there is a credential rather than a claim, and two of the four are
+# shared by BOTH deployments, so a file placed in one would hand this
+# deployment's Discord token to the other's agent.
 instances:
   - name: clawcius
     container: clawcius-agent
@@ -281,10 +280,6 @@ instances:
     envFile: /home/npurcell/clawcius/.env
     memory: 2g
     wakerStatusFile: /var/lib/clawcius/waker-status.json
-    wakeSpoolDir: /var/lib/clawcius/run/wake
-    # opsSpoolDir: /var/lib/clawcius/run/ops   — the default; left implicit.
-    # Where the "you were rebuilt, verify and check in" wake is delivered.
-    wakeChannelId: "000000000000000000"
     # HEAD of this checkout identifies the build for the circuit breaker. A
     # build that has been rolled back once is refused from then on; a new
     # commit is a different build and goes through, because the fix for a bad
@@ -315,7 +310,8 @@ instances:
     #
     # Leave the block out entirely and the host agent has no mailbox on this
     # instance: a coordinator DMing it is told there is no such recipient, which
-    # is the honest answer. The ops spool still works either way.
+    # is the honest answer — and since 2026-08-16 it is also the only answer,
+    # because there is no other way to reach this daemon.
     board:
       db: /var/lib/clawcius/clawcius.db
       crew: clawcius
@@ -327,10 +323,6 @@ instances:
     envFile: /home/npurcell/clawcius/.env.hamachi
     memory: 3g
     wakerStatusFile: /var/lib/hamachi/waker-status.json
-    wakeSpoolDir: /var/lib/hamachi/run/wake
-    # opsSpoolDir: /var/lib/hamachi/run/ops    — the default, and the fix. This
-    # is inside the bind mount Hamachi's container has always had.
-    wakeChannelId: "000000000000000000"
     buildRepo: clawcius
 
     # Confirmed against .env.hamachi on 2026-08-14: CLAWCIUS_DB_PATH is
@@ -344,66 +336,13 @@ instances:
       db: /var/lib/hamachi/hamachi.db
       crew: hamachi
 
-    # ── Optional: narrow what this instance may ask for ─────────────────
-    # OFF BY DEFAULT. No `mayRequest:` block means unrestricted, which is what
-    # every instance had before 2026-08-10 and what an upgrade gets. This
-    # mechanism only became possible with per-instance spools: "Hamachi may not
-    # redeploy Clawcius" is not a rule you can enforce against an anonymous
-    # request, and until the spool identified the requester, every request was
-    # anonymous.
-    #
-    # A key left out is unrestricted. A key present is an exact-match
-    # allowlist. A key present and empty (`instances: []`) means none at all,
-    # which is a legitimate thing to say. Every name is checked against the
-    # real allowlists at boot, because a typo here would otherwise be a silent
-    # total denial that reads like a bug somewhere else.
-    #
-    # To let Hamachi look after itself and nothing else:
-    #
-    #   mayRequest:
-    #     instances: [hamachi]        # task/rollback/checkin targets, and the
-    #                                 # instance a `wake` channel routes to
-    #     verbs: [task, checkin, wake]
-    #
-    # `units:` and `repos:` used to be here too. They are now INERT — no request
-    # carries a unit or a repo since the verbs that named them were deleted —
-    # and the loader says so in the boot journal rather than failing to start,
-    # because this unit is Restart=always and refusing to boot on a stale key
-    # turns a cosmetic problem into a restart loop with every deadline
-    # unhonoured.
-    #
-    # One consequence worth knowing about `instances:`: a task that names NO
-    # instance takes every instance into scope, so for a restricted instance
-    # that would be wider than what it is allowed rather than narrower. The
-    # executor refuses an unnamed task from a restricted instance and says so.
-    #
-    # AND THE BIG CAVEAT, which is different from what this block used to mean.
-    # mayRequest bounds what an instance may ASK FOR. It does not bound what the
-    # host agent may DO. A task scoped to `hamachi` is still carried out by a
-    # session with a shell and sudo, and nothing but the task text and the
-    # standing prompt points that session at Hamachi rather than at anything
-    # else on this box. It is a statement of intent that the journal records —
-    # which is genuinely useful, and is not a boundary.
-
 # ── Limits ────────────────────────────────────────────────────────────────
-# Every one of these is a cap on what a compromised or looping agent can do
-# with a directory it can write.
+# What is left of them. The caps that bounded a directory an agent could write
+# — request size, files per sweep, files present, operations per hour, queue
+# depth — went with the spools on 2026-08-16. A task now arrives as a DM, one
+# at a time, refused rather than queued while another is running; there is no
+# queue to bound and nothing to flood.
 limits:
-  # Bytes. Checked with stat before the file is opened, so an enormous request
-  # costs a stat rather than a read.
-  maxRequestBytes: 16384
-  # Requests consumed per sweep. A burst cannot monopolise the daemon.
-  maxPerSweep: 8
-  # Files allowed to be sitting in the spool at all. Past this the spool is
-  # treated as flooded and drained unread — a container writing thousands of
-  # request files is not a scheduling accident.
-  maxSpoolFiles: 64
-  # Accepted operations per rolling hour, across every verb and instance.
-  maxPerHour: 20
-  # Requests allowed to wait behind the lock. Past this they are refused with a
-  # stated reason, because a refusal the agent can read beats a request that
-  # silently evaporates.
-  maxQueued: 8
   commandTimeoutSeconds: 600
   # Build steps get their own, much larger ceiling. `npm ci` on a cold cache
   # fetches a few hundred packages through the host's proxy and routinely takes
@@ -543,7 +482,9 @@ hostAgent:
   # is a tree the agents get commits merged into — pointing the session there
   # would let any agent hand standing instructions to a process with sudo,
   # through a route nobody would think to audit. The loader refuses a workDir
-  # inside any spool, inside stateDir, or inside a checkout. The executor
+  # inside any instance's bind mounts, inside (or containing) stateDir, or
+  # inside a checkout — it named "any spool" until 2026-08-16, and there are no
+  # spools. The executor
   # creates it at boot and chowns it to `user:` above (it used to chown it to
   # the checkout's owner, which since 2026-08-11 is a different account).
   workDir: /var/lib/clawcius-host-agent
@@ -568,19 +509,29 @@ hostAgent:
   # refuses to spawn a session whose environment contains something looking like
   # a token. That exemption is the point: it makes "yes, I mean it" a diff
   # somebody reviewed. DISCORD_TOKEN here would still be a mistake — this
-  # session reports back through the spool and the sandboxed agent does the
-  # talking, precisely so that a session with a shell cannot speak as anybody.
+  # session answers the coordinator that asked, by DM, and the sandboxed agent
+  # does the talking, precisely so that a session with a shell cannot speak as
+  # anybody. (It reported back through the wake spool until 2026-08-16; the
+  # route changed, the reason it holds no token did not.)
   envPassthrough: []
 
-# ── Waiting for an idle turn ──────────────────────────────────────────────
-# A task may recreate a container, and every live agent session is a `docker
-# exec` into one. Doing that mid-turn kills someone's conversation.
+# ── Waiting for an idle turn — NOTHING READS ANY OF THIS ──────────────────
+# It used to work like this: a task may recreate a container, and every live
+# agent session is a `docker exec` into one, so doing that mid-turn kills
+# someone's conversation. The executor read each in-scope instance's
+# `wakerStatusFile` and waited, up to `maxWaitMinutes`, then ABANDONED the
+# operation rather than deferring it or proceeding anyway.
 #
-# Every instance IN SCOPE is waited for. A task that names an instance scopes to
-# that one; a task that names none scopes to ALL of them, because "which
-# containers might this sentence disturb" has no answer and the safe reading of
-# no answer is "all of them". Naming an instance is how an agent buys a cheap,
-# fast task.
+# The only caller was the wait in front of something destructive, and that went
+# with the ops spool on 2026-08-16 along with the snapshot, the deadline and the
+# rollback. A task by DM has never waited. So all three settings below are read
+# by the loader, validated by the loader, and consulted by nothing.
+#
+# They are left rather than deleted because the expensive half of this mechanism
+# is the containment — keeping `wakerStatusFile` out of every container's mounts
+# so a container cannot declare itself idle — and that is still enforced. The
+# cheap half is a consumer. Clawcius #64 decides whether to add one back or to
+# take the rest out.
 idle:
   # A waker status file older than this is treated as busy. Must be comfortably
   # more than the waker's status.intervalSeconds (20) and comfortably less than
@@ -605,6 +556,9 @@ idle:
 # After a destructive operation the executor wakes the instance with context
 # and waits to hear back. Silence means the rebuild broke it, and the whole
 # point is that nobody has to be awake for that.
+# NOTHING READS THIS. The check-in deadline was armed by a task filed into the
+# ops spool and by nothing else; the spool, the deadline and the automatic
+# rollback all went on 2026-08-16. Clawcius #63.
 deadline:
   minutes: 15
   # Off makes the deadline pure alerting. Recommended only while dryRun is on
@@ -612,15 +566,17 @@ deadline:
   autoRollback: true
 
 # ── Circuit breaker ───────────────────────────────────────────────────────
+# NOTHING WRITES THIS. The breaker counted rollbacks, and there are none. The
+# `frozen` flag it set is still read — a frozen executor refuses every task —
+# and still cleared by ops/unfreeze.sh, but nothing can set it. Clawcius #63.
 breaker:
-  # Consecutive missed check-ins before the executor FREEZES: it stops
-  # accepting destructive verbs entirely and says so, until a human runs
-  # ops/unfreeze.sh. The alternative is a bad build that reinstalls the outage
-  # every fifteen minutes.
+  # WAS: consecutive missed check-ins before the executor froze, refusing every
+  # destructive request until a human ran ops/unfreeze.sh. Nothing counts a
+  # failed recovery now, so nothing reaches this ceiling and nothing freezes.
   maxConsecutiveFailedRecoveries: 2
-  # Quarantined builds remembered per host, oldest evicted. Persisted, because
-  # a breaker that clears on restart is no breaker at all — and `restart` is a
-  # verb the agent can ask for.
+  # WAS: quarantined builds remembered per host, oldest evicted. Nothing
+  # quarantines, and the executor clears any row the retired path left behind on
+  # its first boot rather than publishing a list nothing enforces.
   maxQuarantined: 32
 
 # ── Snapshot restore verification ─────────────────────────────────────────

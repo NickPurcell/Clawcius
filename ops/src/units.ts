@@ -75,7 +75,7 @@
  *     opened `O_NOFOLLOW`, and every decision is made against `fstat` of that
  *     descriptor rather than against the name. A staging entry that is a symlink
  *     to `/root/.ssh/id_ed25519` is refused rather than published into a
- *     world-readable unit file (CWE-59, and the same reasoning as spool.ts);
+ *     world-readable unit file (CWE-59);
  *   - the mode is 0644 and the owner is 0:0 because this code sets them on the
  *     file descriptor it wrote, not because a pattern in a text file asked
  *     politely.
@@ -168,6 +168,17 @@ const MAX_REQUEST_BYTES = 4096;
 
 /** Request file names the desk will even look at. Same rule as the ops spool. */
 const REQUEST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$/;
+
+/**
+ * The suffix the briefing tells the session to write to before renaming.
+ *
+ * EXPORTED, and the export is the point: the sweeper's exemption and the
+ * instruction in `Executor#briefing` have to be the same string, and until
+ * 2026-08-16 they were two string literals in two files that happened to agree.
+ * A session told to use one suffix while the desk exempts another races the
+ * sweep and loses, silently, about half the time under load.
+ */
+export const REQUEST_TEMP_SUFFIX = '.json.tmp';
 
 /**
  * Where the session stages unit content, asks for it to be installed, and reads
@@ -579,11 +590,12 @@ export type UnitDeskOptions = {
  * request says WHICH unit, and nothing else. It cannot say where, or with what
  * mode, or as whom.
  *
- * Everything hostile-input-shaped about it is handled exactly as spool.ts
- * handles the same problem: implausible names discarded unread, size checked on
- * the descriptor rather than on the path, `O_NOFOLLOW | O_NONBLOCK`, and the
- * file unlinked BEFORE it is acted on so that a request which throws cannot come
- * back on the next drain.
+ * Everything hostile-input-shaped about it is handled the way the retired ops
+ * spool handled the same problem, which is where these rules were worked out:
+ * implausible names discarded unread, size checked on the descriptor rather than
+ * on the path, `O_NOFOLLOW | O_NONBLOCK`, and the file unlinked BEFORE it is
+ * acted on so that a request which throws cannot come back on the next drain.
+ * This is now the only directory-as-a-queue left in the repository.
  *
  * This is NOT "the host agent ingesting untrusted content" in the sense
  * host-agent.ts forbids: nothing read here reaches a prompt. It reaches
@@ -621,6 +633,40 @@ export function drainUnitRequests(options: UnitDeskOptions): UnitOpResult[] {
       break;
     }
     const path = join(options.requestDir, name);
+
+    // A file still being written into place is LEFT ALONE, and the exemption is
+    // exactly as wide as the procedure that creates one — no wider.
+    //
+    // The briefing tells the session to file a request the only way that is
+    // safe against a reader on a timer: write `<name>.json.tmp`, then `mv` it
+    // to `<name>.json`, so the rename publishes a file that is already
+    // complete. This loop used to `discard()` every name that failed the
+    // pattern — which includes that `.tmp` file, for the whole window between
+    // the shell opening it and the `mv`. The desk polls every second while the
+    // session runs, so a poll landing in that window deleted the half-written
+    // request, the session's `mv` then failed with no source, and the unit was
+    // never installed. Nothing was logged that named a cause: the line said
+    // "implausible unit-request file name", about a file following the
+    // documented procedure exactly.
+    //
+    // Found on 2026-08-16 behind a self-test that failed about half the time
+    // under load and had been filed as flaky (Clawcius #66). The retired ops
+    // spool had already solved this — it filtered to `.json` BEFORE applying
+    // its stricter name check — and the unit desk, written from it, kept the
+    // strict check and dropped the filter.
+    //
+    // Narrow on purpose. The first fix skipped everything not ending `.json`,
+    // which is what the spool did — and the self-test caught it, because that
+    // also stops collecting the garbage a confused session leaves behind. A
+    // name is exempt here only if it is the documented halfway state, and every
+    // other implausible name is still discarded unread below.
+    //
+    // The cost is a `.json.tmp` from a session that died mid-write, sitting
+    // there until somebody looks. There is deliberately no age check to sweep
+    // it: a timer that deletes a file it cannot know is abandoned is how this
+    // bug happened in the first place, one layer down.
+    if (name.endsWith(REQUEST_TEMP_SUFFIX)) continue;
+
     if (!REQUEST_NAME_PATTERN.test(name)) {
       options.onLog(`${name}: implausible unit-request file name, discarded unread`);
       discard(path);
@@ -664,10 +710,11 @@ type ParsedUnitRequest =
 /**
  * `{"op":"install","unit":"clawcius-status.service"}` and nothing else.
  *
- * Structural rejection, never repair — the same rule request.ts states for the
- * ops spool. An unknown key is a rejection here rather than a logged
- * curiosity, because unlike a spool request this object has exactly two fields
- * and there is no forward-compatibility story to protect.
+ * Structural rejection, never repair. Malformed JSON is discarded whole,
+ * nothing salvages the parseable prefix of a broken file, and nothing coerces
+ * types — a number where a string belongs is a reject. An unknown key is a
+ * rejection here rather than a logged curiosity, because this object has
+ * exactly two fields and there is no forward-compatibility story to protect.
  */
 export function parseUnitRequest(body: string): ParsedUnitRequest {
   let parsed: unknown;

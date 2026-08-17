@@ -65,24 +65,36 @@ The container is long-lived on purpose: cron jobs, daemons and Discord bots the
 agent writes keep running between turns, with no model in the loop.
 
 There is no docker socket and no host socket inside, so the agent cannot touch
-its own deployment directly. What it has instead is a spool: it writes a **task**
-— free text, "clawcius.service has been restarting every 30s since the deploy,
-find out why and fix it" — and a separate root daemon hands it to a Claude Code
-session running on the host, with a shell and sudo.
+its own deployment directly. What it has instead is a conversation: a crew's
+**coordinator** DMs `<crew>-host` with a **task** — free text,
+"clawcius.service has been restarting every 30s since the deploy, find out why
+and fix it" — and a separate root daemon hands it to a Claude Code session
+running on the host, with a shell and sudo. The answer comes back as a DM.
 
-Until 2026-08-10 that spool carried a closed list of seven verbs, and the
+Until 2026-08-10 that path carried a closed list of seven verbs, and the
 argument for it was that a finite, enumerated set of operations is a safety
 property. It is, and it was given up deliberately: a closed set can only hold
 what somebody imagined in advance, and every gap in it turned the operator into
 the agent's hands. **For that one component the sandbox is no longer a security
-boundary.** What replaces it is a snapshot before every task, an automatic
-rollback if the task fails or a service stops being healthy, a complete audit of
-every command it runs, and a deadline the agent must answer or be reverted.
-Since 2026-08-11 it also runs as an unprivileged system account of its own
-(`clawcius-ops`) rather than as the operator — who is in the `docker` group,
-which is root, which made every other control in `ops/` decoration. The daemon
-refuses to start a session as an account that is missing, is uid 0, is in a
-root-equivalent group, or can read the operator's secrets.
+boundary.** What replaces it is a complete audit of every command the session
+runs, written before each command's result is known; the fact that only a
+coordinator can ask at all, checked twice against a column no message body can
+reach; and the fact that this is a personal VPS with snapshots. Since 2026-08-11
+it also runs as an unprivileged system account of its own (`clawcius-ops`)
+rather than as the operator — who is in the `docker` group, which is root, which
+made every other control in `ops/` decoration. The daemon refuses to start a
+session as an account that is missing, is uid 0, is in a root-equivalent group,
+or can read the operator's secrets.
+
+**There used to be more, and it is worth knowing what went.** Until 2026-08-16
+the way in was a bind-mounted spool directory, and around it stood a snapshot
+before every task, an automatic rollback if the task failed or a service stopped
+being healthy, a deadline the agent had to answer or be reverted, and a circuit
+breaker that froze the whole mechanism after two failed recoveries. All of it
+was retired with the spool. **Nothing undoes a task now.** The health sample
+either side of a task survives and it reports; it does not repair. Undoing is a
+person's decision, with the VPS snapshot and git.
+
 See [`ops/README.md`](ops/README.md) — the trust model section is the honest
 account — and [`MIGRATION.md`](MIGRATION.md), which is how the host gets from
 one to the other and has not been run yet. It ships in dry-run, and in dry-run

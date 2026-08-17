@@ -75,8 +75,11 @@ Type=simple
 # operator's. ops/src/host-agent.ts REFUSES TO SPAWN if the environment it
 # built contains anything that looks like a credential. Adding an
 # EnvironmentFile here would be handing a shell session the ability to speak as
-# the bot, which is the one thing the report-back-through-the-spool design
-# exists to prevent.
+# the bot, which is the one thing this daemon's whole reporting design exists to
+# prevent: it says nothing to anybody, it answers the coordinator that asked by
+# DM, and the sandboxed agent — which holds the token — does the talking. (That
+# answer was a file written into the requester's wake spool until 2026-08-16.
+# The route changed; the reason this unit holds no token did not.)
 User=root
 Group=root
 
@@ -120,8 +123,12 @@ RestartSec=5
 #
 # It is deliberately NOT the checkout. Claude Code auto-discovers CLAUDE.md and
 # project settings from its working directory, and the checkout is a tree the
-# agents can get commits merged into; the config loader refuses a workDir inside
-# any repo path, any spool, or stateDir.
+# agents can get commits merged into; the config loader refuses a
+# `hostAgent.workDir` inside any repo path, inside any directory bind-mounted
+# into an instance's container — `<stateDir>/run`, `<stateDir>/workspaces` and
+# `<stateDir>/agent-home`, for every instance — or inside or containing the
+# executor's own stateDir. Until 2026-08-16 the mount half of that was written
+# as "any spool"; the spools are gone and the check names the mounts.
 StateDirectory=clawcius-ops clawcius-host-agent
 StateDirectoryMode=0750
 
@@ -140,13 +147,17 @@ StateDirectoryMode=0750
 # next person to "tidy up" the PATH below knows which of the two they are
 # looking at.
 
-# ── The spools are NOT named here, and that was checked ───────────────────
+# ── No instance path is named here, and that was checked twice ────────────
 #
 # On 2026-08-10 the ops spool became one directory per instance
 # (/var/lib/clawcius/run/ops and /var/lib/hamachi/run/ops rather than the
 # single shared one), which is the kind of change that quietly needs a unit
 # edit. This file was re-read line by line looking for anywhere the old path
-# was named or implied. There is nowhere:
+# was named or implied. There was nowhere. On 2026-08-16 the spools were
+# retired outright — no directory is a queue any more, a task arrives as a DM
+# to `<crew>-host` on the Clawsky board — and the same re-read found the same
+# answer, for the same reasons, which is why they are worth keeping written
+# down rather than rediscovered a third time:
 #
 #   - no ReadWritePaths, so no list to extend;
 #   - no ProtectSystem (=strict breaks the docker socket; see below), so the
@@ -155,22 +166,26 @@ StateDirectoryMode=0750
 #     now also stop the host agent finding its own credentials), so no second
 #     exception to keep in step;
 #   - StateDirectory= names clawcius-ops and clawcius-host-agent, which are the
-#     executor's own state and the host agent's working directory. Neither has
-#     anything to do with the spools, and the loader refuses a config in which
-#     either of them lands inside one.
+#     executor's own state and the host agent's working directory. Neither is
+#     inside any instance's state directory, and the loader refuses a config in
+#     which either of them meets a container's bind mount.
 #
 # So this unit needs no change, and the reason is written down rather than
 # assumed — two units in this repository shipped with hardening that made them
 # unable to run at all (MemoryDenyWriteExecute in #7, ProtectHome here), both
 # times because a directive was reasoned about and never loaded.
 #
-# IF ANYONE ADDS ReadWritePaths= LATER: it must list every instance's
-# opsSpoolDir, not just the first, AND hostAgent.workDir, AND /home/npurcell,
-# AND everywhere a task might need to write — which, since a task is free text,
-# is "the filesystem". That is the honest reason there is no ReadWritePaths
-# here and probably never will be: a path allowlist in front of a session with a
-# shell is a list somebody maintains until the first task it breaks, and then
-# widens to `/`.
+# The general point is the one that survived both dates: the paths that moved
+# are owned by ops-config.yaml and agent-config.yaml, and a unit file that
+# repeated them would have been a second copy to keep in step — the copy nobody
+# edits, because it does not look like configuration. Do not add them here.
+#
+# IF ANYONE ADDS ReadWritePaths= LATER: it must list hostAgent.workDir, AND
+# /home/npurcell, AND everywhere a task might need to write — which, since a
+# task is free text, is "the filesystem". That is the honest reason there is no
+# ReadWritePaths here and probably never will be: a path allowlist in front of a
+# session with a shell is a list somebody maintains until the first task it
+# breaks, and then widens to `/`.
 
 # ── Re-audited 2026-08-11, against the new identity ───────────────────────
 #

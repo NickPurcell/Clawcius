@@ -80,8 +80,8 @@ export type JournalEntry = {
   /** Present when the entry is about a specific instance — the TARGET. */
   instance?: string;
   /**
-   * Who asked. The instance whose spool the request arrived in, or
-   * `(executor)` for the daemon's own actions.
+   * Who asked. The AGENT ID from the mail row's author column, or `(executor)`
+   * for the daemon's own actions.
    *
    * Distinct from `instance`, and the distinction is the point. Before
    * 2026-08-10 there was one shared spool and this field could not have
@@ -91,9 +91,15 @@ export type JournalEntry = {
    * reaching across at its neighbour and it should never have been possible to
    * confuse the two after the fact.
    *
-   * It is set from the spool directory, never from the request body, so it is
-   * as trustworthy as the bind mount — which is the most trustworthy thing in
-   * this pipeline.
+   * The substrate has changed twice and the property has not. It was the
+   * DIRECTORY a request file was found in — one spool per instance,
+   * bind-mounted into exactly one container — which is why it named a crew
+   * rather than an agent. Since 2026-08-16 it is the author column of the mail
+   * row, written by the waker from the id that session's own `sendMail` closes
+   * over: a variable in a process the container cannot reach. So it is now
+   * finer-grained (an agent, not an instance) and at least as trustworthy, and
+   * in both cases the rule is the same one — the requester is never read from
+   * anything the requester wrote.
    */
   requester?: string;
   /**
@@ -143,19 +149,25 @@ export type TaskSummary = {
 export type OpsStatusSnapshot = {
   /** What the executor is doing right now, or 'idle'. */
   current: string;
-  /** Requests waiting behind the lock. */
-  queued: number;
+  /**
+   * Frozen means every task is refused until a human runs `ops/unfreeze.sh`.
+   *
+   * Nothing sets it any more. It was set by the circuit breaker, which counted
+   * failed recoveries on the spool task path, and that path went with the
+   * spools — see the boot report in `Executor`. The flag is still read, still
+   * persisted and still clearable, because a host that is frozen today must not
+   * quietly unfreeze itself on the next deploy. Clawcius #63 is the decision
+   * about what to do with it.
+   */
   frozen: boolean;
   frozenReason: string;
   dryRun: boolean;
   /**
-   * The spools being watched, one per instance, and whether each is
-   * restricted. Published so the status page can show at a glance that every
-   * agent has a reachable queue — the failure this replaced was one agent
-   * silently having none.
+   * Check-in deadlines and quarantined builds still on disk from before the
+   * spools were retired. Always empty on a host that has booted this build
+   * once: nothing arms either any more, and the first boot reports and clears
+   * whatever it finds rather than leaving rows nothing will ever honour.
    */
-  spools: Array<{ instance: string; dir: string; restricted: boolean }>;
-  /** Instances with an armed check-in deadline, and when it expires. */
   pendingCheckins: Array<{ instance: string; deadlineAt: number; reason: string }>;
   quarantined: Array<{ instance: string; build: string; at: number }>;
   consecutiveFailedRecoveries: number;

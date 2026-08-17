@@ -20,7 +20,6 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
-import { WakeSpool } from './wake-spool.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -633,94 +632,6 @@ client.on(Events.MessageUpdate, (_old, updated) => {
 const windowSweeper = setInterval(() => windows.sweep(), 60_000);
 windowSweeper.unref();
 
-/**
- * Wake requests from inside the container.
- *
- * The agent schedules itself with cron and drops a file here. Limits still
- * apply — a request is a request, not a command, so it cannot be used to
- * escape the concurrency cap.
- *
- * THE CHANNEL MUST ALREADY EXIST ON THE BOARD. This file is inside the crew's
- * bind mount, so anything in the container can write it, and `channel` used to
- * be handed straight to `sessions.acquire` — which registers a row for an id it
- * has not seen. That made this an identity forge rather than a scheduler: write
- * a file naming any id you like and a turn starts under that name, holding that
- * name's `sendMail`, with a prompt of your choosing. An engineer could wake as
- * its coordinator and, from there, reach the host agent.
- *
- * Requiring an existing row does not make this route safe — one crewmate can
- * still wake another, because a crew shares a container and this spool is not
- * per agent (Clawcius #31, #39). It removes the ability to *mint* an identity,
- * which is the part that turned a shared filesystem into a privilege boundary
- * anyone could cross. The full answer is the durable scheduler in CLAWSKY.md
- * phase 4, which retires this spool; until that exists, refusing loudly beats
- * registering silently.
- */
-const wakeCounts = new Map<string, number[]>();
-
-const wakeSpool = config.agent.wake.enabled
-  ? new WakeSpool(config.agent.wake.spoolDir, ({ channelId, prompt }) => {
-      const now = Date.now();
-      const recent = (wakeCounts.get(channelId) ?? []).filter((t) => now - t < 3_600_000);
-      if (recent.length >= config.agent.wake.maxPerHour) {
-        return { accepted: false, detail: `rate limit: ${config.agent.wake.maxPerHour}/hour` };
-      }
-      recent.push(now);
-      wakeCounts.set(channelId, recent);
-
-      try {
-        const session = sessions.acquire(channelId, {
-          onToolUse: (tool) => process.stdout.write(`[clawcius ${channelId}] ${tool}\n`),
-          onCliFailure: (cmd, out) =>
-            process.stderr.write(`[clawcius ${channelId}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`),
-          onDone: (summary) => {
-            sessions.persist(channelId);
-            // Retry itself lives in AgentSession, so scheduled wakes get it
-            // without asking. This only has to report what happened.
-            if (summary.apiError) {
-              process.stderr.write(
-                `[clawcius ${channelId}] self-wake REFUSED (${summary.apiErrorKind})\n` +
-                  `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
-                  (summary.retryScheduled
-                    ? `  retry ${summary.retryAttempt} queued\n`
-                    : `  not retrying\n`),
-              );
-            }
-            process.stdout.write(
-              `[clawcius ${channelId}] self-wake turn ${summary.subtype} ` +
-                `$${summary.costUsd.toFixed(4)} (spoke=${summary.sentMessage})\n`,
-            );
-          },
-          onError: (error) => {
-            process.stderr.write(`[clawcius ${channelId}] ${error.message}\n`);
-            void sessions.release(channelId);
-          },
-          onNeedsRespawn: () => {
-            // Drop the session so the next wake gets a fresh process, but never
-            // replay a scheduled prompt: unlike a person's message, nobody is
-            // waiting on this one, and re-firing a schedule is how you get the
-            // same job run twice.
-            process.stderr.write(
-              `[clawcius ${channelId}] stale token on self-wake — dropping session\n`,
-            );
-            void sessions.release(channelId);
-          },
-        });
-        session.wake({ kind: 'schedule', channelId, scheduleId: 'self', prompt });
-        return { accepted: true, detail: 'woken' };
-      } catch (error) {
-        return {
-          accepted: false,
-          detail: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-    // Policy lives here, the refusal lives at the parse boundary: a wake may
-    // name an identity that already exists, never mint one. See the comment
-    // above and `WakeSpool`.
-    (channelId) => registry.get(channelId) !== undefined)
-  : null;
-wakeSpool?.start();
 mailWaker?.start();
 armedWaker?.start();
 
@@ -802,7 +713,6 @@ async function shutdown(signal: string): Promise<void> {
   process.stdout.write(`[clawcius] ${signal} received, shutting down\n`);
   systemd.stopping();
   try {
-    wakeSpool?.stop();
     mailWaker?.stop();
     // Stopping the timer loses nothing: every armed condition is a row, and
     // one that comes due while this process is down fires late on the next

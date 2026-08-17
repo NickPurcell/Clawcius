@@ -179,18 +179,23 @@ export class MailStore {
       // session cannot obtain another session's tool, and the board itself is
       // outside every bind mount.
       //
-      // One route survives, and it is the wake spool. `run/wake` is inside the
-      // crew's mount, a request there names the channel to wake, and nothing
-      // validates that name — so any process in the container can start a turn
-      // as its coordinator with a prompt of its choosing, and that turn holds
-      // the coordinator's `sendMail`. It is impersonation with a model in the
-      // middle rather than a forged stamp, which is weaker but not nothing.
-      // Retiring the spool is CLAWSKY.md phase 4 and Clawcius #39.
+      // The wake spool used to be the exception: `run/wake` was inside the
+      // crew's mount, a request there named the channel to wake, and nothing
+      // validated that name — so any process in the container could start a
+      // turn as its coordinator, holding the coordinator's `sendMail`. That
+      // spool is gone (CLAWSKY.md phase 4, Clawcius #39), and with it the last
+      // path from a shared filesystem into somebody else's identity.
+      //
+      // What is left is not nothing, and it is not a filesystem problem. Every
+      // agent of a crew still shares one container, one uid and one process
+      // table (Clawcius #31, and the rest of #35): a crewmate can read another
+      // session's transcript, and can kill or `docker exec` alongside it. It
+      // cannot *become* it — there is no longer any route by which a name a
+      // process writes down turns into a session holding that name's tools.
+      // Per-agent uids remain the thing that would close the rest.
       //
       // So the rule holds against a mistake, against another crew, and against
-      // anything reached through mail. Within one container it is still worth
-      // no more than the container's own boundary, and per-agent uids remain
-      // the thing that would make it a boundary rather than a convention.
+      // anything reached through mail or through disk.
       //
       // Engineers ask their captain; the captain asks the host.
       if (recipient.role === 'host' && author.role !== 'coordinator') {

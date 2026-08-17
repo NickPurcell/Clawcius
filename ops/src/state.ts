@@ -47,27 +47,42 @@ export type Quarantine = {
   reason: string;
 };
 
-/** A destructive operation waiting to hear that the instance came back. */
+/**
+ * A destructive operation waiting to hear that the instance came back.
+ *
+ * NOTHING ARMS ONE. The only caller was a task filed into the ops spool, and
+ * that path was retired on 2026-08-16 along with the snapshot it rolled back
+ * to and the `checkin` verb that closed it. `Executor.reportRetiredDeadlines()`
+ * clears whatever a previous build left on disk, on its first boot.
+ *
+ * The shape is kept because `state.json` on a running host may still hold rows
+ * in it, and a build that cannot parse its own state file is worse than one
+ * that reads a row and throws it away. Every field below is therefore in the
+ * past tense: this describes what these values MEANT, for whoever is reading a
+ * row that outlived the mechanism. Clawcius #63.
+ */
 export type PendingCheckin = {
   instance: string;
-  /** Epoch ms after which no check-in means roll back. */
+  /** Epoch ms after which no check-in meant roll back. */
   deadlineAt: number;
-  /** What was done, in words, for the wake and the journal. */
+  /** What was done, in words, for the wake file and the journal. */
   reason: string;
-  /** The build that was deployed, quarantined if this deadline is missed. */
+  /** The build that was deployed. Was quarantined if the deadline was missed. */
   build: string;
   /**
    * Snapshot tag to roll back TO. Captured before the operation, because
-   * afterwards the newest snapshot may well be one taken of the broken build.
+   * afterwards the newest snapshot may well have been one taken of the broken
+   * build.
    */
   rollbackTag: string;
   /**
    * True when this deadline was armed by a rollback rather than a deploy.
    *
-   * Deliberately never set today, and the reason is in the executor: an
-   * automatic rollback does NOT arm a new deadline, because a deadline whose
-   * expiry triggers another rollback is a loop with a timer on it. Kept in the
-   * shape so that a future change has to look at this comment first.
+   * Never set, and it never was: an automatic rollback did NOT arm a new
+   * deadline, because a deadline whose expiry triggers another rollback is a
+   * loop with a timer on it. It was kept in the shape so a future change would
+   * have to read that reasoning first — which is still the reason it is here,
+   * now that there are no deadlines at all.
    */
   fromRollback: boolean;
   armedAt: number;
@@ -194,6 +209,27 @@ export class StateStore {
       this.#state.quarantined.shift();
     }
     this.#save();
+  }
+
+  /**
+   * Empty the quarantine list, and say how many rows went.
+   *
+   * Added 2026-08-16 for one job: `Executor.reportRetiredDeadlines()`, which
+   * clears what the retired spool path left behind. Nothing quarantines any
+   * more — `quarantine()` was called only from the automatic rollback after a
+   * missed check-in, and that whole path went with the spools — so a row still
+   * in this list is one nothing will ever act on, sitting in `ops-status.json`
+   * next to a comment promising it would be empty.
+   *
+   * A separate method rather than a flag on `disarm`, because the two answer
+   * different questions and only one of them is about a deadline.
+   */
+  clearQuarantine(): number {
+    const count = this.#state.quarantined.length;
+    if (count === 0) return 0;
+    this.#state.quarantined = [];
+    this.#save();
+    return count;
   }
 
   // ── Pending check-ins ───────────────────────────────────────────────────

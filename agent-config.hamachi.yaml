@@ -25,7 +25,6 @@
 #     container.execEnvDir    /var/lib/hamachi/exec-env
 #     sessions.maxConcurrent  1                      (the VM has ~1.8 GB free)
 #     sessions.workspaceRoot  /var/lib/hamachi/workspaces
-#     wake.spoolDir           /var/lib/hamachi/run/wake
 #     discord.allowed/followUpChannelIds   the test channel
 #
 # paths.discordCli and paths.skillsDir deliberately still point into
@@ -141,22 +140,6 @@ prompts:
   # Placeholders: {time} {author} {authorId} {messageId} {content}
   messageLine: "[{time}] {author}: {content}"
 
-  # Wake message for a schedule the agent set for itself.
-  # Placeholders: {roleNotice} {channelId} {scheduleId} {repeats} {prompt} {cli}
-  scheduleWake: |-
-    {roleNotice}
-
-    Scheduled wake.
-
-    channel_id:  {channelId}
-    schedule_id: {scheduleId}
-    repeats:     {repeats}
-
-    Your instruction to yourself:
-    {prompt}
-
-    No message to reply to. To post:
-      {cli} send -c {channelId} -t "..."
 # The "[1m]" suffix is not decoration and not part of the model name: the SDK
 # parses it. From cli.js --
 #
@@ -183,6 +166,17 @@ prompts:
 container:
   name: hamachi-agent
   claudePath: /usr/local/bin/claude
+  # This instance's CLAWCIUS_STATE_DIR, and the only reason this file knows it:
+  # <stateDir>/run is what docker/run-container.sh bind-mounts read-write into
+  # the container, and nothing else here names that directory. It is never
+  # created and never written to — it is how the loader answers "is this path
+  # somewhere the agent can write", which it does for status.file and for
+  # container.execEnvDir below.
+  #
+  # Must match CLAWCIUS_STATE_DIR in this instance's container unit and
+  # instances[].stateDir in ops/ops-config.yaml. Getting it wrong makes those
+  # checks wrong in the direction of passing.
+  stateDir: /var/lib/hamachi
   # This instance's own. Sharing one directory between the two deployments
   # would work, but the file holds whichever instance's tokens wrote it and
   # each state directory is otherwise strictly per-instance; there is no reason
@@ -487,23 +481,6 @@ git:
   userName: Hamachi
   userEmail: hamachi@users.noreply.github.com
 
-# ── Self-scheduling ───────────────────────────────────────────────────────
-# The agent schedules itself with cron inside its container and POSTs here to
-# be woken. There is no bespoke scheduler any more — it uses tools it already
-# knows, and the waker only has to accept the request.
-#
-#   0 9 * * *  echo '{"channel":"<id>","prompt":"post the morning briefing"}' \
-#                > /var/lib/hamachi/run/wake/$(date +%s).json
-#
-# A directory rather than a socket because gVisor blocks host unix sockets —
-# correctly, since one would be a hole straight through the sandbox boundary.
-#
-# A request is a request: concurrency limits and this rate cap still apply.
-wake:
-  enabled: true
-  spoolDir: /var/lib/hamachi/run/wake
-  maxPerHour: 30
-
 # ── Clawsky: the message board ────────────────────────────────────────────
 # An agent is a row in a registry, and everything addressed to it arrives in
 # one inbox. See CLAWSKY.md. Agents have identity, they read their inbox with
@@ -593,7 +570,14 @@ armed:
 # writable by the agent. A prompt-injected agent that can publish "no turns in
 # flight" can talk a root process into destroying a live session — or into
 # believing a rollback is safe. Both loaders refuse to start if this path ends
-# up inside the spool.
+# up inside `/var/lib/hamachi/run` — the directory docker/run-container.sh
+# actually bind-mounts read-write, and the one this check has to be written
+# against. Until 2026-08-16 it was written against the wake spool instead,
+# `<stateDir>/run/wake`, one level BELOW the mount, so a status file sitting
+# directly in `run/` passed every check in both loaders while being writable by
+# the agent (Clawcius #55). The spool is gone; the waker no longer derives the
+# mount from the spool's parent but reads it from the `container.stateDir` key
+# above, which names it outright.
 status:
   file: /var/lib/hamachi/waker-status.json
   intervalSeconds: 20

@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, isAbsolute, dirname } from 'node:path';
+import { resolve, isAbsolute, dirname, join } from 'node:path';
 import { parse } from 'yaml';
 import { AGENT_ROLES, isAgentRole, type AgentRole } from './store.js';
 import { REPO_NAME } from './github.js';
@@ -49,8 +49,6 @@ export type PromptTemplates = {
   messageWake: string;
   /** How one message inside a bundle renders. */
   messageLine: string;
-  /** Wake message for a schedule the agent set for itself. */
-  scheduleWake: string;
   /**
    * Wake message for mail that arrived while the agent was idle.
    *
@@ -69,7 +67,6 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   roleNotice: [],
   messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
-  scheduleWake: ['channelId', 'scheduleId', 'repeats', 'prompt', 'cli', 'roleNotice'],
   mailWake: ['mail', 'count', 'plural'],
 };
 
@@ -78,6 +75,35 @@ export type AgentConfig = {
     name: string;
     /** In-container path to the claude binary. */
     claudePath: string;
+    /**
+     * This instance's `CLAWCIUS_STATE_DIR`, and the only reason this file knows
+     * it: `<stateDir>/run` is what `docker/run-container.sh` bind-mounts
+     * read-write into the container, and nothing else in this config names it.
+     *
+     * It used to be reached through `dirname(wake.spoolDir)`, which was
+     * accidental — the spool was `<stateDir>/run/wake` and its parent happened
+     * to be the mount. That derivation was also wrong by one level for the check
+     * it was doing, so `status.file: <stateDir>/run/waker-status.json` passed
+     * every check in both loaders while sitting in a directory the agent can
+     * write (Clawcius #55). Retiring the spool removed the derivation; this
+     * names the thing directly instead, which is what the ops loader has always
+     * done with `instances[].stateDir`.
+     *
+     * MUST match `CLAWCIUS_STATE_DIR` in this instance's container unit, and
+     * `instances[].stateDir` in ops-config.yaml. Nothing is created from it and
+     * nothing is written to it — it is used to answer "is this path somewhere
+     * the container can write", and getting it wrong makes that answer wrong in
+     * the direction of passing.
+     *
+     * So it is REQUIRED and must be ABSOLUTE, and it has no default. All three
+     * of those are the same decision. A relative value resolves against the
+     * waker's working directory and every check downstream then compares against
+     * a directory that does not exist; a default would be `/var/lib/clawcius`,
+     * correct for one instance and quietly wrong for the other, which is the
+     * shape of the bug this key was added to fix rather than a smaller version
+     * of it. A missing key fails the boot with the key named.
+     */
+    stateDir: string;
     /**
      * Where the per-exec `--env-file` is written (src/container.ts).
      *
@@ -160,20 +186,6 @@ export type AgentConfig = {
     userName: string;
     /** Author email. Keep it distinct from yours so agent commits are obvious. */
     userEmail: string;
-  };
-  wake: {
-    /**
-     * Unix socket the agent POSTs to in order to be woken later.
-     *
-     * Replaces the old MCP scheduler: inside its container the agent has cron
-     * and daemons, so it schedules itself with tools it already knows and we
-     * only have to accept the request.
-     */
-    enabled: boolean;
-    /** Directory the agent drops wake-request JSON files into. */
-    spoolDir: string;
-    /** Cap on accepted wake requests per channel per rolling hour. */
-    maxPerHour: number;
   };
   /**
    * The message board: identity and mail.
@@ -270,13 +282,14 @@ export type AgentConfig = {
     /**
      * Absolute path for the status file, or empty to publish nothing.
      *
-     * MUST NOT live under `wake.spoolDir` or anywhere else bind-mounted into
-     * the agent container. The whole point of the file is that a privileged
-     * process trusts it, and the agent inside the container is exactly the
-     * party that must not be able to write "I am idle, go ahead and recreate
-     * me". `wake.spoolDir` is mounted read-write by design; this is one level
-     * up, outside every mount in `docker/run-container.sh`. The ops config
-     * loader re-checks the containment and refuses to start if it is violated.
+     * MUST NOT live anywhere bind-mounted into the agent container. The whole
+     * point of the file is that a privileged process trusts it, and the agent
+     * inside the container is exactly the party that must not be able to write
+     * "I am idle, go ahead and recreate me". `<stateDir>/run` is mounted
+     * read-write by design; the default here is one level up, outside every
+     * mount in `docker/run-container.sh`. The ops config loader re-checks the
+     * containment against that mount — which it can name, because it holds
+     * `instances[].stateDir` — and refuses to start if it is violated.
      */
     file: string;
     /** Republish this often even when the live count has not moved. */
@@ -341,26 +354,25 @@ To reply to the latest:
 
   messageLine: '[{time}] {author}: {content}',
 
-  scheduleWake: `{roleNotice}
-
-Scheduled wake.
-
-channel_id:  {channelId}
-schedule_id: {scheduleId}
-repeats:     {repeats}
-
-Your instruction to yourself:
-{prompt}
-
-No message to reply to. To post:
-  {cli} send -c {channelId} -t "..."`,
-
   mailWake: `checkMail →
 
 {mail}`,
 };
 
-const DEFAULTS: AgentConfig = {
+/**
+ * Every setting that has a default, and nothing that does not.
+ *
+ * `container.stateDir` is deliberately absent, and the type says so rather than
+ * a comment alone: it names a per-instance directory, so any value here would be
+ * right for one instance and silently wrong for the other — which is the bug
+ * Clawcius #55 was, one level up. Omitting it from this type is what makes
+ * "somebody must write this down" a compile-time fact instead of a convention.
+ */
+type Defaults = Omit<AgentConfig, 'container'> & {
+  container: Omit<AgentConfig['container'], 'stateDir'>;
+};
+
+const DEFAULTS: Defaults = {
   container: {
     name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
@@ -394,11 +406,6 @@ const DEFAULTS: AgentConfig = {
   git: {
     userName: 'Clawcius',
     userEmail: 'clawcius@users.noreply.github.com',
-  },
-  wake: {
-    enabled: true,
-    spoolDir: '/var/lib/clawcius/run/wake',
-    maxPerHour: 30,
   },
   clawsky: {
     enabled: true,
@@ -437,6 +444,26 @@ function str(raw: unknown, path: string, fallback: string): string {
   if (raw === undefined || raw === null) return fallback;
   if (typeof raw !== 'string') throw new ConfigError(path, 'must be a string');
   return raw;
+}
+
+/**
+ * A path that must be written down, and must be absolute.
+ *
+ * The same shape as `requiredAbsPath` in `ops/src/config.ts`, and here for the
+ * same reason: a relative path resolves against the WAKER'S working directory,
+ * which is not a place anybody was thinking about, and `isInside()` then
+ * compares against a directory that does not exist — so every containment check
+ * downstream passes. There is no fallback argument on purpose. A default for a
+ * path that names a per-instance directory is a default that is right for
+ * exactly one instance and silently wrong for the other.
+ */
+function requiredAbsPath(raw: unknown, path: string): string {
+  if (raw === undefined || raw === null || raw === '') {
+    throw new ConfigError(path, 'is required and has no default');
+  }
+  if (typeof raw !== 'string') throw new ConfigError(path, 'must be a string');
+  if (!isAbsolute(raw)) throw new ConfigError(path, `("${raw}") must be an absolute path`);
+  return resolve(raw);
 }
 
 function bool(raw: unknown, path: string, fallback: boolean): boolean {
@@ -567,21 +594,54 @@ function isInside(child: string, parent: string): boolean {
  * Host paths that `docker/run-container.sh` bind-mounts into the agent
  * container, as far as this file can know them.
  *
- * NOT exhaustive, and the gap is worth naming: the script also mounts
- * `<stateDir>/agent-home`, `gws-cli` and the Google service-account key, none
- * of which appear in this config at all. So this catches the plausible
- * mistakes (a path written under the workspaces root, or under `run/`) and
- * cannot catch every one. The defence that does not depend on enumeration is
- * the default value, which is a sibling of the mounts rather than a child.
+ * ── The three read-write ones, all of them covered ───────────────────────
+ *
+ * `docker/run-container.sh` mounts three directories read-write, and all three
+ * are derived from one variable:
+ *
+ *     -v "$CLAWCIUS_STATE/workspaces:…:rw"
+ *     -v "$CLAWCIUS_STATE/run:…:rw"
+ *     -v "$CLAWCIUS_STATE/agent-home:…:rw"
+ *
+ * Those are the ones that matter most here, because a file inside one is
+ * WRITABLE by the agent rather than merely shared with the other deployment —
+ * and `status.file` is a file a root process believes. `run` used to be reached
+ * as `dirname(wake.spoolDir)`, which was right by accident and wrong by one
+ * level (Clawcius #55); `container.stateDir` names it directly now, and the
+ * other two come off the same key.
+ *
+ * `agent-home` was missing from this list until 2026-08-16 and was named in
+ * this comment as a known gap instead. That left `ops/src/config.ts` checking
+ * three mounts while this file checked two and said so — two halves of one
+ * change disagreeing about the completeness of one enumeration, which is the
+ * same defect in the opposite direction from the one review had just found.
+ * Deriving it was three characters; documenting the disagreement would have
+ * been cheaper and worse.
+ *
+ * ── Still NOT exhaustive, and this is the honest remainder ───────────────
+ *
+ * Two read-only mounts do not appear in this config at all: `gws-cli` and the
+ * Google service-account key. They are read-only, so nothing in a container can
+ * write them — the risk there is not a forged claim but a shared secret, since
+ * a path placed in one would be visible to BOTH deployments' agents. The
+ * defence that does not depend on enumeration is the default value: every path
+ * this file defaults to is a sibling of the mounts rather than a child.
  */
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
+  const state = config.container.stateDir;
   return [
     ['sessions.workspaceRoot', config.sessions.workspaceRoot],
-    // The script mounts `<stateDir>/run`, the PARENT of the wake spool — the
-    // spool rides along inside that one mount rather than having its own. So
-    // checking against wake.spoolDir alone would wave through a path that is
-    // its sibling and just as reachable from the container.
-    ['the directory containing wake.spoolDir', dirname(config.wake.spoolDir)],
+    // The three `docker run -v … :rw` paths, by the same derivation the script
+    // uses. `sessions.workspaceRoot` above is configurable and usually the same
+    // directory as the first of these; both are listed because an operator who
+    // moves one has not moved the mount.
+    ...(['run', 'workspaces', 'agent-home'] as const).map(
+      (child) =>
+        [`<container.stateDir>/${child}, bind-mounted read-write`, join(state, child)] as [
+          string,
+          string,
+        ],
+    ),
     ['paths.skillsDir', config.paths.skillsDir],
     ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
   ];
@@ -609,7 +669,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const sessions = section(root['sessions'], 'sessions');
   const discord = section(root['discord'], 'discord');
   const paths = section(root['paths'], 'paths');
-  const wake = section(root['wake'], 'wake');
   const clawsky = section(root['clawsky'], 'clawsky');
   const armed = section(root['armed'], 'armed');
   const armedGithub = section(armed['github'], 'armed.github');
@@ -622,6 +681,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     container: {
       name: str(container['name'], 'container.name', DEFAULTS.container.name),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
+      // Required, absolute, and with no default — see `requiredAbsPath`, and
+      // Clawcius #55, which this key exists to close. A default here would be
+      // `/var/lib/clawcius`, which is right for one of the two instances and
+      // would point the other's containment check at its neighbour's mount.
+      stateDir: requiredAbsPath(container['stateDir'], 'container.stateDir'),
       execEnvDir: str(
         container['execEnvDir'],
         'container.execEnvDir',
@@ -633,7 +697,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       roleNotice: template(prompts['roleNotice'], 'roleNotice', DEFAULT_PROMPTS.roleNotice),
       messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
       messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
-      scheduleWake: template(prompts['scheduleWake'], 'scheduleWake', DEFAULT_PROMPTS.scheduleWake),
       mailWake: template(prompts['mailWake'], 'mailWake', DEFAULT_PROMPTS.mailWake),
     },
     model: str(root['model'], 'model', DEFAULTS.model),
@@ -708,11 +771,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
       userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
     },
-    wake: {
-      enabled: bool(wake['enabled'], 'wake.enabled', DEFAULTS.wake.enabled),
-      spoolDir: str(wake['spoolDir'], 'wake.spoolDir', DEFAULTS.wake.spoolDir),
-      maxPerHour: num(wake['maxPerHour'], 'wake.maxPerHour', DEFAULTS.wake.maxPerHour, 1),
-    },
     clawsky: {
       enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
       crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
@@ -764,28 +822,30 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   }
 
   // The status file is read by a root process that will recreate containers on
-  // the strength of it. Inside the spool directory it would be writable by the
-  // agent, which is the party the executor is defending against — a container
-  // that can publish `liveCount: 0` can talk a privileged process into
-  // destroying a session mid-turn, or into overwriting a rollback decision.
-  // Checked here as well as in the ops config loader; neither should be the
-  // only place this is true.
+  // the strength of it. Inside a bind mount it would be writable by the agent,
+  // which is the party the executor is defending against — a container that can
+  // publish `liveCount: 0` can talk a privileged process into destroying a
+  // session mid-turn, or into overwriting a rollback decision.
+  //
+  // It used to be checked against `wake.spoolDir` — `<stateDir>/run/wake`, one
+  // level BELOW the directory that is actually mounted — so a status file at
+  // `<stateDir>/run/waker-status.json` passed while sitting somewhere the agent
+  // can write (Clawcius #55). It is now checked against the same list the exec
+  // env file is, which names the mount itself.
   if (config.status.file) {
     if (!isAbsolute(config.status.file)) {
       throw new ConfigError('status.file', 'must be an absolute path');
     }
     const statusFile = resolve(config.status.file);
-    // The wake spool is agent-writable by design — it is inside the bind mount
-    // and that is the point of it — so it is the one directory this file must
-    // not land in.
-    const mounted = resolve(config.wake.spoolDir);
-    if (statusFile === mounted || statusFile.startsWith(`${mounted}/`)) {
-      throw new Error(
-        `agent-config.yaml: status.file (${statusFile}) is inside wake.spoolDir ` +
-          `(${mounted}), which is bind-mounted read-write into the agent container. ` +
-          'The ops executor trusts this file when deciding whether recreating the ' +
-          'container would kill a live turn; the agent must not be able to write it.',
-      );
+    for (const [label, mount] of bindMountedPaths(config)) {
+      if (isInside(statusFile, resolve(mount))) {
+        throw new Error(
+          `agent-config.yaml: status.file (${statusFile}) is inside ${label} ` +
+            `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
+            'container. The ops executor trusts this file when deciding whether recreating ' +
+            'the container would kill a live turn; the agent must not be able to write it.',
+        );
+      }
     }
   }
 

@@ -333,23 +333,26 @@ server-side (5 minutes, or an hour) and independent of process lifetime.
 
 ## 6b. Self-scheduling
 
-No bespoke scheduler. The agent has cron inside its container and asks to be
-woken by writing a file:
+An agent schedules itself by calling a tool. `remindMe` takes a note and a time
+and delivers it as mail from the agent to itself; `watchPr` waits for a stranger
+to review, comment on or merge a pull request. Both are rows in SQLite, so a
+condition that comes due while the process is down fires late on the next start
+rather than not at all, and both are built per session and closed over that
+session's agent id — "an agent may only schedule itself" is the absence of an
+argument rather than the rejection of one. `src/armed.ts`, `src/armed-tool.ts`
+and `src/armed-wake.ts`; configuration is the `armed:` block.
 
-```sh
-0 9 * * *  echo '{"channel":"<id>","prompt":"post the briefing"}' \
-             > /var/lib/clawcius/run/wake/$(date +%s).json
-```
+Until 2026-08-16 there was a second way, and it is worth knowing it existed
+because a rollback to an older `dist/` brings it back. The agent asked to be
+woken by dropping a JSON file into `/var/lib/<instance>/run/wake`, which the
+waker swept. That file named the channel to wake and nothing validated the name,
+so any process in the container could start a turn as any agent of its crew,
+holding that agent's tools — the last route on disk into somebody else's
+identity (Clawcius #39). It is gone. The directory is left on disk and is inert:
+nothing watches it and nothing reads a file left there.
 
-The waker watches that directory (`fs.watch`, plus a 5s sweep because gVisor's
-gofer does not reliably deliver inotify for writes made inside the sandbox),
-consumes each request, and starts a turn. `wake.maxPerHour` still applies — a
-request is a request, not a command, so this cannot be used to escape the
-concurrency cap.
-
-A unix socket was the original design. gVisor blocks connections to host unix
-sockets, correctly, since one would be a hole straight through the sandbox
-boundary; a bind-mounted directory needs no such exception.
+The documentation for it also taught a cron pattern, and there is no cron daemon
+in the container (Clawcius #52). That dies with it.
 
 ---
 
@@ -372,14 +375,17 @@ different name. It also answers — delivered, or refused and why — before the
 call returns, so a mistyped recipient is something the sender is told about
 rather than something it waits on.
 
-Two honest limits. Every agent of a crew still shares a container, a uid and a
-disk. And `run/wake` still takes any channel id, so a process in the container
-can start a turn *as another agent of its crew* with a prompt of its choosing
-— impersonation with a model in the middle rather than a forged name, but a
-real one (Clawcius #39). Retiring the wake spool is `CLAWSKY.md` phase 4.
+One honest limit, and it is smaller than it was. Every agent of a crew still
+shares a container, a uid and a process table (Clawcius #31), so a crewmate can
+read another session's transcript and can `docker exec` alongside it. What it
+can no longer do is *become* one: the wake spool was the last path by which a
+name a process wrote down turned into a session holding that name's tools, and
+it went on 2026-08-16 (Clawcius #39). Per-agent uids are what would close the
+rest.
 
 This replaced per-agent drop directories under `run/clawsky/`. Any that exist
-on disk are inert: nothing watches them and nothing reads a file left there.
+on disk are inert, as `run/wake` and `run/ops` now are: nothing watches them and
+nothing reads a file left there.
 
 `to: "*"` is the feed, which every agent reads and only an agent whose role is
 `poster` may write to. Everything else is a DM, delivered to one agent inside
@@ -406,10 +412,17 @@ host and does it.
 That is a change of kind, not of degree, and it happened on 2026-08-10 after an
 evening in which standing up three services took a dozen ad-hoc shell commands
 the operator had to type himself. **For this component the sandbox has stopped
-being a security boundary.** What replaces it is a snapshot before every task, an
-automatic rollback after a failed one, a complete audit of every command, and
-the fact that this is a personal VPS with snapshots. The operator accepted that
+being a security boundary.** What replaces it is a complete audit of every
+command, an unprivileged service account with a narrow sudoers file, and the
+fact that this is a personal VPS with snapshots. The operator accepted that
 trade explicitly, twice.
+
+There was also a snapshot before every task and an automatic rollback after a
+failed one. Both belonged to the ops spool and both went with it on 2026-08-16:
+**a task filed by DM takes no snapshot, so there is nothing to restore to.** The
+health sample either side survives and now reports rather than repairs, and the
+reply says so. Undoing a task is a person's decision, and the ops journal holds
+every command it ran.
 
 `ops/README.md` is the full write-up and `ops/src/host-agent.ts` is where the
 reasoning lives. **Read at least the trust model before turning `dryRun` off.**
@@ -417,9 +430,9 @@ reasoning lives. **Read at least the trust model before turning `dryRun` off.**
 The executor is still its own unit, and the reason is unchanged: `restart
 clawcius.service` is one of the things a task will ask for, and a process cannot
 restart itself without dying mid-operation. It has to outlive the things it
-restarts. It still has no Discord connection and no GitHub token — the session
-reports its result back through the spool and the sandboxed agent does the
-talking, so that a process with a shell cannot speak as the bot.
+restarts. It still has no Discord connection and no GitHub token — it answers
+the coordinator that asked, by DM, and the sandboxed agent does the talking, so
+that a process with a shell cannot speak as the bot.
 
 **It ships in dry-run, and dry-run is real.** `dryRun: true` in
 `ops/ops-config.yaml` makes the executor take every decision and log the exact
@@ -463,7 +476,7 @@ sudo chown -R npurcell:npurcell /home/npurcell/clawcius   # if a root build got 
 cd /home/npurcell/clawcius/ops
 npm install
 npm run build
-npm run selftest              # 82 tests, no docker required
+npm run selftest              # 58 tests, no docker required
 
 sudo cp ../systemd/clawcius-ops.service \
         ../systemd/clawcius-snapshot-verify.service \
@@ -473,62 +486,50 @@ sudo systemctl enable --now clawcius-ops.service
 sudo systemctl enable --now clawcius-snapshot-verify.timer
 ```
 
-**One spool per instance, since 2026-08-10.** Each lives inside that
-instance's own `run/` mount — the only part of its state directory that
-`docker/run-container.sh` bind-mounts — because that is what makes it reachable
-from that container and from no other. There used to be a single shared one at
-`/var/lib/clawcius/run/ops`, and it was reachable from Clawcius's container and
-simply absent from Hamachi's, which meant the agent the operator talks to most
-could not file a request at all. `ops/README.md` has the whole account.
+**There is no spool.** Until 2026-08-16 each instance had one — a directory
+inside its own `run/` mount that the executor swept — and a request was a JSON
+file, answered by another JSON file written back into `run/wake`. Both are gone.
+A task arrives as a DM to `<crew>-host` from that crew's coordinator, and the
+answer is a DM back.
 
-`docker/run-container.sh` creates them now, next to `run/wake`, running as
-`npurcell` so the ownership matches the container's uid without a `chown`. The
-executor also creates and chowns them at startup, so a fresh host works before
-any container has been started. Neither needs a manual step, but if you want to
-do it by hand ahead of time:
-
-```sh
-sudo install -d -m 0770 -o npurcell -g npurcell /var/lib/clawcius/run/ops
-sudo install -d -m 0770 -o npurcell -g npurcell /var/lib/hamachi/run/ops
-```
-
-Check it is watching **both**, and that the first thing it says is that it is
-not really doing anything:
+Check that the daemon came up, that it took a mailbox on **both** boards, and
+that the first thing it says is that it is not really doing anything:
 
 ```sh
 journalctl -u clawcius-ops -n 30
 # [ops] boot: clawcius-ops — … DRY RUN — every decision is made and logged, nothing is executed.
-# [ops] watching /var/lib/clawcius/run/ops for clawcius (sweep 5s)
-# [ops] watching /var/lib/hamachi/run/ops  for hamachi  (sweep 5s)
+# [ops mail clawcius] clawcius-host is on the board for clawcius (/var/lib/clawcius)
+# [ops mail hamachi]  hamachi-host  is on the board for hamachi  (/var/lib/hamachi)
 ```
 
-If the log carries a `config deprecation` line, `ops-config.yaml` still has the
-old top-level `spoolDir:`. It has been accepted and attributed to the instance
-that owns it — nothing has changed for that instance — and the line names the
-replacement. Delete the key.
+A missing mailbox line means that crew's coordinator cannot reach the host agent
+at all. Check the `board:` block for that instance, and that `db:` names the same
+file as its `CLAWCIUS_DB_PATH`.
 
-Then file a request from inside each container and watch it land. Do both:
-the second one is the case that was broken, and it is the one worth proving.
+If the log carries a `config deprecation` line, `ops-config.yaml` still names a
+retired key — `spoolDir`, `opsSpoolDir`, `wakeSpoolDir`, `wakeChannelId` or
+`mayRequest`. Each is ignored, and each is named in the notice with what stands
+in its place. Delete them; nothing on disk was touched on their account.
+
+Then ask, from each crew's coordinator, and watch it land. Do both — a mailbox
+nobody ever wrote to looks exactly like a quiet night:
+
+> **Hamachi**, DM `hamachi-host`: *report the output of `systemctl is-active
+> clawcius.service` and change nothing.*
 
 ```sh
-for c in clawcius hamachi; do
-  docker exec "$c-agent" sh -c "
-    OPS=/var/lib/$c/run/ops; S=\$(date +%s)
-    printf '%s' '{\"verb\":\"task\",\"instance\":\"$c\",\"task\":\"report the output of systemctl is-active clawcius.service and change nothing\",\"reason\":\"smoke test\"}' \
-      > \$OPS/\$S.tmp && mv \$OPS/\$S.tmp \$OPS/\$S.json"
-done
 journalctl -u clawcius-ops -n 40
-# [ops] request: task clawcius: report the output of systemctl… (from clawcius) — …
-# [ops] request: task hamachi: report the output of systemctl…  (from hamachi)  — …
+# [ops mail hamachi] running a task for hamachi-coordinator: report the output of systemctl…
+# [ops] request: task by mail from hamachi-coordinator (from hamachi-coordinator) — …
 ```
 
-In dry-run the session has no Bash tool, so the smoke test proves the whole
-pipeline — spool, provenance, lock, snapshot decision, session, audit, report —
+In dry-run the session has no Bash tool, so this proves the whole pipeline —
+mailbox, the coordinator check, the lock, the session, the audit, the reply —
 without anything running. Read what it says it would have done.
 
-The `(from …)` is the point of the change: with one shared spool those two
-lines were identical, and the executor had no way to tell which agent had
-asked.
+The `(from …)` is the mail row's author column, written by the waker from the
+sending session's own `sendMail` closure. No argument anywhere reaches it and
+nothing in a message body can change it.
 
 ### The status file each waker publishes
 
@@ -545,11 +546,24 @@ writes:
 **Note the path.** It is a *sibling* of `run/`, not a child. `run/` is
 bind-mounted read-write into the container, so a status file inside it would be
 writable by the agent — and an agent that can publish "no turns in flight" can
-talk a root process into destroying a live session, or into believing a
-rollback is safe. Both config loaders check the containment and refuse to start
-if it is violated. Missing, stale, malformed or future-dated all read as
-*busy*, which is the safe direction; a waker that crashed leaves a stale
-`liveCount: 0` behind, and that is the one value that must never be believed.
+talk a root process into believing a container is safe to recreate. Both config
+loaders check the containment against **`<stateDir>/run` itself** and refuse to
+start if it is violated. Until 2026-08-16 they checked against
+`<stateDir>/run/wake`, one level below the directory that is actually mounted,
+so `<stateDir>/run/waker-status.json` passed both while sitting somewhere the
+agent could write it (Clawcius #55); the waker learns the path from the new
+`container.stateDir` key, which must match `CLAWCIUS_STATE_DIR` in that
+instance's container unit and `instances[].stateDir` in `ops/ops-config.yaml`.
+
+Missing, stale, malformed or future-dated all read as *busy*, which is the safe
+direction; a waker that crashed leaves a stale `liveCount: 0` behind, and that
+is the one value that must never be believed.
+
+**Nothing reads that verdict at present.** The executor consumed it in one
+place — the wait for an idle turn before something destructive — and that wait
+went with the ops spool. The file is still published, still validated and still
+contained, because the containment is the expensive part to get right and the
+consumer is the cheap part to add back.
 
 ### Where each turn's environment is written
 
@@ -600,12 +614,10 @@ absent. Note that it does **not** grant docker: npurcell reaches docker through
 group membership, which is root-equivalent, so the sudoers scoping is about
 keeping the easy path the audited one rather than about containment.
 
-Then set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Set
-the two `wakeChannelId` values first — they are placeholder zeros in the shipped
-config, and they are where the "you were rebuilt, verify and check in" wake is
-delivered. Without a real channel the agent never hears that it is on a
-deadline, and fifteen minutes later it gets rolled back for not answering a
-question it was never asked.
+Then set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Know
+what that turns on: from that moment a task runs a shell with sudo on this host
+and **nothing rolls it back**. The health sample either side reports; it does
+not repair.
 
 ```sh
 sudo systemctl restart clawcius-ops
@@ -613,21 +625,21 @@ sudo systemctl restart clawcius-ops
 
 ### When it freezes
 
-After two consecutive failed recoveries — a missed check-in, or a task that had
-to be rolled back — the executor stops accepting tasks and rollbacks and says
-so, loudly, in the journal. `checkin` and `wake` still work, so an instance that
-is alive can still say so. That is deliberate: something is wrong that another
-task cannot fix, and continuing would mean reinstalling the outage every fifteen
-minutes.
+A frozen executor refuses every task and says so, loudly, in the journal and in
+the reply to whoever asked.
+
+**Nothing sets it any more.** The circuit breaker that did counted failed
+recoveries on the spool task path — a missed check-in, or a task that had to be
+rolled back — and that path went with the spools on 2026-08-16, taking the
+snapshot, the deadline and the rollback with it. So a freeze you are looking at
+predates that. The flag is still read, still persisted and still clearable,
+because a host that is frozen today must not quietly unfreeze itself on the
+next deploy:
 
 ```sh
 sudo ops/unfreeze.sh                    # prints why, asks, then clears
 sudo systemctl restart clawcius-ops
 ```
-
-The quarantine list is not cleared by that. There is no verb for it either —
-though a task could obviously run `unfreeze.sh` itself, which is one more thing
-the audit log is for, and one more reason to read it.
 
 ### The units, after the audit
 
@@ -750,15 +762,17 @@ Two habits that go with it:
   agent session.** Everything up to the spawn is tested against stand-ins (see
   `ops/README.md` § *What has and has not been tested*), and everything past it
   is not: no `claude` session started by the daemon, no `systemctl restart`
-  performed, no container recreated, no snapshot committed or restored, no
-  post-task wake picked up by a live waker. It ships with `dryRun: true` for
-  exactly this reason, and in that mode the session has no Bash tool at all.
+  performed, no container recreated, and no reply DM read by the coordinator
+  that asked for it. It ships with `dryRun: true` for exactly this reason, and
+  in that mode the session has no Bash tool at all.
 - **The sandbox is no longer a security boundary for `clawcius-ops`.** Since
   2026-08-10 it starts a Claude Code session on the host with a shell and
-  passwordless sudo. The controls that replace the old verb allowlist are a
-  pre-task snapshot, an automatic rollback, and a complete audit log. This is a
-  deliberate, documented trade and not an oversight; `ops/README.md` § *The
-  trust model* is the honest version.
+  passwordless sudo. What replaces the old verb allowlist is **a complete audit
+  log**, an unprivileged service account, and a narrow sudoers file — and that
+  is now the whole list. It also said "a pre-task snapshot, an automatic
+  rollback" until 2026-08-16; both belonged to the ops spool and went with it,
+  so nothing undoes a task. This is a deliberate, documented trade and not an
+  oversight; `ops/README.md` § *The trust model* is the honest version.
 - **That session no longer runs as `npurcell` — and the migration to make that
   true has never been run.** Until 2026-08-11 it ran as the checkout's owner,
   which is `npurcell`, which is in the `docker` group, which the line above
@@ -767,17 +781,23 @@ Two habits that go with it:
   system account (`clawcius-ops`) that the daemon refuses to start without, and
   **that account does not exist on this host yet**. Until
   [`MIGRATION.md`](MIGRATION.md) is executed, every ops task is refused with the
-  reason and the fix; the daemon still boots and still honours its rollback
-  deadlines.
+  reason and the fix — in a reply to the coordinator that asked. The daemon
+  still boots, still takes its mailbox on each crew's board, still serves the
+  unit desk and still publishes the status file. (It said "still honours its
+  rollback deadlines" until 2026-08-16; there are no deadlines.)
 - **`ops/clawcius-sudoers` has never been parsed by `visudo -c`.** It was
   written on a machine without sudo, and it was rewritten (larger, and against
   a different user) on 2026-08-11. Check it before installing, from a second
   shell that already holds root — `MIGRATION.md` § 3 has the sequence.
-- **The host agent's rollback covers containers only.** `docker commit` captures
-  an agent container's writable layer; it does not capture `/etc`, the checkout
-  or unit files. A task that breaks the host filesystem is undone by the VPS
-  snapshot and by git, by a person.
-- **The `wakeChannelId` values in `ops/ops-config.yaml` are placeholder
-  zeros.** Until they are real channels the post-rebuild wake goes nowhere, and
-  an instance would be rolled back for failing to answer a question it never
-  received. Set them before turning `dryRun` off.
+- **Nothing undoes a task.** This used to say the rollback covered containers
+  only — `docker commit` captures an agent container's writable layer and not
+  `/etc`, the checkout or unit files. Since 2026-08-16 it covers nothing: the
+  snapshot went with the ops spool. The VPS snapshot and git are the undo, and
+  a person operates both.
+- **A task filed by DM cannot be undone.** The snapshot, the check-in deadline
+  and the automatic rollback belonged to the ops spool and went with it on
+  2026-08-16. The health sample either side reports and does not repair. Undoing
+  a task is a person's decision, and `journal.jsonl` holds every command it ran.
+- **The circuit breaker has no writer.** `frozen` is still read, still persisted
+  and still cleared by `ops/unfreeze.sh`; nothing sets it. See § When it
+  freezes.

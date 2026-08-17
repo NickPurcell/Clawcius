@@ -6,23 +6,32 @@ agents describe in free text.
 
 Until 2026-08-10 this was a closed list of seven verbs and this file said, in
 several places, that there must never be a model in it. That is no longer true.
-The rest of this document is about what changed, why, what was given up, and
-what was put in its place — because the trust model changed and this is the
-place that has to say so honestly.
+Until 2026-08-16 the way in was a directory-as-a-queue that each container could
+write, with a snapshot, an idle wait, a check-in deadline, an automatic rollback
+and a circuit breaker built around it. That is gone too. The rest of this
+document is about what changed, why, what was given up, and what was put in its
+place — because the trust model has changed twice and this is the place that has
+to say so honestly.
+
+**The shortest honest summary: a coordinator DMs the host agent, the session
+runs with sudo, every command it issues is written down before it is known to
+have worked, and nothing undoes any of it.**
 
 ```
   agent containers                          host
   ┌────────────────────────┐               ┌──────────────────────────────────────┐
-  │ clawcius               │  bind mount   │ clawcius-ops.service (root)          │
-  │  /var/lib/clawcius/run │ ────────────► │  one spool watched per instance      │
-  │    ops/   wake/        │               │  the SPOOL names the requester       │
-  ├────────────────────────┤               │  one task at a time                  │
-  │ hamachi                │  bind mount   │  snapshot ▸ idle-wait ▸ SESSION ▸    │
-  │  /var/lib/hamachi/run  │ ────────────► │    health check ▸ roll back if worse │
-  │    ops/   wake/        │ ◄──────────── │  every command audited, in full      │
-  └────────────────────────┘   wakes back  │  deadline armed on what it touched   │
-                                           └───────────────┬──────────────────────┘
-                                                           │ claude -p, as clawcius-ops,
+  │ clawcius               │   a DM, in    │ clawcius-ops.service (root)          │
+  │  coordinator ──────────┼──────────────►│  one mailbox per crew, on that       │
+  │    sendMail(           │   board.db,   │    crew's board                      │
+  │      "clawcius-host")  │◄──────────────┤  the AUTHOR COLUMN names the asker   │
+  ├────────────────────────┤   the reply   │  one task at a time — a second is    │
+  │ hamachi                │               │    REFUSED, not queued               │
+  │  coordinator ──────────┼──────────────►│  health sample ▸ SESSION ▸ health    │
+  └────────────────────────┘               │    sample again ▸ REPORT             │
+                                           │  every command audited, in full      │
+   the boards live OUTSIDE every           │  nothing is rolled back              │
+   bind mount; this daemon opens           └───────────────┬──────────────────────┘
+   them as root and reads rows                             │ claude -p, as clawcius-ops,
                                                            │ with Bash and a short
                                                            │ enumerated sudoers file
                                                            ▼
@@ -58,7 +67,7 @@ exists to remove, so a safety mechanism that reinstates it at every unforeseen
 step is not a safety mechanism with a cost — it is one that is eating the
 product.
 
-## Ask by DM — the spool is no longer the way in
+## Ask by DM — and, since 2026-08-16, there is no other way in
 
 Since 2026-08-14 the host agent is an ordinary Clawsky participant with a
 mailbox and a registry row. **A DM to `<crew>-host` runs it, immediately**, and
@@ -74,7 +83,8 @@ sendMail(
 )
 ```
 
-`sendMail` is one of the two tools the waker gives every session. It has no
+`sendMail` is one of the tools the waker builds per session, alongside
+`checkMail` and the armed conditions that replaced the wake spool. It has no
 `from` argument — the sender is the id the tool closes over — and it returns
 what happened, so a coordinator that is refused is told in the same turn.
 
@@ -90,112 +100,104 @@ enforced in code twice — where the DM is delivered, and again here against the
 author column of the row, immediately before anything runs. Engineers ask their
 captain; the captain asks the host.
 
-Everything below this line still holds: the account, the sudoers file, the
-privilege drop, the tool deny-lists, the per-command audit and the freeze are
-untouched, and every one of them is in the path of a task filed by mail.
+Most of what is below this line still holds: the account, the sudoers file, the
+privilege drop, the tool deny-lists and the per-command audit are untouched, and
+every one of them is in the path of a task filed by mail. The freeze is the
+exception and it is the honest one — the flag is still read and still refuses
+every task, but **nothing sets it any more**; see
+[§ The freeze has no writer](#the-freeze-has-no-writer).
 
 The host agent has a mailbox on an instance only if that instance has a `board:`
 block in `ops-config.yaml`. Without one, a coordinator DMing `<crew>-host` is
-told there is no such recipient, which is the honest answer.
+told there is no such recipient, which is the honest answer — and since
+2026-08-16 it is also the last answer, because there is no other door.
 
-## The requests (the old spool — inert, still running)
+## The spools, and what went with them (2026-08-16)
 
-Nothing files these any more. The directories are still watched and a request
-found in one is still executed the old way, with the snapshot, the idle wait and
-the deadline, because a rollback to the previous `dist/` must not find a request
-format that nothing reads. Read this section for what a `task` still does; do
-not use it for new work.
+There used to be two directory-as-a-queue spools, one pair per instance inside
+the container's own bind mount:
 
-Write to `<name>.tmp` and rename to `<name>.json` — the executor only looks at
-`.json`, and a file written in place can be read while it is still empty.
+- `<stateDir>/run/wake` — the agent dropped a JSON file naming a channel and a
+  prompt, to ask its own waker to start a turn. Replaced by `remindMe` and
+  `watchPr`, armed conditions in the waker (`src/armed.ts`, `src/armed-tool.ts`,
+  `src/armed-wake.ts`) that are built per session and closed over that session's
+  agent id, so "an agent may only schedule itself" is the absence of an argument
+  rather than the rejection of one. The file it replaced named the channel, and
+  nothing validated that name (Clawcius #39);
+- `<stateDir>/run/ops` — the agent dropped a JSON request that this daemon
+  parsed against a verb list and executed. Replaced by the DM above, which had
+  already been in production for two days when the spool was removed.
 
-| Verb | Fields | What it does |
-|---|---|---|
-| `task` | `task`, optional `instance` | free text, handed to a host agent session |
-| `checkin` | `instance` | "I came back up" — closes an armed deadline |
-| `rollback` | `instance`, optional `tag` | restore a snapshot image and recreate |
-| `wake` | `channel`, `detail` | relay a wake into the waker's own spool |
+Around that second directory stood a verb parser, a request schema, a bounded
+queue, a rolling-hour rate limit, per-file and per-sweep and per-directory caps,
+a per-instance `mayRequest:` restriction, a snapshot of every container in
+scope, a wait for every container in scope to fall idle, a check-in deadline, an
+automatic rollback on silence, a quarantine, and a circuit breaker counting the
+rollbacks. **All of it is gone**, and the deletions are recorded here rather
+than erased, because an in-place rollback to an older `dist/` brings the code
+back and somebody will need to know what they are looking at.
 
-`reason` is accepted on anything and is worth writing: it ends up in the journal
-and in the wake you get back.
+It went because the input went. Nothing files a spool request, so every one of
+those stages had no way to be reached, and code that cannot be reached is not a
+safety property — it is a decoration that reads as one. The two things that
+actually stood between a request and the machine were never the queue: they are
+the unprivileged account with its narrow sudoers file, and the audit written
+before each command's result is known.
 
-```sh
-# Your own spool. Clawcius: /var/lib/clawcius/run/ops.
-#                 Hamachi: /var/lib/hamachi/run/ops.
-OPS=$CLAWCIUS_STATE_DIR/run/ops
-STAMP=$(date +%s)
-printf '%s' '{"verb":"task","instance":"clawcius","task":"clawcius.service has been
-restarting every 30s since the last deploy. Find out why and fix it. Do not
-change anything outside the checkout without saying so."}' > $OPS/$STAMP.tmp \
-  && mv $OPS/$STAMP.tmp $OPS/$STAMP.json
-```
+**What was genuinely lost, and is not coming back with a different spelling:**
 
-There is no `requester` field and there must never be one. **The spool you wrote
-into is who you are** — see [Provenance](#provenance-is-the-directory-not-a-field).
+- **the undo.** No snapshot is taken before a task, so there is nothing to
+  restore to. The reply says so in as many words;
+- **the idle wait.** Nothing asks whether a container is mid-turn before a task
+  runs that might recreate it;
+- **the breaker's writer.** `frozen` still refuses every task and nothing sets
+  it;
+- **the per-instance restriction.** `mayRequest:` bounded what one instance
+  could ask for. There is no equivalent; what stands in its place is the coarser
+  and stronger rule that only a coordinator may ask at all.
 
-### Which verbs were kept, and why
-
-Deleted: `restart`, `pull`, `redeploy`, `snapshot`. Each of them is now a
-sentence a task can say, and each was an argument allowlist to maintain.
-`snapshot` is not gone as a *behaviour* — every task takes one before it starts,
-which is strictly more than a verb somebody had to remember to call.
-
-The three that were kept are plumbing, and each survived for its own reason:
-
-- **`checkin` could not have been dropped.** It is the answer to a question the
-  executor asked. A destructive task arms a deadline and rolls the instance back
-  on silence, so the check-in has to work when the instance answering it has
-  just been rebuilt and may be barely alive. It runs no command and is answered
-  inline without taking the lock. Routing it through a model would make the
-  recovery path depend on the thing being recovered.
-- **`rollback` is deliberately not delegated.** It is the undo, and the undo is
-  the safety property that replaced the verb list. "Whatever it does can be
-  undone" is worth nothing if undoing is itself a free-text task carried out by
-  the same machinery that just broke something. It is a fixed argv — retag an
-  image, recreate a container — and the automatic deadline path calls the same
-  code, so it exists whether or not it is exposed.
-- **`wake` is not a privilege at all.** It relays a wake into the waker's own
-  spool, which the agent can already write. It runs no command and grants
-  nothing, so deleting it would remove a documented capability in exchange for
-  nothing.
+The directories themselves are **not deleted from disk**, and `<stateDir>/run`
+is still bind-mounted read-write into each container. Nothing on either side
+reads or writes any of it. That mount is a change to what the agent can do
+rather than to what the daemons read, so it wants its own diff; until then it is
+a writable window onto the host that nothing uses.
 
 ## What a task actually does
 
-1. **Refuse early.** Disabled? Frozen? Out of scope for this requester? Service
-   account missing, root-equivalent, or able to read a secret? Nothing starts —
-   and, in the last case, nothing is spawned at all.
+1. **Refuse early.** Disabled (`hostAgent.enabled: false`)? Frozen? Already
+   busy? Service account missing, root-equivalent, or able to read a secret?
+   Nothing starts — and, in the last case, nothing is spawned at all. A refusal
+   is a reply, in the same turn, to the coordinator that asked.
 2. **Sample health.** `systemctl is-active` for every unit under `units:`,
    `docker container inspect` for every instance. This is the baseline, and
    having one is what makes "this was already broken" distinguishable from "this
    task broke it".
-3. **Snapshot every instance in scope**, and record the tag to go back to. If
-   the snapshot fails, the task is refused: a session with a shell and no
-   rollback target is not a deployment, it is a coin toss.
-4. **Wait for an idle turn** on every instance in scope. A task may recreate a
-   container and every live agent session is a `docker exec` into one.
-5. **Run the session**, auditing every Bash command as it is issued.
-6. **Sample health again and compare.** Anything that was up and is now not is a
+3. **Run the session**, auditing every Bash command as it is issued, and serving
+   the unit desk every second while it runs.
+4. **Sample health again and compare.** Anything that was up and is now not is a
    regression.
-7. **Roll back** if the agent reported failure, the audit came out incomplete,
-   the report says "failed", or health regressed.
-8. **Arm a check-in deadline** for each instance the task actually touched.
-9. **Report back** into the requester's wake spool.
+5. **Report.** The task is failed if the agent reported failure, if the audit
+   came out incomplete, if the report says "failed", or if health regressed —
+   and the reply says which. **Failing a task does not undo it.** Whatever it
+   did is still done.
 
-### Scope: naming an instance is how you buy a cheap task
+Steps 3 and 5 used to have a snapshot in front of them and a rollback behind
+them. They do not. The health sample survived the removal because reporting a
+regression is worth having on its own; what it can no longer do is trigger a
+repair.
 
-A task may name an `instance`. If it does, that instance is what gets
-snapshotted, idle-waited, health-checked and rolled back.
+### Scope: a DM names no instance, and every instance is in the briefing
 
-**If it names none, every configured instance is in scope.** That default is the
-expensive one on purpose. "Which containers might this sentence disturb" has no
-answer — it is prose, and the session has a shell — and the only safe reading of
-"no answer" is the same one `readIdle` uses for a missing waker status file:
-assume the dangerous case. So an unnamed task costs a `docker commit` per
-instance and a wait for all of them to go idle.
+A spool request could carry an `instance` and buy a cheaper task with it. A DM
+carries no such field, so the briefing covers every configured instance: every
+unit under `units:`, every container, every repo's dirty state.
 
-An instance restricted by `mayRequest.instances` may not file an unnamed task at
-all, because for it "unnamed" would be *wider* than what it is allowed rather
-than narrower and slower. It is refused with the fix in the message.
+That is the **briefing's** scope, not a permission. It decides what facts the
+session is handed and what the health sample watches — never what the session
+may touch, which is unbounded by construction because the session has a shell.
+An unscoped task used to cost a `docker commit` per instance and a wait for all
+of them to go idle; now it costs two health samples, which is the honest measure
+of how much less is being done for you.
 
 ## The audit is the accountability mechanism now
 
@@ -215,10 +217,11 @@ Three properties matter more than the format:
   buffer inside a process that just died is not a record.
 - **An incomplete audit fails the task.** Every command arrives through the
   agent's stream-json output, so a line that could not be parsed is a command we
-  cannot swear we logged. That fails the task on its own and triggers the
-  rollback. A command that runs and is not logged is the one failure this design
-  cannot tolerate, and the honest response to "we might have missed one" is to
-  put the container back.
+  cannot swear we logged. That fails the task on its own. A command that runs
+  and is not logged is the one failure this design cannot tolerate. Until
+  2026-08-16 the response to "we might have missed one" was to put the container
+  back; now it is to say so, in the journal and in the reply, and leave the
+  decision to a person — which is weaker, and is the trade.
 - **The sub-agent tool is denied.** A sub-agent's tool calls do not appear in
   this session's stream, so a Bash command run inside one would execute
   unaudited. Denying `Task` is what makes "one conversation" true, and "one
@@ -227,34 +230,46 @@ Three properties matter more than the format:
 It reaches the status page through the existing contract and needed no new
 plumbing: audit entries *are* journal entries, so they are already in the last
 hundred events in `<stateDir>/ops-status.json`, which is the file `status/`
-reads off local disk. `ops-status.json` also gained `hostAgent` (what this
-daemon is now capable of), `auditedCommands` and `lastTask`. Nothing was
-removed, so a reader written against the old shape still works.
+reads off local disk. `ops-status.json` also carries `hostAgent` (what this
+daemon is now capable of), `auditedCommands` and `lastTask`. Two fields **were**
+removed on 2026-08-16 — `queued`, because there is no queue, and `spools`,
+because there are no spools. Both went from the `OpsStatusSnapshot` type *and*
+from every writer of it, which is two: `Executor.snapshot()` in
+`ops/src/executor.ts`, and the oneshot behind `clawcius-snapshot-verify.timer`
+(`ops/src/verify-main.ts`), which publishes a stub snapshot of its own while it
+runs and would otherwise have kept both keys alive in the published file after
+the type stopped declaring them. Neither key is written by anything now, so a
+reader built against the older shape has to tolerate their absence rather than
+find a `queued: 0` and a `spools: []` still going out of habit. Everything else
+is where it was.
 
-## Snapshot before, roll back on failure
+## Nothing is rolled back, and that is the whole of it
 
-`redeploy` used to snapshot before recreating a container. Now every task does,
-for every instance in scope, and the tag is captured at that moment rather than
-looked up afterwards — because afterwards the newest snapshot could easily be
-one taken of the broken state.
+There used to be a section here explaining that every task snapshotted every
+instance in scope first, captured the tag at that moment rather than looking it
+up afterwards, and retagged and recreated on failure. **All of that went with
+the spools on 2026-08-16.** A task filed by DM takes no snapshot, so there is
+nothing to restore to, and the reply says so rather than leaving a coordinator
+to find out.
 
-On failure the executor retags that exact snapshot and recreates the container,
-without being asked and without waiting for an idle turn. The idle wait already
-happened before the task; a container a failed task has just wedged may never
-report idle again, and waiting for it would turn "roll back on failure" into
-"roll back unless the failure was bad enough to matter".
+The sentence that used to be the most important one in this document was that
+the rollback was container-scoped: `docker commit` captures an agent container's
+writable layer, and not `/etc`, the checkout, systemd units, or anything else on
+the host. It is worth keeping, inverted. **The scope is now nothing.** A task
+that breaks a container is in exactly the same position as one that breaks the
+host filesystem: the VPS snapshot and git are the undo, and a person operates
+both. The operator accepted the smaller version of this trade explicitly on
+2026-08-10 and the larger one on 2026-08-14; it is written here so that nobody
+has to discover it.
 
-**This is container-scoped, and that limit is the most important sentence in
-this document.** `docker commit` captures an agent container's writable layer.
-It does not capture `/etc`, the checkout, systemd units, or anything else on the
-host. A task that breaks the host filesystem is undone by the VPS snapshot and
-by git, by a person. The operator accepted that explicitly; it is written here so
-that nobody has to discover it.
-
-Because a snapshot is now taken per task rather than per night, `snapshotKeep`
-raises `docker/snapshot.sh`'s retention from 8 to 24. The ring is shared with the
-nightly timer and whoever runs last prunes to their own ceiling, so at 8 a busy
-evening would evict the previous night's backup by morning. This costs disk.
+`docker/snapshot.sh` and `clawcius-snapshot.timer` are untouched and still take
+a nightly image per container. What no longer happens is a snapshot per task —
+so `snapshotKeep: 24` in `ops-config.yaml` is now **inert**. It was there to
+raise the shared retention ring from 8 because a busy evening of per-task
+snapshots would otherwise evict the previous night's backup by morning; nothing
+passes it to the script any more, `clawcius-snapshot.service` passes no `KEEP`,
+and the script's own default of 8 is what is in force. The key still parses. It
+does nothing.
 
 ## Dry run — on by default, and genuinely unable to act
 
@@ -301,33 +316,40 @@ available"*, and the file it was asked to create does not exist afterwards.
 
 ## The trust model
 
-> **The spool is written by an agent that may be prompt-injected, and read by a
+> **A task is written by an agent that may be prompt-injected, and read by a
 > root process that starts a shell session with sudo.**
 
-That sentence used to end "…and this service is where the container boundary is
-enforced". It does not any more. **For this component the sandbox has stopped
-being a security boundary.** The operator was warned twice and accepted the
-trade in writing. What is offered in exchange is rollback, the audit log, the
-fact that this is a personal VPS with snapshots — and, since 2026-08-11, an
-OS-level boundary that is not a sandbox but is real: the session runs as an
-account that cannot become root.
+That sentence used to name the spool, and used to end "…and this service is
+where the container boundary is enforced". Neither clause is true any more.
+**For this component the sandbox has stopped being a security boundary.** The
+operator was warned twice and accepted the trade in writing. What was offered in
+exchange was rollback, the audit log, the fact that this is a personal VPS with
+snapshots — and, since 2026-08-11, an OS-level boundary that is not a sandbox
+but is real: the session runs as an account that cannot become root. Since
+2026-08-16 the rollback is not part of that exchange. What is left is the
+account, the sudoers file, the audit, and the VPS snapshot a person restores.
 
-**The trust model has now changed three times in two days, so here is the
-honest state of it in one place:**
+**The trust model has now changed four times, so here is the honest state of it
+in one place:**
 
-| | 2026-08-09 | 2026-08-10 | 2026-08-11 | 2026-08-12 |
-|---|---|---|---|---|
-| What bounds the privileged work | a closed list of seven verbs with argument allowlists | nothing in front of prose; a snapshot, a rollback and an audit behind it | the same, **plus** an unprivileged account, an enumerated sudoers file, and no docker socket | the same, with the sudoers file's four holes closed and its false comments corrected |
-| Who the privileged work runs as | root, for two build commands, dropped to the checkout's owner | the whole session, as the checkout's owner — i.e. the operator, i.e. the `docker` group, i.e. root | `clawcius-ops`, refused at start if it is root-equivalent | unchanged |
-| Is the sudoers file a boundary | it was four rules for the waker | **no** — `docker run -v /:/host` went round it | it *claimed* "yes, mostly, one gap" — and that claim was **wrong**: `sudo install` was one command to full root | **yes** — the one remaining gap is unit-content plus restart, and it is now genuinely the only one |
-| Is the audit tamper-proof | n/a | **no** — the session could become root and rewrite it | **no**, though nobody knew it: `rm -f` reached `journal.jsonl` and `journalctl --vacuum-time` erased the system journal | **hard, not impossible** — the remaining path is install-a-unit-and-restart, which is three obvious lines in the log |
-| Can the session read the operator's credentials | yes | yes — `.env`, `~/.claude`, `~/.ssh` | **no** for `.env`/`~/.claude`/`~/.ssh` — but `sudo install /root/.ssh/id_ed25519 …/clawcius-x.service` copied any root-only file out, and `docker inspect` printed the other agents' API keys | **no**, and both of those are closed |
+| | 2026-08-09 | 2026-08-10 | 2026-08-11 | 2026-08-12 | 2026-08-16 |
+|---|---|---|---|---|---|
+| What bounds the privileged work | a closed list of seven verbs with argument allowlists | nothing in front of prose; a snapshot, a rollback and an audit behind it | the same, **plus** an unprivileged account, an enumerated sudoers file, and no docker socket | the same, with the sudoers file's four holes closed and its false comments corrected | the account, the sudoers file and the audit. **The snapshot and the rollback are gone**, and so is the queue in front of them |
+| Who may ask | any process in any agent container, by writing a file | the same | the same | the same | **a crew's coordinator, by DM**, checked twice in two processes against the mail row's author column |
+| Who the privileged work runs as | root, for two build commands, dropped to the checkout's owner | the whole session, as the checkout's owner — i.e. the operator, i.e. the `docker` group, i.e. root | `clawcius-ops`, refused at start if it is root-equivalent | unchanged | unchanged |
+| Is the sudoers file a boundary | it was four rules for the waker | **no** — `docker run -v /:/host` went round it | it *claimed* "yes, mostly, one gap" — and that claim was **wrong**: `sudo install` was one command to full root | **yes** — the one remaining gap is unit-content plus restart, and it is now genuinely the only one | unchanged, and it is now carrying more of the weight than it was |
+| Is the audit tamper-proof | n/a | **no** — the session could become root and rewrite it | **no**, though nobody knew it: `rm -f` reached `journal.jsonl` and `journalctl --vacuum-time` erased the system journal | **hard, not impossible** — the remaining path is install-a-unit-and-restart, which is three obvious lines in the log | unchanged |
+| Can a bad task be undone by this daemon | `redeploy` snapshotted first | yes, per container, automatically | yes | yes | **no.** Nothing here undoes anything |
+| Can the session read the operator's credentials | yes | yes — `.env`, `~/.claude`, `~/.ssh` | **no** for `.env`/`~/.claude`/`~/.ssh` — but `sudo install /root/.ssh/id_ed25519 …/clawcius-x.service` copied any root-only file out, and `docker inspect` printed the other agents' API keys | **no**, and both of those are closed | unchanged |
 
 The 2026-08-11 column is written the way it is on purpose: it is what this
 document *said* on 2026-08-11, next to what was actually true. Three of those
 five rows were wrong, and they were wrong because they described the sudoers
 file's comments rather than its rules. A trust model is not a summary of what a
-config file says about itself.
+config file says about itself. The 2026-08-16 column exists for the same reason
+in the other direction: the temptation on a day when a lot of code is deleted is
+to leave the paragraphs describing what it did, and a protection this file
+claims and the code does not have is this codebase's worst recurring defect.
 
 Everything below is what is still true.
 
@@ -360,16 +382,18 @@ This is the security model now.
 > **OJ reads hostile input and holds no credential.
 > This agent holds everything and must read nothing hostile.**
 
-Its inputs are task files from the agents and a briefing the executor assembled
-itself out of read-only probes — unit states, container states, `git rev-parse`,
-the list of uncommitted filenames. **Never a PR diff. Never repository files
-from a branch under review. Never OJ's findings. Never a web page.**
+Its inputs are the body of a coordinator's DM and a briefing the executor
+assembled itself out of read-only probes — unit states, container states, `git
+rev-parse`, the list of uncommitted filenames. **Never a PR diff. Never
+repository files from a branch under review. Never OJ's findings. Never a web
+page.**
 
 Enforced three ways, in descending order of how much they are worth:
 
-1. **Structurally.** The only text that reaches the prompt is the request's
-   `task` field plus facts this daemon gathered. There is no code path in `ops/`
-   that reads a diff, a pull request, or a file from a branch.
+1. **Structurally.** The only text that reaches the prompt is the message body,
+   capped and stripped of control characters by `sanitiseTask`, plus facts this
+   daemon gathered. There is no code path in `ops/` that reads a diff, a pull
+   request, or a file from a branch.
 2. **By tool policy.** `WebFetch`, `WebSearch` and the sub-agent tool are denied
    outright; `Bash(gh:*)`, `Bash(curl:*)` and `Bash(wget:*)` are denied by rule.
 3. **By instruction.** The standing system prompt says so in as many words, and
@@ -385,9 +409,13 @@ prompt-injectable root shell — and it will look like a feature.
 
 ### It holds no Discord token, and that is asserted rather than assumed
 
-The session reports its result back through the spool and the **sandboxed agent
-does the talking**. A session with a shell, sudo and a chat credential is a
-session that can be talked into impersonation.
+The session's result is handed back to the executor, which writes it as a mail
+row on the crew's board, and the **sandboxed agent does the talking**. A session
+with a shell, sudo and a chat credential is a session that can be talked into
+impersonation. The DM path did not change that: `ops/src/board.ts` writes a row
+into SQLite as root and stops there — nothing in `ops/` opens a socket to
+Discord, and there is still no Discord token anywhere in this unit's
+environment.
 
 Its environment is built from an allowlist, the same shape as `worker.ts` in the
 OJ project and for the same reason: a denylist has to anticipate every name a
@@ -466,12 +494,16 @@ design decision.** The membership this is guarding against —
 never see it.
 
 **It does not `exit(1)`.** This unit is `Restart=always` with
-`StartLimitIntervalSec=0`; refusing to boot would be a five-second restart loop
-with every armed rollback deadline unhonoured, which is the shape of #7. The
-daemon comes up, holds its deadlines, answers check-ins, performs rollbacks —
-and refuses every task, loudly. That is exactly what `hostAgent.enabled: false`
-already does, and this codebase already argues it is strictly better than
-stopping the unit.
+`StartLimitIntervalSec=0`; refusing to boot would be a five-second restart loop,
+which is the shape of #7. The daemon comes up, holds its mailboxes, answers the
+coordinator that asked — and refuses every task, loudly, with the fix in the
+reply. That is exactly what `hostAgent.enabled: false` already does, and this
+codebase already argues it is strictly better than stopping the unit. The older
+version of this paragraph added "and holds its deadlines, answers check-ins,
+performs rollbacks", which was the stronger half of the argument and is no
+longer available: there are no deadlines to hold. What is left is that a daemon
+which is up can *say* why it is refusing, and one that is in a restart loop
+cannot.
 
 #### How the drop is performed
 
@@ -584,89 +616,117 @@ leave a root-owned `node_modules/` behind by accident. The **new** failure in
 that family is the mirror image — an agent that cannot write the tree at all —
 and that is what the shared group and the boot warning are for.
 
-### What still holds, unchanged
+### What still holds
 
-**Provenance.** The requester is the spool directory the file was found in, one
-per instance, each bind-mounted into exactly one container. It is stamped on in
-`src/spool.ts` where the file's contents cannot reach it, and a request that
-writes `"requester": "clawcius"` into Hamachi's spool is logged as an ignored
-unknown field and attributed to Hamachi.
+**Provenance.** The requester is the **author column** of the mail row, which
+the instance's waker writes from the agent id that sending session's own
+`sendMail` tool closes over — a variable in the waker's process that no argument
+reaches. It is never read from a message body, and there is no field a message
+can carry that gets near it. This is the same property the per-instance spools
+bought, arrived at a different way: it used to be inherited from the mount (a
+container can write exactly one directory), and it is now inherited from the
+tool closure (a session can only send as itself). `ops/src/host-mailbox.ts`
+re-reads that column and looks the role up again immediately before running
+anything, in a second process from the one that accepted the DM.
 
-**Structural rejection, not repair.** Malformed JSON is discarded whole. Nothing
-salvages the parseable prefix of a broken file and nothing coerces types.
+**Structural rejection, not repair.** What arrives is a message, not a document
+to be parsed, so most of the old surface is simply absent. What is left is
+`sanitiseTask`: one cap on length, control characters stripped, and truncation
+**reported** rather than silent — a coordinator whose last two paragraphs, the
+ones saying what not to touch, were dropped without being told would be the
+worst version of this.
 
-**Traversal and control bytes are refused, not stripped**, on every identifier —
-`instance`, `tag`, `channel` — even though they are never used as paths.
-
-**Every identifier is still a lookup, not a value.** `instance` is compared by
-exact equality against config and what reaches a docker argv is the config
-entry. That rule is intact everywhere the *executor* builds a command. It cannot
-apply to a task, which is prose.
+**Every identifier is still a lookup, not a value.** Everywhere the *executor*
+builds a command, the strings come from config, compared by exact equality. That
+rule is intact. It cannot apply to a task, which is prose.
 
 **No shell in the executor.** Every command this daemon runs is an argv array
 handed to `execFile` with `shell: false`. The host agent obviously runs a shell —
 that is what it is for — and every string it hands to it is in the audit.
 
-**Caps everywhere.** Per-file size cap enforced by `stat` before the file is
-opened; a cap on files per sweep; a ceiling on files present, past which the
-spool is drained unread; a rolling-hour cap on accepted operations; a bounded
-queue; a wall-clock timeout and a **dollar ceiling** per task.
+**Two caps, where there used to be seven.** A wall-clock timeout and a **dollar
+ceiling** per task, plus the lock. The rest — per-file size, files per sweep,
+files present, operations per rolling hour, queue depth — bounded a directory an
+agent could write, and went with the directory. There is no rate limit now:
+nothing is counted, nothing is delayed, and a coordinator that asks twice in a
+minute gets one task and one refusal.
 
-**The state directory is out of reach of the containers.** The journal, the
-breaker and any armed deadline live in `/var/lib/clawcius-ops`, which is not
-bind-mounted anywhere and is 0750 root-owned. The loader refuses to start if it
-is ever placed inside any spool, or inside the host agent's working directory.
+**The state directory is out of reach of the containers.** The journal and the
+audit live in `/var/lib/clawcius-ops`, which is not bind-mounted anywhere and is
+0750 root-owned. A record of what was done to this host, writable by the party
+it was done on behalf of, is not a record.
+
+**The board is out of reach too.** `board.db` is what decides who is a
+coordinator, and a coordinator is the only agent that may run commands here, so
+a board inside a mount would be the access control being written by the party it
+restrains. The loader refuses one, and `ops/src/board.ts` separately refuses a
+path that is not a regular file.
 
 **The host agent's working directory is not the checkout.** Claude Code
 auto-discovers `CLAUDE.md` and project settings from its cwd, and the checkout
 is a tree the agents can get commits merged into — so a session pointed at it
 would take standing instructions from anything they could merge. It is
 `/var/lib/clawcius-host-agent`, and the loader refuses a `workDir` inside any
-repo path, any spool, or `stateDir`.
+repo path, inside `stateDir`, or overlapping any container's mount in either
+direction.
 
-**The idle signal is out of reach too.** Each waker publishes
-`/var/lib/<instance>/waker-status.json`, a sibling of the bind-mounted `run/`
-directory rather than a child of it. The executor believes that file when it
-decides whether recreating a container would kill a live turn; an agent that
-could write "no turns in flight" could talk root into destroying a session
-mid-conversation. Both config loaders — the waker's and this one's — refuse to
-start if the path ends up inside a mount: its own wake spool, its own or any
-other instance's ops spool, and (since 2026-08-11) *another instance's wake
-spool*, which was the one pairing the first version of these checks missed.
+**The containment checks are now written against the mount itself.** Until
+2026-08-16 they named `opsSpoolDir` and `wakeSpoolDir` — two directories *inside*
+the mount — which meant a path that was agent-writable but in neither of them
+passed. They are now written against `join(instance.stateDir, 'run')`, which is
+exactly what `docker/run-container.sh` bind-mounts read-write into that
+instance's container, and it is derived rather than configured because the script
+derives it too. Simpler, and strictly wider than what it replaced. Each check is
+asked of **every** instance's mount rather than only the file's own: the two
+state directories are siblings under `/var/lib`, so a fat-fingered path lands in
+the neighbour rather than nowhere, and instance A's status file under B's mount
+would mean B can declare A idle whenever it likes.
 
-**The spool's own directory is not trusted either.** It sits inside a mount the
-agent owns, so the agent can delete it and put a symlink in its place. Nothing
-in the executor follows one: see "What it will not do, and why" above. This is
-the sharpest instance of the general rule, because the process on the other end
-of the path is root and the operations are `chown`, `readdir` and `unlink`. A
-spool that is a real directory but owned by the wrong uid is not followed
-either, and — since the second review of PR #8 — is no longer *silent*: the
-sweeper says so on the first sweep that sees it, with the `chown` to run.
+**The idle signal is still out of reach — and nothing reads it.** Each waker
+publishes `/var/lib/<instance>/waker-status.json`, a sibling of the bind-mounted
+`run/` directory rather than a child of it, and both config loaders still refuse
+to start if that path lands inside a mount. `ops/src/idle.ts` still exists, still
+fails safe in every ambiguous case, and is still under test. But **the executor
+no longer consults it**: the idle wait was part of the spool apparatus, so
+nothing in `ops/` now asks whether a container is mid-turn before running a task
+that might recreate it. The `idle:` config block still parses and is still
+validated. Do not read any of that as the executor waiting for an idle turn. It
+does not.
 
 ### What this does *not* protect against
 
 Honest list, and it is longer than it was.
 
 - **The host agent can do a great deal on this host.** That is the feature. It
-  is bounded by the account's permissions, the sudoers file, the rate limit, the
-  timeout, the budget, the lock and the rollback. There is still no allowlist in
-  front of prose and there cannot be — what changed on 2026-08-11 is that the
-  *other* bounds became real rather than notional.
-- **A task filed by mail has no rollback at all.** The snapshot went with the
-  scheduling on 2026-08-14. The health sample either side survives and it
-  reports; nothing restores. This is a deliberate reduction in what the executor
-  will do for you, taken in exchange for a host agent you can actually talk to.
-- **The rollback is containers only** — on the spool path, where it still
-  exists. `/etc`, the checkout, unit files, packages: not covered. VPS snapshots
-  and git are the recovery path, and a person is the one who invokes them.
+  is bounded by the account's permissions, the sudoers file, the timeout, the
+  budget and the lock. It used to also say "the rate limit and the rollback",
+  and both of those went on 2026-08-16. There is still no allowlist in front of
+  prose and there cannot be — what changed on 2026-08-11 is that the *other*
+  bounds became real rather than notional, and what changed on 2026-08-16 is
+  that there are fewer of them.
+- **Nothing undoes a task.** No snapshot is taken, so there is nothing to
+  restore to; there is no check-in deadline, so a container that never comes
+  back up is not noticed by anything here; and there is no automatic rollback,
+  so a task that wedges an agent leaves it wedged. The health sample either side
+  survives and it **reports**. This is a deliberate reduction in what the
+  executor will do for you, taken in exchange for a host agent you can actually
+  talk to, and it is the single most important line in this list.
+- **`/etc`, the checkout, unit files and packages were never covered** by the
+  rollback that existed, and now nothing is. VPS snapshots and git are the
+  recovery path, and a person is the one who invokes them.
+- **Nothing waits for an idle turn.** A task can recreate a container while a
+  live agent session is a `docker exec` into it, and the turn dies with the
+  container. The waker status file that would answer "is anything in flight" is
+  still published and still validated; the executor stopped reading it.
 - **The board is a file this daemon opens as root and reads rows out of.** It is
   outside every bind mount by construction — the config loader refuses a
-  `board.db` inside any spool and `board.ts` refuses a path that is not a
-  regular file — but the *contents* are written by the instance's waker, which
-  is fed by tool calls the container's agents make. What is trusted from it is
-  exactly one thing: the `author` column, which the waker writes from the id the
-  sending session's own `sendMail` tool closes over, and never reads from a
-  body. The role that column resolves to is what decides whether the task runs.
+  `board.db` inside `<stateDir>/run` for any instance, and `board.ts` refuses a
+  path that is not a regular file — but the *contents* are written by the
+  instance's waker, which is fed by tool calls the container's agents make. What
+  is trusted from it is exactly one thing: the `author` column, which the waker
+  writes from the id the sending session's own `sendMail` tool closes over, and
+  never reads from a body. The role that column resolves to is what decides
+  whether the task runs.
 - **The audit is much harder to tamper with than it was, and still not
   tamper-proof.** Until 2026-08-11 this entry read: *"the session runs as
   `npurcell`, and `npurcell` is in the `docker` group … anything that can become
@@ -689,15 +749,18 @@ Honest list, and it is longer than it was.
   mode and the owner, not the bytes. Splitting those across two accounts with a human
   between them is possible and has not been done, because the operator's whole
   complaint was about being the human between things.
-- **`mayRequest` bounds what an instance may ASK for, not what the agent may
-  DO.** A task scoped to `hamachi` is still carried out by a session with a
-  shell, and nothing but the task text and the standing prompt points it at
-  Hamachi rather than at anything else on the box. It is a statement of intent
-  that the journal records.
-- **`mayRequest.units` and `mayRequest.repos` are now inert.** No request carries
-  a unit or a repo. The loader says so loudly at boot rather than failing to
-  start, and anybody who wrote them believing they restricted something is now
-  wrong.
+- **There is no per-instance restriction of any kind.** `mayRequest:` narrowed
+  what one instance could ask for — which targets, which verbs — and it went with
+  the spools on 2026-08-16. Nothing replaced it at that grain. The loader ignores
+  the key and names it in the boot journal, so anybody who wrote one believing it
+  restricted something is told. What stands in its place is coarser and, on its
+  own terms, stronger: only a **coordinator** may ask at all, and there is
+  exactly one thing that can be asked for. What is lost is the narrower
+  statement — "Hamachi may look after itself and nothing else" — which is no
+  longer expressible. It was never a boundary either: a task scoped to `hamachi`
+  was always carried out by a session with a shell, and nothing but the task text
+  and the standing prompt pointed it at Hamachi rather than at anything else on
+  the box.
 - **A dirty tree no longer stops anything.** The check that refused a `pull` is
   gone; the filenames go into the briefing and the standing prompt forbids
   `reset --hard`, `checkout -f`, `stash` and `clean`. An instruction can be
@@ -708,25 +771,21 @@ Honest list, and it is longer than it was.
   hour that cost on 2026-08-09 is now prevented by a standing rule plus the
   per-repo `buildDirs` in the briefing rather than by a step that cannot be
   skipped.
-- **A task that names no instance may still touch one.** Scope-by-omission takes
-  everything, so the snapshot and the rollback do cover it — but nothing stops
-  the session from touching a container the requester was not thinking about.
-  The deadline machinery catches this after the fact by scanning the audit for
-  container names, which is over-broad on purpose.
-- **`task`, `reason` and `detail` are attacker-influenced text.** `task` now
+- **A task may touch a container nobody was thinking about**, and nothing
+  notices. Every task is unscoped now, and the machinery that used to answer
+  "which instance did this actually touch" by scanning the audit for container
+  names existed to arm a check-in deadline. There are no deadlines, so nothing
+  scans, and an instance recreated by a task nobody expected to recreate it is
+  visible only in the audit, to a person reading it.
+- **The task text and the subject are attacker-influenced text.** The task
   reaches a model's prompt, which is not safer than reaching a shell — it is the
-  deal. The rest end up in the journal, in `ops-status.json`, and in wake
-  prompts; anything rendering them owes them the same suspicion.
-- **The symlink defence around the spool directory is a check, not a
-  transaction.** Every sweep `lstat`s the spool and refuses anything that is
-  not a real directory, and every request file is opened `O_NOFOLLOW |
-  O_NONBLOCK`; but Node exposes no `unlinkat`, so the sweep re-resolves the
-  directory by name for each file it removes. An agent swapping the directory
-  for a symlink inside that window could in principle still get a `.json`
-  removed elsewhere. The persistent case — plant a link and wait for the
-  restart, which was the actual bug — is refused and reported. Fixing the
-  residual race needs directory descriptors and `*at()` syscalls this runtime
-  does not offer, so it is written down rather than half-done.
+  deal. Both end up in the journal, in `ops-status.json` and in the reply DM;
+  anything rendering them owes them the same suspicion.
+- **`<stateDir>/run` is still bind-mounted read-write into every container**,
+  and nothing on either side uses it. It is a writable window onto the host that
+  exists for no current reason, and the honest reading is that it is a mount
+  waiting to be removed rather than a control. The old spool directories are
+  still sitting inside it, inert.
 - **Root is root.** This service being small and readable is still the
   mitigation for the supervisor. It is not a mitigation for the session.
 
@@ -734,9 +793,11 @@ Honest list, and it is longer than it was.
 
 `restart clawcius.service` is one of the things a task will ask for. A process
 cannot restart itself: systemd sends it SIGTERM, it dies, and whatever it was
-doing dies with it — including the record of what it was doing and any deadline
-it had just armed. The argument is stronger for a container recreate: every live
-agent session *is* a `docker exec` into the container being recreated.
+doing dies with it — including the record of what it was doing. The argument is
+stronger for a container recreate: every live agent session *is* a `docker exec`
+into the container being recreated. (It used to be stronger still — a restart
+also lost any deadline the daemon had just armed — and that half of it expired
+on 2026-08-16 with the deadlines.)
 
 So it is a unit of its own, with no Discord connection and no GitHub token. It
 now has a model, and `src/host-agent.ts` is where that decision is written down
@@ -747,70 +808,83 @@ in full.
 A lock, not a negotiation. Two host agent sessions with sudo running
 concurrently on the same box is not a scenario anybody should have to reason
 about, and it is much worse than the two overlapping docker operations this lock
-was originally written to prevent. A second request queues; past
-`limits.maxQueued` it is refused with a reason the agent can read.
+was originally written to prevent.
 
-Missing, stale, malformed or future-dated waker status all read as *busy*. The
-stale case is the important one: a waker that crashed leaves a file saying
-`liveCount: 0` forever, and a stale zero is the most dangerous value in this
-system because it is the one that reads as permission.
+**A second task is refused, not queued.** The queue and `limits.maxQueued` went
+with the spools, and the refusal is the better answer for the way in that
+replaced them: "no" arriving in the turn that asked beats a session that starts
+twenty minutes later, next to work it knows nothing about, answering a
+coordinator who has stopped waiting. The refusal names what the executor is busy
+with, so asking again is an informed decision rather than a retry loop.
 
-## The deadline, and the revert
+There used to be a second paragraph here about the waker status file — missing,
+stale, malformed or future-dated all reading as *busy*, and a stale zero being
+the most dangerous value in this system because it is the one that reads as
+permission. That logic is still in `ops/src/idle.ts` and still under test, and
+this daemon no longer calls it. It is kept because the waker uses the same file
+and the reasoning has not stopped being true; it is moved out of this section
+because the executor does not wait for anything but its own lock.
 
-After a task that touched an instance, the executor:
+## The deadline and the revert are gone
 
-1. files a wake to that instance carrying context — *a host task touched you
-   because `<reason>`; here is what to check; check in within N minutes*;
-2. waits `deadline.minutes` for a `checkin` request from it;
-3. on silence, rolls back to the snapshot taken immediately **before** the task,
-   and reports.
+This section used to describe a recovery loop. After a task that touched an
+instance, the executor filed a wake to it — *a host task touched you because
+`<reason>`; here is what to check; check in within N minutes* — waited
+`deadline.minutes` for a `checkin` request, and on silence rolled the instance
+back to the snapshot taken immediately before the task. "Touched" was answered
+from the audit by substring match over the shell text, deliberately over-broad,
+because a false positive cost one wake and a false negative was an instance
+recreated with nobody waiting to hear whether it came back. The automatic
+rollback waited at most a minute for an idle turn and then went ahead anyway,
+which was the fix from the second review of PR #9: a wedged container is exactly
+when a rollback matters most and exactly when it will never report idle.
 
-**The automatic rollback waits at most a minute for an idle turn, and then goes
-ahead anyway.** A requested rollback waits `idle.maxWaitMinutes` and, if the
-instance never reports idle, abandons itself rather than killing a live turn —
-somebody asked for it, and somebody can be told no. A rollback after a missed
-check-in is not a request, it is a recovery, and until 2026-08-11 (review of
-PR #9) it took the requested path: an instance whose rebuild had wedged it
-never reported idle, so the wait ran for the full half hour and then abandoned
-the rollback — leaving the instance on the build that broke it, and, because
-that return happened before the quarantine, leaving the breaker unaware that a
-recovery had failed. A wedged container is exactly when the rollback matters
-most. The minute is kept because a missed check-in can also mean an agent that
-is alive and simply did not file one, and a lost turn is worth avoiding when it
-is cheap; it is capped by `idle.maxWaitMinutes`, so `0` still means "never
-wait". Going ahead is journalled, in those words. `#restoreAll` — the rollback
-after a *failed task* — skips the wait entirely, for the same reason and with
-one fewer doubt.
+**All of it went on 2026-08-16.** The wake it filed needed the wake spool, the
+check-in needed the ops spool, and the rollback needed a snapshot nothing takes.
+It is written down here rather than deleted because a rollback to an older
+`dist/` brings the whole apparatus back, and because a reader who half-remembers
+it should be able to find out in one place that it is not running.
 
-"Touched" is answered from the audit: the task named it, or its container name,
-image or one of the deploy scripts appears in a command the session ran. That is
-a substring match over shell text and is deliberately over-broad — a false
-positive costs one wake and one check-in, a false negative is an instance
-recreated with nobody waiting to hear whether it came back.
+What a host upgrading into this build gets instead: `reportRetiredDeadlines()`
+runs once at boot, finds any check-in deadline the previous build left armed in
+`state.json`, writes each one into the journal by name — with its instance, when
+it was armed, why, and the tag nothing will restore it to — and **clears it**. A
+pending deadline that nothing can honour and nothing can close is worse than
+none, because a status page showing one reads as a recovery in progress.
 
-### Circuit breaker
+### The freeze has no writer
 
-- A build that has been rolled back once is **quarantined** and identified by the
-  `buildRepo` checkout's HEAD, so a fix — which is a new commit — goes through on
-  its own.
-- After `breaker.maxConsecutiveFailedRecoveries` consecutive failed recoveries
-  the executor **freezes** and refuses `task` and `rollback`. `checkin` and
-  `wake` still work, so an instance that is alive can still say so — otherwise a
-  freeze would guarantee the next deadline was missed too.
-- A failed recovery is a missed check-in **or a task that actually had to be
-  rolled back**. A task that failed harmlessly — a typo, a refusal, an agent that
-  decided the request was unsafe — does not count, or two badly worded sentences
-  in a row would take the whole mechanism offline.
-- All of it is persisted. A breaker that clears when its process restarts is not
-  a breaker, and the host agent can restart this process.
+`frozen` still means what it always meant: the executor refuses every task and
+says so, loudly, in the journal, in the boot banner, and in the reply to whoever
+asked. It is still persisted, because a breaker that clears when its process
+restarts is not a breaker and the host agent can restart this process. It is
+still cleared only by a human:
 
 ```sh
 sudo ops/unfreeze.sh          # prints the reason, asks, then clears
 sudo systemctl restart clawcius-ops
 ```
 
-There is deliberately no `unfreeze` task-that-counts: a task *could* run
-`unfreeze.sh`, and that is one more thing the audit is for.
+**Nothing sets it any more.** The circuit breaker that did counted *failed
+recoveries* — a missed check-in, or a task that actually had to be rolled back —
+and quarantined the build (identified by the `buildRepo` checkout's HEAD) so that
+a fix, being a new commit, would go through on its own. Every input to that
+counter was on the spool task path, and that path is gone. So:
+
+- a freeze you are looking at **predates 2026-08-16**. Read it as history, not
+  as something that just happened;
+- `breaker.maxConsecutiveFailedRecoveries` and `breaker.maxQuarantined` still
+  parse. Nothing acts on either. `maxQuarantined` still bounds the ring in
+  `state.json`, which nothing writes to;
+- **a bad build now repeats indefinitely.** The mechanism that stopped a
+  known-bad deploy being reinstalled every fifteen minutes was this breaker, and
+  the thing it was protecting against — an automatic recovery loop — went with
+  it, so the immediate danger is gone too. What is not covered is a coordinator
+  asking for the same broken thing over and over. Nothing counts that.
+
+There was never an `unfreeze` verb, and there is no way to ask for one by DM
+either. A task *could* run `unfreeze.sh`, and that is one more thing the audit is
+for.
 
 ## Sudoers
 
@@ -827,7 +901,7 @@ can do rather than a description of the polite route.
 | `docker ps` / `images` / `logs` / `stats --no-stream` / `version` / `info` | Read-only; `logs` restricted to the three agent containers | This section did not exist before — the previous grantee reached docker through group membership, so a rule "would add nothing except the false impression that docker access is being controlled here". |
 | `docker inspect --format …` | **Enumerated**: six state formats × the three agent containers, plus `{{.Id}}` for the three images | Narrowed on 2026-08-12. The previous `docker inspect *` printed `Config.Env` — the sibling agents' API keys — from an alias called READ. No `*` on these lines: a trailing one re-admits a second `--format`, and docker takes the last. |
 | `docker restart` / `stop` / `start` | `clawcius-agent`, `hamachi-agent`, `oj-agent` | "The agent container is wedged" is a real task. |
-| `mkdir -p`, `chown`, `chmod` | **Exact paths** under `/var/lib/{clawcius,hamachi,oj}/run` | Repair, mostly: the executor creates and chowns every spool at boot. |
+| `mkdir -p`, `chown`, `chmod` | **Exact paths, no wildcard**: `mkdir -p` on `/var/lib/{clawcius,hamachi,oj}` and on `/var/lib/{clawcius,hamachi,oj}/run`; `chown npurcell:npurcell` and `chmod 0770` on `/var/lib/{clawcius,hamachi,oj}/run` | A first start on a fresh instance still has to create the state directory and the `run/` inside it, because `docker/run-container.sh` bind-mounts `<stateDir>/run` read-write and it has to exist, owned by the uid the container runs as. Until 2026-08-16 this alias also named `run/ops` and `run/wake` — six lines each — and those twelve went with the spools they served. That is a narrowing, not tidying: `run/ops` and `run/wake` are *inside* the bind mount, so the container owned their parent directory and could replace either entry with a symlink before root arrived to `mkdir`/`chown` it — the CWE-59 shape this file spends pages on below. `run` itself has its parent, `/var/lib/<instance>`, outside every mount, which is the property that makes the surviving lines safe. The directories are still on disk and inert; nothing creates, chowns or reads them any more. **The operator has to reinstall this file for the removal to take effect, and run `visudo -c` on it first** — the grants on the host are whatever was last installed, not what is in the repo. |
 
 **Removed on 2026-08-12, and not replaced by a narrower rule:**
 
@@ -859,9 +933,11 @@ understood rather than routed around. **`docker.service` is off the list too** �
 restarting it takes both agents down at once.
 
 Deliberately **not** granted: `docker run` / `create` / `exec` / `cp` / `build`
-/ `commit` (the first is `-v /:/host`, i.e. root; the second is root inside a
-container that bind-mounts a spool, i.e. forged provenance; the third is `sudo
-cp` wearing a container), `apt`/`npm`/`pip` as root, `systemctl edit` (opens
+/ `commit` (the first is `-v /:/host`, i.e. root; the second is root inside an
+agent's container, which is a session running as that crew with that crew's
+credentials — it used to be phrased as "forged provenance", back when the
+provenance was a bind-mounted directory, and the point survives the rewording;
+the third is `sudo cp` wearing a container), `apt`/`npm`/`pip` as root, `systemctl edit` (opens
 `$EDITOR` as root), `visudo`/`usermod`/`gpasswd`/`passwd`/`su` — `usermod -aG
 docker clawcius-ops` is now specifically the thing this account must not be able
 to do to itself — `setfacl`/`chattr`/`mount` (each a way past the mode bits the
@@ -947,7 +1023,14 @@ What it does instead:
   against the compiled output, which is the part that a refactor cannot quietly
   undo.
 
-## One spool per instance, and why that turned out to matter twice
+## The spool history, kept because the lessons outlived the code
+
+Two directories were deleted on 2026-08-16. Four things were learned around
+them that are still load-bearing somewhere else, and one that is not learned
+anywhere any more. This section is the record; none of it describes running
+code.
+
+### One spool per instance, and why that turned out to matter twice
 
 Until 2026-08-10 there was a single `spoolDir: /var/lib/clawcius/run/ops` for
 the whole executor. That one line was two bugs, and only one of them was
@@ -955,266 +1038,112 @@ visible.
 
 **The visible one: Hamachi could not file a request at all.**
 `docker/run-container.sh` gives each instance its own state directory and
-bind-mounts only that:
-
-```sh
-CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
-WAKE_DIR=$CLAWCIUS_STATE/run
--v "$WAKE_DIR:$WAKE_DIR:rw"
-```
-
-`systemd/hamachi-container.service` sets `CLAWCIUS_STATE_DIR=/var/lib/hamachi`,
-so Hamachi's container has `/var/lib/hamachi/run` and nothing else. The shared
-spool at `/var/lib/clawcius/run/ops` **does not exist inside it** — verified
-from inside the container. The agent the operator talks to most was the one
-agent locked out of the mechanism built for both of them, and it was silent
-from every angle: the agent's `mv` failed into a shell nobody reads, and the
-executor saw an empty directory, which is exactly what a quiet night looks
-like. The mount asymmetry had been there since the second instance shipped on
-2026-08-08; the spool was written against the first instance's paths and read
-as correct because for the first instance it was.
+bind-mounts only that — `systemd/hamachi-container.service` sets
+`CLAWCIUS_STATE_DIR=/var/lib/hamachi`, so Hamachi's container has
+`/var/lib/hamachi/run` and nothing else, and the shared spool at
+`/var/lib/clawcius/run/ops` **did not exist inside it**, verified from inside
+the container. The agent the operator talks to most was the one agent locked out
+of the mechanism built for both of them, and it was silent from every angle: the
+agent's `mv` failed into a shell nobody reads, and the executor saw an empty
+directory, which is exactly what a quiet night looks like. The mount asymmetry
+had been there since the second instance shipped on 2026-08-08; the spool was
+written against the first instance's paths and read as correct because for the
+first instance it was.
 
 **The invisible one, which matters more: nothing recorded who asked.** A shared
-directory carries no evidence of its writer. `redeploy hamachi` filed by
-Hamachi and `redeploy hamachi` filed by Clawcius are the same forty bytes, and
-the journal said the same thing about both — because it could not tell. One of
-those is an agent maintaining itself. The other is an agent reaching across the
+directory carries no evidence of its writer. `redeploy hamachi` filed by Hamachi
+and `redeploy hamachi` filed by Clawcius were the same forty bytes, and the
+journal said the same thing about both — because it could not tell. One of those
+is an agent maintaining itself. The other is an agent reaching across the
 boundary at its neighbour, and those should never have been indistinguishable
 after the fact on a root process holding docker.
 
-### Provenance is the directory, not a field
+The fix was one spool per instance, and provenance was **the directory, not a
+field**: it was stamped on in `spool.ts` where the file's contents could not
+reach it, and a request writing `"requester": "clawcius"` into Hamachi's spool
+was logged as an ignored unknown field and attributed to Hamachi. That property
+is the one thing from this whole section that is still running, in a different
+substrate — the author column of a mail row, written by the waker from the id
+the sending session's own `sendMail` closes over. Both are the same idea: **the
+identity comes from the channel, never from the payload.** The self-test still
+asserts the modern half of it, because "the attacker supplies their own
+identity" is the obvious way to get this wrong and it would look correct in every
+log until the day it mattered.
 
-Every request now carries a `requester`, and it comes from the spool it was
-found in. It is stamped on in `src/spool.ts`, where the file's contents cannot
-reach it, and it is never read out of the JSON.
+The mount asymmetry that caused the visible bug is *also* still load-bearing,
+now as the basis of the containment checks: `join(instance.stateDir, 'run')` is
+the one directory each container can write, and `stateDir`, every `board.db` and
+every `wakerStatusFile` must be outside all of them.
 
-That is the whole security property, and it is inherited from the mount rather
-than invented here: a container can write into exactly one of these
-directories, no matter what its prompt says, because that is the only one bind
--mounted into it. A request that writes `"requester": "clawcius"` into
-Hamachi's spool is logged as an ignored unknown field and attributed to
-Hamachi. The self-test asserts precisely that, because "the attacker supplies
-their own identity" is the obvious way to get this wrong and it would look
-correct in every log until the day it mattered.
+### What `ensureSpoolDir` was, and why `ensureDirOwnedBy` is not it
 
-It shows up in three places:
-
-- every journal entry gains a `requester`, alongside the existing `instance`
-  (which is the *target* — the two are different questions);
-- every prose log line: `[ops] started: redeploy hamachi (from clawcius) — …`,
-  so `journalctl -u clawcius-ops | grep 'from hamachi'` is now a question with
-  an answer;
-- `ops-status.json` lists the spools being watched, so the status page can show
-  at a glance that every agent has a reachable queue — the failure this
-  replaced was one agent silently having none.
-
-The executor's own actions are attributed to `(executor)`, not to the instance
-they happen to. An automatic rollback after a missed check-in is not a request
-and must not read like one.
-
-### Where the spools live, and who creates them
-
-`instances[].opsSpoolDir`, defaulting to `<stateDir>/run/ops`. Leave it unset.
-The default is the only value that is right by construction — it is inside the
-mount `run-container.sh` already gives that container — and it means a new
-instance can talk to this daemon without anyone remembering a second setting.
-
-**`docker/run-container.sh` creates them**, with `mkdir -p "$OPS_DIR"` directly
-beside the existing `mkdir -p "$WAKE_DIR"`, and for the same reason: that
-script runs as `npurcell` (the container units are `User=npurcell`) and the
-Dockerfile builds the agent user with `AGENT_UID=1000` to match, so the
-directory lands owned by the uid the container runs as without a `chown`
-anywhere.
-
-**The executor also creates them at startup**, because it must not depend on a
-container having ever been started. `ensureSpoolDir()` walks down from the
-instance's state directory creating each missing level, and chowns and chmods
-each level *it creates* to match that state directory — the same rule as
-`build.ts`, where the owner is discovered rather than configured, because this
-daemon is not entitled to an opinion about who owns a directory it was pointed
-at. A failure there is logged loudly with the exact `chown` to run, and is
-never fatal.
-
-The alternative — letting root `mkdir -p` it and leaving it at that — produces
-a root-owned tree the container cannot write, and the symptom is an agent whose
-requests are never seen. That is the same silent shape as the bug this whole
-section is about, so it is not left to chance. Note that "the levels it
-creates", plural, and the explicit `fchmod` are both load-bearing: `mkdir -p`
-as root creates the intermediate `run/` root-owned too, and `mkdir`'s mode
-argument is masked by the umask, so `0770` arrives as `0750` and the
-container's group silently loses write.
-
-#### What it will **not** do, and why (rewritten 2026-08-11)
-
-**It never follows a symlink, and it never chowns anything it did not just
-create.**
-
-The first version of this function did both, and it was a privilege escalation
-out of the sandbox — in the change written to let agents file requests safely.
-Review of PR #8 caught it before it ran anywhere.
-
-The mechanism: the spool's *parent*, `<stateDir>/run`, is bind-mounted
-read-write into the container and is owned by the uid the agent runs as. The
-agent therefore owns the directory entry called `ops` and can replace it:
+The spool's *parent*, `<stateDir>/run`, was bind-mounted read-write into the
+container and owned by the uid the agent ran as. The agent therefore owned the
+directory entry called `ops` and could replace it:
 
 ```sh
 rm -rf run/ops && ln -s /root/.ssh run/ops    # from inside the container
 ```
 
-Restarts are routine — a pull, a redeploy, a reboot — so the next executor
-start ran, as root, `mkdirSync(recursive)` (which returns quietly on an
-existing symlink-to-directory), then `statSync` and `chownSync`, both of which
-follow the terminal symlink. Result: root chowns any path on the host the agent
-chose to `1000:1000`. `/etc`, the checkout, or `/var/lib/clawcius-ops` itself —
-the state directory whose unreachability is the entire argument for why the
-circuit breaker cannot be edited by the instance it has quarantined.
+Restarts are routine, so the next executor start ran, as root,
+`mkdirSync(recursive)` — which returns quietly on an existing
+symlink-to-directory — then `statSync` and `chownSync`, both of which follow the
+terminal symlink. Result: root chowns any path on the host the agent chose to
+`1000:1000`. Review of PR #8 caught it before it ran anywhere. The rule that came
+out of it was stricter than `lchown`, because the real question was whether a
+root process should be repairing paths whose parent directory is owned by the
+adversary: every level `lstat`ed and anything that is not a real directory
+refused, reported and **left exactly where it is**; the chown and chmod through
+an `O_NOFOLLOW | O_DIRECTORY` descriptor whose `fstat` is compared by device and
+inode against the `lstat`; an existing directory with the wrong owner a loud
+warning with the exact `chown` to run and nothing else; and nothing created at
+all if the state directory did not exist, because there was no correct owner to
+copy and a root-owned tree is worse than an absent one.
 
-`lchown` alone would have been the small fix. The rule is stricter than that,
-because the real question is whether a root process should be repairing paths
-whose parent directory is owned by the adversary:
+**`ensureSpoolDir()` is gone with the spools.** What survives is
+`ensureDirOwnedBy()`, which moved out of `spool.ts` into its own file,
+`ops/src/dirs.ts`, precisely so that it is not read as the relaxed version of a
+rule that no longer exists. It is `mkdir -p` plus `chown` **by name**, with no
+symlink checks at all, and that is safe for exactly one reason: it is only ever
+pointed at the host agent's working directory and the three unit-desk
+directories under it, none of which is inside any bind mount and none of which
+has any part of its path owned by a container. The header of that file says so in
+capitals. **Do not point it at anything an agent can write** — the moment
+somebody does, the CWE-59 above is back, and it will not look like a mistake.
 
-- every level is `lstat`ed, and anything that is not a real directory —
-  symlink, file, socket — is **refused, reported and left exactly where it
-  is**. It is not repaired, and it is not deleted either: deleting as root
-  inside a directory the agent owns is another primitive, and the agent can
-  remove its own link. The instance's requests stop arriving until a human
-  looks, which is correct — the only party who can put a symlink there is the
-  one whose requests those would have been;
-- the chown and chmod go through a descriptor opened `O_NOFOLLOW |
-  O_DIRECTORY`, whose `fstat` is compared by device and inode against the
-  `lstat`. Whatever is chowned is the object that was checked, or nothing is;
-- an **existing** directory with the wrong owner is a loud warning with the
-  exact `chown` to run, and nothing else. The old "repair" bought the case
-  where a previous root `mkdir` left a bad owner; it cost the case where the
-  adversary picks the target. That warning is emitted **on every sweep**, from
-  the sweeper itself, and not only by `ensureSpoolDir` — because the second
-  review of PR #8 pointed out that the daemon only ever called `ensureSpoolDir`
-  when the spool was *missing*, so a spool that was already there with the
-  wrong owner was swept happily and forever while the container got `EACCES` on
-  every `mv` and nothing was logged at all. That state is reachable without an
-  adversary: `run-container.sh`'s `mkdir -p "$OPS_DIR"` assumes it runs as
-  `npurcell`, and the executor invokes that script itself, as root, on a
-  `--recreate`. A warning that the running configuration cannot reach is not a
-  warning. It is repeated at most once per state change rather than every five
-  seconds, and it does not stop the sweep: a real directory is safe to read,
-  and refusing here would turn a diagnostic into an outage;
-- if the state directory does not exist yet, **nothing is created at all**.
-  There is no correct owner to copy, and a root-owned tree is worse than an
-  absent one — the absent one is fixed by the instance unit starting, and this
-  is retried on every sweep, so a first-boot ordering race heals itself without
-  a restart.
+One reversal in it is deliberate and worth knowing: the owner is **passed in**
+rather than discovered by `stat`. The spool followed the opposite rule — "the
+owner is discovered, never configured", because this daemon is not entitled to an
+opinion about who owns a directory it was pointed at — and that rule is right for
+a build step and exactly backwards for an identity. Discovering the session's
+identity from the filesystem is how it ended up running as the operator, who is
+in the `docker` group. See [§ The service account](#the-service-account-2026-08-11).
 
-The same rule runs on **every sweep**, not just at startup: `drain()` does
-`readdir` and `unlink` as root, and the agent can swap the directory for a
-symlink at any moment of the process's life, not only before it starts. Files
-inside the spool get it too — they are opened `O_NOFOLLOW | O_NONBLOCK` and
-sized with `fstat` on the descriptor, so a `req.json` that is really a symlink
-to a host file is discarded rather than read into the journal, and one that is
-really a FIFO cannot park the daemon that holds every rollback deadline.
+### The retired config keys, and why a stale one does not fail the boot
 
-### Optional: restricting an instance. Off by default.
+`spoolDir` at the top level, and `opsSpoolDir`, `wakeSpoolDir`, `wakeChannelId`
+and `mayRequest` per instance, are **retired**. The loader ignores each of them
+and writes one deprecation entry per key into `journal.jsonl` — not just to
+stdout — naming the key, the instance, and what stands in its place. Delete them
+once you have read the notice. Nothing on disk was touched on their account.
 
-`instances[].mayRequest` narrows what one instance may ask for:
+**It is not a boot failure, and that decision is older than these keys.** It was
+first made on 2026-08-10 for the legacy top-level `spoolDir`, and the reasoning
+transfers unchanged: `clawcius-ops.service` is `Restart=always` with
+`StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up. A rejected
+config does not produce one loud failure; it produces a root daemon in a
+five-second restart loop. That is the shape of #7, and this repository has
+already agreed not to ship it again. `git pull` also updates `ops-config.yaml`
+under a running process that will not re-read it until somebody restarts it, so
+the new file routinely lands under the old code and the old file under the new.
 
-```yaml
-  - name: hamachi
-    # …
-    mayRequest:
-      instances: [hamachi]        # task/rollback/checkin targets, and the
-                                  # instance a `wake` channel routes to
-      verbs: [task, checkin, wake]
-```
-
-`units:` and `repos:` used to be here too. **They are now inert** — no request
-carries a unit or a repo — and the loader says so in the boot journal rather
-than failing to start, on the same reasoning as the old `spoolDir` key: this
-unit is `Restart=always` with no start limit, and refusing to boot on a stale
-key turns a cosmetic problem into a restart loop with every deadline
-unhonoured. Anybody who wrote them believing they restricted something is now
-wrong, which is exactly why the notice exists.
-
-- **No `mayRequest` block means unrestricted**, which is what every instance had
-  before this existed. Upgrading changes nothing until somebody writes one.
-- A key left out is unrestricted. A key present is an exact-match allowlist. A
-  key present and empty (`instances: []`) means none at all, which is a
-  legitimate thing to say and is not confused with absent.
-- Every name is checked against the real lists at boot. A typo in
-  `mayRequest.instances` would otherwise be a silent total denial of something
-  the operator believed they had granted, and a restriction that fails closed by
-  accident is indistinguishable from a broken executor.
-- An **unnamed task** from a restricted instance is refused. Scope-by-omission
-  takes every instance, so for a restricted one "unnamed" is wider than what it
-  is allowed rather than narrower.
-- Refusals are journalled with the requester and the reason, and are checked
-  **before** the rate limit, so an agent looping on requests it may not make
-  cannot starve the one doing real work.
-- `wake` is checked twice: at intake for the verb, and again after routing,
-  because a wake names a channel and the target instance is not known until it
-  has been resolved. Waking somebody else's agent with attacker-influenced text
-  is exactly what a restricted instance should not be able to do.
-
-This is **not** a security boundary, and since 2026-08-10 it is even less of one
-than it was: it bounds what an instance may *ask for*, not what the host agent
-may *do*. A task scoped to `hamachi` is still carried out by a session with a
-shell and sudo, and nothing but the task text and the standing prompt points it
-at Hamachi rather than at anything else on the box. It is a statement of intent
-that the journal records, which is genuinely useful. It is the narrower thing
-that per-instance spools made expressible for the first time:
-keeping an instance out of its neighbour's business, deliberately, with the
-refusal in the journal. It could not have existed before, because "this
-instance" was not a thing the executor knew.
-
-### Migration: the old `spoolDir` is a deprecated alias, not an error
-
-**Decision: accept it, attribute it, say so loudly. Refuse only if it cannot be
-attributed.**
-
-The executor is running right now, as root, in dry-run, with the old key on
-disk. `pull` updates the checkout — including `ops-config.yaml` — without
-restarting this daemon, so the new file lands under a process that will not
-read it until a person restarts it.
-
-The alternative was to fail the boot with a message saying exactly what to
-write. That is tempting and it is wrong here, because of what failure means for
-*this* unit: `clawcius-ops.service` is `Restart=always` with
-`StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up — since it
-holds the rollback deadlines and a dead executor is how a broken rebuild
-becomes a permanent outage. A rejected config does not produce one loud
-failure; it produces a root daemon in a five-second restart loop with every
-armed deadline unhonoured. That is the shape of #7, and this repository has
-already agreed not to ship it again.
-
-So on boot, a top-level `spoolDir:`:
-
-- is **attributed** to the one instance whose `stateDir` contains it. That
-  instance carries on watching exactly the directory it watched before the
-  upgrade — no behaviour change for it — and every other instance gets its own
-  spool at the default. On this host that means Clawcius keeps
-  `/var/lib/clawcius/run/ops` and Hamachi finally has
-  `/var/lib/hamachi/run/ops`;
-- writes a **deprecation entry into `journal.jsonl`**, not just to stdout,
-  naming the instance it was attributed to and the lines to replace it with.
-  The whole argument for tolerating the key is that the operator gets a durable
-  record saying it was tolerated;
-- **fails the boot** if no instance owns it, if two do, or if it disagrees with
-  an explicit `opsSpoolDir` — with the exact YAML to write. An unattributable
-  spool is the precise thing this change abolishes; guessing at provenance
-  would be worse than the shared spool was.
-
-"Explicit" means *written in the file*, not *different from the default*. Those
-are different questions and the loader used to ask the wrong one: because
-`opsSpoolDir` is resolved against its default before this check, an operator
-who spelled the default out by hand — `opsSpoolDir: /var/lib/clawcius/run/ops`,
-an ordinary thing to write while migrating off the old key — looked identical
-to one who had written nothing, so a stale `spoolDir` pointing somewhere else
-in the same `stateDir` silently replaced their value instead of failing. The
-executor would then watch a directory no container writes, because
-`run-container.sh` hard-codes the container's spool to `<stateDir>/run/ops` and
-that path is not in the config at all. Fixed 2026-08-11, after review of PR #8;
-the loader now tracks presence separately, the same distinction `strListOrNull`
-exists to preserve for `mayRequest`.
-
-Delete the key once you have read the notice.
+The `spoolDir` migration that this replaced was more elaborate — it *attributed*
+the old path to the one instance whose `stateDir` contained it, refused the boot
+if no instance owned it or two did, and tracked whether `opsSpoolDir` was
+*written in the file* separately from whether it *differed from the default*,
+because conflating those two questions silently replaced an operator's
+hand-written value. All of that machinery is deleted. Attribution is meaningless
+when there is nothing to attribute a directory to.
 
 ## Snapshot restore verification
 
@@ -1230,16 +1159,22 @@ The reason is in SETUP.md's known gaps, which carried this for weeks:
 
 The usual cause of a failed rollback is a restore path nobody ever ran. A
 nightly job producing images that have never been booted is not a backup, it is
-2 GB of optimism — and now that a missed check-in triggers an *automatic*
-rollback, that untested path is in the recovery path.
+2 GB of optimism. That argument was written when a missed check-in triggered an
+*automatic* rollback, which put the untested path inside the recovery path.
+**Since 2026-08-16 nothing here restores a snapshot automatically**, so the
+verifier's job has changed rather than gone: the snapshots are now purely a
+person's recovery tool, and the timer is what stops them being a person's
+recovery tool that has never been tried. It is arguably worth more than it was,
+because a human restoring at 3am has no fallback behind them.
 
 `docker run -d` succeeding proves almost nothing: it returns as soon as the
 container is created, and an image whose entrypoint dies immediately satisfies
 it. So the check is start → wait for `running` → `docker exec` the configured
 probe. The throwaway container gets no env file, no bind mounts and no restart
-policy, so it holds no credential and cannot reach the spools, the workspaces
-or Discord; and it is removed in a `finally` on every path, because a verifier
-that leaks 2 GB containers turns a broken snapshot into a full disk.
+policy, so it holds no credential and cannot reach any instance's `run/`
+directory, the workspaces or Discord; and it is removed in a `finally` on every
+path, because a verifier that leaks 2 GB containers turns a broken snapshot into
+a full disk.
 
 ## Running it
 
@@ -1266,33 +1201,50 @@ It now holds three different kinds of thing:
   does not make it safe, it makes it unwatched;
 - **real invariants** — the containment assertions, unchanged and still
   load-bearing;
-- **limits** — how often, how long, how much money. Never *what*.
+- **limits** — how long and how much money. It used to say "how often" too, and
+  there is no longer anything that answers that: the rolling-hour cap went with
+  the spools, and `limits:` is now two timeouts.
 
-`instances:` is the one list that still gates something: it decides what may be
-named as a rollback or check-in target, and what gets snapshotted and rolled
-back. Every key has a default in `src/config.ts` and the loader validates types
-and cross-field invariants, so a typo fails the boot with the offending key
-named rather than producing an executor that quietly does nothing.
+`instances:` no longer gates anything at all. It used to decide what could be
+named as a rollback or check-in target and what got snapshotted; none of those
+exist. What it decides now is what gets health-sampled, what appears in the
+briefing, which boards get a mailbox, and — through `stateDir` — where the
+containment checks say the mounts are. Every key has a default in `src/config.ts`
+and the loader validates types and cross-field invariants, so a typo fails the
+boot with the offending key named rather than producing an executor that quietly
+does nothing.
 
-The cross-field checks worth knowing about, because they are security
-properties rather than tidiness:
+The cross-field checks worth knowing about, because they are security properties
+rather than tidiness. Every one of the containment checks is asked against
+`join(instance.stateDir, 'run')` — the single directory
+`docker/run-container.sh` bind-mounts read-write into that instance's container —
+for **every** instance, not just the one the file belongs to:
 
-- `stateDir` may not be inside any instance's `opsSpoolDir` or `wakeSpoolDir`;
-- an instance's `wakerStatusFile` may not be inside its own wake spool or *any*
-  instance's ops spool — the neighbour's counts, and on this host the two state
-  directories are siblings under `/var/lib`, so a fat-fingered path lands in the
-  neighbour rather than nowhere;
-- no two instances may share an `opsSpoolDir`, and none may nest inside another;
-- an `opsSpoolDir` may not contain or be contained by any `wakeSpoolDir`;
-- `mayRequest` may only name instances and verbs that exist; `units` and `repos`
-  are accepted, inert, and produce a deprecation notice in the boot journal
-  rather than a boot failure;
-- `hostAgent.workDir` may not be inside any spool, inside `stateDir`, or inside
-  any checkout under `repos:` — a session that can write a spool can forge a
-  request from whichever instance owns it, and a session whose cwd is a checkout
-  takes standing instructions from anything the agents can get merged;
-- `buildRepo` must name a real entry under `repos:`, or the breaker cannot
-  identify a build;
+- `stateDir` may not be inside any instance's mount. It holds the journal and the
+  audit, and a record written by the party it is about is not a record;
+- an instance's `wakerStatusFile` may not be inside any instance's mount. A's
+  status file under B's mount means B can declare A idle whenever it likes —
+  which matters less than it did, since this daemon no longer reads the verdict,
+  but the waker still does;
+- an instance's `board.db` may not be inside any instance's mount. It decides who
+  is a coordinator, and a coordinator is the only agent that may run commands on
+  this host;
+- `hostAgent.workDir` may not contain or be contained by any mount, may not
+  contain or be contained by `stateDir`, and may not be inside any checkout under
+  `repos:` — the session writes freely in its own working directory, and a
+  container sharing it can put anything it likes in front of a process with
+  sudo; a session whose cwd is a checkout takes standing instructions from
+  anything the agents can get merged;
+- `unitDir` may not be inside `hostAgent.workDir`, `stateDir`, any checkout, or
+  any instance's `stateDir` — the whole value of installing units in code is that
+  root computes the destination, and a `unitDir` the agent account can already
+  write hands that back with root ownership attached;
+- retired keys (`spoolDir`, `opsSpoolDir`, `wakeSpoolDir`, `wakeChannelId`,
+  `mayRequest`) are ignored, named in a deprecation notice, and are **not** a
+  boot failure;
+- `buildRepo` must name a real entry under `repos:`. It used to be so the breaker
+  could identify a build; the breaker has no writer now, so this validates a key
+  nothing consumes;
 - `repos[].buildDirs` must be relative and must resolve inside the checkout —
   it names a subdirectory of an already-authorised repo, not a second way to
   nominate a directory for a root process to run `npm` in;
@@ -1311,16 +1263,30 @@ sudo is a key somebody widens at 3am. `hostAgent.passwdPath` and
 `hostAgent.groupPath` exist so the self-test can drive the real resolution path
 against fixture files; on a real host there is no reason to touch them.
 
+**Keys that still parse and are consumed by nothing.** `idle:` (all three
+fields), `deadline:` (both), `breaker:` (both) and `snapshotKeep`. They are
+validated on the way in and then no code reads the result. They are left in place
+rather than removed because deleting a key is a boot failure for anyone whose
+file still has it, and the loader's tolerance is spent on the five keys that had
+to go; a second wave can take these. Do not read their presence as evidence of a
+behaviour. There is no idle wait, no deadline, no breaker, and no per-task
+snapshot.
+
 ## Layout
 
 ```
 ops/
-  ops-config.yaml        the authorization model
-  unfreeze.sh            human-only: clear the breaker's freeze
+  ops-config.yaml        health manifest, invariants and limits — NOT an
+                         authorization model, and it has not been one since
+                         2026-08-10
+  unfreeze.sh            human-only: clear the freeze. Still the only way to
+                         clear it, and nothing sets it any more
   clawcius-sudoers       what the host agent may do with sudo, and why
   src/
-    index.ts             daemon entry, single-instance lock, signals
+    index.ts             daemon entry, single-instance lock, signals, one
+                         mailbox per board
     config.ts            typed YAML loader, defaults, containment assertions
+                         against each container's bind mount
     agent-user.ts        WHO THE SESSION IS. Resolves the named service account
                          out of /etc/passwd + /etc/group and refuses to run as
                          one that is missing, is uid 0, is in a root-equivalent
@@ -1336,21 +1302,36 @@ ops/
                          because the two sudo rules that used to do this were
                          one command to full root; the header records the
                          exploits. Read it with clawcius-sudoers open.
-    request.ts           parsing and validating hostile spool content
-    spool.ts             one directory-as-a-queue per instance; the caps, and
-                         the stamp that says whose it was
+    dirs.ts              ensureDirOwnedBy: mkdir -p + chown BY NAME, for the
+                         host agent's working directory and the unit desk only.
+                         It is a file of its own so that it is not mistaken for
+                         the careful spool version it replaced; the header says
+                         why, and says not to point it at anything an agent can
+                         write.
+    board.ts             opening a crew's board.db as root and reading and
+                         writing mail rows. Refuses a path that is not a
+                         regular file, and creates nothing.
+    host-mailbox.ts      THE WAY IN. One mailbox per crew, the coordinator
+                         check re-done against the author column immediately
+                         before anything runs, and the reply.
     host-agent.ts        the session: env allowlist, tool policy, the standing
-                         prompt, stream-json parsing and the audit. READ THIS
-                         FILE FIRST — it is where the trust model lives.
-    executor.ts          the lock, the task supervisor, snapshot/health/rollback,
-                         deadline, breaker
+                         prompt, stream-json parsing, the audit, and
+                         sanitiseTask. READ THIS FILE FIRST — it is where the
+                         trust model lives.
+    executor.ts          the lock, the task supervisor, the health sample
+                         either side, the unit desk. No snapshot, no rollback,
+                         no queue; the header records what went and when.
     runner.ts            argv-array exec, no shell; dry-run
-    idle.ts              reading the waker status file; fails safe
-    state.ts             persisted breaker, quarantine and deadlines
+    idle.ts              reading the waker status file; fails safe. Still
+                         correct, still tested, and consumed by nothing in this
+                         package since the idle wait was removed.
+    state.ts             persisted freeze, quarantine ring and deadline rows.
+                         Only the freeze is still read; the boot reports and
+                         clears whatever deadlines it finds.
     journal.ts           append-only jsonl + ops-status.json
     verify.ts            snapshot restore test
     verify-main.ts       oneshot entry for the verify timer
-    selftest.ts          `npm run selftest`
+    selftest.ts          `npm run selftest` — 58 tests
 ```
 
 ## The status page
@@ -1358,12 +1339,19 @@ ops/
 The executor writes `<stateDir>/ops-status.json`, rewritten atomically on every
 event and again whenever the lock is released. That is the whole integration
 with `status/` — no socket, no API, no shared library. It holds the current
-operation, the queue depth, the freeze, pending check-ins, the quarantine list,
-the spools being watched (one per instance, and whether each is restricted) and
-the last hundred journal entries — each of which now names its requester as
-well as its target. `status/` can grow a panel for it
-whenever someone wants one. Until then it is the file you `cat` when the
-journal is too long.
+operation, the freeze, the host agent's configuration and identity verdict, the
+audited-command count, the last task, and the last hundred journal entries —
+each of which names its requester. `status/` can grow a panel for it whenever
+someone wants one. Until then it is the file you `cat` when the journal is too
+long.
+
+Two fields went on 2026-08-16: `queued`, because a second task is refused rather
+than queued, and `spools`, because there are none. `pendingCheckins` and
+`quarantined` are still in the shape and are **always empty** on a host that has
+booted this build once — nothing arms either, and the first boot reports and
+clears whatever the previous build left behind. They are kept so that a reader
+written against the old shape does not have to handle their absence as well as
+their emptiness.
 
 The durable record is `<stateDir>/journal.jsonl`, appended and fsynced before
 each step proceeds. The systemd journal gets the same lines in prose. Both are
@@ -1474,14 +1462,89 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` runs with no docker, no systemd and no npm, and no real
-`claude`. It covers request validation against hostile inputs (traversal,
-separators, NUL and control bytes, shell metacharacters, unknown verbs, wrong
-types, malformed JSON, oversized files), the spool's caps and flood handling,
-the config loader's containment assertions, the lock and queue, the idle logic
-against synthetic waker status files including the stale-zero case, breaker
-persistence across a fresh `StateStore`, deadline expiry driving an automatic
-rollback and quarantine, and deadlines restored after a restart.
+`npm run selftest` is **58 tests** and runs with no docker, no systemd, no npm
+and no real `claude`. It was 129 before 2026-08-16; the seventy-one that went
+tested request parsing, the spool's caps and flood handling, the queue, the
+`mayRequest` refusals, the deprecated `spoolDir` migration, the idle wait, the
+snapshot-before/rollback-after ordering, the deadline, the automatic rollback and
+the breaker. They did not start failing. **The code they covered was deleted**,
+and a test suite that shrinks by that much is worth being explicit about,
+because the alternative reading — that coverage was dropped — is the one a
+reader should be able to rule out here rather than by reading the diff.
+
+What is covered now:
+
+- **`sanitiseTask`**: a task is capped and stripped of control characters, and
+  says nothing more than it was given;
+- **the containment assertions**, which are the things standing between "the
+  agent writes its mount" and "the agent writes the record of what was done to
+  the host": a `wakerStatusFile` inside a container mount is refused, a
+  `board.db` inside one is refused, a board outside every mount loads and
+  neither of its fields is guessed, and a **near-miss prefix is not treated as
+  containment** — `/var/lib/clawcius-ops` is not inside `/var/lib/clawcius`, and
+  a string comparison that got that wrong would refuse every valid config on
+  this host;
+- **a config still carrying the retired keys boots**, and the notices name each
+  one. That is the whole of the migration promise and it is asserted rather than
+  described;
+- **the board**: it is opened or refused, never created, and the host agent takes
+  its own row and will not take anybody else's;
+- **the lock**: a second task is refused while one is running, and the refusal
+  reaches the sender. Refused, not queued — the test asserts the reply, because
+  a refusal nobody is told about is indistinguishable from a request that
+  evaporated;
+- **the retired deadlines**: one armed by the previous build is reported and
+  cleared at boot, not left pending forever in `ops-status.json`;
+- **the unit desk**, which is the sharpest surface left: a name with a separator,
+  a `..`, a space or the wrong suffix is refused with the reason; an install
+  lands at the path the executor computed, 0644, and nowhere else; a staged
+  symlink is refused rather than published into `/etc/systemd/system`; an empty,
+  oversized or non-unit staged file is not installed; a dry run stages nothing;
+  a request carries a name and nothing else — no path, no mode, no owner; the
+  desk serves a request, answers it, and never serves it twice; and a task can
+  install a unit without sudo, landing in the journal as its own `"kind":"unit"`
+  entry;
+- **the session**: a task reaches it with the task text and nothing else, and a
+  working directory that is not the checkout;
+- **the audit**: every Bash command in the stream reaches the journal, in full,
+  in order, including one with spaces, quotes and a semicolon in it;
+- **`compareHealth` only reports things that got worse** — fixing something is
+  not a regression, and a service that was already dead is not blamed on the
+  task;
+- **dry-run removes the ability to act rather than asking it not to**, the deny
+  list is a superset of everything that can execute, and a task told to `touch`
+  a file leaves no file;
+- **`assertNoSecrets`** throws on a Discord token and on the other credential
+  shapes, the environment is built from nothing and carries no token, and a
+  `NODE_*` variable is refused — that last one because the privilege drop now
+  runs `node` as root first, so a `NODE_OPTIONS` inherited from anywhere would
+  execute before the drop;
+- **the service account**, all of it without root: resolution with both primary
+  and supplementary groups, a primary group that is `docker`, a missing account
+  that never falls back, the docker-group refusal with the `gpasswd` to run,
+  every root-equivalent group rather than just `docker`, uid 0 however it is
+  spelled, an unreadable group file as a refusal rather than a pass, a secret the
+  account can read, the readability check walking the directory rather than only
+  the file, a checkout it cannot write as a warning rather than a refusal, and
+  the standing prompt telling the session which account it holds;
+- **the privilege drop**: the gid list handed to `setgroups` is numbers and never
+  group names, the session is never spawned with the `uid`/`gid` options (that is
+  what clears the groups — #21), the bootstrap verifies against the kernel and
+  then execs, refuses to exec anything when the credentials would be wrong, and
+  `credentialComplaint` names the difference between what was asked for and what
+  happened;
+- **a clean exit with `is_error: true` is a failure, not a success** — the CLI
+  does exactly that when the model's own turn ends badly;
+- **no code path in `ops/src` forces past a dirty tree**, asserted against the
+  compiled `dist/`, which is the part a refactor cannot quietly undo;
+- **`ops-status.json` is valid and describes the current state**;
+- **the verifier** restores the newest snapshot, probes it and always removes it,
+  and a verify dry run says plainly that it proves nothing;
+- **`idle.ts` still has its own tests** — every ambiguous case reads as busy, and
+  an implausibly large status file reads as busy — even though nothing in `ops/`
+  consults the verdict any more. They are kept because the logic is still correct
+  and the waker still depends on the same file; they are not evidence that this
+  daemon waits for anything.
 
 The privileged binaries are replaced with stand-ins that record their argv one
 element per line, which is what proves no shell string is being built by the
@@ -1490,137 +1553,8 @@ executor. `claude` is replaced by a stand-in that emits genuine stream-json and
 not exist in that session, exactly as the real CLI was observed to behave — so
 the dry-run assertions test the whole chain rather than a flag.
 
-The tests added for the host agent on 2026-08-10:
-
-- a task reaches a session with the task text in the prompt, `--setting-sources
-  user`, `--strict-mcp-config`, `--disable-slash-commands`, a fresh
-  `--session-id` and never `--resume`, and a working directory that is **not**
-  the checkout;
-- **every** Bash command in the stream reaches the journal, in order, byte for
-  byte — including one with spaces, quotes and a semicolon in it — and the first
-  audit entry is written before the `finished` entry rather than flushed with it;
-- an unparseable line in the stream fails the task **on its own** and triggers
-  the rollback, and the auditor says so at the time as well as in the summary;
-- a task snapshots before the session starts and, when the agent reports
-  failure, restores that exact tag by name — not "the newest", which after a
-  failed task could easily be one taken of the broken state;
-- a health regression rolls the task back **even though the agent said it
-  succeeded**, and `compareHealth` reports only things that got worse (fixing
-  something is not a regression, and a service that was already dead is not
-  blamed on the task);
-- dry-run: the settings actually sent deny `Bash`, `Task`, `Monitor`, `Write`,
-  `Edit` and `WebFetch`, the tool list is exactly `Read, Glob, Grep`, and — the
-  assertion that matters — a task told to `touch` a file leaves no file;
-- `assertNoSecrets` throws on `DISCORD_TOKEN` **and** on `GITHUB_TOKEN`,
-  `ANTHROPIC_API_KEY`, `DB_PASSWORD`, `MY_SECRET` and `DISCORD_WEBHOOK`, passes
-  ordinary variables, and honours an explicit `envPassthrough` exemption;
-- the built environment inherits nothing by accident, carries the checkout
-  owner's `HOME` rather than root's, and contains no token;
-- a clean exit with `is_error: true` is a failure, not a success — the CLI does
-  exactly that when the model's own turn ends badly, and reading the exit code
-  alone would arm a deadline off a task that failed;
-- an unnamed task snapshots **every** instance, and a restricted instance may
-  not file one;
-- a deadline is armed for an instance the task never named, because a command in
-  the audit mentioned its container;
-- the result is reported back into the requester's wake spool, with the command
-  count, rather than spoken by the host agent;
-- tasks can be switched off (`hostAgent.enabled: false`) while check-ins and
-  rollbacks keep working, and a freeze refuses tasks while still letting an
-  instance check in;
-- the compiled output of `ops/src` contains no `reset`, `stash`, `clean` or
-  `checkout -f` — asserted against `dist/`, which is the part a refactor cannot
-  quietly undo.
-
-The tests added for the service account on 2026-08-11 — all of which run with
-no root, no docker, no systemd and no `clawcius-ops` account on the machine,
-because `/etc/passwd` and `/etc/group` are text files and the fixture writes
-text files:
-
-- the named account is resolved with **both** its primary group (by gid) and
-  its supplementary ones (by member list) — a check that read only the member
-  lists would miss an account whose *primary* group is `docker`, which is
-  exactly how somebody would set this up without thinking about it, and there
-  is a separate test for that case;
-- a **missing** account refuses the task, with the `useradd` line in the
-  message, and **no session is spawned** — there is no fallback to the
-  checkout's owner and that is asserted rather than assumed;
-- an account **in the docker group** refuses the task, names the group, prints
-  the `gpasswd -d`, spawns nothing, is reported as `identity.ok: false` in
-  `ops-status.json`, and **`assertAgentIdentity` throws on its own** —
-  independently of the executor, so a future code path that reaches `spawn`
-  without going through `#doTask` still cannot start;
-- every group in the built-in list is refused, not just `docker`, and
-  `hostAgent.forbiddenGroups` only ever adds to it;
-- an account with **uid 0** is refused however it is spelled (the fixture calls
-  it `toor`);
-- an **unreadable `/etc/group` is a refusal, not a pass** — the assertion the
-  rest of the design rests on must not fail open;
-- a **secret the account can read** refuses the task, names the file, prints
-  the `chmod` — and tightening the mode lets the same task through with **no
-  restart**, which is the per-task evaluation being tested rather than
-  described;
-- the readability check **walks the ancestor directories** for the traverse bit
-  before checking read on the target (the `~/.ssh` shape: 0600 files inside a
-  0700 directory), and a path that does not exist is reported with the reason
-  rather than as "safe";
-- a checkout the account cannot write is a **warning**, not a refusal: the
-  session still starts, and the warning — with the `chgrp` in it — is in the
-  durable record;
-- the environment carries the **service account's** `HOME`, not the operator's,
-  which is the line that decides whose Claude Code login the session uses;
-- the standing prompt tells the session which account it holds, that it is not
-  in the docker group, and that `clawcius-ops.service` is not on the
-  restartable list.
-
-The per-instance-spool tests from earlier the same day are unchanged in intent
-and were rewritten onto `task`: two spools drained concurrently with each
-request attributed to its own directory, a request claiming
-`"requester": "clawcius"` inside Hamachi's spool still attributed to Hamachi,
-"hamachi acting on hamachi" and "hamachi acting on clawcius" producing different
-journal lines, an automatic rollback attributed to `(executor)`, the
-`mayRequest` refusals, the containment assertions across several spools, the
-deprecated `spoolDir` migration, and the check-in instructions naming the
-instance's *own* spool.
-
-The spool-directory tests from PR #8's two reviews came in with that branch and
-are the sharpest ones in the file, because every failure they describe is
-silent and privileged:
-
-- a symlink where the spool should be is refused rather than chowned: the link
-  is still a link afterwards, the directory it points at still has every file
-  it had, and nothing behind it was read as a request or unlinked by the root
-  sweep. A non-directory of any kind gets the same treatment, and so does a
-  symlinked `.json` *inside* a real spool;
-- a fresh host — state directory present, nothing under it — ends up with
-  `run/` **and** `run/ops` existing, owned like the state directory, mode 0770
-  and not the umask's 0750; a *missing* state directory creates nothing at all,
-  and the spool appears by itself on a later sweep;
-- an already-existing spool whose owner does not match the state directory
-  produces the WARNING **from the sweeper**, carrying the exact `chown` — once,
-  not once per sweep — while the directory is left exactly as it was found and
-  requests filed in it still arrive;
-- a **FIFO** named like a request (`mkfifo 1.json`, which the agent owns the
-  directory to do) is discarded, and the request behind it is still delivered.
-  It runs in a child process with a deadline, because the regression it guards
-  against is a *hang*: without `O_NONBLOCK` the sweep blocks in `open(2)` until
-  a writer appears, and a test that hangs cannot report from inside the thread
-  that is hung.
-
-The two added for the second review of PR #9 are both about the automatic
-rollback, which is the least-exercised path in the daemon and the one that runs
-when everything else has already gone wrong:
-
-- a deadline rollback that has to **queue behind a busy operation** still
-  quarantines the build it rolled back, is still attributed to `(executor)`,
-  and still counts towards the breaker. There is one way into `#doRollback` and
-  the origin travels on the job, so the idle path and the queued path cannot
-  drift apart again;
-- an instance that **never reports idle again** — a status file that keeps
-  saying a turn is in flight, which is what a wedged rebuild looks like — is
-  rolled back anyway, within the bounded wait, and quarantined. The same test
-  asserts that a *requested* rollback still gives up rather than interrupting a
-  live turn, because that difference is the whole decision.
+What that stand-in **cannot** prove is that the real CLI honours those settings.
+That was established by experiment on 2026-08-10 and is in the next section.
 
 ### Verified by hand, against the real CLI
 
@@ -1637,6 +1571,9 @@ use it.
 - **No task has ever been run for real.** No `claude` session has been started
   by this daemon on the host, no snapshot has been committed or restored, no
   container has been recreated, no unit has been restarted.
+- **No task has ever arrived by DM on a real host either.** The mailbox path is
+  covered by the self-test against a real SQLite board, and has never run against
+  a live waker writing rows on the other side.
 - **Nothing in `MIGRATION.md` has been executed.** No `useradd`, no `groupadd`,
   no `chgrp`/`chmod`/`find` on the checkout, no `claude auth` as another
   account, no `ssh-keygen` deploy key, no `git pull` as `clawcius-ops` in a tree
@@ -1654,9 +1591,9 @@ use it.
   `host agent: privilege drop —` line in the journal, which is the observed
   credential rather than the intended one.
 - **The sudoers file has never been parsed by `visudo -c`.** Do that first, from
-  a shell that already has root. Still true on 2026-08-12, and re-checked rather
+  a shell that already has root. Still true on 2026-08-16, and re-checked rather
   than copied forward: the machine it is edited on has no `sudo` and no `visudo`
-  binary at all. Two things in it are new syntax as of that date and are what to
+  binary at all. Two things in it are new syntax as of 2026-08-12 and are what to
   look at if it does not parse — the `{{.State.Status}}` format strings on the
   `docker inspect` lines, and the escaped colon in `clawcius-agent\:latest`.
 - **No unit has been installed through `ops/src/units.ts` on a real host.** The
@@ -1669,15 +1606,17 @@ use it.
 - **No unit in `systemd/` has been loaded since the audit below** — which is
   exactly the condition that produced the two units that shipped unable to run
   at all.
-- `ensureSpoolDir`'s `fchown` and `ensureDirOwnedBy`'s `chown` have never run
-  as root here, because the self-test does not run as root and cannot. What
-  *is* tested without root is everything that decides whether the chown happens
-  at all: the refusals, the `O_NOFOLLOW` open, which levels get created, and
-  the mode. Check with `ls -ld /var/lib/*/run/ops /var/lib/clawcius-host-agent`
-  after the first start — and if that ever shows a symlink, read the executor's
-  log rather than fixing it quietly.
-- The wake the executor files after a task has never been picked up by a live
-  waker.
+- **`ensureDirOwnedBy`'s `chown` has never run as root here**, because the
+  self-test does not run as root and cannot. Check with
+  `ls -ld /var/lib/clawcius-host-agent` after the first start. The same sentence
+  used to name `ensureSpoolDir`'s `fchown` alongside it, and used to say to read
+  the executor's log rather than fixing it quietly if a symlink ever turned up
+  there. That function is gone, and so is the reason for the warning:
+  `ensureDirOwnedBy` is only pointed at paths no container owns any part of.
+  **If that ever stops being true, the warning is needed again and this file is
+  wrong.**
+- The old note here said the post-task wake had never been picked up by a live
+  waker. It never will be. Nothing files one.
 
 Run it with `dryRun: true` first and read the log. In that mode the session
 cannot execute anything, and what lands in the journal is the list of commands
