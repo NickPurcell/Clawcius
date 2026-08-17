@@ -167,11 +167,28 @@ VIEWPORTS = {
 # so a fat-fingered 100000 is an OOM in a 2 GB container rather than an error.
 MAX_VIEWPORT = 16384
 
-# Resource types whose failure changes what the page LOOKS like. Used only to
-# decide how loudly to complain — every problem is recorded either way.
+# How a failed request is described. Used only for the prose on stderr — every
+# problem is recorded in full either way, and the JSON ships `resource_type`
+# and makes no claim at all.
+#
+# The split is not "serious" versus "ignorable", and reading it that way was a
+# bug. It is: which of them can you SEE in the screenshot?
+#
+# A missing stylesheet or font is visible in the picture — unstyled text is
+# obviously unstyled. A failed data request is not, and that makes it the more
+# dangerous of the two for a tool whose whole purpose is a screenshot that can
+# be trusted. A dashboard whose /api/items returns 500 does not render the
+# finished page minus some telemetry; it renders a spinner, an empty table or
+# "Something went wrong", and it renders that perfectly.
+#
+# An analytics beacon and a single-page app's data fetch are the same
+# `resource_type` and cannot be told apart from the request alone, so no
+# attempt is made to. Both are reported as content, and what is said about
+# them is conditional, because that is the honest strength of the claim.
 RENDERING_TYPES = frozenset(
     {"document", "stylesheet", "image", "font", "script", "media"}
 )
+CONTENT_TYPES = frozenset({"xhr", "fetch", "eventsource", "websocket"})
 
 DEFAULT_LOG = Path(
     os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
@@ -418,6 +435,7 @@ def single_browser_lock():
     # mkdir and playwright's own `page.screenshot(path=...)` write from Python
     # and raise OSError, so this was the common case, not an exotic one.
     fd = None
+    acquired = False
     try:
         # O_NOFOLLOW: /tmp is world-writable, so refuse to follow a symlink
         # planted where the lock should be rather than open whatever it names.
@@ -435,15 +453,24 @@ def single_browser_lock():
             )
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
+        acquired = True
     except OSError as exc:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(fd)
         raise BrowseError(
             f"cannot take the browser lock at {LOCK_PATH}: {exc.strerror}",
             VALIDATION_ERROR,
             "set BROWSE_LOCK to a writable path.",
         )
+    finally:
+        # Every way out of the block above that did NOT acquire closes the fd,
+        # and there are two of them. The BUSY path leaks without this: it
+        # raises BrowseError, which is not an OSError, so the handler above
+        # does not see it and the release below is never reached — measured at
+        # one fd per refused attempt. It holds no flock and the process is
+        # about to exit, so nothing breaks; it is still a close() before a
+        # raise, in a file whose comments take leaks this seriously.
+        if not acquired and fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     try:
         yield
@@ -480,7 +507,7 @@ def proxy_settings():
 
 
 @contextlib.contextmanager
-def chromium(audit, headed_note=True):
+def chromium(audit):
     """Launch exactly one browser and close it deterministically."""
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -656,37 +683,54 @@ def load_summary(load):
     return out
 
 
+def _marker(entry):
+    kind = entry.get("resource_type")
+    if kind in RENDERING_TYPES:
+        return "*"
+    if kind in CONTENT_TYPES:
+        return "~"
+    return " "
+
+
 def warn_about_problems(load, show_redirect=True):
     """Same information as the JSON, on stderr, for the text-mode caller.
 
-    Everything is listed, but only a failure that changes what the page LOOKS
-    like earns the loud line. A healthy page may 404 a beacon or an optional
-    XHR by design, and "do not read this as the finished page" printed over
-    those is a warning an agent learns to skip — which costs exactly the case
-    the warning was written for.
+    SAY ONLY WHAT WAS CHECKED. An earlier version split these in two and had
+    the negative branch announce that "the rendering above should be complete"
+    whenever nothing visual had failed. That was worse than the warning
+    fatigue it was written to fix: it turned the single case this tool exists
+    to catch — the screenshot that succeeds and misleads — into the one where
+    the tool actively tells the reader to stop worrying. A warning an agent
+    learns to skip and a reassurance an agent learns to trust are the same
+    defect with the sign flipped.
+
+    So there is no all-clear here. Each group speaks only for itself, the
+    content group's claim is conditional because it has to be, and a failure
+    that fits neither group gets no interpretation at all.
     """
     if not load.problems:
         return
-    visual = [p for p in load.problems
-              if p.get("resource_type") in RENDERING_TYPES]
+    visual = [p for p in load.problems if _marker(p) == "*"]
+    content = [p for p in load.problems if _marker(p) == "~"]
+
     note(f"warning: {len(load.problems)} subresource(s) did not load:")
     for entry in load.problems[:10]:
-        marker = "*" if entry.get("resource_type") in RENDERING_TYPES else " "
         kind = entry.get("resource_type") or "?"
-        note(f" {marker} {kind:<11} {entry['reason']:<34} {entry['url'][:96]}")
+        note(f" {_marker(entry)} {kind:<11} {entry['reason']:<34} "
+             f"{entry['url'][:96]}")
     if len(load.problems) > 10:
         note(f"   ... and {len(load.problems) - 10} more (see --output json)")
+
     if visual:
-        note(
-            f"The {len(visual)} marked * affected what the page looks like. "
-            "The rendering above is incomplete — do not read it as the "
-            "finished page."
-        )
-    else:
-        note(
-            "None of these affect what the page looks like; the rendering "
-            "above should be complete."
-        )
+        note(f" * {len(visual)} changed how the page LOOKS. The rendering "
+             "above is incomplete — do not read it as the finished page.")
+    if content:
+        note(f" ~ {len(content)} carried page CONTENT. If this page fetches "
+             "what it displays, it may have rendered an empty state or an "
+             "error — which a screenshot cannot tell apart from real content.")
+    if not visual and not content:
+        # A statement about what was tested, not a verdict on the page.
+        note("   None of these was a layout or content request.")
     if show_redirect and load.redirects:
         note(f"note: redirected from {load.redirects[0]}")
 

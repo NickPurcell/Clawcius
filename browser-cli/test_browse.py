@@ -267,6 +267,28 @@ class LockScopeTest(unittest.TestCase):
         with browse.single_browser_lock():
             pass  # re-acquirable, so the fd was closed
 
+    def test_a_refused_attempt_leaks_no_descriptor(self):
+        """Regression. The BUSY path raised BrowseError with the fd open;
+        that is not an OSError, so the handler above did not see it and the
+        release below was never reached — one fd per refused attempt,
+        measured 5 -> 10 over five tries."""
+        with browse.single_browser_lock():                # hold it
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(5):
+                with self.assertRaises(browse.BrowseError) as caught:
+                    with browse.single_browser_lock():
+                        pass
+                self.assertEqual(caught.exception.code, browse.BUSY)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_an_unopenable_lock_leaks_no_descriptor(self):
+        before = len(os.listdir("/proc/self/fd"))
+        browse.LOCK_PATH = Path("/proc/definitely/not/writable/lock")
+        with contextlib.suppress(browse.BrowseError):
+            with browse.single_browser_lock():
+                pass
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_unopenable_lock_is_still_diagnosed(self):
         browse.LOCK_PATH = Path("/proc/definitely/not/writable/lock")
         with self.assertRaises(browse.BrowseError) as caught:
@@ -332,13 +354,59 @@ class WarningVolumeTest(unittest.TestCase):
                                "http_error", "stylesheet")
         self.assertIn("do not read it as the finished page", self.warn().lower())
 
-    def test_a_failed_beacon_is_reported_but_not_loud(self):
-        browse._record_problem(self.load, self.audit, "/beacon", "HTTP 404",
-                               "http_error", "xhr")
+    def test_a_failed_data_request_is_never_an_all_clear(self):
+        """Regression, and the sharpest one in the suite. An earlier version
+        classified xhr/fetch as "does not affect the rendering" and printed
+        "the rendering above should be complete" over them. But for a
+        single-page app those ARE the path the content arrives on: a dashboard
+        whose /api/items 500s renders a spinner or an empty table, perfectly.
+        That is the exact case this tool exists to catch, so announcing it was
+        fine turned the warning into a reassurance — the same defect as
+        warning fatigue with the sign flipped."""
+        for kind in ("xhr", "fetch", "eventsource", "websocket"):
+            with self.subTest(kind=kind):
+                load = browse.Load("https://app.example")
+                browse._record_problem(load, self.audit, "/api/items",
+                                       "HTTP 500", "http_error", kind)
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    browse.warn_about_problems(load)
+                out = buf.getvalue()
+                self.assertIn("/api/items", out)
+                self.assertIn("CONTENT", out)
+                self.assertNotIn("should be complete", out)
+
+    def test_no_output_ever_claims_the_page_is_fine(self):
+        """No combination of failures may produce an all-clear."""
+        types = ["stylesheet", "xhr", "ping", "font", "fetch", "other", None]
+        for kind in types:
+            with self.subTest(kind=kind):
+                load = browse.Load("https://example.com")
+                browse._record_problem(load, self.audit, f"/x-{kind}", "HTTP 500",
+                                       "http_error", kind)
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    browse.warn_about_problems(load)
+                lowered = buf.getvalue().lower()
+                for claim in ("should be complete", "rendering is fine",
+                              "no effect on", "safe to read"):
+                    self.assertNotIn(claim, lowered)
+
+    def test_layout_and_content_are_reported_separately(self):
+        browse._record_problem(self.load, self.audit, "/a.css", "HTTP 404",
+                               "http_error", "stylesheet")
+        browse._record_problem(self.load, self.audit, "/api", "HTTP 500",
+                               "http_error", "fetch")
         out = self.warn()
-        self.assertIn("/beacon", out)
-        self.assertNotIn("do not read it as the finished page", out.lower())
-        self.assertIn("should be complete", out)
+        self.assertIn("LOOKS", out)
+        self.assertIn("CONTENT", out)
+
+    def test_neither_group_states_only_what_was_checked(self):
+        browse._record_problem(self.load, self.audit, "/ping", "HTTP 404",
+                               "http_error", "ping")
+        out = self.warn()
+        self.assertIn("None of these was a layout or content request.", out)
+        self.assertNotIn("complete", out)
 
     def test_nothing_at_all_says_nothing(self):
         self.assertEqual(self.warn(), "")

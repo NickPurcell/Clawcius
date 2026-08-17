@@ -104,25 +104,50 @@ that Squid refuses never becomes an HTTP response at all and appears as
 the browser is perfectly happy with.
 
 ```
-$ browse probe http://127.0.0.1:8742/
+$ browse probe http://127.0.0.1:8752/
 warning: 3 subresource(s) did not load:
  * stylesheet  net::ERR_TUNNEL_CONNECTION_FAILED  https://nonexistent.invalid/x.css
- * stylesheet  HTTP 404                           http://127.0.0.1:8742/missing.css
-   fetch       HTTP 404                           http://127.0.0.1:8742/beacon.json
-The 2 marked * affected what the page looks like. The rendering above is
-incomplete — do not read it as the finished page.
+ * stylesheet  HTTP 404                           http://127.0.0.1:8752/missing.css
+ ~ fetch       HTTP 404                           http://127.0.0.1:8752/beacon.json
+ * 2 changed how the page LOOKS. The rendering above is incomplete — do not
+   read it as the finished page.
+ ~ 1 carried page CONTENT. If this page fetches what it displays, it may have
+   rendered an empty state or an error — which a screenshot cannot tell apart
+   from real content.
 status      200 OK
-final_url   http://127.0.0.1:8742/
+final_url   http://127.0.0.1:8752/
 title       Local page
-hosts       127.0.0.1:8742, nonexistent.invalid
+hosts       127.0.0.1:8752, nonexistent.invalid
 blocked     3
 ```
 
-**Only the `*` lines earn the loud sentence.** A healthy page may 404 a beacon
-or an optional XHR by design, and "do not read this as the finished page"
-printed over those is a warning an agent learns to skip — which costs exactly
-the case the warning was written for. Everything is still listed, and
-everything is still in the JSON with its `resource_type`.
+The two markers are **not** "serious" and "ignorable". They are *which of these
+can you see in the picture?*
+
+- `*` — stylesheet, font, image, script, media, sub-frame document. A missing
+  stylesheet is visible in the screenshot: unstyled text is obviously unstyled.
+- `~` — xhr, fetch, eventsource, websocket. **Not** visible, and for that
+  reason the more dangerous of the two here. A dashboard whose `/api/items`
+  returns 500 does not render the finished page minus some telemetry; it
+  renders a spinner, an empty table or "Something went wrong", and it renders
+  that *perfectly*.
+
+An analytics beacon and a single-page app's data fetch are the same
+`resource_type` and cannot be told apart from the request alone, so no attempt
+is made to. Both are reported as content, and what is said about them is
+conditional, because that is the honest strength of the claim.
+
+**There is no all-clear.** Each group speaks only for itself, and a failure
+fitting neither gets no interpretation — just `None of these was a layout or
+content request`, which is a statement about what was checked and not a verdict
+on the page. An earlier version did print an all-clear when nothing visual had
+failed, which was worse than the warning fatigue it was written to fix: it
+turned the one case this tool exists to catch into the one where the tool tells
+you to stop worrying. A warning an agent learns to skip and a reassurance an
+agent learns to trust are the same defect with the sign flipped.
+
+The JSON never editorialises at all: it ships every failure with its
+`resource_type` and makes no claim.
 
 A sub-frame counts. An iframe's navigation is a `document` request just as the
 main page's is, so a `403` served into an iframe is reported; only the *main*
