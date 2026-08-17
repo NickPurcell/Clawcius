@@ -31,6 +31,47 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 RUN pip3 install --no-cache-dir --break-system-packages yt-dlp
 
+# Headless Chromium, so an agent can see the pages it builds. `browser-cli/`
+# drives it; that directory is bind-mounted and needs no rebuild, this does.
+#
+# The argument for the size is Clawcius #11. `status/` was built end to end
+# without anyone ever looking at it, and the one real defect in it was found by
+# the operator sending a screenshot back. An agent can read a PNG directly, so
+# a rendered page is evidence it can produce for itself instead of asking.
+#
+# This is the largest thing in the image: roughly 650 MB of browser and 150 MB
+# of the X, GTK and font libraries chromium links against. Two of those 650 are
+# installed because `playwright install chromium` fetches both the full browser
+# and `chrome-headless-shell`; the shell alone is 260 MB and is all `browse`
+# actually launches. Dropping to `playwright install chromium-headless-shell`
+# is the first thing to try if the image size ever bites, and it is not done
+# here because the two-browser form is the supported path and a missing full
+# chromium would only be discovered by needing another rebuild.
+#
+# PLAYWRIGHT_BROWSERS_PATH is set BEFORE the install, and that ordering is
+# load-bearing. Playwright's default location is per-user
+# (~/.cache/ms-playwright); this RUN executes as root and the agent runs as
+# `agent`, so without it the browser lands in root's home where the agent
+# cannot reach it, and the failure appears at first use rather than at build.
+#
+# The pip version is pinned because that is what makes a rebuild reproducible.
+# `playwright install` downloads the browser revision the installed package
+# expects, so pinning the package pins the browser; unpinned, two builds of the
+# same commit could ship different chromiums. To bump: raise the version,
+# rebuild, and run `python3 browser-cli/test_browse.py`.
+#
+# Fonts are named explicitly rather than left to `--with-deps`. Without them a
+# page does not fail, it renders every glyph as a hollow box — a screenshot
+# that is worse than none, because it looks like a bug in the page.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN apt-get update \
+    && pip3 install --no-cache-dir --break-system-packages playwright==1.62.0 \
+    && playwright install --with-deps chromium \
+    && apt-get install -y --no-install-recommends \
+         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH}
+
 # Statically linked, so no glibc coupling to the base image. Verified to run
 # correctly under runsc before this image existed.
 COPY claude /usr/local/bin/claude
@@ -81,4 +122,13 @@ WORKDIR /var/lib/clawcius/workspaces
 
 # The container's job is to stay up. The waker attaches per session with
 # `docker exec`, so this process only has to outlive them.
+#
+# `sleep infinity` never calls wait(), which matters more than it looks: pid 1
+# is where every orphaned process in this container is reparented, so anything
+# orphaned here becomes a zombie that nothing will ever reap, and this
+# container runs with --pids-limit=512. Measured on 2026-08-16: chromium left
+# exactly two per invocation before browser-cli/browse was taught to make
+# itself a subreaper and wait() its own. That fix is per-tool, not general —
+# any other tool whose children outlive it leaks pids the same way. The general
+# fix is `docker run --init`; see Clawcius #74.
 CMD ["sleep", "infinity"]

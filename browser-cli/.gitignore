@@ -1,0 +1,4 @@
+# No trailing slash on __pycache__, deliberately. A directory-only pattern is
+# how a node_modules symlink got committed once — see the root .gitignore.
+__pycache__
+*.pyc
