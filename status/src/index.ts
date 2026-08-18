@@ -14,6 +14,32 @@
  *      0.0.0.0 and merely firewalled has the opposite failure mode, and you
  *      find out about it from a stranger.
  *
+ *      It ALSO listens on unix domain sockets, one per configured instance, so
+ *      that the agent containers can reach it — they are on a network with no
+ *      gateway and could not otherwise. This does not weaken (1): a unix
+ *      socket has no address and no port, the TCP surface is unchanged, and
+ *      the reachability comes from a bind mount rather than from routing.
+ *
+ *      IT DOES WIDEN WHAT AN AGENT CAN SEE, and by more than it first looks.
+ *      There is no scoping by listener, so an agent reaching any socket
+ *      reaches every route for every configured instance: both crews' boards
+ *      (`/api/clawsky`), every session (`/api/agents/<id>/sessions`), the FULL
+ *      message-by-message transcript of any of them
+ *      (`/api/agents/<id>/sessions/<sid>/transcript`, parent or subagent), and
+ *      the OJ worker snapshot (`/api/oj`).
+ *
+ *      That is a different grant, not merely a larger one. A transcript is
+ *      everything an agent ever saw — file contents, tool output — not just
+ *      what it wrote to another agent; and cross-crew transcripts have no path
+ *      into either container without this socket, so it creates the access
+ *      rather than exposing it. Note that point (5) below is load-bearing here
+ *      and is weaker cover for transcripts than it would be for a board.
+ *
+ *      Agreed with the operator, twice — the second time after Osmosis Jones
+ *      found the first description incomplete. See the note on
+ *      `AgentRoot.socketPath` in config.ts for both quotes and for why no
+ *      per-crew scoping is to be added.
+ *
  *   2. It is READ-ONLY. Every route is GET or HEAD; anything else is refused
  *      before routing. Nothing here writes, deletes, or spawns a process, and
  *      no request parameter reaches a shell — there is no shell. The agent
@@ -44,6 +70,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isLoopback, loadStatusConfig } from './config.js';
 import { readOjSnapshot } from './oj.js';
+import { bindUnixSockets, releaseSocketPath, type SocketOutcome } from './socket.js';
 import { isValidSubagentId, TranscriptStore } from './transcripts.js';
 import {
   buildAgentOverview,
@@ -361,7 +388,27 @@ async function handleAsset(pathname: string, response: ServerResponse): Promise<
   }
 }
 
-const server = createServer((request, response) => {
+/**
+ * Outcome of every configured unix socket, filled in at boot and then read
+ * only by `/healthz`.
+ *
+ * A socket that could not be bound is a warning rather than a boot failure
+ * (see `bindUnixSockets`), which makes this the only place the state is
+ * visible. Without it "the agents cannot reach the page" is a thing you
+ * diagnose by strace; with it, it is a field in a JSON document.
+ */
+let socketOutcomes: SocketOutcome[] = [];
+
+/**
+ * The one request listener, shared by every listener socket.
+ *
+ * Named and hoisted out of `createServer` because there is now more than one
+ * server object: the TCP listener plus one per configured unix socket. They
+ * are the same process, the same routes and the same transcript store, and
+ * nothing here asks which socket a request arrived on — see `socket.ts` for
+ * why that is deliberate and what it costs.
+ */
+const handleRequest = (request: IncomingMessage, response: ServerResponse): void => {
   // Read-only, enforced before anything looks at the path. There is no route
   // that mutates, so this is redundant today; it is here so that it stays
   // true if someone adds one without thinking about it.
@@ -390,6 +437,19 @@ const server = createServer((request, response) => {
       streams: streams.size,
       watched: watcher.watchedCount,
       unwatched: Object.fromEntries(watcher.unwatched),
+      // One entry per configured socket, listening or not, with the reason.
+      // Reported even when every socket is healthy: "which of these is the
+      // one my container mounts" is the first question when it is not.
+      sockets: socketOutcomes.map((outcome) =>
+        outcome.listening
+          ? // `dropped` is connections refused because the per-socket
+            // maxConnections cap was already reached. Non-zero means a
+            // container is opening far more than it needs — which, before the
+            // cap existed, is what could exhaust the process's descriptors and
+            // silently stop the TCP listener answering.
+            { path: outcome.path, listening: true, dropped: outcome.dropped }
+          : { path: outcome.path, listening: false, reason: outcome.reason },
+      ),
     });
     return;
   }
@@ -416,7 +476,9 @@ const server = createServer((request, response) => {
     if (!response.headersSent) fail(response, 500, 'internal error');
     else response.end();
   });
-});
+};
+
+const server = createServer(handleRequest);
 
 // The second loopback check, immediately before the bind that would matter.
 // The config loader already rejects a non-loopback host; this catches the case
@@ -442,6 +504,25 @@ server.listen(config.server.port, config.server.host, () => {
   }
 });
 
+// The unix sockets, after the TCP listener rather than before it, so that a
+// slow probe of a stale socket cannot delay the listener that everything else
+// depends on. Nothing awaits this; it settles into `socketOutcomes` and is
+// reported on /healthz from then on.
+const socketPaths = config.agents
+  .map((agent) => agent.socketPath)
+  .filter((path): path is string => path !== null);
+
+void bindUnixSockets(socketPaths, handleRequest).then((outcomes) => {
+  socketOutcomes = outcomes;
+  for (const outcome of outcomes) {
+    if (outcome.listening) {
+      console.log(`[status]   also listening on ${outcome.path} (unix socket, not a network)`);
+    } else {
+      console.warn(`[status]   NOT listening on ${outcome.path}: ${outcome.reason}`);
+    }
+  }
+});
+
 function shutdown(signal: string): void {
   console.log(`[status] ${signal} — closing`);
   clearInterval(heartbeat);
@@ -452,6 +533,14 @@ function shutdown(signal: string): void {
   // `systemctl restart` take a moment rather than a TimeoutStopSec.
   for (const stream of streams) stream.end();
   streams.clear();
+  // Close the unix listeners too, and unlink what we created. A socket file
+  // left behind is what the stale-socket handling in socket.ts exists to
+  // recover from; not leaving one is cheaper than recovering from it.
+  for (const outcome of socketOutcomes) {
+    if (!outcome.listening) continue;
+    outcome.server.close();
+    releaseSocketPath(outcome.path);
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }

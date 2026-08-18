@@ -140,6 +140,52 @@ ReadOnlyPaths=-/var/lib/oj
 ReadOnlyPaths=-/var/lib/clawcius/clawcius.db
 ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
 
+# ── The agent-facing unix sockets ─────────────────────────────────────────
+#
+# THIS IS THE ONE THING THIS UNIT WRITES, and it is two socket files.
+#
+# The agent containers are on `clawcius-internal`, a docker network with no
+# gateway: measured from inside, 172.17.0.1:8477 and 172.31.250.1:8477 are both
+# "Network is unreachable", and squid is the only route out. So the page was
+# unreachable from the containers, which the operator wants fixed.
+#
+# It is fixed with a unix socket per instance, in the run directory that
+# docker/run-container.sh already bind-mounts read-write into each container,
+# and NOT by widening the bind address. Every loopback check above and in the
+# code is untouched; the set of TCP endpoints serving this page is exactly what
+# it was. The address filter below is likewise unchanged and still correct — it
+# governs AF_INET/AF_INET6, and AF_UNIX was already in
+# RestrictAddressFamilies because the process needs it regardless.
+#
+# ProtectSystem=strict is what makes these lines necessary: it makes the whole
+# filesystem read-only, so without them `listen()` on the socket path fails
+# with EROFS. THIS IS THE MOST LIKELY WAY FOR THE FEATURE TO SILENTLY NOT WORK,
+# because the failure is deliberately not fatal — the service still comes up
+# and serves on TCP, and only the agents notice. `curl --unix-socket` from the
+# host, or the `sockets` array in /healthz, is how you check.
+#
+# `-` PREFIXED, for the same reason spelled out at length for the boards above:
+# a path that does not exist fails the namespace setup, and with
+# StartLimitIntervalSec=0 and Restart=always this unit would then retry forever
+# without ever starting. These directories are created by
+# docker/run-container.sh's `mkdir -p "$STATE_RUN"` — a DIFFERENT component,
+# running at a different time — so on a host where no container has ever been
+# started they legitimately do not exist yet.
+#
+# The directory, not the socket path. systemd needs to make the directory
+# writable so the service can CREATE the socket in it; naming the socket file
+# would be naming something that does not exist until this service creates it.
+#
+# What this grants, stated plainly: this service can create, and delete,
+# anything in these two directories. Clawcius #65 records that nothing else has
+# used them since both spools retired — that is no longer true, and #65 should
+# be read alongside this line rather than acted on without it.
+#
+# ADD A LINE HERE when you add an agent instance with a `socketPath` in
+# status-config.yaml.
+ReadWritePaths=-/var/lib/clawcius/run
+ReadWritePaths=-/var/lib/hamachi/run
+
 # ── The boards are in WAL, and that interacts with the line above ─────────
 #
 # A reader of a WAL database needs the `-shm` wal-index. If one exists it can
@@ -160,13 +206,19 @@ ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
 # this state as deployed — the page still reports the observation rather than
 # concluding which service is missing.
 #
-# That state is reported on the page. It is NOT worked around
-# here, and specifically there is no ReadWritePaths= line: the whole claim of
-# this unit is that it writes nothing, and a writable path to the board would
-# put a second writer next to the one that owns it. If this is ever worth
-# fixing, a dedicated read-only account with a supplementary group, or taking
-# the board out of WAL, are the two changes that do not make this service a
-# writer — and both belong to the operator, not to this file.
+# That state is reported on the page. It is NOT worked around here, and
+# specifically there is no ReadWritePaths= line FOR A BOARD: a writable path to
+# the board would put a second writer next to the one that owns it. If this is
+# ever worth fixing, a dedicated read-only account with a supplementary group,
+# or taking the board out of WAL, are the two changes that do not make this
+# service a writer to a board — and both belong to the operator, not here.
+#
+# This unit used to say, in this spot, that it had no ReadWritePaths= at all
+# and that "the whole claim of this unit is that it writes nothing". That
+# sentence is no longer true, and the two ReadWritePaths= lines in "The
+# agent-facing unix sockets" section ABOVE are why. It is corrected rather than
+# deleted because the reasoning it carried still holds for the boards, which is
+# the case it was actually written about.
 #
 # Note that the transcript views are unaffected either way. They are read off
 # disk and never go through SQLite.

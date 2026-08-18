@@ -59,11 +59,25 @@ WORKSPACES=$CLAWCIUS_STATE/workspaces
 # a deployment's business, and an in-place rollback to the previous `dist/`
 # must not find them missing.
 #
-# The mount stays for now because taking it away is a change to what the agent
-# can do rather than to what the daemons read, and removing a -v only takes
-# effect on --recreate, which destroys the writable layer. What it costs while
-# it stays: this is the container's only writable window onto the host, and
-# nothing on either side of it is using it. See Clawcius #65.
+# IT NOW HAS A USER, and Clawcius #65 — which proposed removing it precisely
+# because it had none — should be read with that in mind rather than acted on.
+#
+# clawcius-status listens on a unix domain socket in here, one per instance, at
+# `$CLAWCIUS_STATE/run/status.sock`. That is how the status page is reachable
+# from inside the container at all: this network has no gateway, so the host's
+# 127.0.0.1:8477 cannot be routed to from in here, and widening that bind would
+# throw away the property it exists for. A unix socket in a directory both sides
+# can see costs nothing on the network and is why this mount is now load-bearing.
+#
+# It is still the container's only writable window onto the host, and that still
+# deserves the suspicion #65 gives it: the agent can delete or replace the
+# socket. Doing so breaks its own access to the page until the service restarts
+# and nothing else — status/src/socket.ts refuses to unlink anything that is not
+# a socket, so this cannot be used to make a host service delete a file.
+#
+# The mount is mirrored host->container, like the workspaces mount above, and
+# here that is load-bearing rather than a convenience: status-config.yaml names
+# the socket by its host path and the container opens the same string.
 STATE_RUN=$CLAWCIUS_STATE/run
 SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli

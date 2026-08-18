@@ -18,6 +18,11 @@ server:
   host: 127.0.0.1
   port: 8477
 
+  # There is no socket path here on purpose. It is per-instance and lives on
+  # each `agents:` entry below, because each container bind-mounts only its own
+  # instance's run directory — a single socket under `server:` would be
+  # reachable by exactly one crew.
+
 # One entry per agent instance.
 #
 # These paths are the host side of the mount in docker/run-container.sh:
@@ -44,11 +49,62 @@ server:
 #
 # The value has to MATCH the env file. A wrong path is reported on the page
 # rather than guessed at.
+#
+# `socketPath` is a unix domain socket this service ALSO serves the page on, so
+# that instance's container can reach it. Omit it and that instance gets no
+# socket, which is what shipped before this existed.
+#
+# Why a socket and not a port: the containers are on `clawcius-internal`, which
+# has no gateway — from inside, 172.17.0.1:8477 and 172.31.250.1:8477 are both
+# "Network is unreachable". Binding the server somewhere routable would give
+# the page away exactly when tailscaled is down, which is the failure the
+# loopback bind exists to prevent, so the reachability goes through the
+# filesystem instead: this path is inside the read-write bind mount
+# docker/run-container.sh already gives each container (Clawcius #65), and the
+# host and container see it at the same path because that mount is mirrored.
+#
+# TWO THINGS THIS COSTS, both real:
+#
+#   1. EVERY SOCKET REACHES EVERY ROUTE, for every instance configured here.
+#      There is no scoping by listener, so an agent that can reach one socket
+#      can read:
+#        - /api/clawsky                                both crews' boards,
+#                                                      DMs and feed posts
+#        - /api/agents/<id>/sessions                   every session of every
+#                                                      configured instance
+#        - /api/agents/<id>/sessions/<sid>/transcript  the full message-by-
+#          (and ?subagent=…)                           message transcript
+#        - /api/oj                                     the OJ worker snapshot
+#
+#      That is a DIFFERENT grant, not just a bigger one: a transcript is
+#      everything an agent ever saw — file contents, tool output — not only
+#      what it wrote to another agent, and cross-crew transcripts have no path
+#      into either container without this socket, so it creates the access
+#      rather than exposing it. Credential redaction is "a mitigation and not a
+#      guarantee" (src/index.ts, security model point 5), and that caveat was
+#      written about transcript content, so it is weaker cover here, not
+#      stronger.
+#
+#      AGREED WITH THE OPERATOR, TWICE. The first description named only the
+#      board; Osmosis Jones found it incomplete and the real grant was put
+#      again and accepted ("Fine to have that visibility as a dev agent",
+#      2026-08-17). Do not add per-crew filtering to "fix" it — that isolation
+#      was declined twice. Both quotes are in src/config.ts.
+#   2. The mount is read-write, so the container can delete or replace its own
+#      socket. That breaks its own access until the service restarts. It does
+#      not let it read anything new, and src/socket.ts will not unlink anything
+#      that is not a socket, so it is not a way to have this service delete a
+#      file on the agent's behalf.
+#
+# systemd/clawcius-status.service needs a matching `ReadWritePaths=` line for
+# the DIRECTORY, or the bind fails with EROFS under ProtectSystem=strict and
+# the service comes up looking healthy with no socket. /healthz reports it.
 agents:
   - id: clawcius
     label: Clawcius
     projectsRoot: /var/lib/clawcius/agent-home/projects
     boardDb: /var/lib/clawcius/clawcius.db
+    socketPath: /var/lib/clawcius/run/status.sock
 
   - id: hamachi
     label: Hamachi
@@ -56,6 +112,7 @@ agents:
     # Named for the instance, not for the variable — ops-config.yaml records
     # that the obvious guess, clawcius.db, was wrong here.
     boardDb: /var/lib/hamachi/hamachi.db
+    socketPath: /var/lib/hamachi/run/status.sock
 
   # Osmosis Jones, once it runs as a Claude Code instance of its own. Left
   # commented rather than pointing at a non-existent path so the overview does

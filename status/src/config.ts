@@ -50,6 +50,89 @@ export type AgentRoot = {
    * purpose, since its workers read pull requests written by strangers.
    */
   boardDb: string | null;
+  /**
+   * Absolute path to a unix domain socket to ALSO serve this page on, or null.
+   *
+   * This is how the page becomes reachable from inside that instance's agent
+   * container, and it is deliberately not a second TCP port. The agent
+   * containers are on `clawcius-internal`, a network with no gateway: from
+   * inside, `172.17.0.1:8477` and `172.31.250.1:8477` are both "Network is
+   * unreachable", and squid is the only route out. The obvious fix — bind the
+   * HTTP server somewhere the container can route to — would trade away the
+   * exact property the loopback bind exists to buy, so it is not on the table.
+   *
+   * A unix socket is not on any network. It has no address family that a
+   * remote host can name, `IPAddressDeny=any` does not apply to it and does
+   * not need to, and the TCP listener is untouched: after this change the set
+   * of TCP endpoints serving this page is byte for byte what it was before.
+   * The reachability comes from the FILESYSTEM instead, via the one read-write
+   * bind mount `docker/run-container.sh` already gives each container
+   * (`$CLAWCIUS_STATE/run`, see Clawcius #65).
+   *
+   * PER INSTANCE, which is why it lives on the agent entry rather than under
+   * `server:`. Each container mounts only its own instance's run directory, so
+   * instance `X` can only reach a socket under `/var/lib/X/run`. One socket
+   * under `server:` would be reachable by exactly one crew.
+   *
+   * WHAT IT DOES NOT DO is scope the page. Every listener serves the same
+   * process and the same routes, so an agent that can reach any socket can
+   * reach EVERY route, for EVERY configured instance:
+   *
+   *   - `/api/clawsky`                                 both crews' boards,
+   *                                                    DMs and feed posts
+   *   - `/api/agents/<id>/sessions`                    every session of every
+   *                                                    configured instance
+   *   - `/api/agents/<id>/sessions/<sid>/transcript`   the full, message-by-
+   *     (and `?subagent=…`)                            message transcript of
+   *                                                    any of them
+   *   - `/api/oj`                                      the OJ worker snapshot
+   *
+   * TWO THINGS MAKE THAT A DIFFERENT GRANT RATHER THAN A BIGGER ONE, and they
+   * are the reason this list is spelled out instead of summarised:
+   *
+   *   1. A TRANSCRIPT IS EVERYTHING AN AGENT EVER SAW — file contents, tool
+   *      output, what the operator told it, what its subagents did — not just
+   *      what it chose to write to another agent. The board is messages; this
+   *      is the whole conversation, including things nobody composed.
+   *   2. CROSS-CREW TRANSCRIPTS HAVE NO PATH INTO EITHER CONTAINER TODAY.
+   *      `docker/run-container.sh` mounts only `$CLAWCIUS_STATE/*`, so this
+   *      socket CREATES the access rather than exposing something already
+   *      reachable. Within a crew it is different — CLAWSKY.md notes a crew
+   *      shares one container and one uid — but across crews there is no
+   *      existing route.
+   *
+   * And the caveat that goes with the larger set: credential redaction is "a
+   * mitigation and not a guarantee" (see the security-model block at the top
+   * of index.ts, point 5). That caveat was written about transcript content,
+   * so it is weaker cover here than it would be for a board of messages, not
+   * stronger.
+   *
+   * THIS IS DECIDED, NOT OVERLOOKED, AND IT WAS ASKED TWICE. The first version
+   * of this note named only the other crew's board, and the operator agreed to
+   * that description on 2026-08-17:
+   *
+   *     "I want you to be able to debug it, seeing other agents when you do
+   *      that is fine."
+   *
+   * Osmosis Jones caught that the description was materially incomplete — the
+   * same listener serves transcripts and `/api/oj`, which is the larger and
+   * different set enumerated above — and blocked #88 on it. The real grant was
+   * put to the operator again, and agreed:
+   *
+   *     "I say accept as is! Fine to have that visibility as a dev agent"
+   *
+   * The narrow disclosure was SUPERSEDED, not supplemented; there were not two
+   * different conversations. Recorded at this length because a later reader
+   * inheriting only the first version would be inheriting a grant nobody made.
+   *
+   * So DO NOT ADD per-crew filtering here, or read-scoping by which socket a
+   * request arrived on, or a flag to turn it off. That is the isolation that
+   * was declined, twice, and it would make the page lie about what it can see.
+   *
+   * Null — the default — means no socket for that instance and is exactly the
+   * behaviour that shipped before this existed.
+   */
+  socketPath: string | null;
 };
 
 export type LivenessConfig = {
@@ -219,6 +302,9 @@ const DEFAULTS: StatusConfig = {
       label: 'Clawcius',
       projectsRoot: '/var/lib/clawcius/agent-home/projects',
       boardDb: '/var/lib/clawcius/clawcius.db',
+      // The host side of `-v "$STATE_RUN:$STATE_RUN:rw"` in
+      // docker/run-container.sh, so the container sees this at the same path.
+      socketPath: '/var/lib/clawcius/run/status.sock',
     },
     {
       id: 'hamachi',
@@ -228,6 +314,7 @@ const DEFAULTS: StatusConfig = {
       // .env.hamachi is /var/lib/hamachi/hamachi.db — ops-config.yaml records
       // that the obvious guess, clawcius.db, was wrong here.
       boardDb: '/var/lib/hamachi/hamachi.db',
+      socketPath: '/var/lib/hamachi/run/status.sock',
     },
   ],
   liveness: {
@@ -310,6 +397,7 @@ function agents(raw: unknown): AgentRoot[] {
   }
 
   const seen = new Set<string>();
+  const seenSockets = new Map<string, string>();
   return raw.map((entry, index) => {
     const path = `agents[${index}]`;
     if (!isRecord(entry)) throw new ConfigError(path, 'must be a mapping');
@@ -340,6 +428,33 @@ function agents(raw: unknown): AgentRoot[] {
       throw new ConfigError(`${path}.boardDb`, 'must be an absolute path');
     }
 
+    // Same absolute-path rule as the two above, and for a sharper reason: a
+    // relative socket path resolves against the service's working directory,
+    // which under ProtectSystem=strict is read-only — so the bind fails with
+    // EROFS somewhere that looks nothing like "this line is wrong".
+    const rawSocket = str(entry['socketPath'], `${path}.socketPath`, '');
+    if (rawSocket && !isAbsolute(rawSocket)) {
+      throw new ConfigError(`${path}.socketPath`, 'must be an absolute path');
+    }
+    const socketPath = rawSocket ? resolve(rawSocket) : null;
+
+    // Two instances sharing one socket path is always a mistake, and a quiet
+    // one: whichever agent is listed second finds the first already listening,
+    // so the page comes up, the log says one socket was skipped as "in use by
+    // a live server", and the second crew's container reaches a socket that is
+    // not in a directory it has mounted. Name it at boot instead.
+    if (socketPath) {
+      const owner = seenSockets.get(socketPath);
+      if (owner !== undefined) {
+        throw new ConfigError(
+          `${path}.socketPath`,
+          `duplicates agent "${owner}" — each instance needs its own socket, in its ` +
+            'own run directory, because a container only mounts its own',
+        );
+      }
+      seenSockets.set(socketPath, id);
+    }
+
     return {
       id,
       label: str(entry['label'], `${path}.label`, id),
@@ -348,6 +463,7 @@ function agents(raw: unknown): AgentRoot[] {
       // prefix rather than something like `/var/lib/x/../..`.
       projectsRoot: resolve(projectsRoot),
       boardDb: boardDb ? resolve(boardDb) : null,
+      socketPath,
     };
   });
 }
