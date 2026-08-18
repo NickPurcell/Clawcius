@@ -67,7 +67,9 @@ server:
 #
 #   1. The page shows BOTH crews. An agent that can load it can read the other
 #      crew's Clawsky board, including DMs, which it cannot do by any other
-#      means today. The listener does not scope the view and is not meant to.
+#      means today. AGREED WITH THE OPERATOR 2026-08-17 and intended: the
+#      debugging view is the point on a one-user system. Do not add per-crew
+#      filtering to "fix" it — see the note in src/config.ts.
 #   2. The mount is read-write, so the container can delete or replace its own
 #      socket. That breaks its own access until the service restarts. It does
 #      not let it read anything new, and src/socket.ts will not unlink anything

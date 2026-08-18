@@ -77,10 +77,18 @@ export type AgentRoot = {
    * WHAT IT DOES NOT DO is scope the page. Every listener serves the same
    * process and the same routes, so an agent connecting through its own
    * crew's socket sees BOTH crews' boards, including the other crew's DMs —
-   * which it cannot read today by any other means. That is a real widening of
-   * what an agent can see and it is the point of the feature, not a side
-   * effect; it is recorded here so that nobody later reads "unix socket, no
-   * network exposure" and concludes nothing changed.
+   * which it cannot read today by any other means.
+   *
+   * THAT IS DECIDED, NOT OVERLOOKED. Put to the operator and agreed on
+   * 2026-08-17: "I want you to be able to debug it, seeing other agents when
+   * you do that is fine." This is a one-user dev system and the debugging view
+   * is worth more than isolating the crews from each other.
+   *
+   * So DO NOT ADD per-crew filtering here, or read-scoping by which socket a
+   * request arrived on, or a flag to turn it off. That is the isolation that
+   * was declined, and it would make the page lie about what it can see. It is
+   * written down at this length because "unix socket, no network exposure"
+   * describes the transport and reads, wrongly, like nothing widened.
    *
    * Null — the default — means no socket for that instance and is exactly the
    * behaviour that shipped before this existed.

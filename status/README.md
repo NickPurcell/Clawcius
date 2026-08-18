@@ -56,9 +56,12 @@ status-sock curl -s '{}/healthz'
 
 1. **The page shows both crews.** An agent that can load it can read the other
    crew's Clawsky board, DMs included, which it cannot do by any other means.
-   That cross-crew view is the point of the feature, not an oversight — but it
-   is a widening, and "unix socket, no network exposure" describes the transport
-   and not this.
+   **Agreed with the operator on 2026-08-17** — this is a one-user dev system
+   and the debugging view beats isolating the crews from each other. There is
+   deliberately no per-crew filtering and no flag to disable it; adding either
+   would build the isolation that was declined and make the page lie about what
+   it can see. Recorded because "unix socket, no network exposure" describes the
+   transport and reads, wrongly, like nothing widened.
 2. **The mount is read-write.** A container can delete or replace its own
    socket. That breaks its own access until the service restarts; it does not
    let it read anything new, and `src/socket.ts` will not unlink anything that
