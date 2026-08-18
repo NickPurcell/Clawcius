@@ -787,9 +787,27 @@ the host agent can read journals and cannot make an HTTP request, by design, and
 the container agents cannot reach the host at all.
 
 The generator is wired into `build`, `typecheck` and `dev` in all three
-packages, and writes an untracked `src/build-info.ts`. It never fails a build: a
-tree that cannot name itself still ships, saying so. **A bare `npx tsc` skips
-it** and will compile new code carrying an older sha — use `npm run build`.
+packages, and writes an untracked `src/build-info.ts`.
+
+**Not knowing is never a failure; not writing always is.** If git is missing or
+the directory is not a checkout, it writes `UNKNOWN`, exits 0, and the service
+boots. If it cannot *write* the file it stops the build with one sentence naming
+the file — deliberately, because `&& tsc` continuing would compile against the
+previous build's `build-info.ts` and the artefact would then report someone
+else's commit. On this host the usual cause is a root-owned file from a build
+that ran as root; the `chown -R` above is the fix.
+
+**A bare `npx tsc` skips it** and will compile new code carrying an older sha —
+use `npm run build`.
+
+The uncommitted-path *count* is exact; the *list* keeps the first 20, each
+elided past 100 characters. That is a size ceiling, not tidiness: the same
+constant is published inside `waker-status.json`, and `ops/src/idle.ts` treats
+that file as implausible above 8 KiB and therefore reads the instance as
+**busy**. Because the value is compiled in, one oversized build would mean that
+instance is never seen idle again for the life of the build, with the journal
+blaming the waker rather than the field that grew. A 262-path dirty tree used to
+produce 10098 bytes; it now produces 1878.
 
 `status/` also prints, and re-probes on every `/healthz`, whether it can
 actually read each configured root and board — with the errno, the mode and the

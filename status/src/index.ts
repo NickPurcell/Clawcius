@@ -569,6 +569,15 @@ server.listen(config.server.port, config.server.host, () => {
           'Re-probed on every /healthz.',
       );
     }
+  }).catch((error: unknown) => {
+    // `probe` cannot reject today — every fs call in it is inside a try — so
+    // this is not covering a live path. It is here because the whole argument
+    // of this change is that the identity line must survive a process that is
+    // about to die, and an unhandled rejection under Node's default policy is
+    // one of the ways it dies. The guarantee should be structural, not
+    // contingent on nobody later adding an `await` outside a `try`. The two
+    // request-path promises forty lines up already say exactly this.
+    console.error('[status] boot reachability report failed:', error);
   });
 
   for (const [scope, reason] of watcher.unwatched) {
@@ -595,6 +604,14 @@ void bindUnixSockets(socketPaths, handleRequest).then((outcomes) => {
       console.warn(`[status]   NOT listening on ${outcome.path}: ${outcome.reason}`);
     }
   }
+}).catch((error: unknown) => {
+  // Same reasoning as the reachability report above, and added at the same
+  // time: `bindUnixSockets` resolves every failure into a `SocketOutcome` and
+  // does not reject today, so this is not a live path either. It is here
+  // because leaving one of the two boot promises bare while adding a handler
+  // to the other would make the argument for the first one untrue.
+  console.error('[status] binding unix sockets failed:', error);
+  console.error('[status] the TCP listener is unaffected; no container can reach the page.');
 });
 
 function shutdown(signal: string): void {

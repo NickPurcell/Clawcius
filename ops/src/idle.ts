@@ -50,7 +50,24 @@ export type IdleVerdict = {
   ageSeconds: number | null;
 };
 
-/** Ceiling on the status file's size. It is four fields. */
+/**
+ * Ceiling on the status file's size.
+ *
+ * It said "It is four fields" until 2026-08-18, by which point it was eight —
+ * a sentence that stayed true for a while and then quietly was not, which is
+ * the failure mode the build-identity work was for and is worth not repeating
+ * here. So: it is a small JSON object, and **one of its fields is now
+ * `build`**, which carries the commit the waker was compiled from.
+ *
+ * Crossing this line does not merely lose a reading. It returns `idle: false`,
+ * so the instance is never seen as idle — and because `build` is a compiled-in
+ * constant, an oversized one is the SAME every publish, for the life of that
+ * artefact, while the reason blames the waker for an implausible write. That is
+ * why `scripts/build-info.mjs` caps every string it emits and caps `dirtyFiles`
+ * rather than trusting a tree to be small, and why test/build-info.test.js
+ * checks the worst case against the number below. Change either and that test
+ * fails, which is the point of it.
+ */
 const MAX_STATUS_BYTES = 8 * 1024;
 
 /**

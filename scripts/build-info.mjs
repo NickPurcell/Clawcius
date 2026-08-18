@@ -63,18 +63,91 @@
  * (or worktree) itself and this script works from a temporary checkout in a
  * test exactly as it does from the deployed one.
  *
- * IT NEVER EXITS NON-ZERO. A build that fails because the tree cannot name
- * itself is worse than a build that ships an artefact saying "unknown" — see
- * the same rule at the service end, where an unknown commit must not stop a
- * boot.
+ * ── When it fails, and when it refuses to ─────────────────────────────────
+ *
+ * NOT KNOWING is never a failure. If git is absent, the directory is not a
+ * checkout, or `rev-parse` refuses, this writes an artefact that says UNKNOWN
+ * and exits 0 — the same rule as at the service end, where an unknown commit
+ * must not stop a boot.
+ *
+ * NOT WRITING is a failure, and deliberately so. If the file cannot be written
+ * the build must stop, because `&& tsc` would otherwise compile against
+ * whatever `build-info.ts` was left there by an earlier build — which is
+ * precisely the stale-identity lie this file exists to prevent, arrived at by a
+ * new route. It is not hypothetical on this host: SETUP.md documents a
+ * `chown -R` for when a root build gets in first, so root-owned files under the
+ * checkout recur, and the host agent's `npm run build` output is what somebody
+ * reads about it afterwards. So the error is caught and stated in one sentence
+ * naming the file and why it matters, rather than thrown as a raw stack.
  */
 
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
+/**
+ * ── Every field here is bounded, and that is a correctness requirement ──────
+ *
+ * `BUILD_INFO` is not only printed. `src/waker-status.ts` publishes it inside
+ * `waker-status.json`, and `ops/src/idle.ts` refuses to parse that file above
+ * `MAX_STATUS_BYTES` (8 KiB) — treating anything larger as an implausible write
+ * and therefore as BUSY. Because this value is compiled in, an oversized one is
+ * not a transient fat write: every publish from that artefact is the same
+ * oversized file, so ops would never see that instance idle again for the life
+ * of the build, and the journal would blame the waker for a corrupt status file
+ * rather than name the field that grew.
+ *
+ * A dirty tree at build time is exactly the "hand-built on the host" case this
+ * whole change is written around, so it is not an exotic input: 262 uncommitted
+ * paths produced a 10098-byte status file. Caps, not hope.
+ *
+ * The arithmetic, worst case, pretty-printed at indent 2:
+ *
+ *     dirtyFiles     20 x (100 + quotes + comma + indent)   ~ 2200
+ *     line           10 x 102 + ~280 of prose               ~ 1300
+ *     unknownReason  300                                    ~   310
+ *     repoRoot, branch, service, version   4 x <= 200       ~   700
+ *     commit, shortCommit, keys, structure                  ~   400
+ *                                                            ------
+ *                                                            ~ 4910
+ *
+ * against 8192, leaving the waker's own eight fields ~3 KiB of headroom. The
+ * arithmetic is checked against the REAL constant in test/build-info.test.js,
+ * so lowering `MAX_STATUS_BYTES` or raising a cap here fails a test rather than
+ * quietly wedging the idle gate.
+ */
+
 /** How many uncommitted filenames go into the one-line banner before it stops. */
 const DIRTY_NAMES_IN_LINE = 10;
+
+/**
+ * How many are kept in the data.
+ *
+ * More than the line shows, because the structured field is where somebody
+ * looks when the line was not enough — and far fewer than a dirty tree can
+ * have, because `dirtyFileCount` is the number that matters and 262 filenames
+ * in a status file are not actionable by anyone.
+ */
+const DIRTY_NAMES_KEPT = 20;
+
+/** Longest any single string in the output may be. Paths are middle-elided. */
+const STRING_MAX = 200;
+const PATH_MAX = 100;
+
+/**
+ * Clip a string to `max`, marking it so a truncated value cannot be mistaken
+ * for a short one. Paths lose the middle: the leading directory says which
+ * package, the trailing segment says which file, and it is the run of nested
+ * directories between them that nobody needs.
+ */
+function clip(value, max, middle = false) {
+  if (typeof value !== 'string') return value;
+  if (value.length <= max) return value;
+  if (!middle) return `${value.slice(0, max - 1)}…`;
+  const head = Math.ceil((max - 1) / 2);
+  const tail = max - 1 - head;
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}
 
 const packageDir = process.cwd();
 const outFile = resolve(packageDir, process.argv[2] ?? 'src/build-info.ts');
@@ -122,7 +195,11 @@ let shortCommit = null;
 let branch = null;
 let repoRoot = null;
 let dirty = null;
+/** Every uncommitted path, before the cap. Never emitted; `dirtyFileCount` is. */
+let allDirtyFiles = [];
 let dirtyFiles = [];
+/** `null`, not 0, when the tree state could not be read. See below. */
+let dirtyFileCount = null;
 let unknownReason = null;
 
 const head = git(['rev-parse', 'HEAD']);
@@ -133,14 +210,14 @@ if (!head.ok) {
   shortCommit = commit.slice(0, 7);
 
   const top = git(['rev-parse', '--show-toplevel']);
-  if (top.ok) repoRoot = top.stdout.trim();
+  if (top.ok) repoRoot = clip(top.stdout.trim(), STRING_MAX, true);
 
   // `--abbrev-ref HEAD` answers the literal string "HEAD" on a detached head,
   // which is not a branch name and must not be printed as one.
   const ref = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   if (ref.ok) {
     const name = ref.stdout.trim();
-    branch = name === 'HEAD' ? null : name;
+    branch = name === 'HEAD' ? null : clip(name, STRING_MAX);
   }
 
   // `--porcelain` rather than the prose form: the prose is localised and
@@ -154,14 +231,19 @@ if (!head.ok) {
     // the banner says so.
     unknownReason = `commit known but tree state is not: ${status.reason}`;
   } else {
-    dirtyFiles = status.stdout
+    allDirtyFiles = status.stdout
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
       // Porcelain v1 is `XY <path>`; rename entries are `R  <old> -> <new>`.
       // The status letters go, the rest is kept verbatim including the arrow.
       .map((line) => line.slice(2).trim());
-    dirty = dirtyFiles.length > 0;
+    dirty = allDirtyFiles.length > 0;
+    // The COUNT is uncapped and authoritative. The LIST is capped, because it
+    // is carried inside a status file with a hard size ceiling — see the note
+    // on the constants above.
+    dirtyFileCount = allDirtyFiles.length;
+    dirtyFiles = allDirtyFiles.slice(0, DIRTY_NAMES_KEPT).map((path) => clip(path, PATH_MAX, true));
   }
 }
 
@@ -182,27 +264,34 @@ function buildLine() {
   }
   if (!dirty) return `${stamp} from a clean tree`;
 
+  // Counted off `dirtyFileCount`, never off `dirtyFiles.length` — the array is
+  // capped at DIRTY_NAMES_KEPT, so measuring the tree by it would report a
+  // 262-file tree as a 20-file one, which is the same species of confident
+  // wrong number this whole file exists to stop printing.
   const shown = dirtyFiles.slice(0, DIRTY_NAMES_IN_LINE);
-  const rest = dirtyFiles.length - shown.length;
+  const rest = dirtyFileCount - shown.length;
   const more = rest > 0 ? `, and ${rest} more` : '';
   return (
-    `${stamp} from a DIRTY tree — ${dirtyFiles.length} uncommitted path(s): ` +
+    `${stamp} from a DIRTY tree — ${dirtyFileCount} uncommitted path(s): ` +
     `${shown.join(', ')}${more}. This artefact is NOT ${shortCommit}.`
   );
 }
 
 const info = {
-  service,
-  version,
+  service: clip(service, STRING_MAX),
+  version: clip(version, STRING_MAX),
   commit,
   shortCommit,
   branch,
   repoRoot,
   dirty,
-  dirtyFileCount: dirtyFiles.length,
+  // Tracks `dirty`: `null` when git could not be asked. It used to be 0 there,
+  // and a 0 sitting beside an unknown reads as reassurance in a field a person
+  // scans — "no dirty files" rather than "nobody looked".
+  dirtyFileCount,
   dirtyFiles,
   builtAt,
-  unknownReason,
+  unknownReason: clip(unknownReason, 300),
   line: buildLine(),
 };
 
@@ -234,7 +323,20 @@ export type BuildInfo = {
    * must never be rendered as it.
    */
   dirty: boolean | null;
-  dirtyFileCount: number;
+  /**
+   * How many paths were uncommitted. Uncapped and authoritative; \`null\`
+   * whenever \`dirty\` is null, because a 0 beside an unknown reads as
+   * reassurance rather than as "nobody looked".
+   */
+  dirtyFileCount: number | null;
+  /**
+   * The first ${DIRTY_NAMES_KEPT} of them, each middle-elided past
+   * ${PATH_MAX} characters.
+   *
+   * CAPPED, and it has to be: this object is published inside
+   * \`waker-status.json\`, which \`ops/src/idle.ts\` refuses to parse above 8 KiB
+   * and then treats as busy. Use \`dirtyFileCount\` for how many there were.
+   */
   dirtyFiles: string[];
   builtAt: string;
   /** Why the commit or the tree state is unknown. Null when both are known. */
@@ -246,8 +348,26 @@ export type BuildInfo = {
 export const BUILD_INFO: BuildInfo = ${JSON.stringify(info, null, 2)};
 `;
 
-mkdirSync(dirname(outFile), { recursive: true });
-writeFileSync(outFile, source);
+// A write failure STOPS THE BUILD, and the message has to explain why that is
+// the right outcome — otherwise the obvious next move is to work around it.
+// `&& tsc` continuing here would compile against whatever build-info.ts an
+// earlier build left behind, which is a stale identity reached by a new route.
+try {
+  mkdirSync(dirname(outFile), { recursive: true });
+  writeFileSync(outFile, source);
+} catch (error) {
+  const code = error && error.code ? `${error.code}: ` : '';
+  process.stderr.write(
+    `[build-info] CANNOT WRITE ${outFile}\n` +
+      `[build-info] ${code}${error instanceof Error ? error.message : String(error)}\n` +
+      '[build-info] Stopping the build on purpose. Compiling now would bake in whatever\n' +
+      '[build-info] identity the previous build left in that file, and a service reporting\n' +
+      "[build-info] someone else's commit is the exact failure this generator exists to\n" +
+      '[build-info] prevent. On this host the usual cause is a root-owned file from a build\n' +
+      '[build-info] that ran as root: see SETUP.md, `sudo chown -R npurcell:npurcell`.\n',
+  );
+  process.exit(1);
+}
 
 if (commit === null || dirty !== false) {
   // stderr, and never a non-zero exit: this is a build that should complete
