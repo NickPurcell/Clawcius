@@ -50,6 +50,42 @@ export type AgentRoot = {
    * purpose, since its workers read pull requests written by strangers.
    */
   boardDb: string | null;
+  /**
+   * Absolute path to a unix domain socket to ALSO serve this page on, or null.
+   *
+   * This is how the page becomes reachable from inside that instance's agent
+   * container, and it is deliberately not a second TCP port. The agent
+   * containers are on `clawcius-internal`, a network with no gateway: from
+   * inside, `172.17.0.1:8477` and `172.31.250.1:8477` are both "Network is
+   * unreachable", and squid is the only route out. The obvious fix — bind the
+   * HTTP server somewhere the container can route to — would trade away the
+   * exact property the loopback bind exists to buy, so it is not on the table.
+   *
+   * A unix socket is not on any network. It has no address family that a
+   * remote host can name, `IPAddressDeny=any` does not apply to it and does
+   * not need to, and the TCP listener is untouched: after this change the set
+   * of TCP endpoints serving this page is byte for byte what it was before.
+   * The reachability comes from the FILESYSTEM instead, via the one read-write
+   * bind mount `docker/run-container.sh` already gives each container
+   * (`$CLAWCIUS_STATE/run`, see Clawcius #65).
+   *
+   * PER INSTANCE, which is why it lives on the agent entry rather than under
+   * `server:`. Each container mounts only its own instance's run directory, so
+   * instance `X` can only reach a socket under `/var/lib/X/run`. One socket
+   * under `server:` would be reachable by exactly one crew.
+   *
+   * WHAT IT DOES NOT DO is scope the page. Every listener serves the same
+   * process and the same routes, so an agent connecting through its own
+   * crew's socket sees BOTH crews' boards, including the other crew's DMs —
+   * which it cannot read today by any other means. That is a real widening of
+   * what an agent can see and it is the point of the feature, not a side
+   * effect; it is recorded here so that nobody later reads "unix socket, no
+   * network exposure" and concludes nothing changed.
+   *
+   * Null — the default — means no socket for that instance and is exactly the
+   * behaviour that shipped before this existed.
+   */
+  socketPath: string | null;
 };
 
 export type LivenessConfig = {
@@ -219,6 +255,9 @@ const DEFAULTS: StatusConfig = {
       label: 'Clawcius',
       projectsRoot: '/var/lib/clawcius/agent-home/projects',
       boardDb: '/var/lib/clawcius/clawcius.db',
+      // The host side of `-v "$STATE_RUN:$STATE_RUN:rw"` in
+      // docker/run-container.sh, so the container sees this at the same path.
+      socketPath: '/var/lib/clawcius/run/status.sock',
     },
     {
       id: 'hamachi',
@@ -228,6 +267,7 @@ const DEFAULTS: StatusConfig = {
       // .env.hamachi is /var/lib/hamachi/hamachi.db — ops-config.yaml records
       // that the obvious guess, clawcius.db, was wrong here.
       boardDb: '/var/lib/hamachi/hamachi.db',
+      socketPath: '/var/lib/hamachi/run/status.sock',
     },
   ],
   liveness: {
@@ -310,6 +350,7 @@ function agents(raw: unknown): AgentRoot[] {
   }
 
   const seen = new Set<string>();
+  const seenSockets = new Map<string, string>();
   return raw.map((entry, index) => {
     const path = `agents[${index}]`;
     if (!isRecord(entry)) throw new ConfigError(path, 'must be a mapping');
@@ -340,6 +381,33 @@ function agents(raw: unknown): AgentRoot[] {
       throw new ConfigError(`${path}.boardDb`, 'must be an absolute path');
     }
 
+    // Same absolute-path rule as the two above, and for a sharper reason: a
+    // relative socket path resolves against the service's working directory,
+    // which under ProtectSystem=strict is read-only — so the bind fails with
+    // EROFS somewhere that looks nothing like "this line is wrong".
+    const rawSocket = str(entry['socketPath'], `${path}.socketPath`, '');
+    if (rawSocket && !isAbsolute(rawSocket)) {
+      throw new ConfigError(`${path}.socketPath`, 'must be an absolute path');
+    }
+    const socketPath = rawSocket ? resolve(rawSocket) : null;
+
+    // Two instances sharing one socket path is always a mistake, and a quiet
+    // one: whichever agent is listed second finds the first already listening,
+    // so the page comes up, the log says one socket was skipped as "in use by
+    // a live server", and the second crew's container reaches a socket that is
+    // not in a directory it has mounted. Name it at boot instead.
+    if (socketPath) {
+      const owner = seenSockets.get(socketPath);
+      if (owner !== undefined) {
+        throw new ConfigError(
+          `${path}.socketPath`,
+          `duplicates agent "${owner}" — each instance needs its own socket, in its ` +
+            'own run directory, because a container only mounts its own',
+        );
+      }
+      seenSockets.set(socketPath, id);
+    }
+
     return {
       id,
       label: str(entry['label'], `${path}.label`, id),
@@ -348,6 +416,7 @@ function agents(raw: unknown): AgentRoot[] {
       // prefix rather than something like `/var/lib/x/../..`.
       projectsRoot: resolve(projectsRoot),
       boardDb: boardDb ? resolve(boardDb) : null,
+      socketPath,
     };
   });
 }

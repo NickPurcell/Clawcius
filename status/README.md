@@ -16,9 +16,60 @@ next, and Osmosis Jones once that exists.
   the board                          this service              your laptop
   /var/lib/*/<instance>.db  ────┐    registry + mail
                                 ├──→  index + watch  ─loopback─→ tailscale serve ─→ tailnet
-  transcripts on disk           │     (never writes)             (TLS, MagicDNS)
-  /var/lib/*/agent-home/projects┘     sessions + subagents
+  transcripts on disk           │   (writes only its              (TLS, MagicDNS)
+  /var/lib/*/agent-home/projects┘    own unix sockets)
+                                          │
+                                          └─unix socket─→ /var/lib/<instance>/run/status.sock
+                                                              └─→ that instance's agent container
 ```
+
+## Reaching it from inside an agent container
+
+The agent containers are on `clawcius-internal`, a docker network with **no
+gateway**: from inside one, `172.17.0.1:8477` and `172.31.250.1:8477` are both
+"Network is unreachable", and squid is the only route out. So an agent could
+not see this page at all, and the operator wants it to.
+
+The fix is **not** to move the TCP bind. That bind is loopback-only on purpose —
+`tailscale serve` terminates TLS in front of it, so a dead tailscaled makes the
+page unreachable rather than public — and the whole point of the constraint is
+that it holds. It still holds: the set of TCP endpoints serving this page is
+exactly what it was.
+
+Instead the service **also** listens on a unix domain socket per instance, at
+that instance's `socketPath` in `status-config.yaml`. A unix socket is not on a
+network: no port, no address a remote host can name. What carries the traffic is
+the filesystem — `docker/run-container.sh` already bind-mounts
+`$CLAWCIUS_STATE/run` read-write into each container (see Clawcius #65, which
+described that mount as having no users; it has one now).
+
+Chromium cannot navigate a unix socket, so `browser-cli/status-sock` bridges it
+to an ephemeral TCP port on `127.0.0.1` **inside the container**, for exactly as
+long as one command takes to run:
+
+```sh
+status-sock browse text '{}/clawsky'
+status-sock curl -s '{}/healthz'
+```
+
+**Two things this costs, and both are real:**
+
+1. **The page shows both crews.** An agent that can load it can read the other
+   crew's Clawsky board, DMs included, which it cannot do by any other means.
+   That cross-crew view is the point of the feature, not an oversight — but it
+   is a widening, and "unix socket, no network exposure" describes the transport
+   and not this.
+2. **The mount is read-write.** A container can delete or replace its own
+   socket. That breaks its own access until the service restarts; it does not
+   let it read anything new, and `src/socket.ts` will not unlink anything that
+   is not a socket, so it is not a way to get this service to delete a file on
+   an agent's behalf.
+
+`systemd/clawcius-status.service` needs a `ReadWritePaths=` line for each socket
+**directory**, or `listen()` fails with `EROFS` under `ProtectSystem=strict` —
+and that failure is deliberately not fatal, so the page comes up looking healthy
+with no socket. `/healthz` reports the state of every configured socket, and a
+test asserts the unit and the config agree.
 
 ## Where the agent list comes from
 
