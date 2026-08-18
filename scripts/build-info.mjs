@@ -103,18 +103,21 @@ import { dirname, resolve } from 'node:path';
  *
  * The arithmetic, worst case, pretty-printed at indent 2:
  *
- *     dirtyFiles     20 x (100 + quotes + comma + indent)   ~ 2200
- *     line           10 x 102 + ~280 of prose               ~ 1300
- *     unknownReason  300                                    ~   310
- *     repoRoot, branch, service, version   4 x <= 200       ~   700
- *     commit, shortCommit, keys, structure                  ~   400
- *                                                            ------
- *                                                            ~ 4910
+ *     dirtyFiles     DIRTY_NAMES_KEPT x PATH_MAX
+ *     line           DIRTY_NAMES_IN_LINE x PATH_MAX + STRING_MAX + prose
+ *     unknownReason  REASON_MAX
+ *     repoRoot, branch, service, version   4 x STRING_MAX
+ *     commit, shortCommit, keys, structure
  *
- * against 8192, leaving the waker's own eight fields ~3 KiB of headroom. The
- * arithmetic is checked against the REAL constant in test/build-info.test.js,
- * so lowering `MAX_STATUS_BYTES` or raising a cap here fails a test rather than
- * quietly wedging the idle gate.
+ * Measured rather than asserted in prose: test/build-info.test.js reads these
+ * five constants out of THIS FILE by name, reads `MAX_STATUS_BYTES` out of
+ * ops/src/idle.ts, builds the worst case the former permit and measures it in
+ * bytes against the latter. As of 2026-08-18 that is 5311 against 8192.
+ *
+ * Nothing there is hand-copied, deliberately. A budget test that restates the
+ * numbers it protects passes while the thing it protects changes underneath it
+ * — which is the same defect as a sweep asserting a remembered list, and this
+ * repository has now shipped that shape twice.
  */
 
 /** How many uncommitted filenames go into the one-line banner before it stops. */
@@ -130,9 +133,23 @@ const DIRTY_NAMES_IN_LINE = 10;
  */
 const DIRTY_NAMES_KEPT = 20;
 
-/** Longest any single string in the output may be. Paths are middle-elided. */
+/**
+ * Longest any single string in the output may be. Paths are middle-elided.
+ *
+ * These four are read back out of this file by test/build-info.test.js, which
+ * builds the worst case they permit and measures it against the real
+ * `MAX_STATUS_BYTES` in ops/src/idle.ts. Raising one here without raising the
+ * ceiling there fails that test — so the names and the `const NAME = <digits>;`
+ * shape are load-bearing, not incidental.
+ */
 const STRING_MAX = 200;
 const PATH_MAX = 100;
+
+/**
+ * Longest failure reason kept, in the one field whose length comes from
+ * outside: git's own stderr.
+ */
+const REASON_MAX = 300;
 
 /**
  * Clip a string to `max`, marking it so a truncated value cannot be mistaken
@@ -291,7 +308,7 @@ const info = {
   dirtyFileCount,
   dirtyFiles,
   builtAt,
-  unknownReason: clip(unknownReason, 300),
+  unknownReason: clip(unknownReason, REASON_MAX),
   line: buildLine(),
 };
 

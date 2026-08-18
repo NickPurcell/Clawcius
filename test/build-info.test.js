@@ -222,34 +222,88 @@ test('a very long path is elided rather than carried whole', () => {
   }
 });
 
-test('the worst case BUILD_INFO leaves room under the reader ops actually uses', () => {
-  // The coupling this exists for: `waker-status.json` embeds BUILD_INFO whole,
-  // and ops/src/idle.ts treats anything over MAX_STATUS_BYTES as BUSY rather
-  // than as unreadable. A ceiling that can still be crossed is the same bug
-  // with a bigger number, so the real constant is read out of the real file —
-  // lowering it, or raising a cap in the generator, fails here.
+/**
+ * The generator's caps, read out of the generator.
+ *
+ * NOT restated here. The first version of the budget test below hand-copied
+ * `20`, `100`, `200` and `300` into its own worst case and claimed in a comment
+ * that raising a cap would fail it. Mutation-tested by OJ: `DIRTY_NAMES_KEPT`
+ * 20→60 and `PATH_MAX` 100→500 failed a *neighbouring* test that happened to
+ * hardcode the same number, and `STRING_MAX` 200→2000 failed nothing at all —
+ * 16 pass, 0 fail — while those four fields alone would have exceeded the
+ * ceiling. The budget test would have gone on asserting a worst case the
+ * generator no longer produced.
+ *
+ * That is the same shape as a sweep iterating a remembered list, which this
+ * file already had and already fixed. So the numbers come from the source, and
+ * a missing or renamed constant is a failure rather than a silent default.
+ */
+function generatorCaps() {
+  const source = readFileSync(SCRIPT, 'utf8');
+  const read = (name) => {
+    const found = new RegExp(`^const ${name} = (\\d+);`, 'm').exec(source);
+    assert.ok(found, `could not find \`const ${name} = <number>;\` in ${SCRIPT}`);
+    return Number(found[1]);
+  };
+  return {
+    namesInLine: read('DIRTY_NAMES_IN_LINE'),
+    namesKept: read('DIRTY_NAMES_KEPT'),
+    stringMax: read('STRING_MAX'),
+    pathMax: read('PATH_MAX'),
+    reasonMax: read('REASON_MAX'),
+  };
+}
+
+/**
+ * A string of exactly `cap` characters as `clip` would leave it.
+ *
+ * The ellipsis is one character and THREE BYTES in UTF-8, and `readIdle`
+ * compares bytes — `statSync().size` — not characters. Building the worst case
+ * out of ASCII would understate it by up to two bytes per clipped field.
+ */
+function clipped(cap, fill = 'x') {
+  return `${fill.repeat(cap - 1)}…`;
+}
+
+test('the worst case the caps permit fits under the ceiling ops actually enforces', () => {
+  // The coupling: `waker-status.json` embeds BUILD_INFO whole, and
+  // ops/src/idle.ts treats anything over MAX_STATUS_BYTES as BUSY rather than
+  // as unreadable — so an oversized build does not lose a reading, it makes the
+  // instance permanently non-idle for the life of that artefact.
+  //
+  // Both ends are read from their real files. Raise a cap in the generator or
+  // lower the ceiling in idle.ts and this fails.
   const idle = readFileSync(join(REPO_ROOT, 'ops', 'src', 'idle.ts'), 'utf8');
   const declared = /const MAX_STATUS_BYTES = (\d+) \* (\d+);/.exec(idle);
   assert.ok(declared, 'could not find MAX_STATUS_BYTES in ops/src/idle.ts');
   const maxStatusBytes = Number(declared[1]) * Number(declared[2]);
-  assert.equal(maxStatusBytes, 8192);
 
-  // Built to the generator's documented caps: 20 paths of 100 characters, every
-  // other string at its own limit.
+  const caps = generatorCaps();
+  const worstPath = clipped(caps.pathMax, 'p');
+  const worstBranch = clipped(caps.stringMax, 'b');
+
+  // `line` is not itself clipped — it is assembled from values that are — so it
+  // is built here the way buildLine() builds it, from the same caps, rather
+  // than approximated by a constant somebody would have to remember to grow.
+  const worstLine =
+    `${'a'.repeat(7)} (${worstBranch}) built ${new Date().toISOString()} ` +
+    `from a DIRTY tree — 999999 uncommitted path(s): ` +
+    `${Array.from({ length: caps.namesInLine }, () => worstPath).join(', ')}` +
+    `, and 999999 more. This artefact is NOT aaaaaaa.`;
+
   const worstBuild = {
-    service: 'S'.repeat(200),
-    version: 'V'.repeat(200),
+    service: clipped(caps.stringMax, 's'),
+    version: clipped(caps.stringMax, 'v'),
     commit: 'a'.repeat(40),
     shortCommit: 'a'.repeat(7),
-    branch: 'B'.repeat(200),
-    repoRoot: 'R'.repeat(200),
+    branch: worstBranch,
+    repoRoot: clipped(caps.stringMax, 'r'),
     dirty: true,
     dirtyFileCount: 999999,
-    dirtyFiles: Array.from({ length: 20 }, () => 'p'.repeat(100)),
+    dirtyFiles: Array.from({ length: caps.namesKept }, () => worstPath),
     builtAt: new Date().toISOString(),
-    unknownReason: 'U'.repeat(300),
-    // The line carries ten of those paths plus its prose.
-    line: `${'L'.repeat(300)}${Array.from({ length: 10 }, () => 'p'.repeat(100)).join(', ')}`,
+    unknownReason: clipped(caps.reasonMax, 'u'),
+    line: worstLine,
   };
 
   // The whole file as waker-status.ts writes it: pretty-printed at indent 2,
@@ -269,12 +323,42 @@ test('the worst case BUILD_INFO leaves room under the reader ops actually uses',
     2,
   )}\n`;
 
+  // Bytes, not characters, because `statSync().size` is what readIdle compares.
+  const bytes = Buffer.byteLength(worstFile);
   assert.ok(
-    Buffer.byteLength(worstFile) < maxStatusBytes,
-    `worst-case waker-status.json is ${Buffer.byteLength(worstFile)} bytes against a ` +
-      `${maxStatusBytes}-byte ceiling — ops would read every publish from such a build as ` +
-      'BUSY, for the life of that build',
+    bytes < maxStatusBytes,
+    `worst-case waker-status.json is ${bytes} bytes against a ${maxStatusBytes}-byte ` +
+      'ceiling — ops would read every publish from such a build as BUSY, for the life of ' +
+      `that build. Caps: ${JSON.stringify(caps)}`,
   );
+});
+
+test('the generator honours STRING_MAX on the fields nothing else pins', () => {
+  // Without this, deleting a `clip(..., STRING_MAX)` call leaves the constant
+  // parsing at 200, the budget test passing, and the real output unbounded —
+  // the budget would be protecting a cap the generator no longer applied.
+  const caps = generatorCaps();
+  const { dir, pkgDir, cleanup } = scratch({ packageName: 'n'.repeat(400) });
+  try {
+    // 250 rather than 400: a branch name becomes a filename under
+    // .git/refs/heads/, and 255 bytes is the limit on this filesystem. Still
+    // comfortably above STRING_MAX, which is what this needs.
+    git(dir, ['checkout', '-q', '-b', 'z'.repeat(250)]);
+    const { info } = generate(pkgDir);
+
+    for (const [field, value] of [
+      ['service', info.service],
+      ['branch', info.branch],
+    ]) {
+      assert.ok(
+        value.length <= caps.stringMax,
+        `${field} is ${value.length} characters, above STRING_MAX ${caps.stringMax}`,
+      );
+      assert.ok(value.endsWith('…'), `${field} was truncated without saying so: ${value}`);
+    }
+  } finally {
+    cleanup();
+  }
 });
 
 test('a detached HEAD is not printed as a branch called HEAD', () => {
