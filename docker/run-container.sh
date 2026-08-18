@@ -320,14 +320,23 @@ fi
 #     docker container inspect -f '{{.Name}} {{.HostConfig.Init}}' \
 #         clawcius-agent hamachi-agent
 #
-# And it does not come for free, because --recreate destroys the writable
-# layer this file's header exists to protect. It restarts from $IMAGE, which
+# And it does not come free, because --recreate destroys the writable layer
+# this file's header exists to protect. It restarts from $IMAGE, which
 # defaults to :latest, and docker/snapshot.sh commits to :snap-<stamp> without
-# ever retagging latest — so the obvious command discards everything the agent
-# installed since the image was built. To take the flag and keep the layer,
-# recreate from the newest snapshot instead:
+# ever retagging latest — so the default genuinely does discard everything
+# installed since the image was built.
 #
-#     CLAWCIUS_IMAGE=clawcius-agent:snap-<stamp> docker/run-container.sh --recreate
+# There are two forms and neither is the default answer:
+#
+#     docker/run-container.sh --recreate                       # from :latest
+#     CLAWCIUS_IMAGE=<repo>:snap-<stamp> docker/run-container.sh --recreate
+#
+# The second when the layer holds work that is not in the image yet. The first
+# when losing the layer is the POINT — a rebuild that ships what was being
+# staged by hand makes the reset the outcome you wanted, not the price you
+# paid. That is a question about what is in the layer and what the current
+# image already ships, and the answer changes; do not read either line here as
+# the standing recommendation.
 #
 # Then confirm it landed here, which is a different question from whether the
 # flag works: `docker exec "$NAME" cat /proc/1/comm` should print docker-init,
