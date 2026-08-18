@@ -278,7 +278,7 @@ fi
 # each one becomes a zombie that persists until the container is replaced. A
 # zombie holds no memory, which is why this does not look like the leak it is.
 # It is a PID leak, and --pids-limit below is 512. Measured inside the live
-# container on 2026-08-17: 92 of 99 processes were zombies, every one with
+# container on 2026-08-18 UTC: 92 of 99 processes were zombies, every one with
 # PPid 1, spread across fifteen different programs — node, timeout, python3,
 # systemctl, git, docker, curl. Twenty-eight are the chromium ones that led to
 # #74; the other sixty-four are everything else, which is the argument.
@@ -313,12 +313,31 @@ fi
 # deployment. See Clawcius #84.
 #
 # THAT IS TWO CONTAINERS, NOT ONE. systemd/hamachi-container.service runs this
-# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-17 both it
-# and clawcius-agent reported HostConfig.Init null. Each needs its own
+# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-18 UTC both
+# it and clawcius-agent reported HostConfig.Init null. Each needs its own
 # --recreate, and confirming docker-init in one says nothing about the other:
 #
 #     docker container inspect -f '{{.Name}} {{.HostConfig.Init}}' \
 #         clawcius-agent hamachi-agent
+#
+# DO NOT RECREATE THE SECOND BY OVERRIDING ONLY THE NAME. The command that
+# comes to mind,
+#
+#     CLAWCIUS_CONTAINER=hamachi-agent docker/run-container.sh --recreate
+#
+# is destructive: every other value above falls back to its instance-1
+# default, so hamachi-agent returns built from clawcius's image, holding
+# clawcius's .env, with /var/lib/clawcius/workspaces mounted and
+# /var/lib/clawcius/agent-home as its Claude credential — two agents on one
+# login and one workspace, which is the state the AGENT_HOME paragraph above
+# exists to prevent. The `docker rm -f` has already run by the time any of
+# that is visible.
+#
+# The five values it needs live in systemd/hamachi-container.service. They are
+# deliberately NOT copied here, because a second copy is a thing that drifts;
+# read them from the unit at the moment you need them:
+#
+#     systemctl show hamachi-container -p Environment
 #
 # And it does not come free, because --recreate destroys the writable layer
 # this file's header exists to protect. It restarts from $IMAGE, which
@@ -330,6 +349,16 @@ fi
 #
 #     docker/run-container.sh --recreate                       # from :latest
 #     CLAWCIUS_IMAGE=<repo>:snap-<stamp> docker/run-container.sh --recreate
+#
+# If you take the second, take a snapshot FIRST rather than reaching for the
+# newest existing tag. clawcius-snapshot.timer is the only snapshot timer on
+# this host and clawcius-snapshot.service passes no environment, so it covers
+# instance 1 and nothing else — hamachi's newest tag is its migration day, and
+# even instance 1's is up to a day old (#87). snapshot.sh reads the same
+# CLAWCIUS_CONTAINER, so it is one command per instance and it prints the tag
+# it wrote:
+#
+#     CLAWCIUS_CONTAINER=<name> docker/snapshot.sh
 #
 # The second when the layer holds work that is not in the image yet. The first
 # when losing the layer is the POINT — a rebuild that ships what was being

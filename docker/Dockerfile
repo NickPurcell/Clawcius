@@ -127,7 +127,7 @@ WORKDIR /var/lib/clawcius/workspaces
 # have at pid 1: every orphaned process in a PID namespace is reparented to
 # pid 1, so anything orphaned there becomes a zombie that nothing will ever
 # reap, against --pids-limit=512. Measured in the running container on
-# 2026-08-17, before the fix: 92 of 99 processes were zombies, every one with
+# 2026-08-18 UTC, before the fix: 92 of 99 processes were zombies, every one with
 # PPid 1, across fifteen different programs.
 #
 # It is not pid 1 WHEN THE CONTAINER IS CREATED BY docker/run-container.sh,
