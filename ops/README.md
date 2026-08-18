@@ -123,19 +123,24 @@ This is written down because it went wrong the ordinary way rather than the
 interesting way. Across one incident on 2026-08-17 the operator copy-pasted
 **seven** command outputs into Discord — `journalctl` for two units, a cgroup's
 `memory.events`, `free`, `ps`, `systemctl --failed`, `ls /etc/systemd/system` —
-and only **two** of the things asked of him that night were genuinely beyond the
-host agent: a `docker inspect` with a field outside the whitelist, and a `curl`.
-Ten commands were handed to the host agent afterwards to check, and **eight ran.**
-Nothing had refused them; nobody had asked. Some of that was at 04:00 local,
-which is the real cost of the habit.
+and **the host agent could have produced every one of them.** Two other things
+were asked of him that night and those two were genuine: a `docker inspect` with
+a field outside the whitelist, and a `curl`. Ten commands were handed to the host
+agent afterwards to check, and **eight ran.** Nothing had refused the seven;
+nobody had asked. Some of that was at 04:00 local, which is the real cost of the
+habit.
 
-The reasons that genuinely stand, all of them visible in that incident:
+The reasons that genuinely stand:
 
-- **it needs `docker exec`, or a `docker inspect` field outside the enumerated
-  set.** Both are deliberately ungranted rather than overlooked — `exec` is a
-  session running as another crew with that crew's credentials, and the
-  `inspect` formats were enumerated on 2026-08-12 because the wildcard printed
-  the sibling agents' API keys. See [§ Sudoers](#sudoers);
+- **it needs `docker exec`, or a `docker inspect` field *or container* outside
+  the enumerated set.** Both are deliberately ungranted rather than overlooked —
+  `exec` is a session running as another crew with that crew's credentials
+  (`ops/clawcius-sudoers:557`), and the `inspect` formats were enumerated on
+  2026-08-12 because the wildcard printed the sibling agents' API keys. Note that
+  those lines enumerate the **container** too, not only the format
+  (`ops/clawcius-sudoers:614-634`): every one of them names `clawcius-agent`,
+  `hamachi-agent` or `oj-agent`, so a refusal on any other container is not a
+  wrong format and no format will fix it. See [§ Sudoers](#sudoers);
 - **it needs an HTTP request.** `curl`, `wget` and `gh` are in `LIVE_TOOL_DENY`
   (`ops/src/host-agent.ts:584`) **by design, not by oversight.** This session
   holds every credential on the box and is not sandboxed; the entire reason that
