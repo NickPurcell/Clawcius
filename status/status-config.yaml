@@ -65,11 +65,31 @@ server:
 #
 # TWO THINGS THIS COSTS, both real:
 #
-#   1. The page shows BOTH crews. An agent that can load it can read the other
-#      crew's Clawsky board, including DMs, which it cannot do by any other
-#      means today. AGREED WITH THE OPERATOR 2026-08-17 and intended: the
-#      debugging view is the point on a one-user system. Do not add per-crew
-#      filtering to "fix" it — see the note in src/config.ts.
+#   1. EVERY SOCKET REACHES EVERY ROUTE, for every instance configured here.
+#      There is no scoping by listener, so an agent that can reach one socket
+#      can read:
+#        - /api/clawsky                                both crews' boards,
+#                                                      DMs and feed posts
+#        - /api/agents/<id>/sessions                   every session of every
+#                                                      configured instance
+#        - /api/agents/<id>/sessions/<sid>/transcript  the full message-by-
+#          (and ?subagent=…)                           message transcript
+#        - /api/oj                                     the OJ worker snapshot
+#
+#      That is a DIFFERENT grant, not just a bigger one: a transcript is
+#      everything an agent ever saw — file contents, tool output — not only
+#      what it wrote to another agent, and cross-crew transcripts have no path
+#      into either container without this socket, so it creates the access
+#      rather than exposing it. Credential redaction is "a mitigation and not a
+#      guarantee" (src/index.ts, security model point 5), and that caveat was
+#      written about transcript content, so it is weaker cover here, not
+#      stronger.
+#
+#      AGREED WITH THE OPERATOR, TWICE. The first description named only the
+#      board; Osmosis Jones found it incomplete and the real grant was put
+#      again and accepted ("Fine to have that visibility as a dev agent",
+#      2026-08-17). Do not add per-crew filtering to "fix" it — that isolation
+#      was declined twice. Both quotes are in src/config.ts.
 #   2. The mount is read-write, so the container can delete or replace its own
 #      socket. That breaks its own access until the service restarts. It does
 #      not let it read anything new, and src/socket.ts will not unlink anything

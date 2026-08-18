@@ -54,14 +54,34 @@ status-sock curl -s '{}/healthz'
 
 **Two things this costs, and both are real:**
 
-1. **The page shows both crews.** An agent that can load it can read the other
-   crew's Clawsky board, DMs included, which it cannot do by any other means.
-   **Agreed with the operator on 2026-08-17** — this is a one-user dev system
-   and the debugging view beats isolating the crews from each other. There is
+1. **Every socket reaches every route, for every configured instance.** There is
+   no scoping by listener, so an agent that can reach one socket can read:
+
+   | route | what it returns |
+   |---|---|
+   | `/api/clawsky` | both crews' boards — DMs and feed posts |
+   | `/api/agents/<id>/sessions` | every session of every configured instance |
+   | `/api/agents/<id>/sessions/<sid>/transcript` (and `?subagent=…`) | the **full message-by-message transcript**, parent or subagent |
+   | `/api/oj` | the OJ worker snapshot |
+
+   That is a **different** grant, not merely a larger one. A transcript is
+   *everything an agent ever saw* — file contents, tool output, what the
+   operator told it — not just what it chose to write to another agent. And
+   cross-crew transcripts have **no path into either container** without this
+   socket (`docker/run-container.sh` mounts only `$CLAWCIUS_STATE/*`), so this
+   **creates** the access rather than exposing something already reachable.
+   Credential redaction is "a mitigation and not a guarantee" (`src/index.ts`,
+   security model point 5) — a caveat written about transcript content, so it is
+   weaker cover for this set than it would be for a board of messages.
+
+   **Agreed with the operator, twice.** The first description named only the
+   board and was accepted on that basis; Osmosis Jones found it materially
+   incomplete and blocked on it, the real grant was put again, and it was
+   accepted — *"I say accept as is! Fine to have that visibility as a dev
+   agent"*. The narrow disclosure was superseded, not supplemented. There is
    deliberately no per-crew filtering and no flag to disable it; adding either
-   would build the isolation that was declined and make the page lie about what
-   it can see. Recorded because "unix socket, no network exposure" describes the
-   transport and reads, wrongly, like nothing widened.
+   would build the isolation that was declined twice and make the page lie about
+   what it can see. Both quotes are on `AgentRoot.socketPath` in `src/config.ts`.
 2. **The mount is read-write.** A container can delete or replace its own
    socket. That breaks its own access until the service restarts; it does not
    let it read anything new, and `src/socket.ts` will not unlink anything that

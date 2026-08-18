@@ -43,10 +43,18 @@ import { createServer, type RequestListener } from 'node:http';
  *
  * 0600, not the 0755 a default systemd umask of 0022 would leave: the only
  * principal that should ever connect is the container, and the container runs
- * as the same uid that owns the host-side run directory. Note that the run
- * directory itself is world-traversable (`drwxr-xr-x`), so without this an
- * unprivileged local user could connect — a small hole on a host with two
- * accounts, but free to close.
+ * as the same uid that owns the host-side run directory.
+ *
+ * DEFENCE IN DEPTH, and not the only thing standing there — an earlier version
+ * of this comment claimed it was, on the grounds that the run directory is
+ * `drwxr-xr-x` and therefore world-traversable. Osmosis Jones corrected that in
+ * review of #88: the PARENT `/var/lib/<instance>` is created by `StateDirectory=`
+ * with `StateDirectoryMode=0750` (clawcius.service:61, hamachi.service:59), so
+ * an account outside `npurcell` cannot traverse to the run directory whatever
+ * the run directory's own mode is. The mode is still worth setting — it costs
+ * nothing and it does not depend on a parent directory two other units own —
+ * but it is a second lock on a door that is already locked, and saying
+ * otherwise would misdescribe what protects this socket.
  *
  * Applied in the `listening` callback rather than by setting a process-wide
  * umask, so there is a sub-millisecond window where the socket exists at the
@@ -57,8 +65,53 @@ import { createServer, type RequestListener } from 'node:http';
  */
 const SOCKET_MODE = 0o600;
 
+/**
+ * Connections one agent container may hold on its socket at once.
+ *
+ * NOT a speculative limit. Without it a client that has only the socket — which
+ * is anything in the container — can open connections until the process hits
+ * its file descriptor ceiling, and the unit sets no `LimitNOFILE=`, so that
+ * ceiling is `DefaultLimitNOFILESoft`, 1024 on this host. Measured by Osmosis
+ * Jones in review of #88 against the real `dist/index.js`: 1200 held
+ * connections took the process to 1024 open descriptors and **the TCP listener
+ * stopped answering** — the operator's tailnet page, not merely the agent's
+ * socket. The process stays alive, so systemd sees a healthy unit and nothing
+ * reaches the journal, and `/healthz` cannot report it because `/healthz` is
+ * one of the things that stopped responding.
+ *
+ * That is exactly the kill switch the warn-don't-throw design in this file
+ * exists to deny a container, arrived at through the front door instead of
+ * through a bind failure. A cap here is what makes the rest of the file's
+ * argument true.
+ *
+ * 64, per socket, so the two sockets together can reach 128 descriptors and
+ * leave the TCP listener's budget alone. It is generous for the actual client:
+ * a browser tab holds a handful — the assets, some `/api/*` calls, and one
+ * long-lived SSE stream — so this is roughly ten concurrent tabs, against a
+ * real usage of one `browse` at a time.
+ *
+ * The TCP listener is deliberately NOT capped. It serves `tailscale serve` and
+ * the operator, and a cap there would be a limit on the trusted path to solve a
+ * problem on the untrusted one.
+ */
+const MAX_SOCKET_CONNECTIONS = 64;
+
 export type SocketOutcome =
-  | { path: string; listening: true; server: Server }
+  | {
+      path: string;
+      listening: true;
+      server: Server;
+      /**
+       * Connections refused because `maxConnections` was already reached.
+       *
+       * Node destroys those sockets itself and says nothing, which would make
+       * the cap an invisible failure — the client sees a connection reset and
+       * the host sees nothing at all. This counter is reported by `/healthz`
+       * and the first drop on each socket is logged, so a container that is
+       * hitting the ceiling is legible rather than merely unlucky.
+       */
+      dropped: number;
+    }
   | { path: string; listening: false; reason: string };
 
 function describe(info: Stats): string {
@@ -183,8 +236,17 @@ export async function claimSocketPath(path: string): Promise<{ ok: true } | { ok
  * because a Node server listens once. They share the request listener, so they
  * share every route, the transcript store and the SSE stream set — there is
  * one process and one view of the world, and which listener a request arrived
- * on is not consulted anywhere. See the note on `AgentRoot.socketPath` in
- * config.ts for what that means for what an agent can see.
+ * on is not consulted anywhere.
+ *
+ * SO EVERY SOCKET REACHES EVERYTHING: both crews' boards, every session, the
+ * full message-by-message transcript of any of them, and `/api/oj`. A
+ * transcript is everything an agent ever saw — file contents, tool output —
+ * not just what it wrote to another agent, and cross-crew transcripts have no
+ * other path into a container, so this creates that access rather than
+ * exposing it. Agreed with the operator twice; the second time after Osmosis
+ * Jones found the first description incomplete. The full enumeration, both
+ * quotes, and the instruction not to add per-crew scoping are on
+ * `AgentRoot.socketPath` in config.ts.
  *
  * ── Failures here are warnings, and that is a considered choice ────────────
  *
@@ -221,6 +283,8 @@ export async function bindUnixSockets(
     }
 
     const server = createServer(handler);
+    server.maxConnections = MAX_SOCKET_CONNECTIONS;
+
     const outcome = await new Promise<SocketOutcome>((resolve) => {
       const onError = (error: NodeJS.ErrnoException): void => {
         // EROFS is the one worth naming: ProtectSystem=strict makes the whole
@@ -238,17 +302,49 @@ export async function bindUnixSockets(
       server.once('error', onError);
       server.listen(path, () => {
         server.removeListener('error', onError);
+
+        // A REPLACEMENT 'error' LISTENER, and it is not optional.
+        //
+        // Removing `onError` without attaching this leaves the server with no
+        // 'error' handler at all, and an 'error' event with no handler is an
+        // unhandled 'error' — which takes the whole process down. That is
+        // precisely the fatal outcome the rest of this file is built to deny a
+        // container, reintroduced for the entire lifetime of the listener
+        // rather than just the bind. Found by Osmosis Jones in review of #88,
+        // which was honest that it could not demonstrate a trigger (libuv's
+        // EMFILE handling appears to absorb the obvious candidate). Closing a
+        // gap between what this file promises and what it enforces is worth
+        // one line whether or not the gap is currently reachable.
+        server.on('error', (error: NodeJS.ErrnoException) => {
+          console.warn(`[status] error on ${path}: ${error.code ?? error.message}`);
+        });
+
         try {
           chmodSync(path, SOCKET_MODE);
         } catch (error) {
-          // Listening but world-connectable to anyone who can traverse the
-          // directory. Worth saying out loud; not worth refusing to serve.
+          // Listening, but at whatever mode the umask produced. Worth saying
+          // out loud; not worth refusing to serve.
           console.warn(
             `[status] could not chmod ${path} to ${SOCKET_MODE.toString(8)}: ` +
               `${(error as NodeJS.ErrnoException).code ?? error}`,
           );
         }
-        resolve({ path, listening: true, server });
+
+        const settled: SocketOutcome = { path, listening: true, server, dropped: 0 };
+        // 'drop' fires when maxConnections turned a connection away. Without
+        // this the cap would be silent on both sides.
+        server.on('drop', () => {
+          settled.dropped += 1;
+          if (settled.dropped === 1) {
+            console.warn(
+              `[status] ${path} hit maxConnections (${MAX_SOCKET_CONNECTIONS}); ` +
+                'refusing further connections until some are released. Further drops ' +
+                'are counted in /healthz rather than logged, so that a client looping ' +
+                'on connect cannot flood the journal.',
+            );
+          }
+        });
+        resolve(settled);
       });
     });
     outcomes.push(outcome);

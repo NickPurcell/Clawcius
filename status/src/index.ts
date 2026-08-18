@@ -18,10 +18,27 @@
  *      that the agent containers can reach it — they are on a network with no
  *      gateway and could not otherwise. This does not weaken (1): a unix
  *      socket has no address and no port, the TCP surface is unchanged, and
- *      the reachability comes from a bind mount rather than from routing. It
- *      DOES widen what an agent can see, because the page shows both crews and
- *      an agent could not read the other crew's board before. See `socket.ts`
- *      and the note on `AgentRoot.socketPath`; that widening is the feature.
+ *      the reachability comes from a bind mount rather than from routing.
+ *
+ *      IT DOES WIDEN WHAT AN AGENT CAN SEE, and by more than it first looks.
+ *      There is no scoping by listener, so an agent reaching any socket
+ *      reaches every route for every configured instance: both crews' boards
+ *      (`/api/clawsky`), every session (`/api/agents/<id>/sessions`), the FULL
+ *      message-by-message transcript of any of them
+ *      (`/api/agents/<id>/sessions/<sid>/transcript`, parent or subagent), and
+ *      the OJ worker snapshot (`/api/oj`).
+ *
+ *      That is a different grant, not merely a larger one. A transcript is
+ *      everything an agent ever saw — file contents, tool output — not just
+ *      what it wrote to another agent; and cross-crew transcripts have no path
+ *      into either container without this socket, so it creates the access
+ *      rather than exposing it. Note that point (5) below is load-bearing here
+ *      and is weaker cover for transcripts than it would be for a board.
+ *
+ *      Agreed with the operator, twice — the second time after Osmosis Jones
+ *      found the first description incomplete. See the note on
+ *      `AgentRoot.socketPath` in config.ts for both quotes and for why no
+ *      per-crew scoping is to be added.
  *
  *   2. It is READ-ONLY. Every route is GET or HEAD; anything else is refused
  *      before routing. Nothing here writes, deletes, or spawns a process, and
@@ -425,7 +442,12 @@ const handleRequest = (request: IncomingMessage, response: ServerResponse): void
       // one my container mounts" is the first question when it is not.
       sockets: socketOutcomes.map((outcome) =>
         outcome.listening
-          ? { path: outcome.path, listening: true }
+          ? // `dropped` is connections refused because the per-socket
+            // maxConnections cap was already reached. Non-zero means a
+            // container is opening far more than it needs — which, before the
+            // cap existed, is what could exhaust the process's descriptors and
+            // silently stop the TCP listener answering.
+            { path: outcome.path, listening: true, dropped: outcome.dropped }
           : { path: outcome.path, listening: false, reason: outcome.reason },
       ),
     });

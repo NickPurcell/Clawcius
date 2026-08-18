@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer } from 'node:net';
+import { createServer, connect as netConnect } from 'node:net';
 import { get } from 'node:http';
 import { spawnSync } from 'node:child_process';
 
@@ -170,9 +170,10 @@ test('bindUnixSockets serves HTTP and locks the socket down to 0600', async () =
     });
     assert.equal(body, 'served');
 
-    // 0600, not the 0755 a default umask would leave. The run directory is
-    // world-traversable, so the mode is the only thing between the socket and
-    // any other local account.
+    // 0600, not the 0755 a default umask would leave. Defence in depth rather
+    // than the only lock — StateDirectoryMode=0750 on the parent already stops
+    // an account outside npurcell traversing here — but it costs nothing and it
+    // does not depend on a directory mode two other units own.
     assert.equal(statSync(path).mode & 0o777, 0o600);
   } finally {
     outcomes[0].server.close();
@@ -213,4 +214,79 @@ test('releaseSocketPath removes a socket and nothing else', async () => {
   outcomes[0].server.close();
   releaseSocketPath(path);
   assert.equal(existsSync(path), false);
+});
+
+test('the socket caps concurrent connections, and counts what it turned away', async () => {
+  // The kill switch this closes, measured by Osmosis Jones in review of #88:
+  // a client that has only the socket — anything in the container — held 1200
+  // connections, the process hit its 1024-descriptor ceiling, and THE TCP
+  // LISTENER STOPPED ANSWERING. The operator's tailnet page, switched off from
+  // inside the thing the page watches, with the unit still healthy and nothing
+  // in the journal. socket.ts justifies its whole warn-don't-throw design on
+  // denying a container exactly that, so the cap is what makes that true.
+  const dir = scratch();
+  const path = join(dir, 'status.sock');
+
+  const outcomes = await bindUnixSockets([path], (_request, response) => response.end('ok'));
+  assert.equal(outcomes[0].listening, true);
+  const { server } = outcomes[0];
+
+  // A handful, not a thousand. The exact number is a judgement call; that
+  // there IS one, and that it is far below any plausible descriptor limit, is
+  // not.
+  assert.ok(server.maxConnections > 0, 'a cap is set');
+  assert.ok(
+    server.maxConnections <= 128,
+    `the cap must stay well under DefaultLimitNOFILESoft (1024), got ${server.maxConnections}`,
+  );
+
+  const held = [];
+  try {
+    // Fill the cap, then push past it.
+    const target = server.maxConnections + 12;
+    await Promise.all(
+      Array.from({ length: target }, () =>
+        new Promise((resolve) => {
+          const conn = netConnect(path);
+          held.push(conn);
+          conn.on('connect', resolve);
+          conn.on('error', resolve);
+        }),
+      ),
+    );
+
+    // Node destroys the surplus itself and says nothing, so without the 'drop'
+    // accounting in socket.ts the cap would be invisible on both sides.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.ok(
+      outcomes[0].dropped > 0,
+      'connections past the cap are counted, so /healthz can report them',
+    );
+  } finally {
+    for (const conn of held) conn.destroy();
+    server.close();
+    releaseSocketPath(path);
+  }
+});
+
+test('a listening socket keeps an error handler, so a late error cannot kill the process', async () => {
+  // The bind-time handler is removed in the `listening` callback. Without a
+  // replacement the server has no 'error' listener at all, and an unhandled
+  // 'error' event takes the process down — the one fatal outcome this file
+  // exists to deny a container, reintroduced for the life of the listener.
+  const dir = scratch();
+  const path = join(dir, 'status.sock');
+  const outcomes = await bindUnixSockets([path], () => {});
+
+  try {
+    assert.ok(
+      outcomes[0].server.listenerCount('error') > 0,
+      'a listening unix server must keep an error handler',
+    );
+    // And it must actually absorb one rather than rethrow.
+    outcomes[0].server.emit('error', Object.assign(new Error('late'), { code: 'EMFILE' }));
+  } finally {
+    outcomes[0].server.close();
+    releaseSocketPath(path);
+  }
 });

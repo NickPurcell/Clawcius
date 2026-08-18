@@ -75,20 +75,59 @@ export type AgentRoot = {
    * under `server:` would be reachable by exactly one crew.
    *
    * WHAT IT DOES NOT DO is scope the page. Every listener serves the same
-   * process and the same routes, so an agent connecting through its own
-   * crew's socket sees BOTH crews' boards, including the other crew's DMs —
-   * which it cannot read today by any other means.
+   * process and the same routes, so an agent that can reach any socket can
+   * reach EVERY route, for EVERY configured instance:
    *
-   * THAT IS DECIDED, NOT OVERLOOKED. Put to the operator and agreed on
-   * 2026-08-17: "I want you to be able to debug it, seeing other agents when
-   * you do that is fine." This is a one-user dev system and the debugging view
-   * is worth more than isolating the crews from each other.
+   *   - `/api/clawsky`                                 both crews' boards,
+   *                                                    DMs and feed posts
+   *   - `/api/agents/<id>/sessions`                    every session of every
+   *                                                    configured instance
+   *   - `/api/agents/<id>/sessions/<sid>/transcript`   the full, message-by-
+   *     (and `?subagent=…`)                            message transcript of
+   *                                                    any of them
+   *   - `/api/oj`                                      the OJ worker snapshot
+   *
+   * TWO THINGS MAKE THAT A DIFFERENT GRANT RATHER THAN A BIGGER ONE, and they
+   * are the reason this list is spelled out instead of summarised:
+   *
+   *   1. A TRANSCRIPT IS EVERYTHING AN AGENT EVER SAW — file contents, tool
+   *      output, what the operator told it, what its subagents did — not just
+   *      what it chose to write to another agent. The board is messages; this
+   *      is the whole conversation, including things nobody composed.
+   *   2. CROSS-CREW TRANSCRIPTS HAVE NO PATH INTO EITHER CONTAINER TODAY.
+   *      `docker/run-container.sh` mounts only `$CLAWCIUS_STATE/*`, so this
+   *      socket CREATES the access rather than exposing something already
+   *      reachable. Within a crew it is different — CLAWSKY.md notes a crew
+   *      shares one container and one uid — but across crews there is no
+   *      existing route.
+   *
+   * And the caveat that goes with the larger set: credential redaction is "a
+   * mitigation and not a guarantee" (see the security-model block at the top
+   * of index.ts, point 5). That caveat was written about transcript content,
+   * so it is weaker cover here than it would be for a board of messages, not
+   * stronger.
+   *
+   * THIS IS DECIDED, NOT OVERLOOKED, AND IT WAS ASKED TWICE. The first version
+   * of this note named only the other crew's board, and the operator agreed to
+   * that description on 2026-08-17:
+   *
+   *     "I want you to be able to debug it, seeing other agents when you do
+   *      that is fine."
+   *
+   * Osmosis Jones caught that the description was materially incomplete — the
+   * same listener serves transcripts and `/api/oj`, which is the larger and
+   * different set enumerated above — and blocked #88 on it. The real grant was
+   * put to the operator again, and agreed:
+   *
+   *     "I say accept as is! Fine to have that visibility as a dev agent"
+   *
+   * The narrow disclosure was SUPERSEDED, not supplemented; there were not two
+   * different conversations. Recorded at this length because a later reader
+   * inheriting only the first version would be inheriting a grant nobody made.
    *
    * So DO NOT ADD per-crew filtering here, or read-scoping by which socket a
    * request arrived on, or a flag to turn it off. That is the isolation that
-   * was declined, and it would make the page lie about what it can see. It is
-   * written down at this length because "unix socket, no network exposure"
-   * describes the transport and reads, wrongly, like nothing widened.
+   * was declined, twice, and it would make the page lie about what it can see.
    *
    * Null — the default — means no socket for that instance and is exactly the
    * behaviour that shipped before this existed.

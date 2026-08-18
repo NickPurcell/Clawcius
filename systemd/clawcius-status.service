@@ -215,9 +215,10 @@ ReadWritePaths=-/var/lib/hamachi/run
 #
 # This unit used to say, in this spot, that it had no ReadWritePaths= at all
 # and that "the whole claim of this unit is that it writes nothing". That
-# sentence is no longer true and the two lines below are why. It is corrected
-# rather than deleted because the reasoning it carried still holds for the
-# boards, which is the case it was actually written about.
+# sentence is no longer true, and the two ReadWritePaths= lines in "The
+# agent-facing unix sockets" section ABOVE are why. It is corrected rather than
+# deleted because the reasoning it carried still holds for the boards, which is
+# the case it was actually written about.
 #
 # Note that the transcript views are unaffected either way. They are read off
 # disk and never go through SQLite.
