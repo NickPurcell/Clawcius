@@ -287,10 +287,18 @@ fi
 # children, so every tool whose children outlive it would have to do the same
 # by hand and nobody will remember to.
 #
-# What it costs: one more process, and tini rather than `sleep` receives the
-# signals. It forwards them to its child, so `docker stop` behaves as before.
+# Measured under --runtime=runsc rather than assumed, on throwaway containers
+# on this host: with --init, /proc/1/comm is docker-init and orphans made the
+# way `docker exec` makes them are reaped; the identical probe without it left
+# two zombies for the life of the container. `docker stop` returned 143 in
+# ~0.2s either way, so tini's signal forwarding costs nothing measurable, and
+# the host reports InitBinary=docker-init — no missing binary waiting on the
+# first --recreate.
 #
-# TWO THINGS IT DOES NOT DO.
+# What it costs: one more process, and tini rather than `sleep` receives the
+# signals and forwards them on.
+#
+# THREE THINGS IT DOES NOT DO.
 #
 # It does not clear the zombies already here. Their parent is pid 1, so only
 # replacing the container disposes of them — which --recreate does anyway.
@@ -304,13 +312,27 @@ fi
 # `docker/run-container.sh --recreate`, this changed the script and not the
 # deployment. See Clawcius #84.
 #
-# One thing here is unverified: that Docker's init behaves under
-# --runtime=runsc. It is an ordinary binary run as pid 1 and there is no
-# reason gVisor would treat it specially, but that is an argument rather than
-# a measurement, and it cannot be measured without recreating the container.
-# Check it on the first --recreate: `docker exec "$NAME" cat /proc/1/comm`
-# should print docker-init, and the zombie count should stay flat across a few
-# `browse` runs instead of climbing by two each time.
+# THAT IS TWO CONTAINERS, NOT ONE. systemd/hamachi-container.service runs this
+# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-17 both it
+# and clawcius-agent reported HostConfig.Init null. Each needs its own
+# --recreate, and confirming docker-init in one says nothing about the other:
+#
+#     docker container inspect -f '{{.Name}} {{.HostConfig.Init}}' \
+#         clawcius-agent hamachi-agent
+#
+# And it does not come for free, because --recreate destroys the writable
+# layer this file's header exists to protect. It restarts from $IMAGE, which
+# defaults to :latest, and docker/snapshot.sh commits to :snap-<stamp> without
+# ever retagging latest — so the obvious command discards everything the agent
+# installed since the image was built. To take the flag and keep the layer,
+# recreate from the newest snapshot instead:
+#
+#     CLAWCIUS_IMAGE=clawcius-agent:snap-<stamp> docker/run-container.sh --recreate
+#
+# Then confirm it landed here, which is a different question from whether the
+# flag works: `docker exec "$NAME" cat /proc/1/comm` should print docker-init,
+# and the zombie count should stay flat across a few `browse` runs instead of
+# climbing by two each time.
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \

@@ -130,13 +130,15 @@ WORKDIR /var/lib/clawcius/workspaces
 # 2026-08-17, before the fix: 92 of 99 processes were zombies, every one with
 # PPid 1, across fifteen different programs.
 #
-# It is not pid 1 in a container CREATED SINCE Clawcius #74, where
-# docker/run-container.sh passes --init: Docker's tini is pid 1, it reaps
-# orphans, and this runs as its child. "Created since" is load-bearing — that
-# script reuses an existing container by design, and a `docker run` flag only
-# applies at creation, so a container older than #74 still has this line at
-# pid 1 and is still leaking. `docker exec <name> cat /proc/1/comm` settles
-# which of the two you are looking at; see also #84.
+# It is not pid 1 WHEN THE CONTAINER IS CREATED BY docker/run-container.sh,
+# which passes --init (Clawcius #74): Docker's tini is pid 1, it reaps orphans,
+# and this runs as its child. Every word of that qualifier is load-bearing.
+# `docker run` of this image from anywhere else gets no init — ops/src/verify.ts
+# builds its own, and is fine only because it removes the container each run.
+# Nor does it reach a container that already exists, since that script reuses
+# by design and a run flag applies only at creation; the two long-lived
+# instances predate #74 and are still leaking until each is recreated (#84).
+# `docker exec <name> cat /proc/1/comm` settles which case you are looking at.
 #
 # DO NOT DROP THAT FLAG ON THE ASSUMPTION THAT THIS LINE IS HARMLESS. Nothing
 # in this image reaps anything, and the only thing stopping the leak is a flag
