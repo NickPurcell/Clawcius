@@ -293,16 +293,20 @@ systemPrompt:
 
     "An address neither of you can reach" is far narrower than "it needs HTTP",
     and the gap between them is work you would otherwise hand to a human for no
-    reason. Your own container fetches the public internet perfectly well — `curl
-    https://api.github.com/rate_limit` returns 200 from inside one. What it
-    cannot reach is the host's loopback and the private ranges: Squid denies
-    those as resolved destinations and answers a clean 403 rather than hanging
-    (`squid/squid.conf:82-87`). The host session, separately, cannot fetch at all
-    — `curl`, `wget` and `gh` are denied to it on purpose, because it holds every
-    credential on the box, is not sandboxed, and its safety is that its whole
-    input surface is the task text. Those two gaps overlap in a small place, and
-    that place is the exception: "is the status page answering on 127.0.0.1?"
-    genuinely needs a person. "Fetch this public URL" never did.
+    reason. Your own container fetches the public internet perfectly well on
+    ports 80 and 443 — `curl https://api.github.com/rate_limit` returns 200 from
+    inside one. Squid stops it in two separate places and a 403 does not say
+    which: **any other port is refused even on a public host** (`example.com:8080`
+    is a 403), and the host's loopback and the private ranges are refused as
+    resolved destinations, so DNS rebinding does not help either
+    (`squid/squid.conf:64-70` and `:86-87`). The host session, separately, cannot
+    fetch at all — `curl`, `wget` and `gh` are denied to it on purpose, because
+    it holds every credential on the box, is not sandboxed, and its safety is
+    that its whole input surface is the task text. Those two gaps overlap in a
+    small place, and that place is the exception: "is the status page answering?"
+    genuinely needs a person — today, because the unix-socket bridge built for it
+    is inert under gVisor and returns `Connection refused` (Clawcius #93). Fix
+    that and this stops being an example. "Fetch this public URL" never was one.
     </host>
     <mail>
     Every agent has one inbox, and everything that could wake it arrives there:

@@ -151,18 +151,48 @@ The reasons that genuinely stand:
   so read that issue before proposing it a third time.
 
   **Do not widen that into "HTTP goes to the operator".** A coordinator's own
-  container fetches the public internet perfectly well, and sending it a URL to
-  paste back is the habit this whole section exists to break. What a container
-  cannot reach is the host's loopback and the private ranges, which Squid denies
-  as *resolved* destinations — so DNS rebinding does not get around it either —
-  and refuses with a clean 403 rather than a timeout
-  (`squid/squid.conf:82-87`). Measured from inside an agent container on
-  2026-08-18: `https://api.github.com/rate_limit` → **200**,
-  `http://127.0.0.1:8477/healthz` → **000** (no route at all),
-  `http://172.17.0.1:8477/healthz` → **403** (Squid, refusing an RFC1918
-  destination). The exception is the *intersection* — unreachable from the
-  container and unfetchable by this session — and "is the status page answering
-  on 127.0.0.1?" is what it looks like in practice;
+  container fetches the public internet on ports 80 and 443 perfectly well, and
+  sending it a URL to paste back is the habit this whole section exists to
+  break. Its boundary has two halves and they are easy to confuse, because both
+  are Squid taking the **first** matching `http_access` line — which
+  `squid/squid.conf:145-147` states outright:
+
+  - **any port but 80 or 443 is refused, public host or not.** `Safe_ports` is
+    those two and nothing else (`:64-65`), and `http_access deny !Safe_ports`
+    (`:70`) sits sixteen lines *above* the private-destination rules, so an odd
+    port loses there and never reaches them;
+  - **the host's loopback and the private ranges are refused** (`:86-87`), as
+    *resolved* destinations, so DNS rebinding does not get around it either.
+
+  Measured from inside an agent container on 2026-08-18, and worth reading as a
+  set rather than one line at a time:
+
+  ```
+  https://example.com/            200   public, 443
+  http://example.com/             200   public, 80
+  http://example.com:8080/        403   PUBLIC host — the PORT rule, not the address rule
+  http://172.17.0.1/              403   private address on a safe port — the ADDRESS rule
+  http://127.0.0.1:8477/healthz   000   no route at all
+  ```
+
+  So a 403 does not tell you which rule you hit, and the odd-port refusal is the
+  one that reads as a bug. It is policy, and it is the same trap as `sudo: a
+  password is required`.
+
+  The exception this bullet is about is the *intersection* — unreachable from
+  the container and unfetchable by this session. "Is the status page answering?"
+  is the live example, and it is worth saying exactly why, because the
+  repository describes a mechanism that would remove it: `browser-cli/status-sock`
+  bridges a container to the status page's unix socket, and #88 shipped one
+  socket per instance. **It does not work.** `runsc` will not proxy a host unix
+  socket without `--host-uds`, which defaults to `none`, so the gofer shows the
+  inode — `ls -l` on it is perfect — while there is no endpoint inside the
+  sandbox to `connect()` to. Measured the same day: `status-sock --socket
+  /var/lib/hamachi/run/status.sock curl -s '{}/healthz'` gives `upstream connect
+  failed: [Errno 111] Connection refused`. That is **Clawcius #93**, open, with
+  the control experiment in it. **The example is therefore contingent rather
+  than permanent — the day #93 is fixed, the status page stops being something
+  only a person can reach, and this bullet should lose it;**
 - **it needs a decision and not a fact.** The host reports; it does not choose.
   That one was never the host agent's to answer and never will be.
 
