@@ -123,12 +123,26 @@ WORKDIR /var/lib/clawcius/workspaces
 # The container's job is to stay up. The waker attaches per session with
 # `docker exec`, so this process only has to outlive them.
 #
-# `sleep infinity` never calls wait(), which matters more than it looks: pid 1
-# is where every orphaned process in this container is reparented, so anything
-# orphaned here becomes a zombie that nothing will ever reap, and this
-# container runs with --pids-limit=512. Measured on 2026-08-16: chromium left
-# exactly two per invocation before browser-cli/browse was taught to make
-# itself a subreaper and wait() its own. That fix is per-tool, not general —
-# any other tool whose children outlive it leaks pids the same way. The general
-# fix is `docker run --init`; see Clawcius #74.
+# `sleep infinity` never calls wait(), which is why it is the wrong thing to
+# have at pid 1: every orphaned process in a PID namespace is reparented to
+# pid 1, so anything orphaned there becomes a zombie that nothing will ever
+# reap, against --pids-limit=512. Measured in the running container on
+# 2026-08-17, before the fix: 92 of 99 processes were zombies, every one with
+# PPid 1, across fifteen different programs.
+#
+# It is not pid 1 WHEN THE CONTAINER IS CREATED BY docker/run-container.sh,
+# which passes --init (Clawcius #74): Docker's tini is pid 1, it reaps orphans,
+# and this runs as its child. Every word of that qualifier is load-bearing.
+# `docker run` of this image from anywhere else gets no init — ops/src/verify.ts
+# builds its own, and is fine only because it removes the container each run.
+# Nor does it reach a container that already exists, since that script reuses
+# by design and a run flag applies only at creation; the two long-lived
+# instances predate #74 and are still leaking until each is recreated (#84).
+# `docker exec <name> cat /proc/1/comm` settles which case you are looking at.
+#
+# DO NOT DROP THAT FLAG ON THE ASSUMPTION THAT THIS LINE IS HARMLESS. Nothing
+# in this image reaps anything, and the only thing stopping the leak is a flag
+# in a script in another directory. Fixing it here instead — an ENTRYPOINT
+# that reaps — would mean shipping and maintaining an init in the image to get
+# what Docker already ships.
 CMD ["sleep", "infinity"]

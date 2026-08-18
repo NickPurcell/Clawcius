@@ -270,6 +270,107 @@ else
   echo "note: no Google Workspace key at $GWS_KEY — gdoc will report it is unconfigured"
 fi
 
+# --init makes pid 1 a real init (Docker's tini) instead of `sleep infinity`,
+# and the whole point of that is reaping.
+#
+# Every orphaned process in a PID namespace is reparented to pid 1. `sleep`
+# never calls wait(), so nothing in this container has ever reaped an orphan:
+# each one becomes a zombie that persists until the container is replaced. A
+# zombie holds no memory, which is why this does not look like the leak it is.
+# It is a PID leak, and --pids-limit below is 512. Measured inside the live
+# container on 2026-08-17: 92 of 99 processes were zombies, every one with
+# PPid 1, spread across fifteen different programs — node, timeout, python3,
+# systemctl, git, docker, curl. Twenty-eight are the chromium ones that led to
+# #74; the other sixty-four are everything else, which is the argument.
+# `browser-cli/browse` fixed its own by making itself a subreaper and wait()ing
+# them, and that cannot generalise — a process cannot reap another process's
+# children, so every tool whose children outlive it would have to do the same
+# by hand and nobody will remember to.
+#
+# Measured under --runtime=runsc rather than assumed, on throwaway containers
+# on this host: with --init, /proc/1/comm is docker-init and orphans made the
+# way `docker exec` makes them are reaped; the identical probe without it left
+# two zombies for the life of the container. `docker stop` returned 143 in
+# ~0.2s either way, so tini's signal forwarding costs nothing measurable, and
+# the host reports InitBinary=docker-init — no missing binary waiting on the
+# first --recreate.
+#
+# What it costs: one more process, and tini rather than `sleep` receives the
+# signals and forwards them on.
+#
+# THREE THINGS IT DOES NOT DO.
+#
+# It does not clear the zombies already here. Their parent is pid 1, so only
+# replacing the container disposes of them — which --recreate does anyway.
+#
+# It does not reach a container that already exists. `docker run` flags apply
+# at creation and this script reuses by default, so on every path that returns
+# above this line the flag is inert and pid 1 is still `sleep infinity`.
+# Nothing says so out loud: warn_stale_env compares .env's mtime against the
+# container's start time and has no opinion about flags, so `up.sh` prints
+# "reusing" and looks exactly as it did before. Until somebody runs
+# `docker/run-container.sh --recreate`, this changed the script and not the
+# deployment. See Clawcius #84.
+#
+# THAT IS TWO CONTAINERS, NOT ONE. systemd/hamachi-container.service runs this
+# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-17 both it
+# and clawcius-agent reported HostConfig.Init null. Each needs its own
+# --recreate, and confirming docker-init in one says nothing about the other:
+#
+#     docker container inspect -f '{{.Name}} {{.HostConfig.Init}}' \
+#         clawcius-agent hamachi-agent
+#
+# DO NOT RECREATE THE SECOND BY OVERRIDING ONLY THE NAME. The command that
+# comes to mind,
+#
+#     CLAWCIUS_CONTAINER=hamachi-agent docker/run-container.sh --recreate
+#
+# is destructive: every other value above falls back to its instance-1
+# default, so hamachi-agent returns built from clawcius's image, holding
+# clawcius's .env, with /var/lib/clawcius/workspaces mounted and
+# /var/lib/clawcius/agent-home as its Claude credential — two agents on one
+# login and one workspace, which is the state the AGENT_HOME paragraph above
+# exists to prevent. The `docker rm -f` has already run by the time any of
+# that is visible.
+#
+# The five values it needs live in systemd/hamachi-container.service. They are
+# deliberately NOT copied here, because a second copy is a thing that drifts;
+# read them from the unit at the moment you need them:
+#
+#     systemctl show hamachi-container -p Environment
+#
+# And it does not come free, because --recreate destroys the writable layer
+# this file's header exists to protect. It restarts from $IMAGE, which
+# defaults to :latest, and docker/snapshot.sh commits to :snap-<stamp> without
+# ever retagging latest — so the default genuinely does discard everything
+# installed since the image was built.
+#
+# There are two forms and neither is the default answer:
+#
+#     docker/run-container.sh --recreate                       # from :latest
+#     CLAWCIUS_IMAGE=<repo>:snap-<stamp> docker/run-container.sh --recreate
+#
+# If you take the second, take a snapshot FIRST rather than reaching for the
+# newest existing tag. clawcius-snapshot.timer is the only snapshot timer on
+# this host and clawcius-snapshot.service passes no environment, so it covers
+# instance 1 and nothing else — hamachi's newest tag is 2026-08-14, and even
+# instance 1's is up to a day old (#87). snapshot.sh reads the same
+# CLAWCIUS_CONTAINER, so it is one command per instance and it prints the tag
+# it wrote:
+#
+#     CLAWCIUS_CONTAINER=<name> docker/snapshot.sh
+#
+# The second when the layer holds work that is not in the image yet. The first
+# when losing the layer is the POINT — a rebuild that ships what was being
+# staged by hand makes the reset the outcome you wanted, not the price you
+# paid. That is a question about what is in the layer and what the current
+# image already ships, and the answer changes; do not read either line here as
+# the standing recommendation.
+#
+# Then confirm it landed here, which is a different question from whether the
+# flag works: `docker exec "$NAME" cat /proc/1/comm` should print docker-init,
+# and the zombie count should stay flat across a few `browse` runs instead of
+# climbing by two each time.
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -293,6 +394,7 @@ docker run -d \
   "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \
   --memory="$MEMORY" \
+  --init \
   --pids-limit=512 \
   --security-opt=no-new-privileges:true \
   --cap-drop=NET_RAW --cap-drop=MKNOD --cap-drop=AUDIT_WRITE \
