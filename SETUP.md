@@ -476,7 +476,7 @@ sudo chown -R npurcell:npurcell /home/npurcell/clawcius   # if a root build got 
 cd /home/npurcell/clawcius/ops
 npm install
 npm run build
-npm run selftest              # 58 tests, no docker required
+npm run selftest              # 61 tests, no docker required
 
 sudo cp ../systemd/clawcius-ops.service \
         ../systemd/clawcius-snapshot-verify.service \
@@ -741,6 +741,59 @@ Two habits that go with it:
 - **Do not gate on `$?` after a pipe.** `npm run build 2>&1 | tail -3; echo $?`
   prints `tail`'s status, not the build's — it says `0` over a failed build.
   Use `${PIPESTATUS[0]}`, or do not pipe.
+
+### Asking a running service which commit it is
+
+Every unit that runs `node dist/…` prints its build identity as its **first**
+line, before it loads config and before anything can stop it:
+
+```sh
+journalctl -u clawcius-status          -b | grep -m1 'build '
+journalctl -u clawcius-ops             -b | grep -m1 'build '
+journalctl -u clawcius                 -b | grep -m1 'build '
+journalctl -u hamachi                  -b | grep -m1 'build '
+journalctl -u clawcius-snapshot-verify -b | grep -m1 'build '
+git -C /home/npurcell/clawcius rev-parse --short HEAD    # compare
+```
+
+It is printed from a module imported *before* the config loader, on purpose:
+`clawcius-ops` failed to start 22,675 consecutive times inside its config
+loader, and a banner emitted after the config parsed would have appeared on
+none of them. `clawcius-ops` also writes the same identity into
+`journal.jsonl`'s boot entry and into the `build` field of `ops-status.json`;
+each waker writes it into its `waker-status.json`.
+
+```
+[status] build 84ec62e (main) built 2026-08-18T09:12:44.017Z from a clean tree
+```
+
+Three states, and the difference between them is the point:
+
+| Line says | Means |
+|---|---|
+| `… from a clean tree` | The artefact is that commit. Compare the sha with `rev-parse` and you are done. |
+| `… from a DIRTY tree — N uncommitted path(s): …` | The sha is where the tree started, not what was compiled. The line names the files and says outright that the artefact is not that commit. |
+| `UNKNOWN — <reason>` | Git could not be asked at build time. Nothing is guessed and nothing "clean" is printed. The service still boots. |
+
+The sha is **baked in by `scripts/build-info.mjs` at build time**, not read from
+git at startup, and the whole value is in that distinction. On 2026-08-10 the
+status page was deployed without a rebuild and served an eight-day-old `dist/`
+while the checkout sat at the right commit: a runtime `git rev-parse` would have
+printed a perfectly correct sha for code that was not running (Clawcius #90). In
+the same week `clawcius-ops` failed to start 22,675 times on a `dist/` older
+than its own config (#89). Both were found by listing a directory and eyeballing
+timestamps, because **the journal is the only verification channel there is** —
+the host agent can read journals and cannot make an HTTP request, by design, and
+the container agents cannot reach the host at all.
+
+The generator is wired into `build`, `typecheck` and `dev` in all three
+packages, and writes an untracked `src/build-info.ts`. It never fails a build: a
+tree that cannot name itself still ships, saying so. **A bare `npx tsc` skips
+it** and will compile new code carrying an older sha — use `npm run build`.
+
+`status/` also prints, and re-probes on every `/healthz`, whether it can
+actually read each configured root and board — with the errno, the mode and the
+owning uid when it cannot. See [`status/README.md`](status/README.md).
 
 ---
 

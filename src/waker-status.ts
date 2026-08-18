@@ -33,8 +33,18 @@
 
 import { mkdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { BUILD_INFO, type BuildInfo } from './build-info.js';
 
 export type WakerStatus = {
+  /**
+   * Which code wrote this file — compiled in at build time, not read from git
+   * at runtime, because the checkout and the `dist/` disagree exactly when it
+   * matters. The executor does not read this field; it is here because this
+   * file is one of the few things on the host that says what the waker is, and
+   * "is the running waker the commit I deployed?" should be answerable by
+   * `cat` rather than by comparing directory timestamps (Clawcius #90).
+   */
+  build: BuildInfo;
   /** Instance name, matching the `instances:` key in ops-config.yaml. */
   instance: string;
   /** Sessions currently holding a `claude` child process. 0 means idle. */
@@ -136,6 +146,7 @@ export class WakerStatusPublisher {
     const now = Date.now();
     const liveCount = this.#options.liveCount();
     const status: WakerStatus = {
+      build: BUILD_INFO,
       instance: this.#options.instance,
       liveCount,
       maxConcurrent: this.#options.maxConcurrent,

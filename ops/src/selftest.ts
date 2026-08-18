@@ -2806,6 +2806,33 @@ test('the ops-status.json the page reads is valid and describes the current stat
   assert.equal(state['current'], 'idle');
   assert.equal(state['dryRun'], true);
   assert.ok(Array.isArray(payload['events']));
+
+  // Which code wrote the file. Without this, `ops-status.json` describes the
+  // daemon's state in detail and says nothing about whether the daemon is the
+  // commit anybody deployed — which is #89: 22,675 consecutive failed starts
+  // on a `dist/` older than its own config, found by listing a directory.
+  //
+  // The value is asserted as PRESENT and SHAPED, not as any particular sha:
+  // it is whatever the generator baked in, and in a temporary checkout or a
+  // tarball that is legitimately `null` with a reason.
+  const build = payload['build'] as Record<string, unknown> | undefined;
+  assert.ok(build, 'ops-status.json must say which build wrote it');
+  assert.equal(build['service'], 'clawcius-ops');
+  assert.ok('commit' in build, 'build.commit must be present, even when null');
+  assert.equal(typeof build['line'], 'string');
+  // `dirty` is a tri-state on purpose. `false` means git said clean; `null`
+  // means git could not be asked, and rendering that as clean is the lie the
+  // whole mechanism exists to avoid.
+  assert.ok(
+    build['dirty'] === true || build['dirty'] === false || build['dirty'] === null,
+    'build.dirty must be true, false or null — never absent',
+  );
+  if (build['commit'] === null) {
+    assert.equal(build['dirty'], null, 'an unknown commit cannot have a known tree state');
+    assert.equal(typeof build['unknownReason'], 'string');
+    assert.match(build['line'] as string, /^UNKNOWN — /);
+  }
+
   executor.stop();
 });
 

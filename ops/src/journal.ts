@@ -26,6 +26,7 @@
 
 import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { BUILD_INFO } from './build-info.js';
 
 export type JournalKind =
   | 'boot'
@@ -290,6 +291,12 @@ export class Journal {
       service: 'clawcius-ops',
       generatedAt: Date.now(),
       generatedAtIso: new Date().toISOString(),
+      // Which code wrote this file, compiled in at build time rather than
+      // asked of git at runtime — the two differ exactly when it matters. A
+      // reader of ops-status.json can now tell a daemon running the commit
+      // they deployed from one running a `dist/` that predates it, which is
+      // #89 in a field instead of in a directory listing.
+      build: BUILD_INFO,
       state: this.#snapshot(),
       events: this.#recent,
     };

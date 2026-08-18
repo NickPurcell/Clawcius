@@ -8,12 +8,12 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "build": "node ../scripts/build-info.mjs && tsc -p tsconfig.json",
+    "dev": "node ../scripts/build-info.mjs && node --watch --experimental-strip-types src/index.ts",
     "start": "node dist/index.js",
     "verify": "node dist/verify-main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "selftest": "tsc -p tsconfig.json && node --test dist/selftest.js"
+    "typecheck": "node ../scripts/build-info.mjs && tsc -p tsconfig.json --noEmit",
+    "selftest": "node ../scripts/build-info.mjs && tsc -p tsconfig.json && node --test dist/selftest.js"
   },
   "dependencies": {
     "yaml": "^2.9.0"
