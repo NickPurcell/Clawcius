@@ -112,6 +112,44 @@ block in `ops-config.yaml`. Without one, a coordinator DMing `<crew>-host` is
 told there is no such recipient, which is the honest answer — and since
 2026-08-16 it is also the last answer, because there is no other door.
 
+### Ask the host, not the operator (2026-08-17)
+
+The verb list went because it turned the operator into the agent's hands. A
+coordinator that asks the operator to run something is doing that again by
+habit, with nothing in the way this time — so **DM the host agent by default,
+and treat asking the operator as the exception that needs a reason.**
+
+This is written down because it went wrong the ordinary way rather than the
+interesting way. Across one incident on 2026-08-17 the operator copy-pasted
+**seven** command outputs into Discord — `journalctl` for two units, a cgroup's
+`memory.events`, `free`, `ps`, `systemctl --failed`, `ls /etc/systemd/system` —
+and only **two** of the things asked of him that night were genuinely beyond the
+host agent: a `docker inspect` with a field outside the whitelist, and a `curl`.
+Ten commands were handed to the host agent afterwards to check, and **eight ran.**
+Nothing had refused them; nobody had asked. Some of that was at 04:00 local,
+which is the real cost of the habit.
+
+The reasons that genuinely stand, all of them visible in that incident:
+
+- **it needs `docker exec`, or a `docker inspect` field outside the enumerated
+  set.** Both are deliberately ungranted rather than overlooked — `exec` is a
+  session running as another crew with that crew's credentials, and the
+  `inspect` formats were enumerated on 2026-08-12 because the wildcard printed
+  the sibling agents' API keys. See [§ Sudoers](#sudoers);
+- **it needs an HTTP request.** `curl`, `wget` and `gh` are in `LIVE_TOOL_DENY`
+  (`ops/src/host-agent.ts:584`) **by design, not by oversight.** This session
+  holds every credential on the box and is not sandboxed; the entire reason that
+  is tolerable is that its input surface is task text a coordinator wrote and a
+  briefing this daemon assembled. A fetch is how a stranger's words get into it.
+  Filed as a capability gap in Clawcius #91 and **closed as not planned** — this
+  is not a limitation waiting to be lifted, so read that issue before proposing
+  it a third time;
+- **it needs a decision and not a fact.** The host reports; it does not choose.
+  That one was never the host agent's to answer and never will be.
+
+Everything else — reading a journal, a unit's state, a cgroup counter, what is
+in `/etc/systemd/system`, how much memory is left — is a DM.
+
 ## The spools, and what went with them (2026-08-16)
 
 There used to be two directory-as-a-queue spools, one pair per instance inside
@@ -957,7 +995,7 @@ can edit, as root" — i.e. `sudo ALL`. That is why there is no rule for
 containers recreated: **the executor runs those two itself, as root, with an
 argv it builds.**
 
-### Two things about sudo's matching that shaped the file
+### Things about sudo's matching that shaped the file
 
 - **`*` matches `/` and spaces.** sudo joins the arguments into one string and
   `fnmatch`es it without `FNM_PATHNAME`. So the old `chown … /var/lib/clawcius*`
@@ -980,6 +1018,15 @@ argv it builds.**
   and only the second is granted. A refusal on a unit you are sure is listed is
   almost always this. Both spellings are not listed, deliberately: the value of
   the file is that it can be read in one sitting.
+- **`sudo: a password is required` means "not on the grant list", not "the
+  credentials are wrong".** There is no password to get right — the account is
+  `NOPASSWD` for everything this file names, and sudo falls through to its
+  ordinary password prompt for everything it does not. So that message is the
+  refusal, arriving in the least helpful available wording, and the fix is a
+  line in this file rather than anything to do with authentication.
+  `Defaults:CLAWCIUS_AGENT !requiretty` is why you see it in a second instead of
+  watching the task hang to its timeout. It was read as a credentials problem
+  several times on 2026-08-17 before anyone checked.
 
 ### What it still does not buy, stated plainly
 
