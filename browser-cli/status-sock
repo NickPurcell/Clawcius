@@ -137,16 +137,15 @@ def resolve_socket(explicit):
             % ", ".join(found)
         )
 
+    # `state` is necessarily empty here — the truthy branch returned above — so
+    # this says so rather than carrying a "set to ..." arm that cannot run.
     die(
-        "cannot find the status socket. Looked at $STATUS_SOCKET, then "
-        "$STATE_DIRECTORY/%s (STATE_DIRECTORY is %s), then /var/lib/*/%s.\n"
+        "cannot find the status socket. Looked at $STATUS_SOCKET (not set), then "
+        "$STATE_DIRECTORY/%s (STATE_DIRECTORY not set, which is normal outside an "
+        "agent turn), then /var/lib/*/%s (no match).\n"
         "  Pass --socket if it is somewhere else. If it is simply not there, the status\n"
-        "  service has not created it — see the note under 'no socket at' below."
-        % (
-            DEFAULT_SOCKET_NAME,
-            "set to " + state if state else "not set, which is normal outside an agent turn",
-            DEFAULT_SOCKET_NAME,
-        )
+        "  service has not created it — see the note under 'no socket at'."
+        % (DEFAULT_SOCKET_NAME, DEFAULT_SOCKET_NAME)
     )
 
 
@@ -262,8 +261,17 @@ def main(argv):
     except OSError as error:
         die("cannot bind 127.0.0.1:%d: %s" % (args.port, error))
     listener.listen(16)
-    port = listener.getsockname()[1]
-    base = "http://127.0.0.1:%d" % port
+    # DERIVED FROM THE SOCKET, not rebuilt from a literal.
+    #
+    # This used to read `base = "http://127.0.0.1:%d" % port`, which produced a
+    # loopback URL whatever `bind()` had actually been given — so a test that
+    # asserted on $STATUS_URL was asserting on a constant and would pass with
+    # the wildcard. Osmosis Jones demonstrated exactly that with `sed` in review
+    # of #88. Reading the host back off the socket makes the environment
+    # variable report the real bind, which is both more honest and what lets a
+    # test see the difference.
+    host, port = listener.getsockname()[:2]
+    base = "http://%s:%d" % (host, port)
 
     threading.Thread(target=accept_loop, args=(listener, socket_path), daemon=True).start()
 

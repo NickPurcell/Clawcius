@@ -15,7 +15,9 @@ Same convention as `test_browse.py`: `npm test` runs `node --test`, so this is
 not wired into it. Run it by hand when touching `status-sock`.
 """
 
+import contextlib
 import http.server
+import io
 import importlib.machinery
 import importlib.util
 import os
@@ -37,6 +39,20 @@ status_sock = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(status_sock)
 
 SCRIPT = str(Path(__file__).with_name("status-sock"))
+
+
+def non_loopback_address():
+    """An IPv4 address of this host that is not 127.0.0.0/8, or None.
+
+    Used to prove the bridge is NOT reachable off loopback. A test that only
+    inspects a string cannot tell a loopback bind from a wildcard one; actually
+    trying to connect from another local address can.
+    """
+    try:
+        addr = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+    return None if addr.startswith("127.") else addr
 
 
 class UnixHTTPServer(http.server.ThreadingHTTPServer):
@@ -124,20 +140,52 @@ class ForwarderTest(unittest.TestCase):
         # that some request was made.
         self.assertEqual(result.stdout.strip(), "/echo-path")
 
-    def test_status_url_is_loopback_and_not_the_wildcard(self):
-        # Binding 0.0.0.0 would offer the whole status page — both crews — to
-        # every other container on clawcius-internal.
-        result = self.run_sock(sys.executable, "-c", "import os;print(os.environ['STATUS_URL'])")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("http://127.0.0.1:"))
+    def test_the_bridge_is_not_reachable_from_a_non_loopback_address(self):
+        """The real guard on the wildcard bind.
 
-    def test_listener_binds_loopback_only(self):
-        # Asserted against the socket itself rather than only the URL string.
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind(("127.0.0.1", 0))
-        host, _ = listener.getsockname()
-        listener.close()
-        self.assertEqual(host, "127.0.0.1")
+        This container sits on `clawcius-internal` with other containers. If
+        `status-sock` bound 0.0.0.0 it would offer the whole status page — both
+        crews' boards and every transcript — to every one of them, which is the
+        one thing this tool must not do.
+
+        THE PREVIOUS VERSION OF THIS TEST WAS HOLLOW. It bound its *own* socket
+        to 127.0.0.1 and asserted on that socket's getsockname(), never invoking
+        `status-sock` at all, so it passed with `bind()` mutated to the
+        wildcard. Osmosis Jones demonstrated that with `sed`. This one drives
+        the real tool and probes it from a real non-loopback address, and has
+        been checked to go red under the same mutation.
+        """
+        addr = non_loopback_address()
+        if addr is None:
+            self.skipTest("no non-loopback address on this host to probe from")
+
+        # The child reports both what the tool told it, and whether the bridge
+        # answers on an address that is not loopback.
+        result = self.run_sock(
+            sys.executable,
+            "-c",
+            "import os,socket,urllib.parse as up;"
+            "u=up.urlparse(os.environ['STATUS_URL']);"
+            "s=socket.socket();s.settimeout(5);"
+            "r=s.connect_ex((%r,u.port));s.close();"
+            "print(u.hostname);print('REACHABLE' if r==0 else 'REFUSED')" % addr,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reported_host, reachability = result.stdout.split()
+
+        # Two independent assertions on the same property. The first catches a
+        # wildcard bind via the URL the tool publishes (which is now read back
+        # off the socket, not rebuilt from a literal); the second catches it by
+        # actually trying to reach the port from off-loopback.
+        self.assertEqual(
+            reported_host, "127.0.0.1", "STATUS_URL must report a loopback bind"
+        )
+        self.assertEqual(
+            reachability,
+            "REFUSED",
+            "the bridge answered on %s — it is bound to the wildcard and is "
+            "offering the status page to every other container on this network" % addr,
+        )
 
     def test_exit_code_is_the_child_s(self):
         # Otherwise a failing `browse` inside the wrapper looks like a success.
@@ -271,6 +319,52 @@ class ResolutionTest(unittest.TestCase):
         finally:
             del os.environ["STATE_DIRECTORY"]
 
+
+
+class GlobFallbackTest(unittest.TestCase):
+    """The last resort, for the contexts STATE_DIRECTORY does not reach.
+
+    The real glob is over `/var/lib/*/run/status.sock`, which a test cannot
+    create, so `glob.glob` is patched. That is enough: what is worth pinning is
+    the decision logic — one match is used, several is a refusal rather than a
+    guess, none falls through to an error naming everywhere it looked.
+    """
+
+    def setUp(self):
+        self._real = status_sock.glob.glob
+        for key in ("STATE_DIRECTORY", "STATUS_SOCKET"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        status_sock.glob.glob = self._real
+
+    def test_one_match_is_used(self):
+        status_sock.glob.glob = lambda _p: ["/var/lib/hamachi/run/status.sock"]
+        self.assertEqual(status_sock.resolve_socket(None), "/var/lib/hamachi/run/status.sock")
+
+    def test_several_matches_refuse_rather_than_guess(self):
+        # A container mounts exactly one instance's run directory, so more than
+        # one match means the assumption is wrong. Picking one would send the
+        # agent at a socket in a directory it does not have.
+        status_sock.glob.glob = lambda _p: [
+            "/var/lib/clawcius/run/status.sock",
+            "/var/lib/hamachi/run/status.sock",
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            status_sock.resolve_socket(None)
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_no_match_names_everywhere_it_looked(self):
+        # The error an agent reads when nothing is set and nothing is there. It
+        # must not tell them to set STATE_DIRECTORY, which they cannot do.
+        status_sock.glob.glob = lambda _p: []
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            status_sock.resolve_socket(None)
+        message = err.getvalue()
+        self.assertIn("STATUS_SOCKET", message)
+        self.assertIn("STATE_DIRECTORY", message)
+        self.assertIn("/var/lib/", message)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

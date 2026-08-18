@@ -363,13 +363,24 @@ codes and the two chromium flags that must not be removed.
 python3 browser-cli/test_status_sock.py
 ```
 
-15 tests for `status-sock`, driven end to end against a real unix socket in a
+17 tests for `status-sock`, driven end to end against a real unix socket in a
 temp directory — the bytes crossing, `{}` substitution keeping the path suffix,
-`$STATUS_URL`, exit-code propagation, concurrent requests, `NO_PROXY` being
-extended rather than replaced, and that **no listener survives the run**, which
-is the whole argument for a wrapper instead of a daemon. Plus the refusals: a
-missing socket, a regular file at the socket path, no command, and a command
-that does not exist.
+exit-code propagation, concurrent requests, `NO_PROXY` being extended rather
+than replaced, and that **no listener survives the run**, which is the whole
+argument for a wrapper instead of a daemon. Plus the refusals: a missing socket,
+a regular file at the socket path, no command, a command that does not exist,
+and the glob fallback's three outcomes.
+
+The one to be careful with is
+`test_the_bridge_is_not_reachable_from_a_non_loopback_address`. It replaces two
+earlier tests that **both passed with `bind()` mutated to `0.0.0.0`** — one
+asserted on a socket it had bound itself and never ran `status-sock` at all, the
+other read `$STATUS_URL`, which was built from a hardcoded literal. The
+replacement drives the real tool and probes the port from this container's
+non-loopback address, requiring it refused. Verified red under
+`sed s/127.0.0.1/0.0.0.0/` and green without it; `$STATUS_URL` is now read back
+off the socket, so it reports the real bind. If you touch the bind, re-run that
+mutation rather than trusting the suite went green.
 
 Added because Osmosis Jones pointed out in review of #88 that the service side
 got 17 tests and the half that runs in the container got none.
