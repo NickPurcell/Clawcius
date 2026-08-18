@@ -25,6 +25,13 @@
  * failures only appear in a log file is a verifier nobody reads.
  */
 
+// FIRST, and it must stay first. A oneshot rather than a long-lived service,
+// and it gets the same line for the same reason: it runs out of the same
+// `dist/` as the daemon, so it is subject to the same staleness, and a
+// verifier that is itself out of date is worse than no verifier. See
+// build-banner.ts.
+import './build-banner.js';
+
 import { loadOpsConfig } from './config.js';
 import { Journal } from './journal.js';
 import { Runner } from './runner.js';

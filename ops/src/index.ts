@@ -21,8 +21,15 @@
  * week of that log, then turn it off.
  */
 
+// FIRST, and it must stay first. This prints which commit this artefact was
+// built from, as a side effect of being imported. #89 is 22,675 consecutive
+// failed starts inside the config loader below; a banner in this file's body
+// would have printed on none of them. See build-banner.ts.
+import './build-banner.js';
+
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
+import { BUILD_INFO } from './build-info.js';
 import { loadOpsConfig } from './config.js';
 import { Executor } from './executor.js';
 import { ensureDirOwnedBy } from './dirs.js';
@@ -177,6 +184,12 @@ executor.journal.write({
   what: 'clawcius-ops',
   dryRun: config.dryRun,
   detail:
+    // First thing in the boot entry, before the pid and the counts: this is
+    // the string a verifier compares against `git rev-parse HEAD` to answer
+    // "did the deploy work?", and the journal is the only channel by which
+    // they can answer it — the host agent cannot make an HTTP request
+    // (host-agent.ts) and the container agents cannot reach this host at all.
+    `BUILD ${BUILD_INFO.line} — ` +
     `pid ${process.pid}; state ${config.stateDir}; ` +
     `${config.units.length} unit(s) and ${config.instances.length} container(s) health-` +
     `checked around every task; ${config.repos.length} repo(s) in the briefing. ` +

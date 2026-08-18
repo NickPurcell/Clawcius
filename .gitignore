@@ -9,6 +9,18 @@
 # comes back. See Clawcius #60.
 node_modules
 dist/
+
+# Written by scripts/build-info.mjs immediately before every `tsc`, in all three
+# packages. Untracked deliberately: a tracked copy would be rewritten by every
+# build, so every build would leave the tree dirty — and a dirty tree is what
+# stops `git pull` on the host (ops/src/build.ts), and would also make every
+# artefact report itself as built from a dirty tree, forever. Listed one path
+# per package rather than as a bare basename, so a fourth package is a visible
+# omission instead of a silent inclusion.
+src/build-info.ts
+status/src/build-info.ts
+ops/src/build-info.ts
+
 # Per-instance env files each carry a bot token. The negation keeps the
 # template tracked — without it, adding .env.* silently untracks the one file
 # here that is meant to be committed.

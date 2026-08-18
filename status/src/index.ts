@@ -64,12 +64,20 @@
  *      list in `transcripts.ts`.
  */
 
+// FIRST, and it must stay first. This prints which commit this artefact was
+// built from, as a side effect of being imported, so that the line comes out
+// even when a later import or the config loader ends the process. See
+// build-banner.ts.
+import './build-banner.js';
+
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BUILD_INFO } from './build-info.js';
 import { isLoopback, loadStatusConfig } from './config.js';
 import { readOjSnapshot } from './oj.js';
+import { probeAll, processIdentity, targetsFor } from './reach.js';
 import { bindUnixSockets, releaseSocketPath, type SocketOutcome } from './socket.js';
 import { isValidSubagentId, TranscriptStore } from './transcripts.js';
 import {
@@ -83,6 +91,9 @@ import { BoardWatcher, RootWatcher, type ChangeEvent } from './watch.js';
 
 const config = loadStatusConfig();
 const store = new TranscriptStore(config);
+
+/** The paths whose readability decides whether this page can answer anything. */
+const reachTargets = targetsFor(config);
 
 const PUBLIC_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
@@ -400,6 +411,59 @@ async function handleAsset(pathname: string, response: ServerResponse): Promise<
 let socketOutcomes: SocketOutcome[] = [];
 
 /**
+ * `/healthz` — what this process is, and what it can currently reach.
+ *
+ * `build` is the compiled-in identity of this artefact. It is the same string
+ * the boot banner printed, available to anything that can make a request rather
+ * than only to whoever was reading the journal at the time. Note that the two
+ * verification channels are not equivalent: the host agent CANNOT make an HTTP
+ * request by design (`ops/src/host-agent.ts`), so the journal line is the one
+ * that has to stand on its own, and this is a convenience on top of it.
+ *
+ * `reach` is probed on every request rather than remembered from boot. A
+ * snapshot taken at startup and served for three weeks is the same category of
+ * defect as the stale `dist/` that all of this is for: a sentence that was true
+ * when it was written and is printed in a state nobody has checked. Each entry
+ * carries its own `checkedAt` so it cannot be mistaken for a standing fact.
+ *
+ * `ok` deliberately stays true when a path is unreachable. This service is
+ * still healthy — it is answering, watching and streaming — and flipping it
+ * would make a systemd health check restart a process that is doing its job
+ * about a directory that a restart cannot create. The unreachable entries are
+ * the report; `ok` is about the process.
+ */
+async function handleHealth(response: ServerResponse): Promise<void> {
+  const reach = await probeAll(reachTargets);
+  sendJson(response, 200, {
+    ok: true,
+    build: BUILD_INFO,
+    uptimeSeconds: Math.round(process.uptime()),
+    agents: config.agents.length,
+    streams: streams.size,
+    watched: watcher.watchedCount,
+    unwatched: Object.fromEntries(watcher.unwatched),
+    // Who the answers below are about. "not readable" is only actionable next
+    // to "by whom".
+    identity: processIdentity(),
+    reach,
+    unreachable: reach.filter((result) => !result.ok).length,
+    // One entry per configured socket, listening or not, with the reason.
+    // Reported even when every socket is healthy: "which of these is the
+    // one my container mounts" is the first question when it is not.
+    sockets: socketOutcomes.map((outcome) =>
+      outcome.listening
+        ? // `dropped` is connections refused because the per-socket
+          // maxConnections cap was already reached. Non-zero means a
+          // container is opening far more than it needs — which, before the
+          // cap existed, is what could exhaust the process's descriptors and
+          // silently stop the TCP listener answering.
+          { path: outcome.path, listening: true, dropped: outcome.dropped }
+        : { path: outcome.path, listening: false, reason: outcome.reason },
+    ),
+  });
+}
+
+/**
  * The one request listener, shared by every listener socket.
  *
  * Named and hoisted out of `createServer` because there is now more than one
@@ -430,26 +494,11 @@ const handleRequest = (request: IncomingMessage, response: ServerResponse): void
   }
 
   if (url.pathname === '/healthz') {
-    sendJson(response, 200, {
-      ok: true,
-      uptimeSeconds: Math.round(process.uptime()),
-      agents: config.agents.length,
-      streams: streams.size,
-      watched: watcher.watchedCount,
-      unwatched: Object.fromEntries(watcher.unwatched),
-      // One entry per configured socket, listening or not, with the reason.
-      // Reported even when every socket is healthy: "which of these is the
-      // one my container mounts" is the first question when it is not.
-      sockets: socketOutcomes.map((outcome) =>
-        outcome.listening
-          ? // `dropped` is connections refused because the per-socket
-            // maxConnections cap was already reached. Non-zero means a
-            // container is opening far more than it needs — which, before the
-            // cap existed, is what could exhaust the process's descriptors and
-            // silently stop the TCP listener answering.
-            { path: outcome.path, listening: true, dropped: outcome.dropped }
-          : { path: outcome.path, listening: false, reason: outcome.reason },
-      ),
+    // Async because it re-probes the filesystem; see `handleHealth`.
+    handleHealth(response).catch((error: unknown) => {
+      console.error('[status] /healthz failed:', error);
+      if (!response.headersSent) fail(response, 500, 'internal error');
+      else response.end();
     });
     return;
   }
@@ -494,9 +543,43 @@ server.listen(config.server.port, config.server.host, () => {
     `[status] listening on http://${config.server.host}:${config.server.port} ` +
       `(loopback only — expose with: tailscale serve --bg ${config.server.port})`,
   );
-  for (const agent of config.agents) {
-    console.log(`[status]   ${agent.id}: ${agent.projectsRoot}`);
-  }
+  // What this process can reach, NOT what it was configured with.
+  //
+  // The line that used to be here was `${agent.id}: ${agent.projectsRoot}` —
+  // the config file read back to itself. It would print identically on a host
+  // where the directory had been renamed, which is the whole objection to it.
+  // See reach.ts, including what this deliberately does not cover (#72).
+  //
+  // Not awaited: the listener is already up and nothing serving depends on the
+  // answer. A hung mount delays this report and nothing else.
+  console.log(`[status]   this process is ${processIdentity()}`);
+  void probeAll(reachTargets).then((results) => {
+    for (const result of results) {
+      const line =
+        `[status]   ${result.scope} ${result.what}: ${result.path} — ` +
+        `${result.ok ? 'OK' : 'UNREACHABLE'}: ${result.detail}`;
+      if (result.ok) console.log(line);
+      else console.warn(line);
+    }
+    const bad = results.filter((result) => !result.ok).length;
+    if (bad > 0) {
+      console.warn(
+        `[status]   ${bad} of ${results.length} configured path(s) UNREACHABLE — the page ` +
+          'will render those sections empty, which looks exactly like a quiet host. ' +
+          'Re-probed on every /healthz.',
+      );
+    }
+  }).catch((error: unknown) => {
+    // `probe` cannot reject today — every fs call in it is inside a try — so
+    // this is not covering a live path. It is here because the whole argument
+    // of this change is that the identity line must survive a process that is
+    // about to die, and an unhandled rejection under Node's default policy is
+    // one of the ways it dies. The guarantee should be structural, not
+    // contingent on nobody later adding an `await` outside a `try`. The two
+    // request-path promises forty lines up already say exactly this.
+    console.error('[status] boot reachability report failed:', error);
+  });
+
   for (const [scope, reason] of watcher.unwatched) {
     // A warning, not a failure: the rescan timer covers it, and a root that
     // does not exist yet is the normal state of a new instance.
@@ -521,6 +604,14 @@ void bindUnixSockets(socketPaths, handleRequest).then((outcomes) => {
       console.warn(`[status]   NOT listening on ${outcome.path}: ${outcome.reason}`);
     }
   }
+}).catch((error: unknown) => {
+  // Same reasoning as the reachability report above, and added at the same
+  // time: `bindUnixSockets` resolves every failure into a `SocketOutcome` and
+  // does not reject today, so this is not a live path either. It is here
+  // because leaving one of the two boot promises bare while adding a handler
+  // to the other would make the argument for the first one untrue.
+  console.error('[status] binding unix sockets failed:', error);
+  console.error('[status] the TCP listener is unaffected; no container can reach the page.');
 });
 
 function shutdown(signal: string): void {

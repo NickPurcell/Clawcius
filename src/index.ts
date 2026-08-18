@@ -10,6 +10,13 @@
  * indistinguishable from the bot being down. So the waker says something.
  */
 
+// FIRST, and it must stay first. This prints which commit this artefact was
+// built from, as a side effect of being imported. `./config.js` below throws
+// at IMPORT time on a missing environment variable, so anything printed from
+// this file's body would be lost in precisely the case worth reporting. See
+// build-banner.ts.
+import './build-banner.js';
+
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
 import { config } from './config.js';

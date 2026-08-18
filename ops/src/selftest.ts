@@ -2745,6 +2745,75 @@ test('a clean exit with is_error is a failure, not a success', () => {
   assert.equal(judge({ ...base, resultSubtype: 'error_max_budget' }).reason, 'budget');
 });
 
+test('the build banner survives the config load that kills this daemon', () => {
+  // #89 in one test. `clawcius-ops` failed to start 22,675 consecutive times,
+  // every one of them inside `loadOpsConfig`, on a `dist/` that predated the
+  // config it was choking on — and nothing in those 22,675 journal entries said
+  // which build was failing. That is the entire point of the banner, and this
+  // is the package the incident was about.
+  //
+  // ── What is actually load-bearing here, measured rather than assumed ──────
+  //
+  // Moving `import './build-banner.js'` below `./config.js` in this package's
+  // index.ts does NOT break the banner, and that was checked by doing it and
+  // rebuilding rather than by reasoning about it. The reason is that
+  // `loadOpsConfig` throws when it is CALLED, from index.ts's own body, which
+  // runs after every import has evaluated — so any import position works. The
+  // waker is the opposite case: `src/config.ts` evaluates `loadAgentConfig()`
+  // at import time, so there the position is the whole mechanism, and the test
+  // in test/build-info.test.js does fail when it is moved.
+  //
+  // So the position is defensive here, not currently load-bearing — and the
+  // second assertion below pins it anyway, on the compiled output. "Not
+  // load-bearing today" is exactly the kind of fact that stops being true
+  // quietly: one import above this one that throws while it evaluates, or one
+  // `export const` in ops/src/config.ts, and the banner is gone. A banner that
+  // stopped printing looks like nothing at all until the next incident, at
+  // which point the journal is silent again. No linter here reorders imports;
+  // an editor's organise-imports does it in one keystroke.
+  const dist = dirname(fileURLToPath(import.meta.url));
+  const result = spawnSync(process.execPath, [join(dist, 'index.js')], {
+    encoding: 'utf8',
+    // A path that cannot exist: the loader throws before the lock is taken and
+    // before anything is created, so this starts nothing and leaves nothing.
+    env: { ...process.env, OPS_CONFIG_PATH: '/nonexistent/ops-config.yaml' },
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
+  });
+
+  assert.notEqual(result.status, 0, 'this run is expected to fail; that is the scenario');
+  const output = `${result.stdout}${result.stderr}`;
+  assert.match(
+    output,
+    /\[ops\] build /,
+    `no build banner from a daemon dying in its config loader:\n${output.slice(0, 2000)}`,
+  );
+  // And it really died where this test claims it did, rather than somewhere
+  // else that happens to also exit non-zero.
+  assert.match(output, /Ops config not found at \/nonexistent\/ops-config\.yaml/);
+  // The banner comes FIRST. Ordering is the property, not mere presence: a
+  // banner printed after the throw would be a banner printed by nothing.
+  assert.ok(
+    output.indexOf('[ops] build ') < output.indexOf('Ops config not found'),
+    'the banner must precede the failure it is meant to identify',
+  );
+
+  // And the mechanism, on the compiled artefact: the banner's import comes
+  // before every other one. tsc preserves import order in its ESM output, so
+  // this is a fact about what will run, not about what the source looks like.
+  const compiled = readFileSync(join(dist, 'index.js'), 'utf8');
+  const bannerAt = compiled.indexOf("import './build-banner.js'");
+  assert.notEqual(bannerAt, -1, 'ops/dist/index.js does not import ./build-banner.js at all');
+  const firstImportAt = compiled.indexOf('import ');
+  assert.equal(
+    bannerAt,
+    firstImportAt,
+    'the build banner must be the FIRST import in ops/index.ts — anything evaluated ' +
+      'before it that throws takes the banner with it, and #89 is 22,675 starts that ' +
+      'died before saying which build they were',
+  );
+});
+
 test('no code path in ops/src forces past a dirty tree', () => {
   // This assertion survives the verbs and matters more than it did. The check
   // that refused a pull on a dirty tree is gone — the host agent runs git
@@ -2806,6 +2875,33 @@ test('the ops-status.json the page reads is valid and describes the current stat
   assert.equal(state['current'], 'idle');
   assert.equal(state['dryRun'], true);
   assert.ok(Array.isArray(payload['events']));
+
+  // Which code wrote the file. Without this, `ops-status.json` describes the
+  // daemon's state in detail and says nothing about whether the daemon is the
+  // commit anybody deployed — which is #89: 22,675 consecutive failed starts
+  // on a `dist/` older than its own config, found by listing a directory.
+  //
+  // The value is asserted as PRESENT and SHAPED, not as any particular sha:
+  // it is whatever the generator baked in, and in a temporary checkout or a
+  // tarball that is legitimately `null` with a reason.
+  const build = payload['build'] as Record<string, unknown> | undefined;
+  assert.ok(build, 'ops-status.json must say which build wrote it');
+  assert.equal(build['service'], 'clawcius-ops');
+  assert.ok('commit' in build, 'build.commit must be present, even when null');
+  assert.equal(typeof build['line'], 'string');
+  // `dirty` is a tri-state on purpose. `false` means git said clean; `null`
+  // means git could not be asked, and rendering that as clean is the lie the
+  // whole mechanism exists to avoid.
+  assert.ok(
+    build['dirty'] === true || build['dirty'] === false || build['dirty'] === null,
+    'build.dirty must be true, false or null — never absent',
+  );
+  if (build['commit'] === null) {
+    assert.equal(build['dirty'], null, 'an unknown commit cannot have a known tree state');
+    assert.equal(typeof build['unknownReason'], 'string');
+    assert.match(build['line'] as string, /^UNKNOWN — /);
+  }
+
   executor.stop();
 });
 
