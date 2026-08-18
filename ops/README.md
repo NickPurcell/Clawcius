@@ -125,10 +125,10 @@ interesting way. Across one incident on 2026-08-17 the operator copy-pasted
 `memory.events`, `free`, `ps`, `systemctl --failed`, `ls /etc/systemd/system` —
 and **the host agent could have produced every one of them.** Two other things
 were asked of him that night and those two were genuine: a `docker inspect` with
-a field outside the whitelist, and a `curl`. Ten commands were handed to the host
-agent afterwards to check, and **eight ran.** Nothing had refused the seven;
-nobody had asked. Some of that was at 04:00 local, which is the real cost of the
-habit.
+a field outside the whitelist, and a `curl`. All nine were handed to the host
+agent afterwards to check, and **the only two it could not serve were those same
+two.** Nothing had refused the seven; nobody had asked. Some of that was at 04:00
+local, which is the real cost of the habit.
 
 The reasons that genuinely stand:
 
@@ -141,14 +141,28 @@ The reasons that genuinely stand:
   (`ops/clawcius-sudoers:614-634`): every one of them names `clawcius-agent`,
   `hamachi-agent` or `oj-agent`, so a refusal on any other container is not a
   wrong format and no format will fix it. See [§ Sudoers](#sudoers);
-- **it needs an HTTP request.** `curl`, `wget` and `gh` are in `LIVE_TOOL_DENY`
-  (`ops/src/host-agent.ts:584`) **by design, not by oversight.** This session
-  holds every credential on the box and is not sandboxed; the entire reason that
-  is tolerable is that its input surface is task text a coordinator wrote and a
-  briefing this daemon assembled. A fetch is how a stranger's words get into it.
-  Filed as a capability gap in Clawcius #91 and **closed as not planned** — this
-  is not a limitation waiting to be lifted, so read that issue before proposing
-  it a third time;
+- **it needs an address neither of you can reach.** `curl`, `wget` and `gh` are
+  in `LIVE_TOOL_DENY` (`ops/src/host-agent.ts:584`) **by design, not by
+  oversight.** This session holds every credential on the box and is not
+  sandboxed; the entire reason that is tolerable is that its input surface is
+  task text a coordinator wrote and a briefing this daemon assembled. A fetch is
+  how a stranger's words get into it. Filed as a capability gap in Clawcius #91
+  and **closed as not planned** — this is not a limitation waiting to be lifted,
+  so read that issue before proposing it a third time.
+
+  **Do not widen that into "HTTP goes to the operator".** A coordinator's own
+  container fetches the public internet perfectly well, and sending it a URL to
+  paste back is the habit this whole section exists to break. What a container
+  cannot reach is the host's loopback and the private ranges, which Squid denies
+  as *resolved* destinations — so DNS rebinding does not get around it either —
+  and refuses with a clean 403 rather than a timeout
+  (`squid/squid.conf:82-87`). Measured from inside an agent container on
+  2026-08-18: `https://api.github.com/rate_limit` → **200**,
+  `http://127.0.0.1:8477/healthz` → **000** (no route at all),
+  `http://172.17.0.1:8477/healthz` → **403** (Squid, refusing an RFC1918
+  destination). The exception is the *intersection* — unreachable from the
+  container and unfetchable by this session — and "is the status page answering
+  on 127.0.0.1?" is what it looks like in practice;
 - **it needs a decision and not a fact.** The host reports; it does not choose.
   That one was never the host agent's to answer and never will be.
 
