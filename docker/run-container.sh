@@ -278,7 +278,7 @@ fi
 # each one becomes a zombie that persists until the container is replaced. A
 # zombie holds no memory, which is why this does not look like the leak it is.
 # It is a PID leak, and --pids-limit below is 512. Measured inside the live
-# container on 2026-08-18 UTC: 92 of 99 processes were zombies, every one with
+# container on 2026-08-17: 92 of 99 processes were zombies, every one with
 # PPid 1, spread across fifteen different programs — node, timeout, python3,
 # systemctl, git, docker, curl. Twenty-eight are the chromium ones that led to
 # #74; the other sixty-four are everything else, which is the argument.
@@ -313,8 +313,8 @@ fi
 # deployment. See Clawcius #84.
 #
 # THAT IS TWO CONTAINERS, NOT ONE. systemd/hamachi-container.service runs this
-# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-18 UTC both
-# it and clawcius-agent reported HostConfig.Init null. Each needs its own
+# same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-17 both it
+# and clawcius-agent reported HostConfig.Init null. Each needs its own
 # --recreate, and confirming docker-init in one says nothing about the other:
 #
 #     docker container inspect -f '{{.Name}} {{.HostConfig.Init}}' \
@@ -353,8 +353,8 @@ fi
 # If you take the second, take a snapshot FIRST rather than reaching for the
 # newest existing tag. clawcius-snapshot.timer is the only snapshot timer on
 # this host and clawcius-snapshot.service passes no environment, so it covers
-# instance 1 and nothing else — hamachi's newest tag is its migration day, and
-# even instance 1's is up to a day old (#87). snapshot.sh reads the same
+# instance 1 and nothing else — hamachi's newest tag is 2026-08-14, and even
+# instance 1's is up to a day old (#87). snapshot.sh reads the same
 # CLAWCIUS_CONTAINER, so it is one command per instance and it prints the tag
 # it wrote:
 #
