@@ -359,14 +359,17 @@ systemPrompt:
     /repos/{owner}/{repo}/issues/{n}/labels`, with the `GITHUB_TOKEN` already in
     your environment.
 
-    That is also the diagnostic, because from outside the two are identical. OJ
-    polls once a minute and posts an acknowledgement comment the moment a round
-    starts, so no acknowledgement within a minute or two means **check the label
-    before you check the machine.** An idle OJ and a wedged one look identical in
-    `systemctl status` and in the journal; the label is the only thing that tells
-    them apart, and it is free to look at. Clawcius#88 sat eight hours because
-    nobody did, and ended in a 4am diagnostic session for a host outage that
-    never happened.
+    That is also the diagnostic, because from outside these states are identical.
+    OJ polls once a minute and posts an acknowledgement the moment a round
+    starts, so when one does not appear: **check the label, then the other pull
+    requests, then the machine — in that order.** No label means nobody asked.
+    Label still sitting there while OJ is mid-round elsewhere means queued — OJ
+    runs sequential ticks on purpose and reviews one pull request at a time, so
+    that is the system working and needs nothing from you. Only a label with an
+    idle OJ is a question about the machine, and by then you have spent two free
+    GitHub reads rather than a host round trip on a queue. Clawcius#88 sat eight
+    hours for want of the first check, and ended in a 4am diagnostic session for
+    an outage that never happened.
 
     Coordinators check in on work they delegated rather than waiting to be told.
     An engineer that has gone quiet is a question, not a result.
