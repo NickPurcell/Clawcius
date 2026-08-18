@@ -123,12 +123,18 @@ WORKDIR /var/lib/clawcius/workspaces
 # The container's job is to stay up. The waker attaches per session with
 # `docker exec`, so this process only has to outlive them.
 #
-# `sleep infinity` never calls wait(), which matters more than it looks: pid 1
-# is where every orphaned process in this container is reparented, so anything
-# orphaned here becomes a zombie that nothing will ever reap, and this
-# container runs with --pids-limit=512. Measured on 2026-08-16: chromium left
-# exactly two per invocation before browser-cli/browse was taught to make
-# itself a subreaper and wait() its own. That fix is per-tool, not general —
-# any other tool whose children outlive it leaks pids the same way. The general
-# fix is `docker run --init`; see Clawcius #74.
+# `sleep infinity` never calls wait(), and this used to make it the wrong pid 1:
+# every orphaned process in a PID namespace is reparented to pid 1, so anything
+# orphaned here became a zombie that nothing would ever reap, against
+# --pids-limit=512. Measured 2026-08-17, before the fix: 92 of 99 processes in
+# the running container were zombies, across fifteen different programs.
+#
+# It is not pid 1 any more. docker/run-container.sh passes --init, so Docker's
+# tini is pid 1 and reaps orphans, and this runs as its child (Clawcius #74).
+# DO NOT DROP THAT FLAG ON THE ASSUMPTION THAT THIS LINE IS HARMLESS: nothing
+# in this image reaps anything, and the only reason the leak stopped is a flag
+# in a script in another directory. Fixing it here instead — an ENTRYPOINT that
+# reaps — would mean shipping and maintaining an init in the image to get what
+# Docker already ships; the flag was the smaller change, and the cost of it is
+# that the fix is invisible from this file, which is what this paragraph is for.
 CMD ["sleep", "infinity"]

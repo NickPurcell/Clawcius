@@ -270,6 +270,47 @@ else
   echo "note: no Google Workspace key at $GWS_KEY — gdoc will report it is unconfigured"
 fi
 
+# --init makes pid 1 a real init (Docker's tini) instead of `sleep infinity`,
+# and the whole point of that is reaping.
+#
+# Every orphaned process in a PID namespace is reparented to pid 1. `sleep`
+# never calls wait(), so nothing in this container has ever reaped an orphan:
+# each one becomes a zombie that persists until the container is replaced. A
+# zombie holds no memory, which is why this does not look like the leak it is.
+# It is a PID leak, and --pids-limit below is 512. Measured inside the live
+# container on 2026-08-17: 92 of 99 processes were zombies, every one with
+# PPid 1, spread across fifteen different programs — node, timeout, python3,
+# systemctl, git, docker, curl. Twenty-eight are the chromium ones that led to
+# #74; the other sixty-four are everything else, which is the argument.
+# `browser-cli/browse` fixed its own by making itself a subreaper and wait()ing
+# them, and that cannot generalise — a process cannot reap another process's
+# children, so every tool whose children outlive it would have to do the same
+# by hand and nobody will remember to.
+#
+# What it costs: one more process, and tini rather than `sleep` receives the
+# signals. It forwards them to its child, so `docker stop` behaves as before.
+#
+# TWO THINGS IT DOES NOT DO.
+#
+# It does not clear the zombies already here. Their parent is pid 1, so only
+# replacing the container disposes of them — which --recreate does anyway.
+#
+# It does not reach a container that already exists. `docker run` flags apply
+# at creation and this script reuses by default, so on every path that returns
+# above this line the flag is inert and pid 1 is still `sleep infinity`.
+# Nothing says so out loud: warn_stale_env compares .env's mtime against the
+# container's start time and has no opinion about flags, so `up.sh` prints
+# "reusing" and looks exactly as it did before. Until somebody runs
+# `docker/run-container.sh --recreate`, this changed the script and not the
+# deployment. See Clawcius #84.
+#
+# One thing here is unverified: that Docker's init behaves under
+# --runtime=runsc. It is an ordinary binary run as pid 1 and there is no
+# reason gVisor would treat it specially, but that is an argument rather than
+# a measurement, and it cannot be measured without recreating the container.
+# Check it on the first --recreate: `docker exec "$NAME" cat /proc/1/comm`
+# should print docker-init, and the zombie count should stay flat across a few
+# `browse` runs instead of climbing by two each time.
 docker run -d \
   --name "$NAME" \
   --runtime=runsc \
@@ -293,6 +334,7 @@ docker run -d \
   "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \
   --memory="$MEMORY" \
+  --init \
   --pids-limit=512 \
   --security-opt=no-new-privileges:true \
   --cap-drop=NET_RAW --cap-drop=MKNOD --cap-drop=AUDIT_WRITE \
