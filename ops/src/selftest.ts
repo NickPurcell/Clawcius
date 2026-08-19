@@ -87,7 +87,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadOpsConfig, type OpsConfig } from './config.js';
 import { sanitiseTask, sanitiseTaskText } from './host-agent.js';
@@ -1826,21 +1826,61 @@ test('the read-back refuses a FIFO instead of parking the executor on it (#109 r
   // the daemon and every deadline it holds, which is the same reasoning the
   // staged-unit open gives for its own O_NONBLOCK.
   //
-  // This test BLOCKS rather than failing if the flag is dropped. That is the
-  // honest shape for it: the defect being guarded is a hang, so the test
-  // reproduces one. Verified by removing O_NONBLOCK from the built code and
-  // running this test alone — it never returned.
+  // THE FIFO IS PROBED IN A CHILD PROCESS, and that is the whole point of the
+  // shape below. If the flag is dropped, the open blocks the thread. An
+  // in-process assertion would then block THIS thread, and the three ways of
+  // bounding that were each measured rather than assumed (Clawcius #109,
+  // rounds 3 and 4 — I claimed the first of these before testing it, and the
+  // reviewer then claimed the opposite before testing this configuration):
   //
-  // `node --test` has NO default timeout, so until `--test-timeout` was added
-  // to the `selftest` script this reported as an indefinite hang with no output
-  // and no failing test name, which is the hardest possible signal to act on.
-  // The flag is what makes the sentence above true rather than aspirational
-  // (Clawcius #109, review round 3); the whole suite runs in about 20s, so 30s
-  // per test is slack rather than a deadline anything real is near.
+  //   `--test-timeout` on `node --test dist/selftest.js`   fires, 30s, but
+  //       only because `node --test <file>` runs the file in a CHILD and the
+  //       timer lives in the parent, whose loop is free. It reports
+  //       `not ok 1 - dist/selftest.js`, naming the file and not the test, and
+  //       the remaining tests never run.
+  //   `--test-timeout` with `--experimental-test-isolation=none`  NEVER fires.
+  //       The timer is an event-loop timer and the loop never turns again. The
+  //       process also stops answering SIGTERM, so `timeout` without `-k`
+  //       cannot kill it either.
+  //   `spawnSync(..., { timeout })`                        fires always. It is
+  //       enforced by the PARENT, so a child blocked in `open(2)` is killed on
+  //       schedule whatever the child's event loop is doing.
+  //
+  // Only the last is a property of this test rather than of how the suite
+  // happens to be invoked, so it is the one used. `--test-timeout` stays in
+  // `ops/package.json` as a backstop for asynchronous hangs, which it does
+  // bound; it is not what makes this test report.
+  //
+  // The failing signal is `signal === 'SIGKILL'`: the child was still blocked
+  // when the parent's deadline arrived.
   const root = mkdtempSync(join(tmpdir(), 'ops-units-readback-'));
   const fifo = join(root, 'clawcius-fifo.service');
   const made = spawnSync('mkfifo', [fifo]);
   assert.equal(made.status, 0, 'mkfifo must work for this test to mean anything');
+
+  const units = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), 'units.js')).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { readBackInstalledUnit } = await import(${JSON.stringify(units)});\n` +
+        `readBackInstalledUnit(${JSON.stringify(fifo)});`,
+    ],
+    { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
+  );
+  assert.equal(
+    probe.signal,
+    null,
+    'the probe was killed on the deadline, so the open BLOCKED: O_NONBLOCK is missing from ' +
+      'readBackInstalledUnit and the executor would park on a FIFO forever',
+  );
+  assert.notEqual(probe.status, 0, 'a FIFO must be refused, not accepted');
+  assert.match(probe.stderr, /not a regular file/, probe.stderr);
+
+  // And in-process too, which is safe only because the line above proved it
+  // returns. This is the assertion about the message; the child is the
+  // assertion about the blocking.
   assert.throws(() => readBackInstalledUnit(fifo), /not a regular file/);
 
   // A real file comes back described by its own bytes: the size is the length
