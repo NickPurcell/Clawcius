@@ -1011,6 +1011,15 @@ the descriptor. The request has two fields and neither is a path. Every
 operation and every refusal is a `"kind":"unit"` journal entry naming the
 destination.
 
+**Then it reads the file back and reports what it found** — size, sha256, mode
+and owner, off one `O_NOFOLLOW | O_NONBLOCK` descriptor opened after the
+rename. This is the only guarantee in the list a reader can check from the
+result they were handed rather than by trusting this paragraph: compare the
+sha256 against the checkout. If it does not match what was sent the result is
+`ok: false` and says the file is nevertheless in place and not to reload. The
+result used to report a length taken from the decoded string instead, which was
+wrong on every unit file containing a non-ASCII character — Clawcius #94.
+
 **`clawcius-ops.service` is deliberately not on the restartable list.** It is
 the process that starts the session; restarting it kills the task mid-flight,
 loses the record and silently restarts a recovery window. Until 2026-08-11 that

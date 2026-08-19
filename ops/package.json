@@ -13,7 +13,7 @@
     "start": "node dist/index.js",
     "verify": "node dist/verify-main.js",
     "typecheck": "node ../scripts/build-info.mjs && tsc -p tsconfig.json --noEmit",
-    "selftest": "node ../scripts/build-info.mjs && tsc -p tsconfig.json && node --test dist/selftest.js"
+    "selftest": "node ../scripts/build-info.mjs && tsc -p tsconfig.json && node --test --test-timeout=30000 dist/selftest.js"
   },
   "dependencies": {
     "yaml": "^2.9.0"

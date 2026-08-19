@@ -120,6 +120,7 @@ import {
   writeSync,
   type Stats,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 /**
@@ -206,6 +207,17 @@ export type UnitOp = 'install' | 'remove';
 
 /** What one install or remove did, or refused to do, and why. */
 export type UnitOpResult = {
+  /**
+   * **`ok: false` does not mean nothing was written.** It did until 2026-08-18,
+   * when every false came from `refusal()` and every refusal happened before
+   * the rename. `installUnit` now also returns false when the file it wrote
+   * does not hash to what it sent — and in that one case the file IS installed
+   * and systemd will read it at the next `daemon-reload`. The `detail` says so
+   * in as many words; read it before reacting to this flag.
+   *
+   * No caller currently branches on this to retry or roll back. `writeResult`
+   * serialises it and `Executor.#journalUnitOp` records it, and that is all.
+   */
   ok: boolean;
   op: UnitOp;
   /** The name as asked for, clipped for the log. Never used to build a path unless it validated. */
@@ -320,6 +332,72 @@ export function validateUnitName(unit: unknown): NameVerdict {
   return { ok: true, name: unit };
 }
 
+/** What a file at a path actually is, read off one descriptor. Not what was asked for. */
+export type InstalledFile = {
+  size: number;
+  sha256: string;
+  /** Octal, four digits, as `stat -c %a` would print it. */
+  mode: string;
+  /** `uid:gid`, numeric. `0:0` is root:root and nothing here translates it. */
+  owner: string;
+};
+
+/**
+ * Open the installed unit and report what is there. Throws rather than
+ * returning a partial answer: a caller that cannot read the file back must say
+ * so, not print half of one.
+ *
+ * O_NOFOLLOW because anything that could swap `path` for a symlink between the
+ * rename and this open is exactly what a read-back is for.
+ *
+ * **O_NONBLOCK because the other shape of the same attack is a FIFO**, and this
+ * runs on the executor's poll loop with no timeout around it. `open(2)`
+ * O_RDONLY on a FIFO with no writer blocks until one arrives — forever, in
+ * practice — and O_NOFOLLOW does not help, because it excludes symlinks and not
+ * FIFOs. That would park the daemon and every deadline it is holding, which is
+ * word for word the reason the staged-unit open above gives for its own
+ * O_NONBLOCK. Reproduced under gVisor before the flag was added: `timeout 5`
+ * around the open without it exits 124; with it the open returns at once and
+ * the `isFile()` check below refuses the FIFO by name (Clawcius #109, review
+ * round 1).
+ *
+ * The size comes from the SAME buffer that was hashed rather than from a
+ * separate `fstat`, so the two cannot describe different reads of the file.
+ * Mode and owner do come from the `fstat`, which is a second syscall — they are
+ * metadata and cannot be derived from the bytes.
+ */
+export function readBackInstalledUnit(path: string): InstalledFile {
+  const back = openSync(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const stat = fstatSync(back);
+    // A FIFO reaches here rather than hanging the open, so it is refused with a
+    // sentence instead of an EAGAIN from the read.
+    if (!stat.isFile()) throw new Error(`${path} is ${describe(stat)}, not a regular file`);
+    if (stat.size > MAX_UNIT_BYTES) {
+      throw new Error(
+        `${path} is ${String(stat.size)} bytes, over the ${String(MAX_UNIT_BYTES)}-byte ` +
+          'ceiling. It was not read.',
+      );
+    }
+    const buf = readFileSync(back);
+    return {
+      size: buf.length,
+      sha256: createHash('sha256').update(buf).digest('hex'),
+      mode: (stat.mode & 0o7777).toString(8).padStart(4, '0'),
+      owner: `${String(stat.uid)}:${String(stat.gid)}`,
+    };
+  } finally {
+    try {
+      closeSync(back);
+    } catch {
+      /* nothing useful to do about a failed close */
+    }
+  }
+}
+
 /**
  * Install one unit file: fixed source directory, computed destination, mode and
  * ownership set on the descriptor.
@@ -397,6 +475,40 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   const contentProblem = unitContentProblem(content);
   if (contentProblem) return refusal('install', name, `${source}: ${contentProblem}`, path);
 
+  // The bytes that will actually be written, encoded ONCE, here, and used for
+  // the write, for the dry run's number and for the hash below.
+  //
+  // `content` is a JavaScript string and `content.length` is its length in
+  // UTF-16 CODE UNITS, not bytes. `writeSync` encodes it back to UTF-8. Every
+  // character outside ASCII is one code unit and two or three bytes, so on any
+  // unit file containing the box-drawing rules and em-dashes this project
+  // writes its comments with, the two numbers differ — and the result message
+  // reported the string length as "bytes" (Clawcius #94). Measured against the
+  // eleven unit files in systemd/ on 2026-08-18: eight of them disagree,
+  // clawcius-status.service by 524 on 12780 (12256 reported), and
+  // clawcius-ops.service by 743 on 25280.
+  //
+  // That is not a rounding error in a log line. The count was the only thing in
+  // the result describing what landed, so it is what a reader checks before
+  // deciding whether to trust an install, and a number 524 short of the file
+  // reads as a truncated write — the one failure that justifies an immediate
+  // rollback. A correct install was reported in the shape of the worst thing it
+  // could have been.
+  //
+  // Buffer.byteLength(content) would fix the count alone. It is not what this
+  // does, because a count taken from the intent can only ever be checked
+  // against the intent. See the read-back after the rename.
+  //
+  // Note that these are not necessarily the staged file's bytes: `content` was
+  // decoded as UTF-8, so a staged file that is not valid UTF-8 has already had
+  // its bad sequences replaced with U+FFFD and this re-encodes the replacement.
+  // That is unchanged behaviour — the old `writeSync(out, content)` did exactly
+  // the same — and the read-back below now makes it VISIBLE, because the hash
+  // reported is the hash of what landed and will not match the checkout. That
+  // is containment, not a fix: Clawcius #110 is to write the buffer.
+  const bytes = Buffer.from(content, 'utf8');
+  const sent = createHash('sha256').update(bytes).digest('hex');
+
   // A symlink or a directory where the unit belongs is refused rather than
   // replaced. `rename(2)` would replace a symlink without following it, so this
   // is not strictly necessary for safety — it is here because something else
@@ -426,8 +538,10 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
       path,
       skipped: true,
       detail:
-        `DRY RUN — would have installed ${content.length} bytes from ${source} to ${path} ` +
-        'as 0644 root:root. Nothing was written.',
+        `DRY RUN — would have installed ${bytes.length} bytes from ${source} to ${path} ` +
+        `as 0644 root:root, sha256 ${sent}. Nothing was written. A live run reports the ` +
+        'size and sha256 it reads back off the installed file, so if that sha256 differs ' +
+        'from this one, the file changed between the two runs.',
     };
   }
 
@@ -450,7 +564,16 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   }
 
   try {
-    writeSync(out, content);
+    // Checked, because `write(2)` is allowed to write fewer bytes than it was
+    // given and this code has no loop. On a local regular file a short write
+    // effectively does not happen — but "effectively does not happen" is the
+    // reason nobody would look here after a truncated unit, and the check is
+    // one comparison. Throws into the catch below, which unlinks the temp file,
+    // so nothing half-written can reach `path`.
+    const written = writeSync(out, bytes);
+    if (written !== bytes.length) {
+      throw new Error(`short write: ${written} of ${bytes.length} bytes`);
+    }
     // Set on the DESCRIPTOR, not on the path, and this is the line that makes
     // "a unit file arrives 0644 root:root or it does not arrive" a true
     // sentence for the first time. The sudoers rule that used to claim it was
@@ -493,7 +616,98 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
 
   syncDir(options.unitDir);
 
-  const asRoot = process.getuid?.() === 0;
+  const reload = ' Run `sudo systemctl daemon-reload` before starting or restarting it.';
+
+  // Read the file back and describe THAT, rather than describing the request.
+  //
+  // The question this sentence is being used to answer is "is what landed what
+  // I sent?", and it is asked by someone deciding whether to roll back. A size
+  // and a hash computed from the artefact answer it; anything computed from
+  // `content` answers a different question — "what did I mean to send?" — in
+  // the same words, and cannot detect the failure that would make the answer
+  // interesting. The host agent in #94 got the truth by hashing the file
+  // itself, which is the executor's job and is now done here.
+  //
+  // EVERYTHING the success message states about the installed file comes from
+  // this one call — size, hash, mode and owner. Not just the two that #94 was
+  // about: a mode and an owner taken from "did this code call fchmod/fchown"
+  // are intent, and printing them beside two verified values in one sentence
+  // lends them a credibility they have not earned.
+  let landed: InstalledFile;
+  try {
+    landed = readBackInstalledUnit(path);
+  } catch (error) {
+    // The rename returned success, so the install happened; what failed is the
+    // description of it. Say that, and do not fall back to the values from the
+    // request — a size printed here would be indistinguishable from one that
+    // had been verified, which is the whole defect this change is about, and a
+    // message that says "mode 0644" one clause before "I cannot say what
+    // landed" is that defect inside its own correction.
+    return {
+      ok: true,
+      op: 'install',
+      unit: name,
+      path,
+      skipped: false,
+      detail:
+        `installed ${source} to ${path}: the rename returned success, so the file was in ` +
+        `place a moment ago — but ${path} could not be read back (${String(error)}), and the ` +
+        'most ordinary reason to be reading this is that it is no longer there. This result ' +
+        'therefore CANNOT ' +
+        'say what landed — not its size, not its hash, not its mode, not its owner. What was ' +
+        `SENT is ${String(bytes.length)} bytes, sha256 ${sent}. Check the file against that ` +
+        `by hand before trusting it.${reload}`,
+    };
+  }
+
+  if (landed.sha256 !== sent) {
+    return {
+      ok: false,
+      op: 'install',
+      unit: name,
+      path,
+      skipped: false,
+      detail:
+        `WROTE THE WRONG BYTES: ${path} is ${String(landed.size)} bytes, sha256 ` +
+        `${landed.sha256}, mode ${landed.mode}, owner ${landed.owner} — but ` +
+        `${String(bytes.length)} bytes with sha256 ${sent} were sent from ${source}. NOTE ` +
+        'THAT ok=false HERE DOES NOT MEAN NOTHING HAPPENED: the file IS in place and systemd ' +
+        'will read it at the next daemon-reload. Do not reload; look at it. Either the write ' +
+        'was short, or something replaced the file between the rename and the read-back.',
+    };
+  }
+
+  // 0644 and 0:0 are what the code above SETS; `landed` is what the file HAS.
+  // Stated this way round so the sentence stays a report of the artefact even
+  // when the two disagree — which in the self-test the owner always does, since
+  // it does not run as root. Each half is named separately: they have different
+  // causes, and one message covering both would explain the wrong one.
+  const notRoot = process.getuid?.() !== 0;
+  const off: string[] = [];
+  // Each phrase carries its own "this executor sets", so that joining two of
+  // them does not leave the qualifier binding only the second one.
+  if (landed.mode !== '0644') off.push('the mode is not the 0644 this executor sets');
+  if (landed.owner !== '0:0') off.push('the owner is not the 0:0 this executor sets');
+  const why: string[] = [];
+  if (landed.owner !== '0:0' && notRoot) {
+    why.push(
+      'It is NOT running as root, so it did not chown. On the host it is ' +
+        '(clawcius-ops.service is User=root); if you are seeing this on the host, THAT is ' +
+        'the finding.',
+    );
+  }
+  // Anything left unexplained by the line above — a wrong mode, or a wrong
+  // owner while this IS root — has no benign cause. Say so rather than naming
+  // the value and stopping, which is what the previous version did for an owner
+  // that was wrong under root.
+  if (landed.mode !== '0644' || (landed.owner !== '0:0' && !notRoot)) {
+    why.push(
+      'Mode and owner are set on the descriptor before the rename, so a value this executor ' +
+        'did not set means something changed the file afterwards — look at it.',
+    );
+  }
+  const asSet = off.length === 0 ? '' : ` NOTE: ${off.join(', and ')}. ${why.join(' ')}`;
+
   return {
     ok: true,
     op: 'install',
@@ -501,13 +715,9 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
     path,
     skipped: false,
     detail:
-      `installed ${content.length} bytes from ${source} to ${path}, mode 0644` +
-      (asRoot
-        ? ', owner root:root'
-        : `, owner left as uid ${String(process.getuid?.() ?? -1)} because this executor is ` +
-          'NOT running as root. On the host it is (clawcius-ops.service is User=root); if you ' +
-          'are seeing this on the host, that is the finding.') +
-      '. Run `sudo systemctl daemon-reload` before starting or restarting it.',
+      `installed ${source} to ${path}: ${String(landed.size)} bytes, sha256 ${landed.sha256}, ` +
+      `mode ${landed.mode}, owner ${landed.owner}. All four were read back off ${path} after ` +
+      `the write, and the hash matches what was sent.${asSet}${reload}`,
   };
 }
 

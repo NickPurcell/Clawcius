@@ -312,14 +312,52 @@ class Audit:
 #
 # The cause is structural. Chromium's browser process spawns helpers; when the
 # Playwright node driver exits, those helpers are orphaned and reparented to
-# pid 1, and pid 1 in this container is `sleep infinity` (docker/Dockerfile),
-# which never calls wait(). Nothing reaps them, ever.
+# pid 1. Whether anything ever reaps them THERE depends on how the container
+# was created, and this file cannot know which container it is running in.
 #
-# The fix is PR_SET_CHILD_SUBREAPER: it makes THIS process the reparenting
-# target for its orphaned descendants instead of pid 1, so they become our
-# children and we can wait() them. Verified supported under gVisor/runsc.
-# Without it a process simply cannot reap another process's children, and no
-# amount of care in `finally` would help.
+# WHAT PID 1 IS DEPENDS ON THE CONTAINER, AND BOTH ANSWERS EXIST ON THIS HOST.
+# The image's CMD is `sleep infinity` (docker/Dockerfile), which never calls
+# wait(). A container started without --init has that at pid 1: nothing reaps,
+# and every orphan is a zombie for the life of the container. Since Clawcius
+# #86 `docker/run-container.sh` passes --init, so a container it CREATED has
+# Docker's tini at pid 1 instead, and tini does reap.
+#
+# Measured, not assumed. In `hamachi-agent` on 2026-08-18, recreated since #86:
+# /proc/1/comm is `docker-init` and the zombie count is 0. On 2026-08-17
+# `clawcius-agent` had not been recreated and still reported HostConfig.Init
+# null — a run flag applies at creation, so the script changing did not change
+# a container that already existed (#84). `ops/src/verify.ts` builds its
+# throwaway with a bare `docker run` and passes no --init at all.
+#
+#     cat /proc/1/comm      # `docker-init` or `sleep` — that is the answer,
+#                           # for THIS container, and no comment can be it
+#
+# So the paragraph above is history in one container and current in another.
+# Read the command, the way `docker/run-container.sh` asks you to after #106:
+# it prints the container's real HostConfig.Init rather than describing what
+# the script would have passed.
+#
+# The mechanism here is PR_SET_CHILD_SUBREAPER: it makes THIS process the
+# reparenting target for its orphaned descendants instead of pid 1, so they
+# become our children and we can wait() them. Verified supported under
+# gVisor/runsc. Without it a process simply cannot reap another process's
+# children, and no amount of care in `finally` would help.
+#
+# IT STAYS EVEN WHERE tini MAKES IT REDUNDANT. This is a decision, not an
+# oversight, and the reasons are in ascending order of how much they matter:
+#
+#   - it reaps SYNCHRONOUSLY, within the run, so `browse` can say what it
+#     reaped (the `reaped` and `leaked_children` events) and the log stays a
+#     complete account of the run. tini reaps silently and afterwards; nothing
+#     in the log would ever mention it.
+#   - it does not depend on a flag in a script in another directory surviving a
+#     future edit, nor on this container having been recreated since #86.
+#   - deleting it would make this tool's correctness a property of how its
+#     container happened to be created. That is precisely the property #86 and
+#     #106 spent their review rounds making visible instead of assumed, and
+#     re-importing it here to save sixty lines is the wrong trade.
+#
+# It costs one prctl and one WNOHANG loop, and it is correct in both worlds.
 
 PR_SET_CHILD_SUBREAPER = 36
 
@@ -521,7 +559,8 @@ def chromium(audit):
         )
 
     # Before the launch, so every process the launch creates reparents to us
-    # rather than to an init that never reaps. See the process-hygiene block.
+    # rather than to pid 1 — which reaps or does not depending on how this
+    # container was created, and we do not check. See the process-hygiene block.
     subreaper = become_subreaper()
     if not subreaper:
         audit.event("subreaper_unavailable")

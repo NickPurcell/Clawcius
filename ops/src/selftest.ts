@@ -84,9 +84,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadOpsConfig, type OpsConfig } from './config.js';
 import { sanitiseTask, sanitiseTaskText } from './host-agent.js';
@@ -133,6 +134,7 @@ import {
   drainUnitRequests,
   installUnit,
   parseUnitRequest,
+  readBackInstalledUnit,
   removeUnit,
   validateUnitName,
   MAX_UNIT_BYTES,
@@ -1733,6 +1735,169 @@ test('a dry run stages nothing into the unit directory', () => {
   assert.equal(result.skipped, true);
   assert.match(result.detail, /DRY RUN/);
   assert.deepEqual(readdirSync(fixture.unitDir), []);
+});
+
+test('the install result describes the file that landed, not the request (#94)', () => {
+  // The defect: the result said `installed ${content.length} bytes`, and
+  // `content` is a decoded STRING whose `.length` is UTF-16 code units.
+  // clawcius-status.service is 12780 bytes and reported 12256 — a correct
+  // install described in the exact shape of a truncated write, which is the one
+  // failure that justifies rolling back immediately.
+  //
+  // So the fixture body is deliberately not ASCII. Every one of these is one
+  // code unit and three UTF-8 bytes, which is what the project's own unit files
+  // are full of: eight of the eleven in systemd/ would have been misreported.
+  const banner = '═'.repeat(40);
+  const body = `# ${banner}\n# — a unit file, described in the project's house style —\n${UNIT_BODY}`;
+  const fixture = unitFixture('readback');
+  const staged = fixture.stage('clawcius-selftest.service', body);
+
+  const trueBytes = readFileSync(staged);
+  const trueSha = createHash('sha256').update(trueBytes).digest('hex');
+  assert.notEqual(
+    trueBytes.length,
+    body.length,
+    'the fixture must actually exercise the bug: byte length and string length must differ',
+  );
+
+  const options = {
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+  };
+
+  // The dry run says what a live run would write, and says it in bytes.
+  const dry = installUnit({ ...options, dryRun: true });
+  assert.equal(dry.ok, true, dry.detail);
+  assert.match(dry.detail, new RegExp(`would have installed ${String(trueBytes.length)} bytes`));
+  assert.match(dry.detail, new RegExp(`sha256 ${trueSha}`));
+
+  const result = installUnit({ ...options, dryRun: false });
+  assert.equal(result.ok, true, result.detail);
+
+  // The hash is the point: it is computed from the artefact, so it cannot drift
+  // from the artefact the way a count taken upstream of the write can.
+  assert.match(result.detail, new RegExp(`sha256 ${trueSha}`));
+  assert.match(result.detail, new RegExp(`${String(trueBytes.length)} bytes`));
+  assert.equal(
+    statSync(result.path).size,
+    trueBytes.length,
+    'and that is genuinely the size on disk',
+  );
+
+  // The regression itself, stated as the thing that must not appear. Asserting
+  // only "the right number is present" would still pass if both were printed.
+  assert.doesNotMatch(
+    result.detail,
+    new RegExp(`\\b${String(body.length)}\\b`),
+    'the UTF-16 string length must not appear in the result at all',
+  );
+  // And the result must not be quoting the request back: the hash it prints is
+  // the one it read off the installed path.
+  assert.match(result.detail, /read back off/);
+
+  // Mode and owner are read back too, not asserted from having called
+  // fchmod/fchown. The self-test does not run as root, so the owner is this
+  // uid — which is the point: a message that said "owner root:root" here would
+  // be wrong, and the old one did.
+  const st = statSync(result.path);
+  assert.match(
+    result.detail,
+    new RegExp(`mode ${(st.mode & 0o7777).toString(8).padStart(4, '0')}`),
+    'the mode printed is the mode on disk',
+  );
+  assert.match(
+    result.detail,
+    new RegExp(`owner ${String(st.uid)}:${String(st.gid)}`),
+    'and the owner is the uid that actually owns it, not "root:root" from having tried',
+  );
+  // The self-test is not root, so the owner cannot be 0:0 and the message must
+  // say which of the two it is complaining about. It must NOT complain about
+  // the mode, which fchmod set correctly without needing root.
+  assert.match(result.detail, /the owner is not the 0:0/);
+  assert.doesNotMatch(result.detail, /the mode is not the 0644/);
+  assert.match(result.detail, /NOT running as root/);
+});
+
+test('the read-back refuses a FIFO instead of parking the executor on it (#109 review)', () => {
+  // `open(2)` O_RDONLY on a FIFO with no writer blocks until one arrives.
+  // O_NOFOLLOW does not help: it excludes symlinks, not FIFOs. This call runs
+  // on the executor's poll loop with no timeout around it, so a block here is
+  // the daemon and every deadline it holds, which is the same reasoning the
+  // staged-unit open gives for its own O_NONBLOCK.
+  //
+  // THE FIFO IS PROBED IN A CHILD PROCESS, and that is the whole point of the
+  // shape below. If the flag is dropped, the open blocks the thread. An
+  // in-process assertion would then block THIS thread, and the three ways of
+  // bounding that were each measured rather than assumed (Clawcius #109,
+  // rounds 3 and 4 — I claimed the first of these before testing it, and the
+  // reviewer then claimed the opposite before testing this configuration):
+  //
+  //   `--test-timeout` on `node --test dist/selftest.js`   fires, 30s, but
+  //       only because `node --test <file>` runs the file in a CHILD and the
+  //       timer lives in the parent, whose loop is free. It reports
+  //       `not ok 1 - dist/selftest.js`, naming the file and not the test, and
+  //       the remaining tests never run.
+  //   `--test-timeout` with `--experimental-test-isolation=none`  NEVER fires.
+  //       The timer is an event-loop timer and the loop never turns again. The
+  //       process also stops answering SIGTERM, so `timeout` without `-k`
+  //       cannot kill it either.
+  //   `spawnSync(..., { timeout })`                        fires always. It is
+  //       enforced by the PARENT, so a child blocked in `open(2)` is killed on
+  //       schedule whatever the child's event loop is doing.
+  //
+  // Only the last is a property of this test rather than of how the suite
+  // happens to be invoked, so it is the one used. `--test-timeout` stays in
+  // `ops/package.json` as a backstop for asynchronous hangs, which it does
+  // bound; it is not what makes this test report.
+  //
+  // The failing signal is `signal === 'SIGKILL'`: the child was still blocked
+  // when the parent's deadline arrived.
+  const root = mkdtempSync(join(tmpdir(), 'ops-units-readback-'));
+  const fifo = join(root, 'clawcius-fifo.service');
+  const made = spawnSync('mkfifo', [fifo]);
+  assert.equal(made.status, 0, 'mkfifo must work for this test to mean anything');
+
+  const units = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), 'units.js')).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { readBackInstalledUnit } = await import(${JSON.stringify(units)});\n` +
+        `readBackInstalledUnit(${JSON.stringify(fifo)});`,
+    ],
+    { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
+  );
+  assert.equal(
+    probe.signal,
+    null,
+    'the probe was killed on the deadline, so the open BLOCKED: O_NONBLOCK is missing from ' +
+      'readBackInstalledUnit and the executor would park on a FIFO forever',
+  );
+  assert.notEqual(probe.status, 0, 'a FIFO must be refused, not accepted');
+  assert.match(probe.stderr, /not a regular file/, probe.stderr);
+
+  // And in-process too, which is safe only because the line above proved it
+  // returns. This is the assertion about the message; the child is the
+  // assertion about the blocking.
+  assert.throws(() => readBackInstalledUnit(fifo), /not a regular file/);
+
+  // A real file comes back described by its own bytes: the size is the length
+  // of the buffer that was hashed, so the two cannot describe different reads.
+  const real = join(root, 'clawcius-real.service');
+  const body = '[Unit]\nDescription=— an em dash, three bytes, one code unit —\n';
+  writeFileSync(real, body);
+  const seen = readBackInstalledUnit(real);
+  assert.equal(seen.size, readFileSync(real).length);
+  assert.notEqual(seen.size, body.length, 'and it is the byte length, not the string length');
+  assert.equal(seen.sha256, createHash('sha256').update(readFileSync(real)).digest('hex'));
+  assert.equal(seen.mode, (statSync(real).mode & 0o7777).toString(8).padStart(4, '0'));
+  assert.equal(seen.owner, `${String(statSync(real).uid)}:${String(statSync(real).gid)}`);
+
+  // A path that is not there throws rather than returning a partial answer,
+  // which is what puts installUnit into its "CANNOT say what landed" branch.
+  assert.throws(() => readBackInstalledUnit(join(root, 'clawcius-absent.service')));
 });
 
 test('a unit request carries a name and nothing else — no path, no mode, no owner', () => {
