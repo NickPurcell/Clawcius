@@ -20,6 +20,12 @@
 # The cost of reuse is that changes to the flags below (mounts, memory, env)
 # do not reach a container that already exists. Env changes are the common
 # case, so a stale .env is detected and reported rather than left to confuse.
+#
+# The flags themselves are not detected and are not compared — they are simply
+# read back off the container and printed, on the reuse paths as well as on
+# creation, so that the output says which container this is and what it
+# actually has rather than looking identical either way. See
+# describe_container() below for why that is a report and not a check.
 set -euo pipefail
 
 RECREATE=0
@@ -218,9 +224,170 @@ warn_stale_env() {
   fi
 }
 
+# Print which container this is and what it ACTUALLY has, read back off the
+# container rather than echoed from the variables below.
+#
+# Echoing the variables would be a second copy of the `docker run` block, and a
+# second copy drifts: delete `--init` down there and the echo up here keeps
+# printing "init true" forever. That is the exact defect Clawcius #84 and #92
+# are about — a sentence that was true when it was written, printed in a state
+# nobody checked — so the fix must not be built out of one. A readback cannot
+# say something the container does not.
+#
+# DELIBERATELY NOT A COMPARISON against the flags below, and not a per-flag
+# check either. A general flag-drift detector would have to be maintained in
+# step with the `docker run` block, which is its own drift, and would be silent
+# about the next flag somebody adds — a partial diff that looks complete is
+# worse than none. A check for the flag of the week (#84 sketches
+# warn_missing_init) becomes dead code the day everybody has recreated once,
+# and will not be written for the flag after it. What was missing here was
+# never a verdict, it was the facts; this prints the facts and leaves the
+# comparison to the reader, who has this file open.
+#
+# Why these fields and not others: they are what differs between the two
+# deployments, or between two containers of the same deployment.
+#
+#   .Created dates the container. It moves only on `docker run` — `start` and
+#   `restart` preserve it — so it is what says whether a container predates a
+#   flag, and it is the field #92 used to establish both were hand-recreated.
+#
+#   .HostConfig.Init is invisible in every other output. `.Command` reads
+#   `sleep infinity` with or without it, because it reports the image Cmd
+#   rather than pid 1, so a reader who checks that concludes the flag is absent
+#   in every case. Expect `true`, or `false`/`<nil>` on a container created
+#   before #74 — docker renders the unset pointer as `<nil>`.
+#
+#   The image id as well as the tag, because the tag is `:latest` for both
+#   instances and moves under them: the tag says which image was asked for, the
+#   id says which build answered.
+#
+#   .Id is the one that makes a stale journal line detectable rather than
+#   merely old, and that is the whole of #92. `docker ps` IS in
+#   CLAWCIUS_DOCKER_READ (both the bare and the `*` form), so a reader with no
+#   inspect grant can put `docker ps --format '{{.ID}}'` next to the id in the
+#   journal and see that the line describes a container object that no longer
+#   exists. A .Created-only line cannot be checked that way — it looks equally
+#   authoritative whether or not its subject is still alive, which is exactly
+#   how "created clawcius-agent from clawcius-agent:latest" misled from August.
+#
+# This is also how the answer reaches somebody who can use it. The host agent
+# cannot inspect HostConfig.Init at all — ops/clawcius-sudoers enumerates
+# `docker inspect` by fixed field/container pairs and has no rule for it (#91)
+# — which is why establishing #74's landing went back to the operator. The
+# journal it CAN read, with no sudo: journal access there is systemd-journal
+# group membership. Printing this on stdout puts it in `journalctl -u
+# <instance>-container.service` for free, and printing it on the reuse paths
+# too is what makes that journal current for a container nobody recreated
+# through the unit — which is both of them (#92).
+describe_container() {
+  # `local` on its own line, then assign. `local raw=$(cmd)` takes local's exit
+  # status rather than the command's, so the `||` below would never fire.
+  local raw created id image imageid runtime init memory pids
+  # THIS TEMPLATE IS A PERMISSIONS DECISION, not just a choice of fields, and
+  # the next person to add a ninth one should read this before they do.
+  #
+  # Everything printed here lands in a journal that clawcius-ops can read with
+  # no sudo. That is the point (see above) — but it means this line is a second
+  # read channel for container config, running alongside the sudoers gate and
+  # not through it. ops/clawcius-sudoers draws that boundary deliberately:
+  # `docker inspect *` was REMOVED on 2026-08-12 precisely because --format can
+  # print Config.Env, and the rule it left behind is "anything that would print
+  # .Config.Env, .Config.Cmd, .Mounts or the whole object does not go in".
+  #
+  # So a field added here must stay inside what CLAWCIUS_DOCKER_READ would have
+  # granted. No Config.Env, no Config.Cmd, no .Mounts, no whole objects. A
+  # widening done here needs no visudo -c and no reviewer who thinks they are
+  # looking at a permissions change, which is exactly why it is written down
+  # next to the template rather than only two directories away.
+  #
+  # One inspect, `|` between the fields: none of these values can contain one.
+  # Guarded like warn_stale_env, and for a sharper reason — this runs from
+  # systemd under `set -e`, on a path where the container is already up. A
+  # docker version that moves or nulls a field fails the whole template, and a
+  # readback must not be what takes the unit start down.
+  raw=$(docker container inspect -f \
+    '{{.Created}}|{{.Id}}|{{.Config.Image}}|{{.Image}}|{{.HostConfig.Runtime}}|{{.HostConfig.Init}}|{{.HostConfig.Memory}}|{{.HostConfig.PidsLimit}}' \
+    "$NAME" 2>/dev/null) || {
+    # Said out loud, not swallowed: silence about this is the thing being fixed.
+    echo "  (could not read this container's config back: docker container inspect failed)"
+    return 0
+  }
+  IFS='|' read -r created id image imageid runtime init memory pids <<<"$raw" || return 0
+  # HostConfig.Memory is bytes; --memory is written 2g/3g. Converted only when
+  # it really is a number, so anything unexpected prints as itself instead of
+  # failing the arithmetic under `set -e`. 0 is docker's "no limit", which
+  # "0m" would misreport.
+  case "$memory" in
+    0) memory=unlimited ;;
+    '' | *[!0-9]*) ;;
+    *) memory="$((memory / 1024 / 1024))m" ;;
+  esac
+  # Docker spells "no pids limit" as 0 and as -1, and a bare `pids-limit 0`
+  # reads as the opposite of what it means — "no processes allowed". Only
+  # reachable on a container created outside this script, since the `docker
+  # run` block below pins 512; printed correctly anyway, because the whole
+  # point of this line is the container somebody else made.
+  case "$pids" in
+    0 | -1) pids=unlimited ;;
+  esac
+  id=${id:0:12}
+  imageid=${imageid#sha256:}
+  imageid=${imageid:0:12}
+  # Nanoseconds trimmed, the Z kept: this is UTC, and `docker ps` next to it is
+  # local. A reader who has to work out the offset should be told there is one.
+  created=${created/.*Z/Z}
+  # The heading names its own incompleteness, and that is not politeness.
+  # These are eight fields of roughly twenty-five: no --security-opt, no
+  # --cap-drop, no --network, no --restart, none of the eight mounts. An
+  # unqualified "what this container has" over a partial list is the same
+  # artifact this function refuses to be — a partial account that presents as
+  # complete — so the qualifier is load-bearing. It prints only after a
+  # successful readback, so a failed inspect does not head an empty list.
+  echo "  read back, in the fields that differ between deployments (not the whole config):"
+  echo "  id $id  created $created  image $image ($imageid)"
+  echo "  runtime $runtime  init $init  memory $memory  pids-limit $pids"
+}
+
+# The reuse paths' half of it: say plainly that THIS RUN did not apply the
+# flags in this file, then show what the container it found has.
+#
+# UNCONDITIONAL, and that is the whole design. `docker run` flags apply at
+# creation, this script reuses by default, therefore on every path that returns
+# above the `docker run` below, this invocation applied nothing. That is true
+# by construction of the code path, so there is nothing to detect and nothing
+# that can go stale — unlike a warn_missing_init(), it does not become dead
+# code once everybody has recreated, or go quiet when the next flag is added.
+#
+# BE PRECISE ABOUT WHOSE PROPERTY THAT IS, and the first draft of this was not.
+# It said the flags "were NOT applied to it", which is a claim about the
+# CONTAINER, and that claim is false in the ordinary steady state: after any
+# --recreate, every subsequent boot reuses a container that does have the
+# current flags. Printing "not applied" over a container that has them, and
+# then recommending --recreate — the one operation here that destroys the
+# agent's packages, crontabs and daemons — is worse than the silence this
+# replaced. The audience is an agent reading journalctl without the operator's
+# context, and it will act on the recommendation.
+#
+# What the code path knows is "this run applied nothing". What the container
+# has is the two lines describe_container prints underneath. Those are separate
+# facts and the wording keeps them separate.
+#
+# It deliberately does not call any of this a fault. Reuse is the design: the
+# writable layer is the sandbox, and a container that predates a flag is the
+# ordinary state of affairs, not a problem. What was missing was that the
+# output looked exactly the same whether the flag had reached the deployment
+# or not.
+warn_flags_inert() {
+  echo "  NOTE: reused, not created — this run did not apply the docker run flags"
+  echo "        below; whatever it has, it got when it was created. --recreate"
+  echo "        applies the current ones, and discards the writable layer."
+  describe_container
+}
+
 case "$STATE" in
   running)
     echo "reusing $NAME (already running)"
+    warn_flags_inert
     warn_stale_env
     docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
     exit 0
@@ -228,6 +395,7 @@ case "$STATE" in
   paused)
     docker unpause "$NAME" >/dev/null
     echo "unpaused $NAME"
+    warn_flags_inert
     warn_stale_env
     exit 0
     ;;
@@ -235,6 +403,14 @@ case "$STATE" in
     ;;
   dead)
     echo "$NAME is in the 'dead' state and cannot be started." >&2
+    # Onto stderr with the rest of this branch, and printed here of all places
+    # because this is where the facts decide the next command. The advice below
+    # discards the writable layer, so what the reader needs before taking it is
+    # how old this container is and which image it came from — that is the
+    # difference between `--recreate` and taking a snapshot first. Costs
+    # nothing: describe_container needs no running container and returns 0 on
+    # every path, so it cannot turn a diagnosed failure into an undiagnosed one.
+    describe_container >&2
     echo "Recreate it (this discards its writable layer):" >&2
     echo "    docker/run-container.sh --recreate" >&2
     exit 1
@@ -243,6 +419,7 @@ case "$STATE" in
     # exited or created — start it back up with its layer intact.
     docker start "$NAME" >/dev/null
     echo "restarted $NAME (writable layer preserved)"
+    warn_flags_inert
     warn_stale_env
     docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
     exit 0
@@ -319,12 +496,17 @@ fi
 #
 # It does not reach a container that already exists. `docker run` flags apply
 # at creation and this script reuses by default, so on every path that returns
-# above this line the flag is inert and pid 1 is still `sleep infinity`.
-# Nothing says so out loud: warn_stale_env compares .env's mtime against the
-# container's start time and has no opinion about flags, so `up.sh` prints
-# "reusing" and looks exactly as it did before. Until somebody runs
-# `docker/run-container.sh --recreate`, this changed the script and not the
-# deployment. See Clawcius #84.
+# above this line the flag is inert and pid 1 is still `sleep infinity`. Until
+# somebody runs `docker/run-container.sh --recreate`, this changed the script
+# and not the deployment.
+#
+# That much is unchanged; what changed is that the output no longer hides it.
+# warn_flags_inert() says on the three reuse paths that the run applied
+# nothing, and describe_container() prints the container's real
+# HostConfig.Init underneath, so "reusing" and "created" no longer look alike
+# (Clawcius #84, #92). Read the printed value, not this paragraph: this
+# paragraph cannot know which container you are looking at, and it is not
+# evidence that the flag is absent from yours.
 #
 # THAT IS TWO CONTAINERS, NOT ONE. systemd/hamachi-container.service runs this
 # same script with CLAWCIUS_CONTAINER=hamachi-agent, and on 2026-08-17 both it
@@ -422,4 +604,9 @@ docker run -d \
 # a narrow sudoers file with every command audited.
 
 echo "created $NAME from $IMAGE"
+# Read back rather than echoed from the variables above even here, where the
+# variables are right by construction — one function, one format, so a line in
+# the journal from a creation and a line from a reuse are the same shape and
+# can be compared without translating between them.
+describe_container
 docker ps --filter "name=$NAME" --format '  {{.Names}}  {{.Status}}  runtime-isolated'
