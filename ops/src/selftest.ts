@@ -1826,9 +1826,17 @@ test('the read-back refuses a FIFO instead of parking the executor on it (#109 r
   // the daemon and every deadline it holds, which is the same reasoning the
   // staged-unit open gives for its own O_NONBLOCK.
   //
-  // This test HANGS FOREVER rather than failing if the flag is dropped. That is
-  // the honest shape for it — the defect being guarded is a hang — and a test
-  // timeout is how it reports.
+  // This test BLOCKS rather than failing if the flag is dropped. That is the
+  // honest shape for it: the defect being guarded is a hang, so the test
+  // reproduces one. Verified by removing O_NONBLOCK from the built code and
+  // running this test alone — it never returned.
+  //
+  // `node --test` has NO default timeout, so until `--test-timeout` was added
+  // to the `selftest` script this reported as an indefinite hang with no output
+  // and no failing test name, which is the hardest possible signal to act on.
+  // The flag is what makes the sentence above true rather than aspirational
+  // (Clawcius #109, review round 3); the whole suite runs in about 20s, so 30s
+  // per test is slack rather than a deadline anything real is near.
   const root = mkdtempSync(join(tmpdir(), 'ops-units-readback-'));
   const fifo = join(root, 'clawcius-fifo.service');
   const made = spawnSync('mkfifo', [fifo]);

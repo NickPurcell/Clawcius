@@ -650,8 +650,10 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
       path,
       skipped: false,
       detail:
-        `installed ${source} to ${path}: the rename returned success, so the file is there, ` +
-        `but ${path} could not be read back (${String(error)}). This result therefore CANNOT ` +
+        `installed ${source} to ${path}: the rename returned success, so the file was in ` +
+        `place a moment ago — but ${path} could not be read back (${String(error)}), and the ` +
+        'most ordinary reason to be reading this is that it is no longer there. This result ' +
+        'therefore CANNOT ' +
         'say what landed — not its size, not its hash, not its mode, not its owner. What was ' +
         `SENT is ${String(bytes.length)} bytes, sha256 ${sent}. Check the file against that ` +
         `by hand before trusting it.${reload}`,
@@ -680,22 +682,31 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   // when the two disagree — which in the self-test the owner always does, since
   // it does not run as root. Each half is named separately: they have different
   // causes, and one message covering both would explain the wrong one.
+  const notRoot = process.getuid?.() !== 0;
   const off: string[] = [];
-  if (landed.mode !== '0644') off.push('the mode is not the 0644');
-  if (landed.owner !== '0:0') off.push('the owner is not the 0:0');
-  const asSet =
-    off.length === 0
-      ? ''
-      : ` NOTE: ${off.join(' and ')} this executor sets.` +
-        (landed.owner !== '0:0' && process.getuid?.() !== 0
-          ? ' It is NOT running as root, so it did not chown. On the host it is ' +
-            '(clawcius-ops.service is User=root); if you are seeing this on the host, THAT ' +
-            'is the finding.'
-          : '') +
-        (landed.mode !== '0644'
-          ? ' The mode was set on the descriptor before the rename, so something changed it ' +
-            'afterwards — look at the file.'
-          : '');
+  // Each phrase carries its own "this executor sets", so that joining two of
+  // them does not leave the qualifier binding only the second one.
+  if (landed.mode !== '0644') off.push('the mode is not the 0644 this executor sets');
+  if (landed.owner !== '0:0') off.push('the owner is not the 0:0 this executor sets');
+  const why: string[] = [];
+  if (landed.owner !== '0:0' && notRoot) {
+    why.push(
+      'It is NOT running as root, so it did not chown. On the host it is ' +
+        '(clawcius-ops.service is User=root); if you are seeing this on the host, THAT is ' +
+        'the finding.',
+    );
+  }
+  // Anything left unexplained by the line above — a wrong mode, or a wrong
+  // owner while this IS root — has no benign cause. Say so rather than naming
+  // the value and stopping, which is what the previous version did for an owner
+  // that was wrong under root.
+  if (landed.mode !== '0644' || (landed.owner !== '0:0' && !notRoot)) {
+    why.push(
+      'Mode and owner are set on the descriptor before the rename, so a value this executor ' +
+        'did not set means something changed the file afterwards — look at it.',
+    );
+  }
+  const asSet = off.length === 0 ? '' : ` NOTE: ${off.join(', and ')}. ${why.join(' ')}`;
 
   return {
     ok: true,
