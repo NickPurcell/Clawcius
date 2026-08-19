@@ -120,6 +120,7 @@ import {
   writeSync,
   type Stats,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 /**
@@ -397,6 +398,40 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   const contentProblem = unitContentProblem(content);
   if (contentProblem) return refusal('install', name, `${source}: ${contentProblem}`, path);
 
+  // The bytes that will actually be written, encoded ONCE, here, and used for
+  // the write, for the dry run's number and for the hash below.
+  //
+  // `content` is a JavaScript string and `content.length` is its length in
+  // UTF-16 CODE UNITS, not bytes. `writeSync` encodes it back to UTF-8. Every
+  // character outside ASCII is one code unit and two or three bytes, so on any
+  // unit file containing the box-drawing rules and em-dashes this project
+  // writes its comments with, the two numbers differ — and the result message
+  // reported the string length as "bytes" (Clawcius #94). Measured against the
+  // eleven unit files in systemd/ on 2026-08-18: eight of them disagree,
+  // clawcius-status.service by 524 on 12780 (12256 reported), and
+  // clawcius-ops.service by 743 on 25280.
+  //
+  // That is not a rounding error in a log line. The count was the only thing in
+  // the result describing what landed, so it is what a reader checks before
+  // deciding whether to trust an install, and a number 524 short of the file
+  // reads as a truncated write — the one failure that justifies an immediate
+  // rollback. A correct install was reported in the shape of the worst thing it
+  // could have been.
+  //
+  // Buffer.byteLength(content) would fix the count alone. It is not what this
+  // does, because a count taken from the intent can only ever be checked
+  // against the intent. See the read-back after the rename.
+  //
+  // Note that these are not necessarily the staged file's bytes: `content` was
+  // decoded as UTF-8, so a staged file that is not valid UTF-8 has already had
+  // its bad sequences replaced with U+FFFD and this re-encodes the replacement.
+  // That is unchanged behaviour — the old `writeSync(out, content)` did exactly
+  // the same — and the read-back below now makes it VISIBLE, because the hash
+  // reported is the hash of what landed and will not match the checkout. It is
+  // filed separately rather than fixed here.
+  const bytes = Buffer.from(content, 'utf8');
+  const sent = createHash('sha256').update(bytes).digest('hex');
+
   // A symlink or a directory where the unit belongs is refused rather than
   // replaced. `rename(2)` would replace a symlink without following it, so this
   // is not strictly necessary for safety — it is here because something else
@@ -426,8 +461,10 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
       path,
       skipped: true,
       detail:
-        `DRY RUN — would have installed ${content.length} bytes from ${source} to ${path} ` +
-        'as 0644 root:root. Nothing was written.',
+        `DRY RUN — would have installed ${bytes.length} bytes from ${source} to ${path} ` +
+        `as 0644 root:root, sha256 ${sent}. Nothing was written. A live run reports the ` +
+        'size and sha256 it reads back off the installed file, so if that sha256 differs ' +
+        'from this one, the file changed between the two runs.',
     };
   }
 
@@ -450,7 +487,16 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   }
 
   try {
-    writeSync(out, content);
+    // Checked, because `write(2)` is allowed to write fewer bytes than it was
+    // given and this code has no loop. On a local regular file a short write
+    // effectively does not happen — but "effectively does not happen" is the
+    // reason nobody would look here after a truncated unit, and the check is
+    // one comparison. Throws into the catch below, which unlinks the temp file,
+    // so nothing half-written can reach `path`.
+    const written = writeSync(out, bytes);
+    if (written !== bytes.length) {
+      throw new Error(`short write: ${written} of ${bytes.length} bytes`);
+    }
     // Set on the DESCRIPTOR, not on the path, and this is the line that makes
     // "a unit file arrives 0644 root:root or it does not arrive" a true
     // sentence for the first time. The sudoers rule that used to claim it was
@@ -494,6 +540,77 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   syncDir(options.unitDir);
 
   const asRoot = process.getuid?.() === 0;
+  const owner = asRoot
+    ? ', owner root:root'
+    : `, owner left as uid ${String(process.getuid?.() ?? -1)} because this executor is ` +
+      'NOT running as root. On the host it is (clawcius-ops.service is User=root); if you ' +
+      'are seeing this on the host, that is the finding.';
+  const reload = '. Run `sudo systemctl daemon-reload` before starting or restarting it.';
+
+  // Read the file back and describe THAT, rather than describing the request.
+  //
+  // The question this sentence is being used to answer is "is what landed what
+  // I sent?", and it is asked by someone deciding whether to roll back. A size
+  // and a hash computed from the artefact answer it; anything computed from
+  // `content` answers a different question — "what did I mean to send?" — in
+  // the same words, and cannot detect the failure that would make the answer
+  // interesting. The host agent in #94 got the truth by hashing the file
+  // itself, which is the executor's job and is now done here.
+  //
+  // Both numbers come from the same descriptor, so they cannot disagree with
+  // each other, and O_NOFOLLOW because anything that could swap `path` for a
+  // symlink between the rename and this open is exactly what a read-back is
+  // for.
+  let landed: { size: number; sha256: string };
+  try {
+    const back = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      landed = {
+        size: fstatSync(back).size,
+        sha256: createHash('sha256').update(readFileSync(back)).digest('hex'),
+      };
+    } finally {
+      try {
+        closeSync(back);
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (error) {
+    // The rename returned success, so the install happened; what failed is the
+    // description of it. Say that, and do not fall back to the numbers from the
+    // request — a size printed here would be indistinguishable from one that
+    // had been verified, which is the whole defect this change is about.
+    return {
+      ok: true,
+      op: 'install',
+      unit: name,
+      path,
+      skipped: false,
+      detail:
+        `installed ${source} to ${path}, mode 0644${owner}. The rename succeeded, but ${path} ` +
+        `could not be read back (${String(error)}), so this result CANNOT say what landed. ` +
+        `What was sent is ${String(bytes.length)} bytes, sha256 ${sent}; check the file ` +
+        `against that by hand before trusting it${reload}`,
+    };
+  }
+
+  if (landed.sha256 !== sent) {
+    return {
+      ok: false,
+      op: 'install',
+      unit: name,
+      path,
+      skipped: false,
+      detail:
+        `WROTE THE WRONG BYTES: ${path} is ${String(landed.size)} bytes, sha256 ` +
+        `${landed.sha256}, but ${String(bytes.length)} bytes with sha256 ${sent} were sent ` +
+        `from ${source}. The file IS in place and systemd will read it at the next ` +
+        'daemon-reload. Do not reload; look at it. Either the write was short, or something ' +
+        'replaced the file between the rename and the read-back.',
+    };
+  }
+
   return {
     ok: true,
     op: 'install',
@@ -501,13 +618,9 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
     path,
     skipped: false,
     detail:
-      `installed ${content.length} bytes from ${source} to ${path}, mode 0644` +
-      (asRoot
-        ? ', owner root:root'
-        : `, owner left as uid ${String(process.getuid?.() ?? -1)} because this executor is ` +
-          'NOT running as root. On the host it is (clawcius-ops.service is User=root); if you ' +
-          'are seeing this on the host, that is the finding.') +
-      '. Run `sudo systemctl daemon-reload` before starting or restarting it.',
+      `installed ${source} to ${path}: ${String(landed.size)} bytes, sha256 ${landed.sha256}, ` +
+      `mode 0644${owner}. The size and the hash were read back off ${path} after the write ` +
+      `and match what was sent${reload}`,
   };
 }
 

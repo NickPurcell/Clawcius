@@ -296,15 +296,38 @@ holds no pages — but a **PID** leak, and the container runs with
 `--pids-limit=512`. Two per run is the tool becoming unusable after a couple of
 hundred screenshots, presenting weeks later as some unrelated `fork()` failing.
 
-Chromium's helpers are orphaned when the Playwright driver exits, and pid 1
-here is `sleep infinity`, which never calls `wait()`. A process cannot reap
-another process's children, so `browse` sets `PR_SET_CHILD_SUBREAPER` before
-launching: orphaned descendants reparent to *it* instead of pid 1, and it
-waits them. Verified: 2 zombies per run before, 0 after.
+Chromium's helpers are orphaned when the Playwright driver exits and reparent
+to pid 1. A process cannot reap another process's children, so `browse` sets
+`PR_SET_CHILD_SUBREAPER` before launching: orphaned descendants reparent to
+*it* instead of pid 1, and it waits them. Verified: 2 zombies per run before,
+0 after.
 
-That fix is per-tool and does not generalise — any other tool whose children
-outlive it leaks pids the same way. The general fix is `docker run --init`:
-Clawcius #74.
+**Whether pid 1 would have reaped them anyway depends on the container, and
+both cases exist on this host.** The image's `CMD` is `sleep infinity`, which
+never calls `wait()`; a container started without `--init` has that at pid 1
+and nothing reaps, ever. Since Clawcius #86 `docker/run-container.sh` passes
+`--init`, so a container it *created* has Docker's tini at pid 1, and tini
+reaps. Measured in `hamachi-agent` on 2026-08-18, recreated since #86:
+`/proc/1/comm` is `docker-init` and the zombie count is 0. `clawcius-agent` on
+2026-08-17 still reported `HostConfig.Init` null, because a run flag applies at
+creation and the script changing does not reach a container that already exists
+(#84); `ops/src/verify.ts` builds its throwaway with no `--init` at all.
+
+Do not take either sentence on trust. `cat /proc/1/comm` inside the container
+you are actually in answers it — `docker-init` or `sleep` — and after #106
+`docker/run-container.sh` prints the container's real `HostConfig.Init` rather
+than what the script would have passed.
+
+**The subreaper stays regardless**, because it is redundant where tini is pid 1
+and load-bearing where it is not, and `browse` cannot tell which one it is in.
+It also reaps *synchronously, within the run*, which is what lets the log say
+what was reaped; tini reaps silently and afterwards. The alternative — deleting
+it — makes this tool's correctness a property of how its container was created,
+which is the thing #86 and #106 went to some trouble to stop hiding.
+
+The subreaper is still per-tool and does not generalise: any other tool whose
+children outlive it leaks pids the same way in a container without `--init`.
+That is what `--init` is for, and it is Clawcius #74 / #86.
 
 Anything still *alive* after `close()` is killed and printed loudly, because a
 leak cleaned up silently is a leak nobody fixes. All of it is scoped to

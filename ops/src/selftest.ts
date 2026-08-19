@@ -84,6 +84,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1733,6 +1734,66 @@ test('a dry run stages nothing into the unit directory', () => {
   assert.equal(result.skipped, true);
   assert.match(result.detail, /DRY RUN/);
   assert.deepEqual(readdirSync(fixture.unitDir), []);
+});
+
+test('the install result describes the file that landed, not the request (#94)', () => {
+  // The defect: the result said `installed ${content.length} bytes`, and
+  // `content` is a decoded STRING whose `.length` is UTF-16 code units.
+  // clawcius-status.service is 12780 bytes and reported 12256 — a correct
+  // install described in the exact shape of a truncated write, which is the one
+  // failure that justifies rolling back immediately.
+  //
+  // So the fixture body is deliberately not ASCII. Every one of these is one
+  // code unit and three UTF-8 bytes, which is what the project's own unit files
+  // are full of: eight of the eleven in systemd/ would have been misreported.
+  const banner = '═'.repeat(40);
+  const body = `# ${banner}\n# — a unit file, described in the project's house style —\n${UNIT_BODY}`;
+  const fixture = unitFixture('readback');
+  const staged = fixture.stage('clawcius-selftest.service', body);
+
+  const trueBytes = readFileSync(staged);
+  const trueSha = createHash('sha256').update(trueBytes).digest('hex');
+  assert.notEqual(
+    trueBytes.length,
+    body.length,
+    'the fixture must actually exercise the bug: byte length and string length must differ',
+  );
+
+  const options = {
+    unit: 'clawcius-selftest.service',
+    unitDir: fixture.unitDir,
+    stagingDir: fixture.staging,
+  };
+
+  // The dry run says what a live run would write, and says it in bytes.
+  const dry = installUnit({ ...options, dryRun: true });
+  assert.equal(dry.ok, true, dry.detail);
+  assert.match(dry.detail, new RegExp(`would have installed ${String(trueBytes.length)} bytes`));
+  assert.match(dry.detail, new RegExp(`sha256 ${trueSha}`));
+
+  const result = installUnit({ ...options, dryRun: false });
+  assert.equal(result.ok, true, result.detail);
+
+  // The hash is the point: it is computed from the artefact, so it cannot drift
+  // from the artefact the way a count taken upstream of the write can.
+  assert.match(result.detail, new RegExp(`sha256 ${trueSha}`));
+  assert.match(result.detail, new RegExp(`${String(trueBytes.length)} bytes`));
+  assert.equal(
+    statSync(result.path).size,
+    trueBytes.length,
+    'and that is genuinely the size on disk',
+  );
+
+  // The regression itself, stated as the thing that must not appear. Asserting
+  // only "the right number is present" would still pass if both were printed.
+  assert.doesNotMatch(
+    result.detail,
+    new RegExp(`\\b${String(body.length)}\\b`),
+    'the UTF-16 string length must not appear in the result at all',
+  );
+  // And the result must not be quoting the request back: the hash it prints is
+  // the one it read off the installed path.
+  assert.match(result.detail, /read back off/);
 });
 
 test('a unit request carries a name and nothing else — no path, no mode, no owner', () => {
