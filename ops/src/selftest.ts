@@ -134,6 +134,7 @@ import {
   drainUnitRequests,
   installUnit,
   parseUnitRequest,
+  readBackInstalledUnit,
   removeUnit,
   validateUnitName,
   MAX_UNIT_BYTES,
@@ -1794,6 +1795,61 @@ test('the install result describes the file that landed, not the request (#94)',
   // And the result must not be quoting the request back: the hash it prints is
   // the one it read off the installed path.
   assert.match(result.detail, /read back off/);
+
+  // Mode and owner are read back too, not asserted from having called
+  // fchmod/fchown. The self-test does not run as root, so the owner is this
+  // uid — which is the point: a message that said "owner root:root" here would
+  // be wrong, and the old one did.
+  const st = statSync(result.path);
+  assert.match(
+    result.detail,
+    new RegExp(`mode ${(st.mode & 0o7777).toString(8).padStart(4, '0')}`),
+    'the mode printed is the mode on disk',
+  );
+  assert.match(
+    result.detail,
+    new RegExp(`owner ${String(st.uid)}:${String(st.gid)}`),
+    'and the owner is the uid that actually owns it, not "root:root" from having tried',
+  );
+  // The self-test is not root, so the owner cannot be 0:0 and the message must
+  // say which of the two it is complaining about. It must NOT complain about
+  // the mode, which fchmod set correctly without needing root.
+  assert.match(result.detail, /the owner is not the 0:0/);
+  assert.doesNotMatch(result.detail, /the mode is not the 0644/);
+  assert.match(result.detail, /NOT running as root/);
+});
+
+test('the read-back refuses a FIFO instead of parking the executor on it (#109 review)', () => {
+  // `open(2)` O_RDONLY on a FIFO with no writer blocks until one arrives.
+  // O_NOFOLLOW does not help: it excludes symlinks, not FIFOs. This call runs
+  // on the executor's poll loop with no timeout around it, so a block here is
+  // the daemon and every deadline it holds, which is the same reasoning the
+  // staged-unit open gives for its own O_NONBLOCK.
+  //
+  // This test HANGS FOREVER rather than failing if the flag is dropped. That is
+  // the honest shape for it — the defect being guarded is a hang — and a test
+  // timeout is how it reports.
+  const root = mkdtempSync(join(tmpdir(), 'ops-units-readback-'));
+  const fifo = join(root, 'clawcius-fifo.service');
+  const made = spawnSync('mkfifo', [fifo]);
+  assert.equal(made.status, 0, 'mkfifo must work for this test to mean anything');
+  assert.throws(() => readBackInstalledUnit(fifo), /not a regular file/);
+
+  // A real file comes back described by its own bytes: the size is the length
+  // of the buffer that was hashed, so the two cannot describe different reads.
+  const real = join(root, 'clawcius-real.service');
+  const body = '[Unit]\nDescription=— an em dash, three bytes, one code unit —\n';
+  writeFileSync(real, body);
+  const seen = readBackInstalledUnit(real);
+  assert.equal(seen.size, readFileSync(real).length);
+  assert.notEqual(seen.size, body.length, 'and it is the byte length, not the string length');
+  assert.equal(seen.sha256, createHash('sha256').update(readFileSync(real)).digest('hex'));
+  assert.equal(seen.mode, (statSync(real).mode & 0o7777).toString(8).padStart(4, '0'));
+  assert.equal(seen.owner, `${String(statSync(real).uid)}:${String(statSync(real).gid)}`);
+
+  // A path that is not there throws rather than returning a partial answer,
+  // which is what puts installUnit into its "CANNOT say what landed" branch.
+  assert.throws(() => readBackInstalledUnit(join(root, 'clawcius-absent.service')));
 });
 
 test('a unit request carries a name and nothing else — no path, no mode, no owner', () => {

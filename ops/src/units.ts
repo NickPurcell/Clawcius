@@ -207,6 +207,17 @@ export type UnitOp = 'install' | 'remove';
 
 /** What one install or remove did, or refused to do, and why. */
 export type UnitOpResult = {
+  /**
+   * **`ok: false` does not mean nothing was written.** It did until 2026-08-18,
+   * when every false came from `refusal()` and every refusal happened before
+   * the rename. `installUnit` now also returns false when the file it wrote
+   * does not hash to what it sent — and in that one case the file IS installed
+   * and systemd will read it at the next `daemon-reload`. The `detail` says so
+   * in as many words; read it before reacting to this flag.
+   *
+   * No caller currently branches on this to retry or roll back. `writeResult`
+   * serialises it and `Executor.#journalUnitOp` records it, and that is all.
+   */
   ok: boolean;
   op: UnitOp;
   /** The name as asked for, clipped for the log. Never used to build a path unless it validated. */
@@ -319,6 +330,72 @@ export function validateUnitName(unit: unknown): NameVerdict {
     };
   }
   return { ok: true, name: unit };
+}
+
+/** What a file at a path actually is, read off one descriptor. Not what was asked for. */
+export type InstalledFile = {
+  size: number;
+  sha256: string;
+  /** Octal, four digits, as `stat -c %a` would print it. */
+  mode: string;
+  /** `uid:gid`, numeric. `0:0` is root:root and nothing here translates it. */
+  owner: string;
+};
+
+/**
+ * Open the installed unit and report what is there. Throws rather than
+ * returning a partial answer: a caller that cannot read the file back must say
+ * so, not print half of one.
+ *
+ * O_NOFOLLOW because anything that could swap `path` for a symlink between the
+ * rename and this open is exactly what a read-back is for.
+ *
+ * **O_NONBLOCK because the other shape of the same attack is a FIFO**, and this
+ * runs on the executor's poll loop with no timeout around it. `open(2)`
+ * O_RDONLY on a FIFO with no writer blocks until one arrives — forever, in
+ * practice — and O_NOFOLLOW does not help, because it excludes symlinks and not
+ * FIFOs. That would park the daemon and every deadline it is holding, which is
+ * word for word the reason the staged-unit open above gives for its own
+ * O_NONBLOCK. Reproduced under gVisor before the flag was added: `timeout 5`
+ * around the open without it exits 124; with it the open returns at once and
+ * the `isFile()` check below refuses the FIFO by name (Clawcius #109, review
+ * round 1).
+ *
+ * The size comes from the SAME buffer that was hashed rather than from a
+ * separate `fstat`, so the two cannot describe different reads of the file.
+ * Mode and owner do come from the `fstat`, which is a second syscall — they are
+ * metadata and cannot be derived from the bytes.
+ */
+export function readBackInstalledUnit(path: string): InstalledFile {
+  const back = openSync(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const stat = fstatSync(back);
+    // A FIFO reaches here rather than hanging the open, so it is refused with a
+    // sentence instead of an EAGAIN from the read.
+    if (!stat.isFile()) throw new Error(`${path} is ${describe(stat)}, not a regular file`);
+    if (stat.size > MAX_UNIT_BYTES) {
+      throw new Error(
+        `${path} is ${String(stat.size)} bytes, over the ${String(MAX_UNIT_BYTES)}-byte ` +
+          'ceiling. It was not read.',
+      );
+    }
+    const buf = readFileSync(back);
+    return {
+      size: buf.length,
+      sha256: createHash('sha256').update(buf).digest('hex'),
+      mode: (stat.mode & 0o7777).toString(8).padStart(4, '0'),
+      owner: `${String(stat.uid)}:${String(stat.gid)}`,
+    };
+  } finally {
+    try {
+      closeSync(back);
+    } catch {
+      /* nothing useful to do about a failed close */
+    }
+  }
 }
 
 /**
@@ -539,13 +616,7 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
 
   syncDir(options.unitDir);
 
-  const asRoot = process.getuid?.() === 0;
-  const owner = asRoot
-    ? ', owner root:root'
-    : `, owner left as uid ${String(process.getuid?.() ?? -1)} because this executor is ` +
-      'NOT running as root. On the host it is (clawcius-ops.service is User=root); if you ' +
-      'are seeing this on the host, that is the finding.';
-  const reload = '. Run `sudo systemctl daemon-reload` before starting or restarting it.';
+  const reload = ' Run `sudo systemctl daemon-reload` before starting or restarting it.';
 
   // Read the file back and describe THAT, rather than describing the request.
   //
@@ -557,30 +628,21 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   // interesting. The host agent in #94 got the truth by hashing the file
   // itself, which is the executor's job and is now done here.
   //
-  // Both numbers come from the same descriptor, so they cannot disagree with
-  // each other, and O_NOFOLLOW because anything that could swap `path` for a
-  // symlink between the rename and this open is exactly what a read-back is
-  // for.
-  let landed: { size: number; sha256: string };
+  // EVERYTHING the success message states about the installed file comes from
+  // this one call — size, hash, mode and owner. Not just the two that #94 was
+  // about: a mode and an owner taken from "did this code call fchmod/fchown"
+  // are intent, and printing them beside two verified values in one sentence
+  // lends them a credibility they have not earned.
+  let landed: InstalledFile;
   try {
-    const back = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try {
-      landed = {
-        size: fstatSync(back).size,
-        sha256: createHash('sha256').update(readFileSync(back)).digest('hex'),
-      };
-    } finally {
-      try {
-        closeSync(back);
-      } catch {
-        /* ignore */
-      }
-    }
+    landed = readBackInstalledUnit(path);
   } catch (error) {
     // The rename returned success, so the install happened; what failed is the
-    // description of it. Say that, and do not fall back to the numbers from the
+    // description of it. Say that, and do not fall back to the values from the
     // request — a size printed here would be indistinguishable from one that
-    // had been verified, which is the whole defect this change is about.
+    // had been verified, which is the whole defect this change is about, and a
+    // message that says "mode 0644" one clause before "I cannot say what
+    // landed" is that defect inside its own correction.
     return {
       ok: true,
       op: 'install',
@@ -588,10 +650,11 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
       path,
       skipped: false,
       detail:
-        `installed ${source} to ${path}, mode 0644${owner}. The rename succeeded, but ${path} ` +
-        `could not be read back (${String(error)}), so this result CANNOT say what landed. ` +
-        `What was sent is ${String(bytes.length)} bytes, sha256 ${sent}; check the file ` +
-        `against that by hand before trusting it${reload}`,
+        `installed ${source} to ${path}: the rename returned success, so the file is there, ` +
+        `but ${path} could not be read back (${String(error)}). This result therefore CANNOT ` +
+        'say what landed — not its size, not its hash, not its mode, not its owner. What was ' +
+        `SENT is ${String(bytes.length)} bytes, sha256 ${sent}. Check the file against that ` +
+        `by hand before trusting it.${reload}`,
     };
   }
 
@@ -604,12 +667,35 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
       skipped: false,
       detail:
         `WROTE THE WRONG BYTES: ${path} is ${String(landed.size)} bytes, sha256 ` +
-        `${landed.sha256}, but ${String(bytes.length)} bytes with sha256 ${sent} were sent ` +
-        `from ${source}. The file IS in place and systemd will read it at the next ` +
-        'daemon-reload. Do not reload; look at it. Either the write was short, or something ' +
-        'replaced the file between the rename and the read-back.',
+        `${landed.sha256}, mode ${landed.mode}, owner ${landed.owner} — but ` +
+        `${String(bytes.length)} bytes with sha256 ${sent} were sent from ${source}. NOTE ` +
+        'THAT ok=false HERE DOES NOT MEAN NOTHING HAPPENED: the file IS in place and systemd ' +
+        'will read it at the next daemon-reload. Do not reload; look at it. Either the write ' +
+        'was short, or something replaced the file between the rename and the read-back.',
     };
   }
+
+  // 0644 and 0:0 are what the code above SETS; `landed` is what the file HAS.
+  // Stated this way round so the sentence stays a report of the artefact even
+  // when the two disagree — which in the self-test the owner always does, since
+  // it does not run as root. Each half is named separately: they have different
+  // causes, and one message covering both would explain the wrong one.
+  const off: string[] = [];
+  if (landed.mode !== '0644') off.push('the mode is not the 0644');
+  if (landed.owner !== '0:0') off.push('the owner is not the 0:0');
+  const asSet =
+    off.length === 0
+      ? ''
+      : ` NOTE: ${off.join(' and ')} this executor sets.` +
+        (landed.owner !== '0:0' && process.getuid?.() !== 0
+          ? ' It is NOT running as root, so it did not chown. On the host it is ' +
+            '(clawcius-ops.service is User=root); if you are seeing this on the host, THAT ' +
+            'is the finding.'
+          : '') +
+        (landed.mode !== '0644'
+          ? ' The mode was set on the descriptor before the rename, so something changed it ' +
+            'afterwards — look at the file.'
+          : '');
 
   return {
     ok: true,
@@ -619,8 +705,8 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
     skipped: false,
     detail:
       `installed ${source} to ${path}: ${String(landed.size)} bytes, sha256 ${landed.sha256}, ` +
-      `mode 0644${owner}. The size and the hash were read back off ${path} after the write ` +
-      `and match what was sent${reload}`,
+      `mode ${landed.mode}, owner ${landed.owner}. All four were read back off ${path} after ` +
+      `the write, and the hash matches what was sent.${asSet}${reload}`,
   };
 }
 

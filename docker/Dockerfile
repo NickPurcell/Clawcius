@@ -137,8 +137,15 @@ WORKDIR /var/lib/clawcius/workspaces
 # builds its own, and is fine only because it removes the container each run.
 # Nor does it reach a container that already exists, since that script reuses
 # by design and a run flag applies only at creation; the two long-lived
-# instances predate #74 and are still leaking until each is recreated (#84).
-# `docker exec <name> cat /proc/1/comm` settles which case you are looking at.
+# instances predate #74 and leak until each is recreated (#84).
+#
+# THAT LAST CLAUSE IS DATED, BECAUSE IT IS ABOUT A CONTAINER AND NOT ABOUT THIS
+# FILE. On 2026-08-17 both reported HostConfig.Init null. On 2026-08-18
+# hamachi-agent had been recreated and reported /proc/1/comm = docker-init with
+# a zombie count of 0; clawcius-agent had not. Neither sentence can stay true by
+# itself, and a recreate that happens after this line is written will not come
+# back and edit it. `docker exec <name> cat /proc/1/comm` settles which case you
+# are looking at, for the container you are actually asking about.
 #
 # DO NOT DROP THAT FLAG ON THE ASSUMPTION THAT THIS LINE IS HARMLESS. Nothing
 # in this image reaps anything, and the only thing stopping the leak is a flag
