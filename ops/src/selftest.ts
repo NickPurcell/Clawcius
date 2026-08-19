@@ -35,8 +35,9 @@
  *     now — see `Executor`, and the boot report that clears what the retired
  *     spool path left armed, which is tested.
  *
- * Seventy-one tests went on 2026-08-16 with the code they covered: the request
- * parser, the spool's structural defences, the spool DIRECTORY (a root process
+ * The suite went from 129 tests to 61 on 2026-08-16 — both measured by running
+ * it — when the code they covered went with them: the request parser, the
+ * spool's structural defences, the spool DIRECTORY (a root process
  * meeting a path the sandbox controls the name of), the queue, the rate limit,
  * the per-instance `mayRequest` restriction, the idle wait, the snapshot, the
  * check-in deadline and the automatic rollback. None of that is coverage that

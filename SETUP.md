@@ -476,7 +476,8 @@ sudo chown -R npurcell:npurcell /home/npurcell/clawcius   # if a root build got 
 cd /home/npurcell/clawcius/ops
 npm install
 npm run build
-npm run selftest              # 61 tests, no docker required
+npm run selftest              # no docker required; ops/README.md § What has
+                              # and has not been tested states the count
 
 sudo cp ../systemd/clawcius-ops.service \
         ../systemd/clawcius-snapshot-verify.service \

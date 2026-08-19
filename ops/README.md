@@ -1427,7 +1427,8 @@ ops/
     journal.ts           append-only jsonl + ops-status.json
     verify.ts            snapshot restore test
     verify-main.ts       oneshot entry for the verify timer
-    selftest.ts          `npm run selftest` — 58 tests
+    selftest.ts          `npm run selftest` — count in § What has and has
+                         not been tested, which is the only place that says it
 ```
 
 ## The status page
@@ -1558,15 +1559,21 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` is **58 tests** and runs with no docker, no systemd, no npm
-and no real `claude`. It was 129 before 2026-08-16; the seventy-one that went
-tested request parsing, the spool's caps and flood handling, the queue, the
-`mayRequest` refusals, the deprecated `spoolDir` migration, the idle wait, the
-snapshot-before/rollback-after ordering, the deadline, the automatic rollback and
-the breaker. They did not start failing. **The code they covered was deleted**,
-and a test suite that shrinks by that much is worth being explicit about,
-because the alternative reading — that coverage was dropped — is the one a
-reader should be able to rule out here rather than by reading the diff.
+`npm run selftest` is **62 tests** — measured on `main` at `208dafb`, which is
+the only state that claim is made about; run it rather than trusting this line,
+and if it disagrees the suite is right. It runs with no docker, no systemd, no
+npm and no real `claude`. It was 129 before 2026-08-16 and 61 after, both
+measured by running it: sixty-eight fewer, from seventy-five titles going and
+seven arriving. No count is put on the list that follows, because at least one
+of the seven is an old test renamed rather than a new one and the arithmetic
+stops being honest. What went tested request parsing, the spool's caps and
+flood handling, the queue, the `mayRequest` refusals, the deprecated `spoolDir`
+migration, the idle wait, the snapshot-before/rollback-after ordering, the
+deadline, the automatic rollback and the breaker. They did not start failing.
+**The code they covered was deleted**, and a test suite that shrinks by that
+much is worth being explicit about, because the alternative reading — that
+coverage was dropped — is the one a reader should be able to rule out here
+rather than by reading the diff.
 
 What is covered now:
 
