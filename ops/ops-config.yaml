@@ -286,6 +286,17 @@ instances:
     # build is a new build.
     buildRepo: clawcius
 
+    # ── Where this instance's snapshots come from ────────────────────────
+    # Nothing starts, stops or queries this unit. It is the name the restore
+    # verifier prints when it finds this instance's newest snapshot has stopped
+    # moving, and it is written down rather than derived because verify.ts used
+    # to print "Check clawcius-snapshot.timer" as a literal for EVERY instance
+    # — so hamachi, the one instance that would ever have hit it, would have
+    # been sent to read instance 1's timer, which was running correctly and had
+    # nothing to do with it. Leave it out and the verifier says no timer is
+    # recorded, which is a truer thing to print than a guess.
+    snapshotTimer: clawcius-snapshot.timer
+
     # ── The Clawsky board: how a coordinator reaches the host agent ──────
     # Since 2026-08-14 the host agent is an ordinary Clawsky participant with a
     # mailbox. A DM to `<crew>-host` from that crew's COORDINATOR runs a session
@@ -324,6 +335,21 @@ instances:
     memory: 3g
     wakerStatusFile: /var/lib/hamachi/waker-status.json
     buildRepo: clawcius
+
+    # systemd/hamachi-snapshot.timer, added 2026-08-19. Until then this line
+    # would have had to be blank: nothing on this host snapshotted hamachi at
+    # all between 2026-08-14 and that unit, and the thing standing in for a
+    # timer beforehand was a side effect — the per-task snapshot the ops
+    # executor took before recreating an instance, retired the same day. See
+    # Clawcius #87.
+    #
+    # THE UNIT SHIPPING IS NOT THE UNIT BEING INSTALLED. Writing the name here
+    # asserts which timer owns this instance, not that it is enabled on this
+    # host — that is a deploy step (SETUP.md § Install the units). The check
+    # that catches the difference is `snapshotVerify.maxAgeHours`: if the unit
+    # never gets enabled, hamachi's newest snapshot goes on aging and the
+    # verifier says so within two nights.
+    snapshotTimer: hamachi-snapshot.timer
 
     # Confirmed against .env.hamachi on 2026-08-14: CLAWCIUS_DB_PATH is
     # /var/lib/hamachi/hamachi.db. Note the file is named for the instance, not
@@ -585,10 +611,35 @@ breaker:
 # for weeks while the nightly timer produced 2 GB images that had never been
 # booted. Now that a missed check-in triggers an automatic rollback, that gap
 # is in the recovery path.
+#
+# It also has to check the DATE, and until 2026-08-19 it did not. It sorted the
+# tags, took the newest, booted it and passed — which is a test that succeeds
+# forever on an image that gets one day older every day. `hamachi` was in
+# exactly that state for days: nothing had been snapshotting it since the
+# per-task snapshot was retired on 2026-08-14, its newest image never moved, and
+# this timer booted that image every night and reported the rollback path sound.
+# It was sound. It restored to last week. Clawcius #87.
 snapshotVerify:
   enabled: true
   instances: [clawcius, hamachi]
   startTimeoutSeconds: 60
+
+  # How old the newest snapshot may be before the instance is reported broken.
+  #
+  # 48h is two missed nightly snapshots, and it is measured in whole cycles on
+  # purpose. One missed cycle has a benign cause: every timer here is
+  # Persistent=true, so a host that was down overnight queues the snapshot and
+  # the verify catch-ups together at boot, and the verifier can win that race
+  # and measure an image the catch-up is about to replace. Going red for that
+  # would train everyone to ignore this unit, which costs more than the check is
+  # worth. Two consecutive misses is not weather.
+  #
+  # Raise this if the snapshot timers ever move to a longer interval — the
+  # relationship that has to hold is `maxAgeHours` > 2 x the snapshot period —
+  # and note that nothing enforces that relationship, because nothing here knows
+  # the period: it lives in the .timer's OnCalendar, on the host.
+  maxAgeHours: 48
+
   # Run inside the throwaway container once it reports running. argv array, no
   # shell. `docker run -d` succeeding proves almost nothing — it returns as
   # soon as the container is created, and an image whose entrypoint dies

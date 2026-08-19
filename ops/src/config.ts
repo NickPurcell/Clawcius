@@ -179,6 +179,32 @@ export type InstanceEntry = {
    * exact same bytes being redeployed in a loop.
    */
   buildRepo: string;
+  /**
+   * The systemd timer that snapshots this instance, or empty for "none is
+   * recorded".
+   *
+   * Nothing starts, stops or reads this unit. It exists so the restore
+   * verifier can name something an operator can act on when it finds an
+   * instance's newest snapshot has stopped moving — and the only alternatives
+   * were both wrong. `verify.ts` said "Check clawcius-snapshot.timer" as a
+   * literal, on every instance, which for `hamachi` pointed at instance 1's
+   * timer: green, healthy, and not the one that had stopped. Deriving
+   * `<name>-snapshot.timer` instead would be a guess about the host printed as
+   * a fact, which is the same defect one level quieter.
+   *
+   * So it is written down, per instance, and **empty is a finding rather than
+   * a default**. An instance whose snapshots have gone stale and that names no
+   * timer is very probably an instance nothing is scheduled to snapshot at
+   * all — which is exactly what happened to `hamachi` between 2026-08-14 and
+   * Clawcius #87, and the verifier says so in those words instead of sending
+   * somebody to read the wrong unit.
+   *
+   * It is NOT required, because a missing one must not be a boot failure: this
+   * loader is shared with `clawcius-snapshot-verify.service`, and a verifier
+   * that refuses to start over an unconfigured instance reports nothing at all
+   * about the instances that *are* configured.
+   */
+  snapshotTimer: string;
 };
 
 export type LimitsConfig = {
@@ -250,6 +276,26 @@ export type SnapshotVerifyConfig = {
   instances: string[];
   /** Seconds a restored throwaway container gets to come up. */
   startTimeoutSeconds: number;
+  /**
+   * How old the newest snapshot may be before the instance is reported broken,
+   * in hours.
+   *
+   * The verifier used to take `tags[0]` and never look at the date on it, so
+   * "there is an image and it boots" was the whole of the test. That passes
+   * forever on an image that gets one day older every day, which is the state
+   * `hamachi` was in for days under a nightly green light (Clawcius #87). This
+   * is the number that makes the difference between "a rollback target exists"
+   * and "a rollback target from *last week* exists" expressible.
+   *
+   * Size it in whole missed snapshot cycles, not in hours. A red the operator
+   * cannot act on is as useless as a wrong green, and there is one benign way
+   * to be a cycle behind: both snapshot timers and the verify timer are
+   * `Persistent=true`, so a host that was down overnight queues all three
+   * catch-up runs at boot, and the verifier can win that race and measure a
+   * snapshot the catch-up is about to replace. Two consecutive misses is not
+   * weather.
+   */
+  maxAgeHours: number;
   /**
    * Command run inside the throwaway container to prove it is genuinely up.
    * argv array, no shell. A container that is "running" but whose PID 1 is
@@ -534,6 +580,8 @@ const DEFAULTS: OpsConfig = {
     enabled: true,
     instances: [],
     startTimeoutSeconds: 60,
+    // 48h: two missed nightly snapshots. See SnapshotVerifyConfig.maxAgeHours.
+    maxAgeHours: 48,
     probe: ['/bin/sh', '-c', 'test -x /usr/local/bin/claude'],
   },
   deprecations: [],
@@ -792,6 +840,24 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     }
     const stateDir = requiredAbsPath(entry['stateDir'], `${at}.stateDir`);
 
+    // Validated for shape, never resolved against the host. Nothing in this
+    // process starts or queries it — it is remediation text the verifier prints
+    // when this instance's snapshots have stopped moving, and the shape check is
+    // there so a typo surfaces at boot rather than as a `systemctl status` that
+    // says "Unit not found" during an incident. Empty is allowed and means "no
+    // timer is recorded", which the verifier reports as its own finding; see
+    // `InstanceEntry.snapshotTimer`.
+    const snapshotTimer = str(entry['snapshotTimer'], `${at}.snapshotTimer`, '');
+    if (snapshotTimer && !UNIT_PATTERN.test(snapshotTimer)) {
+      throw new OpsConfigError(
+        `${at}.snapshotTimer`,
+        `("${snapshotTimer}") must be a full systemd unit name with a type suffix, ` +
+          `matching ${String(UNIT_PATTERN)}. Leave it out entirely for "no snapshot ` +
+          'timer is recorded for this instance" — the verifier reports that, and it is ' +
+          'a truer thing to print than a unit name nobody checked.',
+      );
+    }
+
     // Absent is "no mailbox", which is what an upgrade gets: the host agent
     // stays reachable only through the spool until somebody writes down where
     // the board is. Present means both fields, and neither has a default —
@@ -821,6 +887,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       memory: str(entry['memory'], `${at}.memory`, '2g'),
       wakerStatusFile: requiredAbsPath(entry['wakerStatusFile'], `${at}.wakerStatusFile`),
       buildRepo,
+      snapshotTimer,
       board,
     };
   });
@@ -1043,6 +1110,18 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         DEFAULTS.snapshotVerify.startTimeoutSeconds,
         5,
         3600,
+      ),
+      // Floor of 1 rather than 0. Zero would mean "every snapshot is stale the
+      // instant it is taken", which is a permanently red verifier — the exact
+      // failure the design note above says is worth no more than a permanently
+      // green one. The ceiling is a year, which is not a recommendation; it is
+      // far enough out that anyone reaching it has decided something.
+      maxAgeHours: num(
+        verify['maxAgeHours'],
+        'snapshotVerify.maxAgeHours',
+        DEFAULTS.snapshotVerify.maxAgeHours,
+        1,
+        8760,
       ),
       probe: strList(verify['probe'], 'snapshotVerify.probe', DEFAULTS.snapshotVerify.probe),
     },

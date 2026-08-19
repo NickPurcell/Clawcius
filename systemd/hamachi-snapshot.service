@@ -1,0 +1,72 @@
+[Unit]
+Description=Snapshot the Hamachi agent container
+Documentation=file:/home/npurcell/clawcius/ops/README.md
+Requires=docker.service
+
+# ── Ordering: three units, one directive, and none of them a dependency ───
+#
+# ONE `After=` line on purpose. systemd appends repeated assignments to
+# list-typed directives like this one, so splitting it would also work — but a
+# second `After=` twelve comment-lines below the first reads to almost everyone
+# (and to every naive ini parser) as overwriting it, and an ordering constraint
+# that looks deleted is one somebody deletes.
+#
+#   docker.service            — clawcius-snapshot.service has
+#                               `Requires=docker.service` and no `After=`.
+#                               Requires is a dependency, not an ordering, so
+#                               the two are free to start in parallel there; the
+#                               only thing saving it is that its container unit
+#                               is itself ordered after docker. Clawcius #112.
+#   hamachi-container.service — the unit that owns this instance's container.
+#                               There is nothing to commit before it has run.
+#   clawcius-snapshot.service — so the two instances' commits do not overlap.
+#                               The .timer offsets them by half an hour, but an
+#                               offset is a schedule, not a guarantee:
+#                               `Persistent=true` on both means a host that was
+#                               down overnight queues BOTH catch-up runs at
+#                               boot, in one transaction, and this line is the
+#                               only thing keeping two multi-gigabyte `docker
+#                               commit`s off the same disk at the same moment on
+#                               a 12 GB box.
+#
+# Ordering only — no Requires, no Wants, on any of the three. A failed or absent
+# clawcius-snapshot.service must not stop THIS instance being backed up, which
+# is the whole lesson of #87: hamachi's backups stopped as a by-product of
+# something else's removal. "After it, if it is running; regardless, if it is
+# not" is exactly the asymmetry wanted.
+After=docker.service hamachi-container.service clawcius-snapshot.service
+
+[Service]
+Type=oneshot
+User=npurcell
+Group=npurcell
+SupplementaryGroups=docker
+
+# The whole of the difference from instance 1. docker/snapshot.sh has been
+# parameterised on CLAWCIUS_CONTAINER since it was written — the same way
+# run-container.sh is — so a second instance is a unit file and not a forked
+# copy of the script. (Named rather than cited by line number: the line moved
+# by six the first time somebody edited that script's header, which was in the
+# same commit as this file.)
+#
+# CLAWCIUS_SNAPSHOT_REPO is deliberately NOT set: the script defaults it to
+# $CLAWCIUS_CONTAINER, so the images land in `hamachi-agent:snap-<stamp>`. That
+# default is load-bearing rather than incidental — ops/src/verify.ts finds the
+# snapshots to restore-test by stripping the tag off this instance's `image:`
+# in ops-config.yaml (`hamachi-agent:latest` -> `hamachi-agent`), so a repo set
+# to anything else here produces images the verifier would not look at, and it
+# would go on reporting "no snapshot images exist" beside a disk filling with
+# them.
+Environment=CLAWCIUS_CONTAINER=hamachi-agent
+
+ExecStart=/home/npurcell/clawcius/docker/snapshot.sh
+
+# KEEP is unset here, as it is in clawcius-snapshot.service, so the script's own
+# default of 8 is in force. `snapshotKeep: 24` in ops-config.yaml is inert and
+# has been since the per-task snapshot was retired on 2026-08-14 — see
+# ops/README.md § "Nothing is rolled back". Do not read that key as this unit's
+# retention.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hamachi-snapshot

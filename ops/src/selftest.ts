@@ -97,7 +97,7 @@ import { readIdle } from './idle.js';
 import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
 import { Executor, compareHealth } from './executor.js';
-import { verifyInstance } from './verify.js';
+import { snapshotTakenAt, verifyInstance } from './verify.js';
 import {
   agentProblems,
   agentWarnings,
@@ -205,10 +205,28 @@ function makeHost(options: {
    * A test below flips this to 0o644 to prove the refusal fires.
    */
   envFileMode?: number;
+  /**
+   * Age of the newest snapshot the fixture's `docker images` reports, in hours.
+   *
+   * Defaults to 1.5, which is what the real host reads at 05:30 with the
+   * snapshot timer at 04:00 — i.e. healthy. Push it past
+   * `snapshotVerify.maxAgeHours` to produce the state hamachi was actually in.
+   */
+  snapshotAgeHours?: number;
+  /**
+   * The tag list verbatim, for the cases that are not about age: `[]` is an
+   * instance nothing has ever snapshotted, and a malformed stamp is a tag
+   * something other than `snapshot.sh` wrote.
+   */
+  snapshotTags?: string[];
+  /** `snapshotVerify.maxAgeHours`. Left out entirely means "take the default". */
+  maxAgeHours?: number;
 }): {
   root: string;
   config: OpsConfig;
   callsDir: string;
+  /** The tag `verify.ts` should pick, derived the same way it derives it. */
+  newestSnapshot: string;
   /** The fixture service account, resolved through the real code path. */
   agent: AgentUser;
   calls: () => string[][];
@@ -275,12 +293,45 @@ function makeHost(options: {
     return path;
   };
 
+  // ── The snapshot tags this fixture's docker reports ─────────────────────
+  //
+  // Computed from the clock, NEVER written as literals, and that is not a
+  // stylistic preference. They used to be `snap-20260801-040000` and
+  // `snap-20260808-040000`, which was fine for a verifier that only asked
+  // whether an image booted — and would have become a suite that passed on the
+  // day the age check was written and failed silently a fortnight later, when
+  // the fixture's own snapshots aged past the ceiling. A frozen date in a
+  // fixture for a test *about staleness* is the bug under test, in the test.
+  //
+  // Default 1.5h is what a real host reads at 05:30 with the snapshot timer at
+  // 04:00; `snapshotAgeHours` moves it, and `snapshotTags` replaces the list
+  // outright for the cases that are not about age at all (none, malformed).
+  const snapAgeHours = options.snapshotAgeHours ?? 1.5;
+  const snapTags =
+    options.snapshotTags ??
+    [snapAgeHours, snapAgeHours + 24].map((hours) => {
+      const at = new Date(Date.now() - hours * 3_600_000);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      return (
+        `snap-${at.getUTCFullYear()}${pad(at.getUTCMonth() + 1)}${pad(at.getUTCDate())}` +
+        `-${pad(at.getUTCHours())}${pad(at.getUTCMinutes())}${pad(at.getUTCSeconds())}`
+      );
+    });
+  // Newest first, the same way `verify.ts` sorts them, so a test can assert
+  // against "the one that should have been picked" without re-deriving it.
+  const newestSnapshot = [...snapTags].sort().reverse()[0] ?? '';
+
   // docker: enough surface for images/inspect/tag/rm/exec/run.
   const docker = recorder(
     'docker',
     [
       'if [ "$1" = "images" ]; then',
-      "  printf 'snap-20260801-040000\\nsnap-20260808-040000\\nlatest\\n'",
+      // In the FORMAT string, not an argument: POSIX `printf %s` does not
+      // process escapes in its operands, so `printf '%s' "a\nb"` emits a
+      // literal backslash-n and `docker images` would return one unparseable
+      // line. Safe to interpolate — every tag here matches [a-z0-9-] and
+      // carries no `%`.
+      `  printf '${[...snapTags, 'latest'].join('\\n')}\\n'`,
       'elif [ "$1" = "image" ] && [ "$2" = "inspect" ]; then',
       "  printf 'sha256:abc123def456\\n'",
       'elif [ "$1" = "container" ] && [ "$2" = "inspect" ]; then',
@@ -598,6 +649,11 @@ emit({
       '  enabled: true',
       `  instances: [${specs.map((spec) => spec.name).join(', ')}]`,
       '  startTimeoutSeconds: 5',
+      // Written only when a test asks for one, so the default fixture goes
+      // through the loader's own default (48h) rather than through a number
+      // this file chose — a fixture that always states the value can never
+      // catch the default being changed to something absurd.
+      ...(options.maxAgeHours === undefined ? [] : [`  maxAgeHours: ${options.maxAgeHours}`]),
       '  probe: [/bin/true]',
       '',
     ].join('\n'),
@@ -619,6 +675,7 @@ emit({
   return {
     root,
     config,
+    newestSnapshot,
     // Resolved through the real code path rather than assembled by hand, so a
     // change to the parser shows up here rather than being papered over by a
     // fixture that knows the answer.
@@ -1567,6 +1624,8 @@ test('a unit name with a separator, a "..", a space or the wrong suffix is refus
     'clawcius-snapshot.timer',
     'hamachi.service',
     'hamachi-container.service',
+    'hamachi-snapshot.service',
+    'hamachi-snapshot.timer',
     'oj.service',
   ]) {
     const verdict = validateUnitName(name);
@@ -3083,7 +3142,8 @@ test('the verifier restores the newest snapshot, probes it, and always removes i
 
   const outcome = await verifyInstance(host.config, runner, instance);
   assert.equal(outcome.ok, true, outcome.detail);
-  assert.equal(outcome.tag, 'snap-20260808-040000', 'the newest snapshot is the one tested');
+  assert.equal(outcome.finding, 'ok', outcome.detail);
+  assert.equal(outcome.tag, host.newestSnapshot, 'the newest snapshot is the one tested');
 
   const calls = host.calls().filter((call) => call[0] === 'docker');
   const run = calls.find((call) => call[1] === 'run');
@@ -3095,7 +3155,7 @@ test('the verifier restores the newest snapshot, probes it, and always removes i
   assert.equal(run?.includes('--env-file'), false);
   assert.equal(run?.includes('-v'), false);
   assert.equal(run?.includes('--restart'), false);
-  assert.equal(run?.includes('clawcius-agent:snap-20260808-040000'), true);
+  assert.equal(run?.includes(`clawcius-agent:${host.newestSnapshot}`), true);
 
   // Started, then inspected, then probed, then removed — and removed twice,
   // because the pre-emptive cleanup runs first.
@@ -3116,8 +3176,259 @@ test('a verify dry run says plainly that it proves nothing', async () => {
 
   const outcome = await verifyInstance(host.config, runner, instance);
   assert.equal(outcome.ok, true);
+  assert.equal(outcome.finding, 'dry-run');
   assert.match(outcome.detail, /NOT evidence/);
   assert.equal(host.calls().some((call) => call[1] === 'run'), false);
+});
+
+// ── The age check, which is the half of #87 that stops the NEXT one ───────
+//
+// Adding hamachi-snapshot.timer closes today's gap. Everything below is what
+// makes the next silent stop visible, and every test here is written against
+// the behaviour rather than the wording: the thing that was broken was a
+// verifier that returned `ok: true`, so `ok` and `finding` are what get
+// asserted, and the prose is only checked where the prose IS the deliverable
+// (what an operator is told to do about it).
+
+test('a snapshot older than the ceiling is not ok, however well it boots', async () => {
+  // The state hamachi was actually in: an image that restores perfectly, from
+  // a week ago, under a green light. Nine days, against the 48h default.
+  const host = makeHost({ dryRun: false, suffix: 'verifystale', snapshotAgeHours: 9 * 24 });
+  const runner = new Runner(false, 20, () => {});
+  const instance = host.config.instances[0];
+  assert.ok(instance);
+
+  const outcome = await verifyInstance(host.config, runner, instance);
+  assert.equal(outcome.ok, false, 'this is the green that #87 is about');
+  assert.equal(outcome.finding, 'stale');
+  assert.equal(outcome.tag, host.newestSnapshot);
+  assert.ok(outcome.ageHours !== null);
+  assert.ok(
+    outcome.ageHours > 9 * 24 - 1 && outcome.ageHours < 9 * 24 + 1,
+    `nine days should read as about ${9 * 24} hours, got ${outcome.ageHours}`,
+  );
+
+  // The image was still booted and probed. Skipping the restore test on a
+  // stale image would lose the difference between "old" and "old AND broken",
+  // which are the two states a rollback can be in and one repair apart.
+  const calls = host.calls().filter((call) => call[0] === 'docker');
+  assert.equal(
+    calls.some((call) => call[1] === 'exec' && call.includes('/bin/true')),
+    true,
+    'staleness must not short-circuit the boot test',
+  );
+  // And it says so, because the operator must not go looking at the image.
+  assert.match(outcome.detail, /the image is fine/);
+});
+
+test('stale and absent are different findings, in different words', async () => {
+  const stale = makeHost({ dryRun: false, suffix: 'vdiffstale', snapshotAgeHours: 400 });
+  const none = makeHost({ dryRun: false, suffix: 'vdiffnone', snapshotTags: [] });
+  const runner = new Runner(false, 20, () => {});
+
+  const staleInstance = stale.config.instances[0];
+  const noneInstance = none.config.instances[0];
+  assert.ok(staleInstance && noneInstance);
+
+  const staleOutcome = await verifyInstance(stale.config, runner, staleInstance);
+  const noneOutcome = await verifyInstance(none.config, runner, noneInstance);
+
+  assert.equal(staleOutcome.finding, 'stale');
+  assert.equal(noneOutcome.finding, 'no-snapshots');
+  assert.equal(staleOutcome.ok, false);
+  assert.equal(noneOutcome.ok, false);
+
+  // A rollback target that exists and is old, versus one that does not exist.
+  // Both are red and they are not the same repair, so they must not be the
+  // same sentence — the old code had one message for the second and none at
+  // all for the first.
+  assert.notEqual(staleOutcome.detail, noneOutcome.detail);
+  assert.equal(noneOutcome.tag, '');
+  assert.equal(noneOutcome.ageHours, null, 'no snapshot is "not measured", not "zero hours old"');
+  assert.notEqual(staleOutcome.tag, '');
+  assert.ok(staleOutcome.ageHours !== null);
+
+  // Nothing was started for the instance with no images at all: there is
+  // nothing to start, and `docker run` on a tag that does not exist would have
+  // reported a pull failure rather than the absence.
+  assert.equal(
+    none.calls().some((call) => call[0] === 'docker' && call[1] === 'run'),
+    false,
+  );
+});
+
+test('every failure names a unit or says none is recorded, and never guesses one', async () => {
+  // With a timer written down. It must be THIS instance's, from config.
+  const named = makeHost({
+    dryRun: false,
+    suffix: 'vtimer',
+    snapshotAgeHours: 400,
+    instances: [{ name: 'hamachi', extra: ['    snapshotTimer: hamachi-snapshot.timer'] }],
+  });
+  const runner = new Runner(false, 20, () => {});
+  const namedInstance = named.config.instances[0];
+  assert.ok(namedInstance);
+
+  const withTimer = await verifyInstance(named.config, runner, namedInstance);
+  assert.equal(withTimer.finding, 'stale');
+  assert.match(withTimer.detail, /hamachi-snapshot\.timer/);
+  // The specific regression: the old code printed "Check clawcius-snapshot.timer"
+  // for every instance, so the one agent that ever hit it was pointed at the
+  // other instance's timer — which was running, nightly, and correct.
+  assert.equal(
+    withTimer.detail.includes('clawcius-snapshot.timer'),
+    false,
+    "must not name another instance's timer",
+  );
+  // Actionable, not merely accusatory.
+  assert.match(withTimer.detail, /systemctl list-timers/);
+
+  // Without one, it says so rather than deriving `<name>-snapshot.timer`.
+  const silent = makeHost({
+    dryRun: false,
+    suffix: 'vnotimer',
+    snapshotAgeHours: 400,
+    instances: [{ name: 'hamachi' }],
+  });
+  const silentInstance = silent.config.instances[0];
+  assert.ok(silentInstance);
+
+  const withoutTimer = await verifyInstance(silent.config, runner, silentInstance);
+  assert.equal(withoutTimer.finding, 'stale');
+  assert.equal(
+    /hamachi-snapshot\.timer/.test(withoutTimer.detail),
+    false,
+    'a derived unit name is a guess about the host printed as a fact',
+  );
+  assert.match(withoutTimer.detail, /no `snapshotTimer`/);
+  // And it still tells them what to run.
+  assert.match(withoutTimer.detail, /systemctl list-timers/);
+});
+
+test('a dry run cannot prove a restore, and still reports a stopped snapshot schedule', async () => {
+  // The age comes from `docker images`, which is a probe, which runs in dry
+  // run. So staleness is the one thing this verifier can establish honestly on
+  // a dry-run host — and the shipped config is dryRun: true.
+  const host = makeHost({ dryRun: true, suffix: 'verifydrystale', snapshotAgeHours: 200 });
+  const runner = new Runner(true, 20, () => {});
+  const instance = host.config.instances[0];
+  assert.ok(instance);
+
+  const outcome = await verifyInstance(host.config, runner, instance);
+  assert.equal(outcome.ok, false, 'a measured fact is not suspended by dry run');
+  assert.equal(outcome.finding, 'stale');
+  assert.match(outcome.detail, /DRY RUN/);
+  assert.equal(
+    host.calls().some((call) => call[0] === 'docker' && call[1] === 'run'),
+    false,
+    'nothing may be started in a dry run',
+  );
+  assert.equal(
+    host.calls().some((call) => call[0] === 'docker' && call[1] === 'images'),
+    true,
+    'the probe that measures the age must still run',
+  );
+});
+
+test('the ceiling comes from config and tolerates one missed nightly snapshot', async () => {
+  const runner = new Runner(false, 20, () => {});
+
+  // 26 hours: one missed cycle, which a Persistent=true catch-up racing the
+  // verifier can produce on a healthy host. Green at the shipped 48h.
+  const oneMissed = makeHost({ dryRun: false, suffix: 'vonemiss', snapshotAgeHours: 26 });
+  const oneMissedInstance = oneMissed.config.instances[0];
+  assert.ok(oneMissedInstance);
+  const tolerated = await verifyInstance(oneMissed.config, runner, oneMissedInstance);
+  assert.equal(tolerated.finding, 'ok', tolerated.detail);
+  assert.equal(
+    oneMissed.config.snapshotVerify.maxAgeHours,
+    48,
+    'the shipped default is what the tolerance above is reasoned against',
+  );
+
+  // The same host, the same image, a tighter ceiling: red. The threshold is a
+  // config value and not a constant compiled into the check.
+  const tight = makeHost({
+    dryRun: false,
+    suffix: 'vtight',
+    snapshotAgeHours: 26,
+    maxAgeHours: 12,
+  });
+  const tightInstance = tight.config.instances[0];
+  assert.ok(tightInstance);
+  const red = await verifyInstance(tight.config, runner, tightInstance);
+  assert.equal(red.finding, 'stale');
+  assert.match(red.detail, /12h ceiling/);
+});
+
+test('a stamp that is not a real instant, or is in the future, is not "fresh"', async () => {
+  const runner = new Runner(false, 20, () => {});
+
+  // Shaped like the tag regex, not a date. `Date.UTC` would roll 31 February
+  // over into 2 March in silence and report a real age for a snapshot that was
+  // never taken.
+  const bogus = makeHost({
+    dryRun: false,
+    suffix: 'vbogus',
+    snapshotTags: ['snap-20260231-000000'],
+  });
+  const bogusInstance = bogus.config.instances[0];
+  assert.ok(bogusInstance);
+  const unreadable = await verifyInstance(bogus.config, runner, bogusInstance);
+  assert.equal(unreadable.finding, 'unreadable-stamp');
+  assert.equal(unreadable.ok, false);
+  assert.equal(unreadable.ageHours, null);
+
+  // Dated ahead. This matters in one direction only, and it is the dangerous
+  // one: a clock ahead of real time makes stale snapshots read as fresh, so
+  // "fresh" is exactly what a wrong clock forges.
+  const ahead = makeHost({ dryRun: false, suffix: 'vahead', snapshotAgeHours: -48 });
+  const aheadInstance = ahead.config.instances[0];
+  assert.ok(aheadInstance);
+  const future = await verifyInstance(ahead.config, runner, aheadInstance);
+  assert.equal(future.finding, 'future-stamp');
+  assert.equal(future.ok, false);
+
+  // The parser itself, at the boundary and in UTC. `snapshot.sh` stamps with
+  // `date -u` and this host runs CEST; reading the stamp as local time shifts
+  // every age by two hours in the lenient direction.
+  assert.equal(snapshotTakenAt('snap-20260814-190145'), Date.UTC(2026, 7, 14, 19, 1, 45));
+  assert.equal(snapshotTakenAt('snap-20261301-000000'), null, 'month 13 is not December + 1');
+  assert.equal(snapshotTakenAt('latest'), null);
+  assert.equal(snapshotTakenAt('snap-20260814-190145-extra'), null);
+});
+
+test('an old snapshot that ALSO fails to boot reports both, not whichever was checked last', async () => {
+  // Two repairs. A verifier that reported only the boot failure would get the
+  // image fixed and leave the schedule stopped, which is the same instance back
+  // here in a fortnight.
+  const host = makeHost({ dryRun: false, suffix: 'vboth', snapshotAgeHours: 400 });
+  const instance = host.config.instances[0];
+  assert.ok(instance);
+
+  // Make `docker run` fail, which is how an image that is not there or will not
+  // create presents. Deliberately this failure and not "never reaches running":
+  // that one is equally valid and costs `startTimeoutSeconds` of real polling,
+  // and `startTimeoutSeconds` has a floor of 5 in the loader. Both paths return
+  // the same finding through the same branch of the same function, so buying
+  // the identical assertion for five seconds of wall clock would be five
+  // seconds spent on nothing — in a file whose own timeout is the ceiling.
+  const dockerStub = host.config.dockerPath;
+  writeFileSync(
+    dockerStub,
+    readFileSync(dockerStub, 'utf8').replace(
+      'if [ "$1" = "images" ]; then',
+      'if [ "$1" = "run" ]; then\n  exit 1\nelif [ "$1" = "images" ]; then',
+    ),
+    { mode: 0o755 },
+  );
+
+  const outcome = await verifyInstance(host.config, new Runner(false, 20, () => {}), instance);
+  assert.equal(outcome.finding, 'unbootable', 'the more severe fact wins the finding');
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.detail, /could not start a container/);
+  assert.match(outcome.detail, /separately/, 'the age must be reported too, not dropped');
+  assert.ok(outcome.ageHours !== null && outcome.ageHours > 48);
 });
 
 // ══════════════════════════════════════════════════════════════════════════

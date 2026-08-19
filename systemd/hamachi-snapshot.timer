@@ -1,0 +1,37 @@
+[Unit]
+Description=Periodic snapshot of the Hamachi agent container
+
+[Timer]
+# 04:30, half an hour after clawcius-snapshot.timer, and the arithmetic is the
+# point rather than the number:
+#
+#   clawcius-snapshot   04:00 + 0..15m jitter   -> starts 04:00-04:15
+#   hamachi-snapshot    04:30 + 0..15m jitter   -> starts 04:30-04:45
+#   clawcius-snapshot-verify  05:30 + 0..20m    -> starts 05:30-05:50
+#
+# RandomizedDelaySec only ever DELAYS, so those windows do not widen downwards.
+# That leaves a floor of 15 minutes between instance 1's latest possible start
+# and this one's earliest, and 45 minutes before the verifier begins restoring
+# a ~3 GB image on top of whatever is still committing.
+#
+# A floor, not a guarantee: a `docker commit` of a large writable layer that
+# runs longer than 15 minutes still overlaps. The offset is the cheap half of
+# the answer and `After=clawcius-snapshot.service` in the .service is the other
+# half — that is what actually serialises the two when they do collide, which
+# is mostly a catch-up run after downtime rather than a normal night.
+#
+# Before the verifier, deliberately, and for the reason its own timer gives:
+# what gets restore-tested should be the image an incident tonight would
+# actually roll back to, not yesterday's.
+OnCalendar=*-*-* 04:30:00
+
+# Catch up after downtime rather than silently skipping a day, exactly as
+# instance 1 does. A day skipped in silence is the failure this unit exists
+# because of: hamachi had no snapshot timer at all between 2026-08-14 and this
+# unit shipping, and nothing said so — see Clawcius #87 and the age check in
+# ops/src/verify.ts, which is what makes the next silent stop visible.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

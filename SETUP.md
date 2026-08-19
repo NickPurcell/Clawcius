@@ -271,6 +271,35 @@ sudo systemctl enable --now clawcius.service
 sudo systemctl enable --now clawcius-snapshot.timer
 ```
 
+**One snapshot timer per instance, and it is per instance because the container
+name is.** `docker/snapshot.sh` is parameterised on `CLAWCIUS_CONTAINER` and
+`clawcius-snapshot.service` passes no environment, so that unit backs up
+`clawcius-agent` and nothing else. A second instance needs its own pair — which
+`hamachi` did not have between 2026-08-14 and 2026-08-19, under a nightly green
+restore test, because the verifier did not look at the date on the image it was
+booting (Clawcius #87):
+
+```sh
+sudo cp systemd/hamachi-container.service \
+        systemd/hamachi-snapshot.service \
+        systemd/hamachi-snapshot.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hamachi-container.service
+sudo systemctl enable --now hamachi-snapshot.timer
+```
+
+Then check that it is really armed, because "the unit file is in the repo" and
+"a timer is going to fire tonight" are different claims and only the second one
+is a backup:
+
+```sh
+systemctl list-timers --all | grep snap    # every instance should have a line
+```
+
+Whatever is enabled here, write the timer's name into that instance's
+`snapshotTimer:` in `ops/ops-config.yaml` — it is what
+`clawcius-snapshot-verify` names when that instance's snapshots stop moving.
+
 `clawcius-container.service` is `Before=clawcius.service`, and the waker
 `Requires=docker.service`. Without that ordering you get a bot that connects to
 Discord and then fails every turn on `docker exec` — which reads as a Discord
@@ -886,7 +915,20 @@ owning uid when it cannot. See [`status/README.md`](status/README.md).
   snapshot into a throwaway container nightly and fails the unit if it does not
   come up. The timer is written and its logic is covered by the ops self-test
   against stand-in binaries, but it has not yet run against real images here —
-  so the gap stays open until the first green run at 05:30.
+  so the gap stays open until the first green run at 05:30. Note that it *did*
+  report green nightly for days over an image nothing had refreshed, which is
+  the narrower gap below.
+- **`hamachi-snapshot.timer` has never fired, and until it does hamachi's
+  newest snapshot is 2026-08-14.** `systemd/hamachi-snapshot.{service,timer}`
+  ship as of 2026-08-19; installing and enabling them is a deploy step (§ 3,
+  *Install the units*) and nothing in the repo can do it. Between 2026-08-14
+  and that unit, nothing on this host snapshotted `hamachi-agent` at all — not
+  because a timer broke, but because the thing standing in for one was the ops
+  executor's per-task snapshot, retired that day for unrelated reasons
+  (Clawcius #87). **The check that closes this gap for good is the age check
+  in `ops/src/verify.ts`, not the new timer**: if the units never get enabled,
+  `clawcius-snapshot-verify` reports hamachi `stale` within two nights instead
+  of reporting it healthy forever.
 - **The ops executor has never executed anything, and has never started a host
   agent session.** Everything up to the spawn is tested against stand-ins (see
   `ops/README.md` § *What has and has not been tested*), and everything past it

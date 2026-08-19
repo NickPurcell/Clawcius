@@ -37,20 +37,193 @@
  *     anything anyway;
  *   - removed in a `finally`, and removed again pre-emptively before each run
  *     in case a previous run died between create and remove.
+ *
+ * ── And then the same failure, one level up ───────────────────────────────
+ *
+ * Everything above tests whether the newest snapshot *boots*. Until Clawcius
+ * #87 that was the whole test: sort the tags, take `tags[0]`, restore it, pass.
+ * Nothing looked at the date on the tag.
+ *
+ * So when `hamachi` stopped being snapshotted on 2026-08-14 — not by losing a
+ * timer, it never had one, but by losing the per-task snapshot the ops executor
+ * had been taking before every container recreate, retired that day — this file
+ * went on booting its 2026-08-14 image every night, watching it come up, and
+ * reporting the rollback path sound. It was sound. It restored to a week ago.
+ *
+ * That is this file's own header happening to this file: "the usual cause of a
+ * failed rollback is a restore path nobody ever ran" was answered by running
+ * it, and the next cause along is a restore path that runs perfectly onto stale
+ * content. A component whose entire job is checking, returning a confident
+ * green over an artefact nobody had dated.
+ *
+ * Hence two things that are deliberately not one thing:
+ *
+ *   **The age is measured before the boot test, from a `probe`.** `docker
+ *   images` runs even under `dryRun`, so staleness is the one property this
+ *   verifier can establish honestly on a dry-run host. It is reported there.
+ *
+ *   **The outcome says WHICH fact it found**, in `finding`, and the four bad
+ *   ones do not collapse into one red. "There is no snapshot at all", "the
+ *   newest one is nine days old", "it is dated in the future", and "it does not
+ *   boot" call for four different actions, and a verifier that prints them all
+ *   as `ok: false` has measured four things and told you one.
  */
 
 import type { InstanceEntry, OpsConfig } from './config.js';
 import { Runner, summarise } from './runner.js';
 
+/**
+ * What the verifier found, as a fact rather than a verdict.
+ *
+ * `ok` is derived from this and is a convenience for callers that only want a
+ * traffic light. The distinction that matters most is `stale` versus
+ * `unbootable`: a stale snapshot IS a working rollback target, to the wrong
+ * day, and the thing to fix is the schedule that stopped — whereas an
+ * unbootable one is a broken image and the schedule may be fine.
+ */
+export type VerifyFinding =
+  /** Newest snapshot is within `maxAgeHours`, restored, and passed the probe. */
+  | 'ok'
+  /** Nothing was restored because `dryRun` is on. Age was still measured. */
+  | 'dry-run'
+  /** `docker images` could not be run at all, so nothing at all is known. */
+  | 'images-unlistable'
+  /** No snapshot tags exist. There is no rollback target of any age. */
+  | 'no-snapshots'
+  /** Newest tag matched the shape but is not a real UTC instant. */
+  | 'unreadable-stamp'
+  /** Newest tag is dated in the future, so the age is not trustworthy. */
+  | 'future-stamp'
+  /** Newest snapshot boots and probes clean, and is older than the ceiling. */
+  | 'stale'
+  /** Newest snapshot did not start, did not reach running, or failed the probe. */
+  | 'unbootable'
+  /** Named in `snapshotVerify.instances` with no matching entry under `instances:`. */
+  | 'not-configured';
+
 export type VerifyOutcome = {
   instance: string;
+  /** True only for `ok` and `dry-run`. Derived from `finding`; see above. */
   ok: boolean;
+  /** Which fact was found. Prefer this over `ok` when reporting. */
+  finding: VerifyFinding;
   /** The snapshot tag that was tested, when one was found. */
   tag: string;
+  /**
+   * Age of `tag` in hours at the moment of the check, or null when there was no
+   * tag or its stamp could not be read.
+   *
+   * Null and zero are different answers and the type says so. A number here is
+   * a measurement; null is "not measured", and the two used to be the same
+   * missing field.
+   */
+  ageHours: number | null;
   detail: string;
 };
 
-const SNAPSHOT_TAG = /^snap-[0-9]{8}-[0-9]{6}$/;
+/**
+ * The tag `docker/snapshot.sh` writes: `snap-` then `date -u +%Y%m%d-%H%M%S`.
+ *
+ * Capturing rather than merely testing, because the same shape that filters the
+ * tags is what dates them — the fields are already proven present by the filter,
+ * so reading them costs nothing and needs no second `docker` call.
+ */
+const SNAPSHOT_TAG = /^snap-([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})$/;
+
+/**
+ * A tag may be up to this far in the future before the stamp is called wrong
+ * rather than fresh.
+ *
+ * Not zero, because `snapshot.sh` run by hand a minute ago is a legitimate
+ * newest tag and clocks are not exact. Not generous either: the whole point of
+ * treating a future stamp as a finding is that "fresh" is precisely what a
+ * wrong clock, or an image tagged on another machine and loaded here, would
+ * forge — and forging freshness is the defect this age check exists to end.
+ */
+const FUTURE_SLACK_MS = 5 * 60 * 1000;
+
+/**
+ * When the snapshot behind `tag` was taken, in epoch ms, or null.
+ *
+ * **UTC, and that is load-bearing.** `snapshot.sh` stamps with `date -u`; this
+ * host runs CEST. Reading the stamp as local time would shift every age by two
+ * hours, which is invisible in the middle of the range and wrong at the
+ * boundary — and a boundary that is wrong by two hours in the lenient direction
+ * is a stale snapshot reported green, which is the whole bug again.
+ */
+export function snapshotTakenAt(tag: string): number | null {
+  const match = SNAPSHOT_TAG.exec(tag);
+  if (!match) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  const ms = Date.UTC(year, month - 1, day, hour, minute, second);
+  // `Date.UTC` rolls out-of-range components over in silence: month 13 becomes
+  // January of the next year and `snap-20260231-000000` becomes 2 March. Every
+  // one of those parses, and every one of them would be reported as a real
+  // instant that no snapshot was taken at. Round-trip instead, so a tag that is
+  // shaped like a date without being one comes back as unreadable.
+  const back = new Date(ms);
+  const same =
+    back.getUTCFullYear() === year &&
+    back.getUTCMonth() === month - 1 &&
+    back.getUTCDate() === day &&
+    back.getUTCHours() === hour &&
+    back.getUTCMinutes() === minute &&
+    back.getUTCSeconds() === second;
+  return same ? ms : null;
+}
+
+/** Ages a human reads at 3am: hours while that is meaningful, days once it is not. */
+function describeAge(ms: number): string {
+  const hours = ms / 3_600_000;
+  if (hours < 48) return `${hours.toFixed(1)} hours`;
+  return `${(hours / 24).toFixed(1)} days (${Math.round(hours)} hours)`;
+}
+
+/** The stamp, spelled out, so nobody has to decode `snap-20260814-190145` under pressure. */
+function describeInstant(ms: number): string {
+  return `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+}
+
+/**
+ * What to do about an instance whose snapshots have stopped moving.
+ *
+ * Every branch of this returns something an operator can run. That is the other
+ * half of the design constraint on this change: a verifier that goes red for a
+ * reason nobody can act on has only moved the uselessness, and the failure text
+ * is where the action has to live because the failure text is what
+ * `systemctl --failed` sends someone to read.
+ *
+ * The unit name comes from config and is never derived from the instance name.
+ * This function used to be a hardcoded "Check clawcius-snapshot.timer" in the
+ * no-snapshots branch, printed for every instance — so the one instance that
+ * ever actually hit it would have been sent to read instance 1's timer, which
+ * was running, nightly, correctly, and had nothing to do with it.
+ */
+function whatToDoAbout(instance: InstanceEntry): string {
+  if (instance.snapshotTimer) {
+    return (
+      `Nothing is currently producing snapshots of ${instance.container}. ` +
+      `\`systemctl list-timers --all ${instance.snapshotTimer}\` — a timer that is not ` +
+      'listed is not enabled, and one listed with a NEXT in the past is not firing.'
+    );
+  }
+  return (
+    `ops-config.yaml records no \`snapshotTimer\` for instance "${instance.name}", and on ` +
+    'its own that is the likeliest explanation: an instance with nothing scheduled to ' +
+    'snapshot it produces exactly this reading, which is how hamachi spent days with a ' +
+    'green restore test over a frozen image (Clawcius #87). Compare ' +
+    '`systemctl list-timers --all | grep snap` against `instances:` — and once you know ' +
+    `which timer owns ${instance.container}, write it into that instance's ` +
+    '`snapshotTimer` so the next report names it instead of saying this.'
+  );
+}
 
 function imageRepo(instance: InstanceEntry): string {
   const colon = instance.image.lastIndexOf(':');
@@ -77,7 +250,9 @@ export async function verifyInstance(
     return {
       instance: instance.name,
       ok: false,
+      finding: 'images-unlistable',
       tag: '',
+      ageHours: null,
       detail: `cannot list images for ${repo}: ${images.stderr || summarise(images)}`,
     };
   }
@@ -91,18 +266,76 @@ export async function verifyInstance(
 
   const tag = tags[0];
   if (!tag) {
-    // Not a pass. An instance with no snapshots has no rollback path at all,
-    // which is a worse position than one whose snapshots are broken — at least
-    // a broken snapshot is a thing you can find out about.
+    // Not a pass, and NOT the same finding as a stale one. An instance with no
+    // snapshots has no rollback path at any date; an instance with an old one
+    // has a rollback path to the wrong day. The first is a hole, the second is
+    // a clock that stopped, and they are repaired differently — so they get
+    // different findings and different words rather than a shared red.
     return {
       instance: instance.name,
       ok: false,
+      finding: 'no-snapshots',
       tag: '',
+      ageHours: null,
       detail:
-        `no snapshot images exist for ${repo}. There is nothing to restore, so an ` +
-        'automatic rollback of this instance would fail. Check clawcius-snapshot.timer.',
+        `no snapshot images exist for ${repo} at all. There is nothing to restore at any ` +
+        `date, so a rollback of ${instance.container} is not something that would go badly ` +
+        `— it is something that cannot be attempted. ${whatToDoAbout(instance)}`,
     };
   }
+
+  // ── The age, measured before anything is started ────────────────────────
+  //
+  // Deliberately here rather than after the restore. `docker images` above is a
+  // `probe`, so it runs even under dryRun; the restore below does not. Putting
+  // the measurement first is what lets a dry-run host still learn the one thing
+  // it can honestly learn, and it is the reading that was missing entirely.
+  const takenAt = snapshotTakenAt(tag);
+  if (takenAt === null) {
+    return {
+      instance: instance.name,
+      ok: false,
+      finding: 'unreadable-stamp',
+      tag,
+      ageHours: null,
+      detail:
+        `the newest tag on ${repo} is ${tag}, whose stamp is shaped like a UTC timestamp ` +
+        'but is not one — so how old this instance\'s rollback target is cannot be ' +
+        'established, which is the same position as not checking. Something other than ' +
+        'docker/snapshot.sh wrote this tag.',
+    };
+  }
+
+  const ageMs = Date.now() - takenAt;
+  const ageHours = ageMs / 3_600_000;
+  if (ageMs < -FUTURE_SLACK_MS) {
+    return {
+      instance: instance.name,
+      ok: false,
+      finding: 'future-stamp',
+      tag,
+      ageHours,
+      detail:
+        `the newest tag on ${repo} is ${tag}, dated ${describeInstant(takenAt)} — ` +
+        `${describeAge(-ageMs)} in the future. Every age on this instance is therefore ` +
+        'untrustworthy, and note which way the error points: a clock ahead of real time ' +
+        'makes stale snapshots look fresh, so this is reported rather than tolerated. ' +
+        'Check the host clock, and check whether this image was tagged somewhere else and ' +
+        'loaded here.',
+    };
+  }
+
+  const maxAgeMs = config.snapshotVerify.maxAgeHours * 3_600_000;
+  const stale = ageMs > maxAgeMs;
+  // The staleness sentence, assembled once: it is appended to the unbootable
+  // findings too, because "it does not boot AND it is nine days old" is two
+  // repairs, and reporting only the one that happened to be checked last is how
+  // the second gets fixed a week later.
+  const staleDetail =
+    `${repo}:${tag} is the newest snapshot and it was taken ${describeInstant(takenAt)}, ` +
+    `${describeAge(ageMs)} ago — past the ${config.snapshotVerify.maxAgeHours}h ceiling ` +
+    '(`snapshotVerify.maxAgeHours`), which is sized at two missed nightly snapshots so ' +
+    'that one benign catch-up after downtime does not trip it.';
 
   // Pre-emptive cleanup. A previous run killed between create and remove
   // leaves the throwaway behind, and `docker run --name` would then fail with
@@ -138,20 +371,44 @@ export async function verifyInstance(
     return {
       instance: instance.name,
       ok: false,
+      finding: 'unbootable',
       tag,
-      detail: `could not start a container from ${repo}:${tag}: ${started.stderr || summarise(started)}`,
+      ageHours,
+      detail:
+        `could not start a container from ${repo}:${tag}: ${started.stderr || summarise(started)}` +
+        (stale ? ` — and separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
     };
   }
 
   if (started.skipped) {
+    // A dry run proves nothing about restoring, and it does not have to: the
+    // age came from a probe, which ran. So a dry-run host still reports a
+    // stopped snapshot schedule, and reports it as `stale` rather than as a
+    // dry-run pass — because the staleness was measured and not simulated.
+    if (stale) {
+      return {
+        instance: instance.name,
+        ok: false,
+        finding: 'stale',
+        tag,
+        ageHours,
+        detail:
+          `${staleDetail} ${whatToDoAbout(instance)} (DRY RUN — nothing was restored, so ` +
+          'whether this image still BOOTS is untested. Its age is not: that was read from ' +
+          '`docker images`, which runs in dry run.)',
+      };
+    }
     return {
       instance: instance.name,
       ok: true,
+      finding: 'dry-run',
       tag,
+      ageHours,
       detail:
         `DRY RUN — would have restored ${repo}:${tag} into ${throwaway}, probed it with ` +
         `${config.snapshotVerify.probe.join(' ')}, and removed it. Nothing was started, so ` +
-        'this is NOT evidence that the snapshot restores.',
+        'this is NOT evidence that the snapshot restores. Its age WAS checked and is ' +
+        `${describeAge(ageMs)}, within the ${config.snapshotVerify.maxAgeHours}h ceiling.`,
     };
   }
 
@@ -171,11 +428,14 @@ export async function verifyInstance(
         return {
           instance: instance.name,
           ok: false,
+          finding: 'unbootable',
           tag,
+          ageHours,
           detail:
             `${repo}:${tag} did not reach "running" within ` +
             `${config.snapshotVerify.startTimeoutSeconds}s (last state: ${lastState}). ` +
-            'This snapshot would not restore.',
+            'This snapshot would not restore.' +
+            (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
         };
       }
       await sleep(1000);
@@ -190,21 +450,47 @@ export async function verifyInstance(
       return {
         instance: instance.name,
         ok: false,
+        finding: 'unbootable',
         tag,
+        ageHours,
         detail:
           `${repo}:${tag} started, but the probe ` +
           `(${config.snapshotVerify.probe.join(' ')}) failed: ${probe.stderr || summarise(probe)}. ` +
-          'The container is up and its contents are not what a restore needs them to be.',
+          'The container is up and its contents are not what a restore needs them to be.' +
+          (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
+      };
+    }
+
+    // Boots, probes clean, and old. This is the case the whole change is for,
+    // and the wording has to carry the distinction: nothing is wrong with the
+    // IMAGE. It restores. What is wrong is that it is the newest one there is.
+    if (stale) {
+      return {
+        instance: instance.name,
+        ok: false,
+        finding: 'stale',
+        tag,
+        ageHours,
+        detail:
+          `${repo}:${tag} restored, reached "running", and passed ` +
+          `${config.snapshotVerify.probe.join(' ')} — the image is fine. What is not fine is ` +
+          `its date. ${staleDetail} So a rollback of ${instance.container} today would work, ` +
+          `and would land on ${describeInstant(takenAt)}, discarding everything the agent ` +
+          `installed since. ${whatToDoAbout(instance)}`,
       };
     }
 
     return {
       instance: instance.name,
       ok: true,
+      finding: 'ok',
       tag,
+      ageHours,
       detail:
         `${repo}:${tag} restored, reached "running", and passed ` +
-        `${config.snapshotVerify.probe.join(' ')}. This snapshot is a usable rollback target.`,
+        `${config.snapshotVerify.probe.join(' ')}. Taken ${describeInstant(takenAt)}, ` +
+        `${describeAge(ageMs)} ago, within the ${config.snapshotVerify.maxAgeHours}h ceiling. ` +
+        'This snapshot is a usable rollback target, and a current one.',
     };
   } finally {
     // Always, on every path, including the failures above. A verifier that
@@ -235,7 +521,9 @@ export async function verifyAll(config: OpsConfig, runner: Runner): Promise<Veri
       outcomes.push({
         instance: name,
         ok: false,
+        finding: 'not-configured',
         tag: '',
+        ageHours: null,
         detail: 'not found under instances: in ops-config.yaml',
       });
       continue;
