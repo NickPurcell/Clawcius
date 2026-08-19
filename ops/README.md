@@ -1427,7 +1427,8 @@ ops/
     journal.ts           append-only jsonl + ops-status.json
     verify.ts            snapshot restore test
     verify-main.ts       oneshot entry for the verify timer
-    selftest.ts          `npm run selftest` — 58 tests
+    selftest.ts          `npm run selftest` — count in § What has and has
+                         not been tested, which is the only place that says it
 ```
 
 ## The status page
@@ -1558,8 +1559,11 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` is **58 tests** and runs with no docker, no systemd, no npm
-and no real `claude`. It was 129 before 2026-08-16; the seventy-one that went
+`npm run selftest` is **62 tests** — measured on `main` at `208dafb`, which is
+the only state that claim is made about; run it rather than trusting this line,
+and if it disagrees the suite is right. It runs with no docker, no systemd, no
+npm and no real `claude`. It was 129 before 2026-08-16 and 61 after, both
+measured the same way; the sixty-eight that went
 tested request parsing, the spool's caps and flood handling, the queue, the
 `mayRequest` refusals, the deprecated `spoolDir` migration, the idle wait, the
 snapshot-before/rollback-after ordering, the deadline, the automatic rollback and
