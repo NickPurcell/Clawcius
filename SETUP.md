@@ -86,33 +86,50 @@ memory, environment — do not reach a container that already exists. A changed
 `.env` is the common case, so it is detected and reported at startup rather
 than left to look like a credentials bug.
 
-The flags are not detected, because there is nothing to detect: on a reuse the
-answer is always "not applied". So the script says that outright and then
-prints what the container it found actually has — its id, when it was created,
-the image tag and the image id behind it, the runtime, `--init`, `--memory`
-and `--pids-limit`:
+The flags are not detected, because there is nothing to detect. What a reuse
+knows for certain is that *this run* applied none of them; whether the
+container already has them depends on when it was last created, which is a
+different question. So the script says the first thing and then answers the
+second by reading the container back:
 
 ```
 reusing clawcius-agent (already running)
-  NOTE: reused, not created — the docker run flags in this file were NOT
-        applied to it. --recreate applies them, and discards the writable
-        layer. What this container actually has:
+  NOTE: reused, not created — this run did not apply the docker run flags
+        below; whatever it has, it got when it was created. --recreate
+        applies the current ones, and discards the writable layer.
+  read back, in the fields that differ between deployments (not the whole config):
   id 7f3a91c2b0d4  created 2026-08-18T07:27:27Z  image clawcius-agent:latest (0f3d1a2b3c4d)
   runtime runsc  init true  memory 2048m  pids-limit 512
   clawcius-agent  Up 3 days  runtime-isolated
 ```
 
-The same lines print on creation, so `journalctl -u clawcius-container` and
-`journalctl -u hamachi-container` answer "what does the running container have,
-and how old is it" without a `docker inspect` grant — which the host agent does
-not have for `HostConfig.Init` (`ops/clawcius-sudoers` enumerates that command
-by fixed field/container pairs). Reading the journal needs no sudo at all: it is
-`systemd-journal` group membership.
+Note what the NOTE does **not** say. It does not claim the container lacks the
+flags — after any `--recreate` the reused container has exactly the current
+ones, and a line asserting otherwise would be recommending the one operation
+here that destroys the agent's packages, crontabs and daemons.
 
-It is a report and not a verdict. It does not compare the printed values against
-the flags in the file, because a partial comparison that looks complete is worse
-than none — read the printed line against `run-container.sh`, which is one
-scroll away.
+The read-back lines also print on creation, and on the `dead` branch where the
+choice is `--recreate` versus taking a snapshot first. So `journalctl -u
+clawcius-container` and `journalctl -u hamachi-container` answer "what does the
+running container have, and how old is it" without a `docker inspect` grant —
+which the host agent does not have for `HostConfig.Init` (`ops/clawcius-sudoers`
+enumerates that command by fixed field/container pairs). Reading the journal
+needs no sudo at all: it is `systemd-journal` group membership. `docker ps` *is*
+granted, so the printed `id` can be checked against the live container — that is
+what tells a stale journal line from a current one.
+
+Two limits, both deliberate. It is eight fields of roughly twenty-five, which
+is why the heading says so: no `--security-opt`, no `--cap-drop`, no
+`--network`, no mounts. And it is a report, not a verdict — it does not compare
+the printed values against the flags in the file, because a partial comparison
+that presents as complete is worse than none. Read the printed line against
+`run-container.sh`, which is one scroll away.
+
+Because these lines reach `clawcius-ops` through the journal rather than
+through the sudoers gate, the field list is a permissions decision: anything
+added to it must stay inside what `CLAWCIUS_DOCKER_READ` would have granted —
+no `Config.Env`, no `Config.Cmd`, no `Mounts`, no whole objects. The comment
+above `describe_container()` says so next to the template.
 
 This is the only way the agent runs — there is no host mode. A local child
 process would have confined nothing but shell commands, leaving `Read`,
