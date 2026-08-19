@@ -35,7 +35,13 @@ import './build-banner.js';
 import { loadOpsConfig } from './config.js';
 import { Journal } from './journal.js';
 import { Runner } from './runner.js';
-import { verifyAll } from './verify.js';
+import {
+  BANNER,
+  CONSEQUENCE,
+  journalWhat,
+  summariseVerify,
+  verifyAll,
+} from './verify.js';
 
 const config = loadOpsConfig();
 
@@ -114,7 +120,7 @@ for (const outcome of outcomes) {
   if (!outcome.ok) failed += 1;
   journal.write({
     kind: 'verify',
-    what: `snapshot-verify ${outcome.instance}${outcome.tag ? ` ${outcome.tag}` : ''}`,
+    what: journalWhat(outcome),
     instance: outcome.instance,
     ok: outcome.ok,
     dryRun: config.dryRun,
@@ -122,15 +128,16 @@ for (const outcome of outcomes) {
   });
   if (!outcome.ok) {
     process.stderr.write(
-      `[ops verify] ══ RESTORE TEST FAILED ══ ${outcome.instance}: ${outcome.detail}\n` +
-        '[ops verify] An automatic rollback of this instance would not work today.\n',
+      `[ops verify] ${BANNER[outcome.finding]} ${outcome.instance}: ${outcome.detail}\n` +
+        `[ops verify] ${CONSEQUENCE[outcome.finding]}\n`,
     );
   }
 }
 
-process.stdout.write(
-  `[ops verify] ${outcomes.length - failed}/${outcomes.length} instance(s) have a working ` +
-    `restore path${config.dryRun ? ' (DRY RUN — nothing was actually restored)' : ''}\n`,
-);
+// Assembled in verify.ts, and tested there. Everything this oneshot prints is
+// now a pure function of the outcomes — which is the point, because the report
+// IS the deliverable of this change and the summary line was the one piece of
+// it that had no test and was the one piece of it that was wrong.
+process.stdout.write(`[ops verify] ${summariseVerify(outcomes, config.dryRun)}\n`);
 
 process.exit(failed > 0 ? 1 : 0);

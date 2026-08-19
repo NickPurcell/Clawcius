@@ -547,12 +547,18 @@ fi
 #     CLAWCIUS_IMAGE=<repo>:snap-<stamp> docker/run-container.sh --recreate
 #
 # If you take the second, take a snapshot FIRST rather than reaching for the
-# newest existing tag. clawcius-snapshot.timer is the only snapshot timer on
-# this host and clawcius-snapshot.service passes no environment, so it covers
-# instance 1 and nothing else — hamachi's newest tag is 2026-08-14, and even
-# instance 1's is up to a day old (#87). snapshot.sh reads the same
-# CLAWCIUS_CONTAINER, so it is one command per instance and it prints the tag
-# it wrote:
+# newest existing tag. Even a timer that is working leaves the newest tag up to
+# a day old, and this comment said something stronger until 2026-08-19:
+# clawcius-snapshot.timer WAS the only snapshot timer on this host, so hamachi's
+# newest tag was 2026-08-14 and getting older (#87). systemd/ now ships
+# hamachi-snapshot.{service,timer} as well — but shipping is not installing, so
+# do not read that as an assurance about the host you are typing on. Ask it:
+#
+#     systemctl list-timers --all | grep snap
+#     docker image ls <container> --format '{{.Tag}}\t{{.CreatedSince}}' | head -3
+#
+# snapshot.sh reads the same CLAWCIUS_CONTAINER, so taking one is one command
+# per instance and it prints the tag it wrote:
 #
 #     CLAWCIUS_CONTAINER=<name> docker/snapshot.sh
 #

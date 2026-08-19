@@ -18,7 +18,13 @@
 # clawcius-snapshot-verify.timer starts a throwaway container from the newest
 # snapshot and proves it comes up. It exists because these images had been
 # produced nightly for weeks without one of them ever having been booted, which
-# is not a backup, it is 2 GB of optimism. See ops/README.md.
+# is not a backup, it is 2 GB of optimism.
+#
+# It also checks the DATE on the tag it picks, which it did not until 2026-08-19
+# — and that omission is why this script's own coverage gap went unnoticed for
+# days. One instance had no timer calling this script at all, its newest image
+# never moved, and the verifier booted that frozen image every night and
+# reported the rollback path healthy. See ops/README.md and Clawcius #87.
 set -euo pipefail
 
 # Parameterised the same way as run-container.sh, and for the same reason: a

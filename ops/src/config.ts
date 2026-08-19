@@ -179,6 +179,32 @@ export type InstanceEntry = {
    * exact same bytes being redeployed in a loop.
    */
   buildRepo: string;
+  /**
+   * The systemd timer that snapshots this instance, or empty for "none is
+   * recorded".
+   *
+   * Nothing starts, stops or reads this unit. It exists so the restore
+   * verifier can name something an operator can act on when it finds an
+   * instance's newest snapshot has stopped moving — and the only alternatives
+   * were both wrong. `verify.ts` said "Check clawcius-snapshot.timer" as a
+   * literal, on every instance, which for `hamachi` pointed at instance 1's
+   * timer: green, healthy, and not the one that had stopped. Deriving
+   * `<name>-snapshot.timer` instead would be a guess about the host printed as
+   * a fact, which is the same defect one level quieter.
+   *
+   * So it is written down, per instance, and **empty is a finding rather than
+   * a default**. An instance whose snapshots have gone stale and that names no
+   * timer is very probably an instance nothing is scheduled to snapshot at
+   * all — which is exactly what happened to `hamachi` between 2026-08-14 and
+   * Clawcius #87, and the verifier says so in those words instead of sending
+   * somebody to read the wrong unit.
+   *
+   * It is NOT required, because a missing one must not be a boot failure: this
+   * loader is shared with `clawcius-snapshot-verify.service`, and a verifier
+   * that refuses to start over an unconfigured instance reports nothing at all
+   * about the instances that *are* configured.
+   */
+  snapshotTimer: string;
 };
 
 export type LimitsConfig = {
@@ -250,6 +276,26 @@ export type SnapshotVerifyConfig = {
   instances: string[];
   /** Seconds a restored throwaway container gets to come up. */
   startTimeoutSeconds: number;
+  /**
+   * How old the newest snapshot may be before the instance is reported broken,
+   * in hours.
+   *
+   * The verifier used to take `tags[0]` and never look at the date on it, so
+   * "there is an image and it boots" was the whole of the test. That passes
+   * forever on an image that gets one day older every day, which is the state
+   * `hamachi` was in for days under a nightly green light (Clawcius #87). This
+   * is the number that makes the difference between "a rollback target exists"
+   * and "a rollback target from *last week* exists" expressible.
+   *
+   * Size it in whole missed snapshot cycles, not in hours. A red the operator
+   * cannot act on is as useless as a wrong green, and there is one benign way
+   * to be a cycle behind: both snapshot timers and the verify timer are
+   * `Persistent=true`, so a host that was down overnight queues all three
+   * catch-up runs at boot, and the verifier can win that race and measure a
+   * snapshot the catch-up is about to replace. Two consecutive misses is not
+   * weather.
+   */
+  maxAgeHours: number;
   /**
    * Command run inside the throwaway container to prove it is genuinely up.
    * argv array, no shell. A container that is "running" but whose PID 1 is
@@ -483,6 +529,16 @@ export type OpsConfig = {
   deprecations: string[];
 };
 
+/**
+ * Two missed nightly snapshots. See `SnapshotVerifyConfig.maxAgeHours`.
+ *
+ * Exported because `verify.ts` states this number's REASONING in the failure
+ * text, and that reasoning is a fact about 48 rather than about the key — so it
+ * has to be able to tell "still the shipped default" from "somebody configured
+ * this", and say the second differently.
+ */
+export const DEFAULT_MAX_AGE_HOURS = 48;
+
 const DEFAULTS: OpsConfig = {
   dryRun: true,
   stateDir: '/var/lib/clawcius-ops',
@@ -534,6 +590,7 @@ const DEFAULTS: OpsConfig = {
     enabled: true,
     instances: [],
     startTimeoutSeconds: 60,
+    maxAgeHours: DEFAULT_MAX_AGE_HOURS,
     probe: ['/bin/sh', '-c', 'test -x /usr/local/bin/claude'],
   },
   deprecations: [],
@@ -637,6 +694,39 @@ function requiredAbsPath(raw: unknown, path: string): string {
 const NAME_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 /** Unit names carry a type suffix, so they get one extra allowance: the dot. */
 const UNIT_PATTERN = /^[a-z][a-z0-9@.-]{0,95}\.(service|timer|socket|target|path)$/;
+/**
+ * `instances[].snapshotTimer`: a TIMER, not any unit. See the check for why the
+ * suffix is load-bearing rather than pedantic.
+ */
+const SNAPSHOT_TIMER_PATTERN = /^[a-z][a-z0-9@.-]{0,95}\.timer$/;
+/** Every key an instance block may carry. Anything else fails the boot, named. */
+const INSTANCE_KEYS = new Set([
+  'name',
+  'container',
+  'image',
+  'stateDir',
+  'envFile',
+  'memory',
+  'wakerStatusFile',
+  'buildRepo',
+  'snapshotTimer',
+  'board',
+]);
+/**
+ * Retired instance keys, tolerated so an un-updated file still boots.
+ *
+ * THE SAME LIST the deprecation notice is built from, deliberately — these keys
+ * must survive the unknown-key check in order to reach it, and two lists would
+ * mean a key that is refused at the boot it is supposed to be reported at.
+ * `clawcius-ops.service` is `Restart=always` with no start limit, so a config
+ * the loader rejects is not one loud error, it is a root daemon in a
+ * five-second restart loop.
+ *
+ * (The check below found this the honest way: it refused `wakeSpoolDir` and the
+ * existing "retired spool keys still boot" test went red.)
+ */
+const RETIRED_PER_INSTANCE = ['opsSpoolDir', 'wakeSpoolDir', 'wakeChannelId', 'mayRequest'] as const;
+const RETIRED_INSTANCE_KEYS: ReadonlySet<string> = new Set(RETIRED_PER_INSTANCE);
 /** Image references: repo[:tag]. No registry host, no digest — we build these. */
 const IMAGE_PATTERN = /^[a-z][a-z0-9._/-]{0,95}(:[a-zA-Z0-9._-]{1,64})?$/;
 
@@ -792,6 +882,67 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     }
     const stateDir = requiredAbsPath(entry['stateDir'], `${at}.stateDir`);
 
+    // Validated for shape, never resolved against the host. Nothing in this
+    // process starts or queries it — it is remediation text the verifier prints
+    // when this instance's snapshots have stopped moving, and the shape check is
+    // there so a typo surfaces at boot rather than as a `systemctl status` that
+    // says "Unit not found" during an incident. Empty is allowed and means "no
+    // timer is recorded", which the verifier reports as its own finding; see
+    // `InstanceEntry.snapshotTimer`.
+    const snapshotTimer = str(entry['snapshotTimer'], `${at}.snapshotTimer`, '');
+    // `.timer`, specifically — NOT the general UNIT_PATTERN, which also permits
+    // `.service`, `.socket`, `.target` and `.path`.
+    //
+    // Given a pair of unit files that differ only in suffix, `.service` is the
+    // likely typo, and it is the one the shape check exists to catch — because
+    // the value ends up inside "`systemctl list-timers --all <unit>` — a timer
+    // that is not listed is not enabled", and `list-timers` never lists a
+    // `.service`. That sentence would tell the operator the timer is disabled
+    // WHATEVER THE TRUTH IS, in the one field whose entire purpose is to be the
+    // string they trust. Found by OJ in review of #87, by putting
+    // `hamachi-snapshot.service` in and reading what came out.
+    if (snapshotTimer && !SNAPSHOT_TIMER_PATTERN.test(snapshotTimer)) {
+      throw new OpsConfigError(
+        `${at}.snapshotTimer`,
+        `("${snapshotTimer}") must be a systemd TIMER unit name, ending in .timer and ` +
+          `matching ${String(SNAPSHOT_TIMER_PATTERN)}. A .service is not a timer: the ` +
+          'verifier prints this value inside a `systemctl list-timers` command, which ' +
+          'never lists a service, so it would report the timer disabled whatever the ' +
+          'truth was. Leave it out entirely for "no snapshot timer is recorded for this ' +
+          'instance" — the verifier reports that, and it is a truer thing to print than ' +
+          'a unit name nobody checked.',
+      );
+    }
+
+    // ── Nothing unrecognised in an instance block ─────────────────────────
+    //
+    // `ops-config.yaml`'s own header promises "a typo fails the boot with the
+    // offending key named", and for an instance block that was not true: an
+    // unknown key loaded clean and was dropped. Newly consequential with
+    // `snapshotTimer`, because `snapshotTimers:` leaves the field empty and the
+    // verifier then states, as the likeliest explanation, that nothing is
+    // scheduled to snapshot this instance — a confident wrong root cause,
+    // produced by a silent typo, in the report this whole change is about.
+    //
+    // Scoped to instance blocks rather than the whole file: this is where the
+    // new key is and where the failure is consequential, and widening it would
+    // be a boot failure for keys nobody has audited. RETIRED_INSTANCE_KEYS is
+    // tolerated because an operator's file may still carry those — the same
+    // tolerance the top level already spends on `spoolDir`, and for the same
+    // reason: deleting a key must not be a boot failure for whoever has not
+    // caught up. They must pass through here to reach the deprecation notice
+    // that names them.
+    for (const key of Object.keys(entry)) {
+      if (!INSTANCE_KEYS.has(key) && !RETIRED_INSTANCE_KEYS.has(key)) {
+        throw new OpsConfigError(
+          `${at}.${key}`,
+          `is not a key this loader knows. Valid keys: ${[...INSTANCE_KEYS].sort().join(', ')}. ` +
+            'A misspelt key used to load clean and be dropped, which for `snapshotTimer` ' +
+            'meant the verifier confidently naming the wrong root cause.',
+        );
+      }
+    }
+
     // Absent is "no mailbox", which is what an upgrade gets: the host agent
     // stays reachable only through the spool until somebody writes down where
     // the board is. Present means both fields, and neither has a default —
@@ -821,6 +972,7 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       memory: str(entry['memory'], `${at}.memory`, '2g'),
       wakerStatusFile: requiredAbsPath(entry['wakerStatusFile'], `${at}.wakerStatusFile`),
       buildRepo,
+      snapshotTimer,
       board,
     };
   });
@@ -839,12 +991,9 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
   // which is a good deal worse than a stale key. So every retired key is named,
   // once, in journal.jsonl, next to the operations it does not govern.
   const RETIRED_TOP_LEVEL = ['spoolDir'] as const;
-  const RETIRED_PER_INSTANCE = [
-    'opsSpoolDir',
-    'wakeSpoolDir',
-    'wakeChannelId',
-    'mayRequest',
-  ] as const;
+  // RETIRED_PER_INSTANCE is at module scope: the unknown-key check on each
+  // instance block has to tolerate exactly these, or a retired key would be
+  // refused at the very boot that is meant to report it.
 
   /**
    * The caps that bounded a directory an agent could write.
@@ -1044,6 +1193,18 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
         5,
         3600,
       ),
+      // Floor of 1 rather than 0. Zero would mean "every snapshot is stale the
+      // instant it is taken", which is a permanently red verifier — the exact
+      // failure the design note above says is worth no more than a permanently
+      // green one. The ceiling is a year, which is not a recommendation; it is
+      // far enough out that anyone reaching it has decided something.
+      maxAgeHours: num(
+        verify['maxAgeHours'],
+        'snapshotVerify.maxAgeHours',
+        DEFAULTS.snapshotVerify.maxAgeHours,
+        1,
+        8760,
+      ),
       probe: strList(verify['probe'], 'snapshotVerify.probe', DEFAULTS.snapshotVerify.probe),
     },
     deprecations,
@@ -1065,6 +1226,29 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       }
       seen.add(name);
     }
+  }
+
+  // Two instances naming one timer, which is the copy-paste this key exists to
+  // end. `verify.ts` prints it as "the timer that snapshots THIS instance", so
+  // a shared value sends whoever reads it to a unit that is running correctly
+  // for somebody else — precisely the misdirection the hardcoded
+  // "Check clawcius-snapshot.timer" used to produce, reintroduced by config.
+  // Checked here with the other duplicate checks rather than per entry, because
+  // a duplicate is a property of the set.
+  const timerOwners = new Map<string, string>();
+  for (const instance of instances) {
+    if (!instance.snapshotTimer) continue;
+    const owner = timerOwners.get(instance.snapshotTimer);
+    if (owner) {
+      throw new OpsConfigError(
+        'instances[].snapshotTimer',
+        `("${instance.snapshotTimer}") is named by both "${owner}" and "${instance.name}". ` +
+          'One timer snapshots one container, so the verifier would send whoever read it ' +
+          "to a unit that is running correctly for the other instance — which is the " +
+          'misdirection this key exists to end.',
+      );
+    }
+    timerOwners.set(instance.snapshotTimer, instance.name);
   }
 
   for (const name of config.snapshotVerify.instances) {

@@ -360,6 +360,8 @@ Cmnd_Alias CLAWCIUS_UNIT_RESTART = \
     /usr/bin/systemctl restart clawcius-netguard.service, \
     /usr/bin/systemctl restart clawcius-snapshot.service, \
     /usr/bin/systemctl restart clawcius-snapshot.timer, \
+    /usr/bin/systemctl restart hamachi-snapshot.service, \
+    /usr/bin/systemctl restart hamachi-snapshot.timer, \
     /usr/bin/systemctl restart clawcius-snapshot-verify.service, \
     /usr/bin/systemctl restart clawcius-snapshot-verify.timer, \
     /usr/bin/systemctl restart oj.service, \
@@ -374,6 +376,8 @@ Cmnd_Alias CLAWCIUS_UNIT_START = \
     /usr/bin/systemctl start clawcius-netguard.service, \
     /usr/bin/systemctl start clawcius-snapshot.service, \
     /usr/bin/systemctl start clawcius-snapshot.timer, \
+    /usr/bin/systemctl start hamachi-snapshot.service, \
+    /usr/bin/systemctl start hamachi-snapshot.timer, \
     /usr/bin/systemctl start clawcius-snapshot-verify.service, \
     /usr/bin/systemctl start clawcius-snapshot-verify.timer, \
     /usr/bin/systemctl start oj.service, \
@@ -388,6 +392,8 @@ Cmnd_Alias CLAWCIUS_UNIT_STOP = \
     /usr/bin/systemctl stop clawcius-netguard.service, \
     /usr/bin/systemctl stop clawcius-snapshot.service, \
     /usr/bin/systemctl stop clawcius-snapshot.timer, \
+    /usr/bin/systemctl stop hamachi-snapshot.service, \
+    /usr/bin/systemctl stop hamachi-snapshot.timer, \
     /usr/bin/systemctl stop clawcius-snapshot-verify.service, \
     /usr/bin/systemctl stop clawcius-snapshot-verify.timer, \
     /usr/bin/systemctl stop oj.service, \
@@ -407,6 +413,7 @@ Cmnd_Alias CLAWCIUS_UNIT_ENABLE = \
     /usr/bin/systemctl enable hamachi-container.service, \
     /usr/bin/systemctl enable clawcius-netguard.service, \
     /usr/bin/systemctl enable clawcius-snapshot.timer, \
+    /usr/bin/systemctl enable hamachi-snapshot.timer, \
     /usr/bin/systemctl enable clawcius-snapshot-verify.timer, \
     /usr/bin/systemctl enable oj.service, \
     /usr/bin/systemctl enable oj-container.service, \
@@ -417,6 +424,7 @@ Cmnd_Alias CLAWCIUS_UNIT_ENABLE = \
     /usr/bin/systemctl disable hamachi-container.service, \
     /usr/bin/systemctl disable clawcius-netguard.service, \
     /usr/bin/systemctl disable clawcius-snapshot.timer, \
+    /usr/bin/systemctl disable hamachi-snapshot.timer, \
     /usr/bin/systemctl disable clawcius-snapshot-verify.timer, \
     /usr/bin/systemctl disable oj.service, \
     /usr/bin/systemctl disable oj-container.service, \
@@ -427,6 +435,7 @@ Cmnd_Alias CLAWCIUS_UNIT_ENABLE = \
     /usr/bin/systemctl reset-failed hamachi-container.service, \
     /usr/bin/systemctl reset-failed clawcius-netguard.service, \
     /usr/bin/systemctl reset-failed clawcius-snapshot.service, \
+    /usr/bin/systemctl reset-failed hamachi-snapshot.service, \
     /usr/bin/systemctl reset-failed clawcius-snapshot-verify.service, \
     /usr/bin/systemctl reset-failed oj.service, \
     /usr/bin/systemctl reset-failed oj-container.service

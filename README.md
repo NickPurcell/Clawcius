@@ -149,8 +149,8 @@ agent installed and crontabs it wrote survive restarts and reboots — otherwise
 "persistent sandbox" would be a fiction.
 
 Code the agent writes lives in git; the writable layer is snapshotted nightly
-by a host-side timer the agent cannot reach. A wedged container is one flag
-from clean, with the workspace mount untouched:
+by a host-side timer *per instance* that the agent cannot reach. A wedged
+container is one flag from clean, with the workspace mount untouched:
 
 ```sh
 docker/up.sh --recreate   # discard the writable layer, rebuild from the image
@@ -160,3 +160,12 @@ Those snapshots are now restore-tested rather than trusted:
 `clawcius-snapshot-verify.timer` boots the newest one in a throwaway container
 nightly and fails loudly if it does not come up. The usual cause of a failed
 rollback is a restore path nobody ever ran.
+
+It also checks how old that snapshot is, which it did not until 2026-08-19 —
+and the reason is the same argument one level up. **One timer per instance**,
+and for days there was only one timer and two instances, so the second
+instance's newest image never moved while a restore test booted it every night
+and reported the rollback path healthy. It was healthy. It restored to last
+week. A backup nobody has restored is optimism; a backup nobody has *dated* is
+the same optimism with a green light on it. See Clawcius #87 and `ops/README.md`
+§ *The age check, and why a green light needed one*.

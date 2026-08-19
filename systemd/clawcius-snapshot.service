@@ -9,6 +9,16 @@ User=npurcell
 Group=npurcell
 SupplementaryGroups=docker
 ExecStart=/home/npurcell/clawcius/docker/snapshot.sh
+
+# `Type=oneshot` disables the start timeout by DEFAULT (`man systemd.service`),
+# and `JobTimeoutSec=` defaults to infinity — so until 2026-08-19 a `docker
+# commit` that wedged here left a start job that never completed and never
+# failed, which means nothing in `systemctl --failed` and a night with no
+# backup that looked exactly like a night with one. 1800s matches
+# clawcius-snapshot-verify.service. Added alongside hamachi-snapshot.service,
+# which is ordered after this unit and would otherwise wait on the hang.
+TimeoutStartSec=1800
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=clawcius-snapshot
