@@ -427,8 +427,8 @@ export function installUnit(options: UnitOpOptions): UnitOpResult {
   // its bad sequences replaced with U+FFFD and this re-encodes the replacement.
   // That is unchanged behaviour — the old `writeSync(out, content)` did exactly
   // the same — and the read-back below now makes it VISIBLE, because the hash
-  // reported is the hash of what landed and will not match the checkout. It is
-  // filed separately rather than fixed here.
+  // reported is the hash of what landed and will not match the checkout. That
+  // is containment, not a fix: Clawcius #110 is to write the buffer.
   const bytes = Buffer.from(content, 'utf8');
   const sent = createHash('sha256').update(bytes).digest('hex');
 
