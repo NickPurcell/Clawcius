@@ -69,7 +69,7 @@
  *   as `ok: false` has measured four things and told you one.
  */
 
-import type { InstanceEntry, OpsConfig } from './config.js';
+import { DEFAULT_MAX_AGE_HOURS, type InstanceEntry, type OpsConfig } from './config.js';
 import { Runner, summarise } from './runner.js';
 
 /**
@@ -118,6 +118,19 @@ export type VerifyOutcome = {
    * missing field.
    */
   ageHours: number | null;
+  /**
+   * Whether the newest datable snapshot was past `maxAgeHours`, independent of
+   * `finding`.
+   *
+   * Orthogonal on purpose. `finding` carries the single most severe fact, so an
+   * instance that is stale AND does not boot reports `unbootable` — and a
+   * summary that counted staleness by `finding === 'stale'` therefore left that
+   * instance out of the stale count while its own detail line described it as
+   * both. Two facts, two fields. False when nothing was measured (no snapshots,
+   * unreadable stamp, docker unreachable), which is "not stale as far as anyone
+   * knows" rather than "fresh".
+   */
+  stale: boolean;
   detail: string;
 };
 
@@ -179,11 +192,29 @@ export function snapshotTakenAt(tag: string): number | null {
   return same ? ms : null;
 }
 
+/**
+ * Truncate toward zero at `places`, never round.
+ *
+ * `toFixed` rounds to nearest, and rounding an age against a ceiling collides
+ * from both sides: at a 48h ceiling, 47.97h rendered "48.0 hours … within the
+ * 48h ceiling" and 48.001h rendered "48 hours … past the 48h ceiling". Two runs
+ * a minute apart printing the same age and opposite verdicts reads as a bug in
+ * the check rather than as a boundary being crossed, which is the one reading
+ * this report cannot afford. Truncation keeps the printed number on the same
+ * side of the ceiling as the comparison that produced the verdict.
+ */
+function truncTo(value: number, places: number): string {
+  const scale = 10 ** places;
+  return (Math.trunc(value * scale) / scale).toFixed(places);
+}
+
 /** Ages a human reads at 3am: hours while that is meaningful, days once it is not. */
 function describeAge(ms: number): string {
   const hours = ms / 3_600_000;
-  if (hours < 48) return `${hours.toFixed(1)} hours`;
-  return `${(hours / 24).toFixed(1)} days (${Math.round(hours)} hours)`;
+  if (hours < 48) return `${truncTo(hours, 1)} hours`;
+  // Both figures truncated, so they cannot disagree with each other either:
+  // 120.5h used to print "5.0 days (121 hours)".
+  return `${truncTo(hours / 24, 1)} days (${truncTo(hours, 0)} hours)`;
 }
 
 /** The stamp, spelled out, so nobody has to decode `snap-20260814-190145` under pressure. */
@@ -253,19 +284,46 @@ export async function verifyInstance(
       finding: 'images-unlistable',
       tag: '',
       ageHours: null,
+      stale: false,
       detail: `cannot list images for ${repo}: ${images.stderr || summarise(images)}`,
     };
   }
 
-  const tags = images.stdout
+  // ── Newest READABLE, not newest ─────────────────────────────────────────
+  //
+  // Selection used to be max-then-validate: take `tags[0]`, then try to date
+  // it. One tag that matches the shape without being a real instant sorts
+  // highest forever and the boot test never runs on the good image behind it —
+  // and `snapshot.sh` prunes the LOWEST tags (`sort -r | tail -n +KEEP`), so
+  // nothing ever removes it. A single bad tag would retire the restore test
+  // permanently, which is a worse outcome than the bad tag.
+  //
+  // So: validate first, pick the newest that dates, and carry the bad ones into
+  // the report rather than tripping over them. Loud AND still testing.
+  const shaped = images.stdout
     .split('\n')
     .map((line) => line.trim())
     .filter((tag) => SNAPSHOT_TAG.test(tag))
     .sort()
     .reverse();
+  const dated = shaped.map((tag) => ({ tag, at: snapshotTakenAt(tag) }));
+  const readable = dated.filter(
+    (entry): entry is { tag: string; at: number } => entry.at !== null,
+  );
+  const unreadable = dated.filter((entry) => entry.at === null).map((entry) => entry.tag);
 
-  const tag = tags[0];
-  if (!tag) {
+  // Appended to every detail below when it is non-empty. These tags are inert
+  // for selection now, and saying nothing about them would leave the disk
+  // quietly accumulating something no retention rule can reach.
+  const badTagNote = unreadable.length
+    ? ` (Ignoring ${unreadable.length} tag(s) on ${repo} that match the snapshot shape but ` +
+      `are not real instants: ${unreadable.join(', ')}. snapshot.sh prunes the LOWEST tags, ` +
+      'so nothing will ever remove these — `docker rmi ' +
+      `${unreadable.map((bad) => `${repo}:${bad}`).join(' ')}\` when you have worked out what ` +
+      'wrote them.)'
+    : '';
+
+  if (shaped.length === 0) {
     // Not a pass, and NOT the same finding as a stale one. An instance with no
     // snapshots has no rollback path at any date; an instance with an old one
     // has a rollback path to the wrong day. The first is a hole, the second is
@@ -277,6 +335,7 @@ export async function verifyInstance(
       finding: 'no-snapshots',
       tag: '',
       ageHours: null,
+      stale: false,
       detail:
         `no snapshot images exist for ${repo} at all. There is nothing to restore at any ` +
         `date, so a rollback of ${instance.container} is not something that would go badly ` +
@@ -290,21 +349,26 @@ export async function verifyInstance(
   // `probe`, so it runs even under dryRun; the restore below does not. Putting
   // the measurement first is what lets a dry-run host still learn the one thing
   // it can honestly learn, and it is the reading that was missing entirely.
-  const takenAt = snapshotTakenAt(tag);
-  if (takenAt === null) {
+  const newest = readable[0];
+  if (!newest) {
+    // Tags exist and NOT ONE of them dates. Distinct from `no-snapshots`: there
+    // are images here, they may even restore, and none of them can be placed in
+    // time — which is the same position as not checking.
     return {
       instance: instance.name,
       ok: false,
       finding: 'unreadable-stamp',
-      tag,
+      tag: shaped[0] ?? '',
       ageHours: null,
+      stale: false,
       detail:
-        `the newest tag on ${repo} is ${tag}, whose stamp is shaped like a UTC timestamp ` +
-        'but is not one — so how old this instance\'s rollback target is cannot be ' +
-        'established, which is the same position as not checking. Something other than ' +
-        'docker/snapshot.sh wrote this tag.',
+        `every snapshot tag on ${repo} is shaped like a UTC timestamp without being one ` +
+        `(${shaped.join(', ')}), so how old this instance's rollback target is cannot be ` +
+        'established. Something other than docker/snapshot.sh wrote these. Note that ' +
+        'snapshot.sh prunes the LOWEST tags, so nothing will ever remove them on its own.',
     };
   }
+  const { tag, at: takenAt } = newest;
 
   const ageMs = Date.now() - takenAt;
   const ageHours = ageMs / 3_600_000;
@@ -315,13 +379,17 @@ export async function verifyInstance(
       finding: 'future-stamp',
       tag,
       ageHours,
+      stale: false,
       detail:
         `the newest tag on ${repo} is ${tag}, dated ${describeInstant(takenAt)} — ` +
         `${describeAge(-ageMs)} in the future. Every age on this instance is therefore ` +
         'untrustworthy, and note which way the error points: a clock ahead of real time ' +
         'makes stale snapshots look fresh, so this is reported rather than tolerated. ' +
-        'Check the host clock, and check whether this image was tagged somewhere else and ' +
-        'loaded here.',
+        'Check the host clock (`timedatectl`), and check whether this image was tagged ' +
+        'somewhere else and loaded here. THE RESTORE TEST DID NOT RUN this time — a ' +
+        'future-dated tag sorts highest and snapshot.sh prunes the lowest, so this one ' +
+        `will not age out and nothing will be tested until it goes: \`docker rmi ${repo}:${tag}\` ` +
+        `once you know what wrote it.${badTagNote}`,
     };
   }
 
@@ -331,11 +399,23 @@ export async function verifyInstance(
   // findings too, because "it does not boot AND it is nine days old" is two
   // repairs, and reporting only the one that happened to be checked last is how
   // the second gets fixed a week later.
+  //
+  // The ceiling's RATIONALE is stated only when the configured value is still
+  // the shipped one. "Sized at two missed nightly snapshots" is a fact about
+  // 48, not about `maxAgeHours` — it is false for the 12 the suite's own test
+  // configures, and a report that explains a number by reciting the default's
+  // reasoning is the same defect as the green light this whole change is about:
+  // a sentence that was true when written, printed in a state nobody checked.
+  const rationale =
+    config.snapshotVerify.maxAgeHours === DEFAULT_MAX_AGE_HOURS
+      ? ', which is sized at two missed nightly snapshots so that one benign catch-up ' +
+        'after downtime does not trip it'
+      : ` (the shipped default is ${DEFAULT_MAX_AGE_HOURS}h; this host has been configured ` +
+        'differently)';
   const staleDetail =
     `${repo}:${tag} is the newest snapshot and it was taken ${describeInstant(takenAt)}, ` +
     `${describeAge(ageMs)} ago — past the ${config.snapshotVerify.maxAgeHours}h ceiling ` +
-    '(`snapshotVerify.maxAgeHours`), which is sized at two missed nightly snapshots so ' +
-    'that one benign catch-up after downtime does not trip it.';
+    `(\`snapshotVerify.maxAgeHours\`)${rationale}.`;
 
   // Pre-emptive cleanup. A previous run killed between create and remove
   // leaves the throwaway behind, and `docker run --name` would then fail with
@@ -374,9 +454,11 @@ export async function verifyInstance(
       finding: 'unbootable',
       tag,
       ageHours,
+      stale,
       detail:
         `could not start a container from ${repo}:${tag}: ${started.stderr || summarise(started)}` +
-        (stale ? ` — and separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
+        (stale ? ` — and separately, ${staleDetail} ${whatToDoAbout(instance)}` : '') +
+        badTagNote,
     };
   }
 
@@ -392,10 +474,12 @@ export async function verifyInstance(
         finding: 'stale',
         tag,
         ageHours,
+        stale: true,
         detail:
           `${staleDetail} ${whatToDoAbout(instance)} (DRY RUN — nothing was restored, so ` +
           'whether this image still BOOTS is untested. Its age is not: that was read from ' +
-          '`docker images`, which runs in dry run.)',
+          '`docker images`, which runs in dry run.)' +
+          badTagNote,
       };
     }
     return {
@@ -404,11 +488,13 @@ export async function verifyInstance(
       finding: 'dry-run',
       tag,
       ageHours,
+      stale: false,
       detail:
         `DRY RUN — would have restored ${repo}:${tag} into ${throwaway}, probed it with ` +
         `${config.snapshotVerify.probe.join(' ')}, and removed it. Nothing was started, so ` +
         'this is NOT evidence that the snapshot restores. Its age WAS checked and is ' +
-        `${describeAge(ageMs)}, within the ${config.snapshotVerify.maxAgeHours}h ceiling.`,
+        `${describeAge(ageMs)}, within the ${config.snapshotVerify.maxAgeHours}h ceiling.` +
+        badTagNote,
     };
   }
 
@@ -431,11 +517,13 @@ export async function verifyInstance(
           finding: 'unbootable',
           tag,
           ageHours,
+          stale,
           detail:
             `${repo}:${tag} did not reach "running" within ` +
             `${config.snapshotVerify.startTimeoutSeconds}s (last state: ${lastState}). ` +
             'This snapshot would not restore.' +
-            (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
+            (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : '') +
+            badTagNote,
         };
       }
       await sleep(1000);
@@ -453,11 +541,13 @@ export async function verifyInstance(
         finding: 'unbootable',
         tag,
         ageHours,
+        stale,
         detail:
           `${repo}:${tag} started, but the probe ` +
           `(${config.snapshotVerify.probe.join(' ')}) failed: ${probe.stderr || summarise(probe)}. ` +
           'The container is up and its contents are not what a restore needs them to be.' +
-          (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : ''),
+          (stale ? ` And separately, ${staleDetail} ${whatToDoAbout(instance)}` : '') +
+          badTagNote,
       };
     }
 
@@ -471,12 +561,14 @@ export async function verifyInstance(
         finding: 'stale',
         tag,
         ageHours,
+        stale: true,
         detail:
           `${repo}:${tag} restored, reached "running", and passed ` +
           `${config.snapshotVerify.probe.join(' ')} — the image is fine. What is not fine is ` +
           `its date. ${staleDetail} So a rollback of ${instance.container} today would work, ` +
           `and would land on ${describeInstant(takenAt)}, discarding everything the agent ` +
-          `installed since. ${whatToDoAbout(instance)}`,
+          `installed since. ${whatToDoAbout(instance)}` +
+          badTagNote,
       };
     }
 
@@ -486,11 +578,13 @@ export async function verifyInstance(
       finding: 'ok',
       tag,
       ageHours,
+      stale: false,
       detail:
         `${repo}:${tag} restored, reached "running", and passed ` +
         `${config.snapshotVerify.probe.join(' ')}. Taken ${describeInstant(takenAt)}, ` +
         `${describeAge(ageMs)} ago, within the ${config.snapshotVerify.maxAgeHours}h ceiling. ` +
-        'This snapshot is a usable rollback target, and a current one.',
+        'This snapshot is a usable rollback target, and a current one.' +
+        badTagNote,
     };
   } finally {
     // Always, on every path, including the failures above. A verifier that
@@ -524,6 +618,7 @@ export async function verifyAll(config: OpsConfig, runner: Runner): Promise<Veri
         finding: 'not-configured',
         tag: '',
         ageHours: null,
+        stale: false,
         detail: 'not found under instances: in ops-config.yaml',
       });
       continue;
@@ -535,4 +630,112 @@ export async function verifyAll(config: OpsConfig, runner: Runner): Promise<Veri
   }
 
   return outcomes;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// The report
+//
+// These live here rather than in `verify-main.ts` so they can be tested. That
+// is not tidiness: the argument for this whole change is that the
+// OPERATOR-FACING REPORT is the deliverable, and the summary line — the line
+// most likely to be the only one read — was the one piece of it with no test.
+// It said a stale restore "works" two lines after the detail said whether it
+// boots was untested, and nothing caught that because nothing could.
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The banner a finding gets, and why they are not all the same one.
+ *
+ * Until Clawcius #87 every failure printed `RESTORE TEST FAILED`, which was
+ * accurate while the only thing tested was whether the image booted. It is not
+ * accurate for the finding that change added: a stale snapshot passes the
+ * restore test — that is what makes it dangerous — and telling an operator at
+ * 3am that the restore failed would send them to look at an image that is
+ * perfectly good and away from the schedule that stopped.
+ *
+ * `Record<VerifyFinding, ...>`, so adding a finding without a banner is a
+ * compile error rather than an empty string in a log at 3am.
+ */
+export const BANNER: Record<VerifyFinding, string> = {
+  ok: '',
+  'dry-run': '',
+  'images-unlistable': '══ NOTHING IS KNOWN ══',
+  'no-snapshots': '══ NO ROLLBACK TARGET AT ALL ══',
+  'unreadable-stamp': '══ SNAPSHOT AGE UNREADABLE ══',
+  'future-stamp': '══ SNAPSHOT DATED IN THE FUTURE ══',
+  stale: '══ SNAPSHOTS HAVE STOPPED ══',
+  unbootable: '══ RESTORE TEST FAILED ══',
+  'not-configured': '══ INSTANCE NOT CONFIGURED ══',
+};
+
+/** The one-line consequence, which is the sentence an operator acts on. */
+export const CONSEQUENCE: Record<VerifyFinding, string> = {
+  ok: '',
+  'dry-run': '',
+  'images-unlistable': 'Whether this instance has a rollback path is currently unknown.',
+  'no-snapshots': 'This instance cannot be rolled back to any date.',
+  'unreadable-stamp': 'This instance has a rollback path of unknown vintage.',
+  'future-stamp': 'Ages on this instance cannot be trusted, in the direction that hides staleness.',
+  stale: 'This instance CAN be rolled back, and only to a state that keeps getting older.',
+  unbootable: 'A rollback of this instance would not work today.',
+  'not-configured': 'Nothing was tested for this instance.',
+};
+
+/**
+ * The journal `what` string: greppable by failure mode.
+ *
+ * `grep '"kind":"verify"' journal.jsonl | grep stale` answers "when did this
+ * instance stop being snapshotted" without anyone parsing a sentence.
+ */
+export function journalWhat(outcome: VerifyOutcome): string {
+  return (
+    `snapshot-verify ${outcome.instance} [${outcome.finding}]` +
+    `${outcome.tag ? ` ${outcome.tag}` : ''}` +
+    `${outcome.ageHours === null ? '' : ` age=${outcome.ageHours.toFixed(1)}h`}`
+  );
+}
+
+/**
+ * The closing summary line.
+ *
+ * **Under `dryRun` it may not say anything works.** It used to end
+ * `1 restore(s) work and are older than the configured ceiling` in a run whose
+ * detail line two lines above said, correctly, that whether the image boots was
+ * untested — because the `stale` branch returns before anything is started. The
+ * summary asserted the opposite of the detail, in the shipped mode, on the line
+ * most likely to be the only one read. Nothing here may claim a restore works
+ * unless a restore was actually attempted.
+ */
+export function summariseVerify(outcomes: VerifyOutcome[], dryRun: boolean): string {
+  const total = outcomes.length;
+  const current = outcomes.filter((outcome) => outcome.finding === 'ok').length;
+  const withinCeiling = outcomes.filter(
+    (outcome) => outcome.ageHours !== null && !outcome.stale,
+  ).length;
+  // By the `stale` FIELD, not by `finding` — an instance that is stale and also
+  // unbootable reports `unbootable`, and counting by finding dropped it from
+  // the tally while its own detail described it as both.
+  const staleWorking = outcomes.filter((o) => o.stale && o.finding === 'stale').length;
+  const staleBroken = outcomes.filter((o) => o.stale && o.finding !== 'stale').length;
+
+  if (dryRun) {
+    return (
+      `DRY RUN — no restore was attempted, so NO restore path is proven here. Ages were ` +
+      `read, and they are real: ${withinCeiling}/${total} instance(s) have a snapshot ` +
+      `within the ceiling` +
+      (staleWorking + staleBroken > 0 ? `, ${staleWorking + staleBroken} older than it` : '') +
+      '.'
+    );
+  }
+
+  return (
+    `${current}/${total} instance(s) have a current, working restore path` +
+    (staleWorking > 0
+      ? `; ${staleWorking} restore(s) work and are older than the configured ceiling`
+      : '') +
+    (staleBroken > 0
+      ? `; ${staleBroken} are older than the ceiling AND did not restore`
+      : '') +
+    '.'
+  );
 }

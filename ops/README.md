@@ -374,6 +374,23 @@ forked script because `snapshot.sh` has been parameterised on
 — see SETUP.md § *Install the units*, and see the age check below, which is what
 notices if it never gets enabled.
 
+Both snapshot services now carry `TimeoutStartSec=1800`. `Type=oneshot`
+**disables the start timeout by default** (`man systemd.service`) and
+`JobTimeoutSec=` defaults to infinity, so a `docker commit` that wedged left a
+start job that never completed and never failed — nothing in
+`systemctl --failed`, and a night with no backup that looked exactly like a
+night with one. That is bad enough alone; with `hamachi-snapshot.service`
+ordered `After=clawcius-snapshot.service` it would also be transitive, instance
+1's hang holding instance 2's start job behind it indefinitely. Backups stopping
+as a by-product of somebody else's problem is #87's shape, not its opposite,
+which is why the bound goes on **both** units rather than only the new one.
+
+Note also that each timer keeps its **own** ring of 8 (`snapshot.sh`'s default;
+`snapshotKeep` is inert and nothing passes `KEEP`), so a second timer roughly
+doubles the snapshot footprint — on the order of ~32 GB across two instances at
+the ~2 GB an image measured below. Layers are shared between a snapshot and its
+base image but not between snapshots, so the count is the cost.
+
 What no longer happens is a snapshot per task — so `snapshotKeep: 24` in
 `ops-config.yaml` is now **inert**. It was there to raise the shared retention
 ring from 8 because a busy evening of per-task snapshots would otherwise evict
@@ -1365,7 +1382,36 @@ nothing scheduled to snapshot it produces exactly that reading.
 The age is measured from a `probe`, before anything is started, so **a dry-run
 host still reports a stopped snapshot schedule.** That is deliberate: the
 shipped config is `dryRun: true`, and staleness is the one property this
-verifier can establish honestly in that mode.
+verifier can establish honestly in that mode. The corollary is that under
+`dryRun` the summary line **may not say a restore works**, because none was
+attempted — it said `1 restore(s) work and are older than the configured
+ceiling` two lines below a detail line correctly reporting that whether the
+image boots was untested. The summary is the line most likely to be the only
+one read. `summariseVerify()` lives in `verify.ts` rather than in the oneshot
+precisely so it has a test.
+
+Two smaller properties, both there because the alternative reads as a bug in the
+check rather than as a fact about the host:
+
+- **Selection is newest-*datable*, not newest.** It was max-then-validate, so
+  one tag matching the snapshot shape without being a real instant sorted
+  highest forever and the good image behind it was never booted again — and
+  `snapshot.sh` prunes the *lowest* tags, so nothing would ever remove it. A
+  single bad tag would have retired the restore test permanently. Bad tags are
+  now skipped for selection and named in the report with the `docker rmi` that
+  retention will never perform for you; `unreadable-stamp` means *not one* tag
+  dates.
+- **Ages truncate, they do not round.** At a 48h ceiling, `toFixed` printed
+  47.97h as "48.0 hours … within the 48h ceiling" and 48.001h as "48 hours …
+  past the 48h ceiling" — the same number with opposite verdicts. The printed
+  figure now stays on the same side of the ceiling as the comparison that
+  produced the verdict.
+
+And the ceiling's *rationale* is printed only when the configured value is still
+the shipped 48. "Sized at two missed nightly snapshots" is a fact about 48, not
+about `maxAgeHours`, and reciting it next to a configured 12 would be a sentence
+that was true when written, printed in a state nobody checked — which is the
+defect this whole section is about.
 
 ## Running it
 
@@ -1383,7 +1429,9 @@ reports names `dist/selftest.js:1:1` rather than the test that was running when
 it fired. It was 30000 and the suite ran in 21-30 seconds, so it was already
 failing intermittently at head with a message that pointed at no test in
 particular: an `# cancelled 1` and a `not ok 1 - dist/selftest.js`, which reads
-like a hang rather than a clock. Raised to 120000 on 2026-08-19. Anything here
+like a hang rather than a clock. Raised to 120000 on 2026-08-19, with the suite
+at 78 tests and runs observed between 21s and 31s — the top of that range is
+above the old ceiling, so this was not a margin worth leaving. Anything here
 that waits out `startTimeoutSeconds` costs at least five seconds of real
 polling, so prefer a failure mode that fails immediately when both reach the
 same branch.
@@ -1455,14 +1503,30 @@ for **every** instance, not just the one the file belongs to:
 - `snapshotVerify.maxAgeHours` is bounded below at 1, not 0: zero would mean
   every snapshot is stale the instant it is taken, and a permanently red
   verifier is worth no more than a permanently green one;
-- `instances[].snapshotTimer` must be a full unit name if present, and **absent
-  is allowed and is not a boot failure**. Nothing starts or queries it; it is
-  the unit the restore verifier names when that instance's snapshots stop
-  moving, and the shape check is so a typo surfaces at boot rather than as
-  "Unit not found" during an incident. This loader is shared with
-  `clawcius-snapshot-verify.service`, and a verifier that refuses to start over
-  one unconfigured instance reports nothing about the instances that *are*
-  configured;
+- `instances[].snapshotTimer` must end in **`.timer`** if present — not the
+  general unit pattern, which also permits `.service`. Given a pair of unit
+  files differing only in suffix that is the likely typo, and it is the one that
+  produces a confidently wrong sentence: the value is printed inside
+  ``systemctl list-timers --all <unit>` — a timer that is not listed is not
+  enabled`, and `list-timers` never lists a service, so it would report the
+  timer disabled *whatever the truth was*, in the one field whose entire purpose
+  is to be the string an operator trusts. **Absent is allowed and is not a boot
+  failure** — this loader is shared with `clawcius-snapshot-verify.service`, and
+  a verifier that refuses to start over one unconfigured instance reports
+  nothing about the instances that *are* configured;
+- **two instances may not name the same `snapshotTimer`** — the copy-paste this
+  key exists to end, since a shared value sends whoever reads the failure to a
+  unit running correctly for the other instance;
+- **an unrecognised key inside an `instances:` block fails the boot with the key
+  named.** This file's header has always promised that and it was not true of
+  instance blocks: an unknown key loaded clean and was dropped. Newly
+  consequential, because `snapshotTimers:` leaves the field empty and the
+  verifier then states, as the likeliest explanation, that nothing is scheduled
+  to snapshot the instance — a confident wrong root cause from a silent typo.
+  Retired keys (`opsSpoolDir`, `wakeSpoolDir`, `wakeChannelId`, `mayRequest`)
+  are tolerated by the *same list* the deprecation notice is built from, so they
+  reach the notice that names them rather than being refused at the boot meant
+  to report them;
 - `hostAgent.user` must be a plain account name, and `hostAgent.secretPaths`
   and `hostAgent.gitSshKey` must be absolute — a relative "secret path" would
   resolve against whatever working directory systemd happened to give the unit,

@@ -12,7 +12,10 @@ Requires=docker.service
 # that looks deleted is one somebody deletes.
 #
 #   docker.service            — clawcius-snapshot.service has
-#                               `Requires=docker.service` and no `After=`.
+#                               `Requires=docker.service` and no
+#                               `After=docker.service`. (It does have
+#                               `After=clawcius-container.service`; the missing
+#                               ordering is against docker specifically.)
 #                               Requires is a dependency, not an ordering, so
 #                               the two are free to start in parallel there; the
 #                               only thing saving it is that its container unit
@@ -34,6 +37,10 @@ Requires=docker.service
 # is the whole lesson of #87: hamachi's backups stopped as a by-product of
 # something else's removal. "After it, if it is running; regardless, if it is
 # not" is exactly the asymmetry wanted.
+#
+# FAILED AND ABSENT ARE NOT THE ONLY TWO STATES. A start job that HANGS is the
+# third, and `After=` waits on it — see TimeoutStartSec= below, which is what
+# makes this line safe to write.
 After=docker.service hamachi-container.service clawcius-snapshot.service
 
 [Service]
@@ -60,6 +67,31 @@ SupplementaryGroups=docker
 Environment=CLAWCIUS_CONTAINER=hamachi-agent
 
 ExecStart=/home/npurcell/clawcius/docker/snapshot.sh
+
+# ── The bound that makes the After= above safe, and is worth having anyway ─
+#
+# `Type=oneshot` DISABLES the start timeout by default — `man systemd.service`:
+# "Defaults to DefaultTimeoutStartSec= set in the manager, except when
+# Type=oneshot is used, in which case the timeout is disabled by default." And
+# `JobTimeoutSec=` defaults to infinity. So without this line a `docker commit`
+# that wedges — a stuck overlay2 layer, a hung containerd shim — leaves a start
+# job that never completes and never fails, which means NOTHING IN
+# `systemctl --failed`.
+#
+# On its own that is already the worst kind of backup failure: silent. With the
+# `After=clawcius-snapshot.service` above it is also transitive — instance 1's
+# hung commit would hold instance 2's start job behind it, unbounded, and
+# hamachi's backups would stop as a by-product of somebody else's problem with
+# nothing saying so. That is #87's shape, not its opposite, and it is the one
+# state the ordering rationale above did not cover.
+#
+# 1800s, the value clawcius-snapshot-verify.service already carries for the same
+# reason. Long enough that a slow multi-gigabyte commit on a loaded box is not
+# cut off mid-write; short enough that a wedge becomes a failed unit before the
+# next night's run. clawcius-snapshot.service gets the same line, since today a
+# hung commit on EITHER instance hangs forever with nothing to see. Found by OJ
+# in review of #87.
+TimeoutStartSec=1800
 
 # KEEP is unset here, as it is in clawcius-snapshot.service, so the script's own
 # default of 8 is in force. `snapshotKeep: 24` in ops-config.yaml is inert and

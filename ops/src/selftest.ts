@@ -97,7 +97,16 @@ import { readIdle } from './idle.js';
 import { Runner, render } from './runner.js';
 import { StateStore } from './state.js';
 import { Executor, compareHealth } from './executor.js';
-import { snapshotTakenAt, verifyInstance } from './verify.js';
+import {
+  BANNER,
+  CONSEQUENCE,
+  journalWhat,
+  snapshotTakenAt,
+  summariseVerify,
+  verifyInstance,
+  type VerifyFinding,
+  type VerifyOutcome,
+} from './verify.js';
 import {
   agentProblems,
   agentWarnings,
@@ -1247,6 +1256,106 @@ test('structural config errors fail the boot with the key named', () => {
         ]),
       ),
     /two entries named/,
+  );
+
+  // ── The branches added with the age check (#87) ───────────────────────
+  // These matter more than the coverage does: this loader is shared with
+  // clawcius-ops.service, so a later edit that makes one of them throw when it
+  // should not is a ROOT DAEMON THAT WILL NOT BOOT, and a suite that never
+  // exercised them would stay green through it.
+
+  // Zero would mean every snapshot is stale the instant it is taken — a
+  // permanently red verifier, worth no more than a permanently green one.
+  assert.throws(
+    () =>
+      loadOpsConfig(
+        writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), 'snapshotVerify:', '  maxAgeHours: 0']),
+      ),
+    /snapshotVerify\.maxAgeHours/,
+  );
+
+  // A `.service` is the likely typo given a pair of units differing only in
+  // suffix, and it is the one that produces a confidently wrong sentence:
+  // `systemctl list-timers` never lists a service, so the remediation text
+  // would report the timer disabled whatever the truth was.
+  assert.throws(
+    () =>
+      loadOpsConfig(
+        writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), '    snapshotTimer: clawcius-snapshot.service']),
+      ),
+    /snapshotTimer/,
+  );
+  for (const bad of ['clawcius-snapshot', 'Clawcius-Snapshot.timer', 'clawcius-snapshot.tmier']) {
+    assert.throws(
+      () =>
+        loadOpsConfig(writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), `    snapshotTimer: ${bad}`])),
+      /snapshotTimer/,
+      `${bad} must be refused`,
+    );
+  }
+  // And the shipped shape still loads, or the key is gone rather than checked.
+  assert.equal(
+    loadOpsConfig(
+      writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), '    snapshotTimer: clawcius-snapshot.timer']),
+    ).instances[0]?.snapshotTimer,
+    'clawcius-snapshot.timer',
+  );
+  // Absent is allowed and is NOT a boot failure — the verify oneshot shares
+  // this loader, and refusing to start over one unconfigured instance would
+  // report nothing about the instances that are configured.
+  assert.equal(
+    loadOpsConfig(writeConfig(MINIMAL_INSTANCE('/var/lib/z'))).instances[0]?.snapshotTimer,
+    '',
+  );
+
+  // A misspelt key used to load clean and be dropped. For this key that is a
+  // silent typo producing a confident wrong root cause, because the verifier
+  // then names "nothing is scheduled to snapshot this instance" as the
+  // likeliest explanation.
+  assert.throws(
+    () =>
+      loadOpsConfig(
+        writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), '    snapshotTimers: clawcius-snapshot.timer']),
+      ),
+    /snapshotTimers/,
+  );
+  // Retired keys stay tolerated: deleting a key must not be a boot failure for
+  // whoever has not caught up.
+  assert.equal(
+    loadOpsConfig(
+      writeConfig([...MINIMAL_INSTANCE('/var/lib/z'), '    mayRequest: [redeploy]']),
+    ).instances.length,
+    1,
+  );
+});
+
+test('two instances may not name one snapshot timer', () => {
+  // The copy-paste this key exists to end. A shared value sends whoever reads
+  // the failure to a unit that is running correctly for somebody else — which
+  // is exactly the misdirection the old hardcoded "Check
+  // clawcius-snapshot.timer" produced, reintroduced through config.
+  assert.throws(
+    () =>
+      loadOpsConfig(
+        writeConfig([
+          'instances:',
+          '  - name: clawcius',
+          '    container: clawcius-agent',
+          '    image: clawcius-agent:latest',
+          '    stateDir: /var/lib/z/a',
+          '    envFile: /var/lib/z/env',
+          '    wakerStatusFile: /var/lib/z/a/waker.json',
+          '    snapshotTimer: clawcius-snapshot.timer',
+          '  - name: hamachi',
+          '    container: hamachi-agent',
+          '    image: hamachi-agent:latest',
+          '    stateDir: /var/lib/z/b',
+          '    envFile: /var/lib/z/env',
+          '    wakerStatusFile: /var/lib/z/b/waker.json',
+          '    snapshotTimer: clawcius-snapshot.timer',
+        ]),
+      ),
+    /is named by both/,
   );
 });
 
@@ -3443,3 +3552,191 @@ test('an old snapshot that ALSO fails to boot reports both, not whichever was ch
 
 /** A host with both agents, as the real one has had since 2026-08-08. */
 // ── Containment, across every instance's bind mount ───────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════
+// The verifier's report
+//
+// Added in review of #87. Every test above drives `verifyInstance`; the
+// operator-facing report had none — and the PR's whole argument is that the
+// report IS the deliverable. The summary line was the one piece with no test
+// and the one piece that was wrong, which is not a coincidence.
+// ══════════════════════════════════════════════════════════════════════════
+
+function outcome(over: Partial<VerifyOutcome> & { finding: VerifyFinding }): VerifyOutcome {
+  return {
+    instance: 'x',
+    ok: over.finding === 'ok' || over.finding === 'dry-run',
+    tag: 'snap-20260819-040000',
+    ageHours: 1.5,
+    stale: false,
+    detail: '',
+    ...over,
+  };
+}
+
+test('the dry-run summary never claims a restore works, because none was attempted', () => {
+  // The regression, exactly: the summary line said `1 restore(s) work and are
+  // older than the configured ceiling` two lines after the detail line said
+  // whether the image boots was untested — because the stale branch returns
+  // before anything is started. In the shipped mode, on the line most likely to
+  // be the only one read.
+  const line = summariseVerify(
+    [outcome({ finding: 'dry-run' }), outcome({ finding: 'stale', stale: true, ageHours: 200 })],
+    true,
+  );
+  assert.equal(/\bworks?\b/.test(line), false, `dry run may not claim anything works: ${line}`);
+  assert.match(line, /DRY RUN/);
+  assert.match(line, /NO restore path is proven/);
+  // It must still report the age finding, which IS real in dry run.
+  assert.match(line, /older than it/);
+
+  // With nothing stale it still refuses to claim a working restore path.
+  const clean = summariseVerify([outcome({ finding: 'dry-run' })], true);
+  assert.equal(/\bworks?\b/.test(clean), false, clean);
+  assert.match(clean, /1\/1 instance\(s\) have a snapshot within the ceiling/);
+});
+
+test('the stale count is by fact, not by finding, so stale-and-broken is counted', () => {
+  // An instance that is stale AND unbootable reports `unbootable` — the more
+  // severe fact wins the finding. Counting staleness by `finding === 'stale'`
+  // dropped it from the tally while its own detail described it as both.
+  const line = summariseVerify(
+    [
+      outcome({ finding: 'ok' }),
+      outcome({ finding: 'unbootable', ok: false, stale: true, ageHours: 300 }),
+    ],
+    false,
+  );
+  assert.match(line, /1 are older than the ceiling AND did not restore/);
+  assert.equal(
+    /restore\(s\) work and are older/.test(line),
+    false,
+    'an unbootable one must not be counted as working',
+  );
+
+  // And the working-but-old case is still reported as working, because outside
+  // dry run it genuinely was restored and probed.
+  const working = summariseVerify(
+    [outcome({ finding: 'ok' }), outcome({ finding: 'stale', ok: false, stale: true })],
+    false,
+  );
+  assert.match(working, /1 restore\(s\) work and are older than the configured ceiling/);
+});
+
+test('every finding has a banner and a consequence, and only the good ones are silent', () => {
+  const findings: VerifyFinding[] = [
+    'ok',
+    'dry-run',
+    'images-unlistable',
+    'no-snapshots',
+    'unreadable-stamp',
+    'future-stamp',
+    'stale',
+    'unbootable',
+    'not-configured',
+  ];
+  for (const finding of findings) {
+    const good = finding === 'ok' || finding === 'dry-run';
+    assert.equal(BANNER[finding] === '', good, `${finding} banner`);
+    assert.equal(CONSEQUENCE[finding] === '', good, `${finding} consequence`);
+  }
+  // The distinction the whole change rests on: a stale snapshot PASSES the
+  // restore test, so it must not be announced as a failed restore test.
+  assert.notEqual(BANNER.stale, BANNER.unbootable);
+  assert.equal(/RESTORE TEST FAILED/.test(BANNER.stale), false);
+  assert.match(BANNER.unbootable, /RESTORE TEST FAILED/);
+  // The journal line is greppable by failure mode and carries the age.
+  const what = journalWhat(outcome({ finding: 'stale', stale: true, ageHours: 120.44 }));
+  assert.match(what, /\[stale\]/);
+  assert.match(what, /age=120\.4h/);
+  assert.equal(journalWhat(outcome({ finding: 'no-snapshots', tag: '', ageHours: null })).includes('age='), false);
+});
+
+test('an age either side of the ceiling prints on the side its verdict is on', async () => {
+  // toFixed rounds to nearest, so 47.97h printed "48.0 hours ... within the 48h
+  // ceiling" and 48.001h printed "48 hours ... past" — the same number with
+  // opposite verdicts, which reads as a bug in the check rather than a boundary.
+  const runner = new Runner(false, 20, () => {});
+
+  const under = makeHost({ dryRun: false, suffix: 'vunder', snapshotAgeHours: 47.97 });
+  const underInstance = under.config.instances[0];
+  assert.ok(underInstance);
+  const green = await verifyInstance(under.config, runner, underInstance);
+  assert.equal(green.finding, 'ok', green.detail);
+  assert.equal(/48(\.0)? hours/.test(green.detail), false, `must not print 48: ${green.detail}`);
+
+  const over = makeHost({ dryRun: false, suffix: 'vover', snapshotAgeHours: 48.02 });
+  const overInstance = over.config.instances[0];
+  assert.ok(overInstance);
+  const red = await verifyInstance(over.config, runner, overInstance);
+  assert.equal(red.finding, 'stale', red.detail);
+  assert.match(red.detail, /past the 48h ceiling/);
+});
+
+test('the ceiling rationale is claimed only for the value it is a fact about', async () => {
+  // "sized at two missed nightly snapshots" is true of 48, not of maxAgeHours.
+  // Reciting the default's reasoning next to a configured number is a sentence
+  // that was true when written, printed in a state nobody checked — which is
+  // the defect this whole change is about.
+  const runner = new Runner(false, 20, () => {});
+
+  const shipped = makeHost({ dryRun: false, suffix: 'vrat48', snapshotAgeHours: 400 });
+  const shippedInstance = shipped.config.instances[0];
+  assert.ok(shippedInstance);
+  const a = await verifyInstance(shipped.config, runner, shippedInstance);
+  assert.match(a.detail, /two missed nightly snapshots/);
+
+  const tuned = makeHost({
+    dryRun: false,
+    suffix: 'vrat12',
+    snapshotAgeHours: 400,
+    maxAgeHours: 12,
+  });
+  const tunedInstance = tuned.config.instances[0];
+  assert.ok(tunedInstance);
+  const b = await verifyInstance(tuned.config, runner, tunedInstance);
+  assert.equal(
+    /two missed nightly snapshots/.test(b.detail),
+    false,
+    `12h is less than one nightly cycle: ${b.detail}`,
+  );
+  assert.match(b.detail, /shipped default is 48h/);
+});
+
+test('one undatable tag does not retire the restore test for good', async () => {
+  // Selection was max-then-validate, so a shape-matching tag that is not a real
+  // instant sorts highest forever and the good image behind it is never booted
+  // again — and snapshot.sh prunes the LOWEST tags, so nothing removes it.
+  const host = makeHost({
+    dryRun: false,
+    suffix: 'vbadtag',
+    snapshotTags: ['snap-20260231-000000', 'snap-20260819-040000'],
+  });
+  const instance = host.config.instances[0];
+  assert.ok(instance);
+
+  const out = await verifyInstance(host.config, new Runner(false, 20, () => {}), instance);
+  assert.equal(out.tag, 'snap-20260819-040000', 'the newest DATABLE tag is the one tested');
+  assert.equal(
+    host.calls().some((call) => call[0] === 'docker' && call[1] === 'run'),
+    true,
+    'the restore test must still run',
+  );
+  // Loud about the bad one all the same, with the removal command — because
+  // retention will never reach it.
+  assert.match(out.detail, /snap-20260231-000000/);
+  assert.match(out.detail, /docker rmi/);
+  assert.match(out.detail, /prunes the LOWEST tags/);
+
+  // Only when NOT ONE tag dates is the finding unreadable-stamp.
+  const allBad = makeHost({
+    dryRun: false,
+    suffix: 'vallbad',
+    snapshotTags: ['snap-20260231-000000', 'snap-20261301-000000'],
+  });
+  const allBadInstance = allBad.config.instances[0];
+  assert.ok(allBadInstance);
+  const none = await verifyInstance(allBad.config, new Runner(false, 20, () => {}), allBadInstance);
+  assert.equal(none.finding, 'unreadable-stamp');
+  assert.equal(none.ageHours, null);
+});

@@ -35,8 +35,13 @@ import './build-banner.js';
 import { loadOpsConfig } from './config.js';
 import { Journal } from './journal.js';
 import { Runner } from './runner.js';
-import type { VerifyFinding } from './verify.js';
-import { verifyAll } from './verify.js';
+import {
+  BANNER,
+  CONSEQUENCE,
+  journalWhat,
+  summariseVerify,
+  verifyAll,
+} from './verify.js';
 
 const config = loadOpsConfig();
 
@@ -110,56 +115,12 @@ const journal = new Journal(config.stateDir, () => ({
 
 const outcomes = await verifyAll(config, runner);
 
-/**
- * The banner a finding gets, and why they are not all the same one.
- *
- * Until Clawcius #87 every failure printed `RESTORE TEST FAILED`, which was
- * accurate while the only thing tested was whether the image booted. It is not
- * accurate for the finding that change added: a stale snapshot passes the
- * restore test — that is what makes it dangerous — and telling an operator at
- * 3am that the restore failed would send them to look at an image that is
- * perfectly good and away from the schedule that stopped.
- */
-const BANNER: Record<VerifyFinding, string> = {
-  ok: '',
-  'dry-run': '',
-  'images-unlistable': '══ NOTHING IS KNOWN ══',
-  'no-snapshots': '══ NO ROLLBACK TARGET AT ALL ══',
-  'unreadable-stamp': '══ SNAPSHOT AGE UNREADABLE ══',
-  'future-stamp': '══ SNAPSHOT DATED IN THE FUTURE ══',
-  stale: '══ SNAPSHOTS HAVE STOPPED ══',
-  unbootable: '══ RESTORE TEST FAILED ══',
-  'not-configured': '══ INSTANCE NOT CONFIGURED ══',
-};
-
-/** The one-line consequence, which is the sentence an operator acts on. */
-const CONSEQUENCE: Record<VerifyFinding, string> = {
-  ok: '',
-  'dry-run': '',
-  'images-unlistable': 'Whether this instance has a rollback path is currently unknown.',
-  'no-snapshots': 'This instance cannot be rolled back to any date.',
-  'unreadable-stamp': 'This instance has a rollback path of unknown vintage.',
-  'future-stamp': 'Ages on this instance cannot be trusted, in the direction that hides staleness.',
-  stale: 'This instance CAN be rolled back, and only to a state that keeps getting older.',
-  unbootable: 'A rollback of this instance would not work today.',
-  'not-configured': 'Nothing was tested for this instance.',
-};
-
 let failed = 0;
-let stale = 0;
 for (const outcome of outcomes) {
   if (!outcome.ok) failed += 1;
-  if (outcome.finding === 'stale') stale += 1;
   journal.write({
     kind: 'verify',
-    // The finding goes in `what`, not only in the prose, so the journal is
-    // greppable by failure mode: `grep '"kind":"verify"' journal.jsonl | grep
-    // stale` answers "when did this instance stop being snapshotted" without
-    // anyone parsing a sentence.
-    what:
-      `snapshot-verify ${outcome.instance} [${outcome.finding}]` +
-      `${outcome.tag ? ` ${outcome.tag}` : ''}` +
-      `${outcome.ageHours === null ? '' : ` age=${outcome.ageHours.toFixed(1)}h`}`,
+    what: journalWhat(outcome),
     instance: outcome.instance,
     ok: outcome.ok,
     dryRun: config.dryRun,
@@ -173,15 +134,10 @@ for (const outcome of outcomes) {
   }
 }
 
-// Two numbers, because "have a working restore path" was one number answering
-// two questions and the stale case is the one it got wrong: those instances DO
-// have a working restore path. Saying so and saying it is out of date in the
-// same line is the whole point of the finding.
-process.stdout.write(
-  `[ops verify] ${outcomes.length - failed}/${outcomes.length} instance(s) have a current, ` +
-    `working restore path` +
-    (stale ? `; ${stale} restore(s) work and are older than the configured ceiling` : '') +
-    `${config.dryRun ? ' (DRY RUN — nothing was actually restored; ages were still read)' : ''}\n`,
-);
+// Assembled in verify.ts, and tested there. Everything this oneshot prints is
+// now a pure function of the outcomes — which is the point, because the report
+// IS the deliverable of this change and the summary line was the one piece of
+// it that had no test and was the one piece of it that was wrong.
+process.stdout.write(`[ops verify] ${summariseVerify(outcomes, config.dryRun)}\n`);
 
 process.exit(failed > 0 ? 1 : 0);

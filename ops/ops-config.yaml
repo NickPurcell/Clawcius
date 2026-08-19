@@ -295,6 +295,13 @@ instances:
     # been sent to read instance 1's timer, which was running correctly and had
     # nothing to do with it. Leave it out and the verifier says no timer is
     # recorded, which is a truer thing to print than a guess.
+    #
+    # MUST END IN .timer, and the loader refuses anything else — including a
+    # .service, which is the likely typo given a pair of unit files differing
+    # only in suffix. The value is printed inside a `systemctl list-timers`
+    # command, and that never lists a service, so a .service here would tell an
+    # operator the timer is disabled whatever the truth was. Two instances may
+    # not name the same one either.
     snapshotTimer: clawcius-snapshot.timer
 
     # ── The Clawsky board: how a coordinator reaches the host agent ──────
@@ -379,17 +386,44 @@ limits:
   buildTimeoutSeconds: 1800
 
 # ── Snapshots kept per instance ───────────────────────────────────────────
-# Passed to docker/snapshot.sh as KEEP, which defaults to 8 on its own.
 #
-# 8 was sized for one snapshot a night, before a redeploy. Since 2026-08-10 one
-# is taken before EVERY task, and the retention ring is shared with the nightly
-# timer — whoever runs last prunes to their own ceiling — so at 8 a dozen small
-# tasks in an evening would evict the previous night's backup by morning.
+# ── THIS KEY IS INERT. NOTHING READS IT. ──────────────────────────────────
 #
-# This is disk. Snapshot images share their base layers, so the marginal cost is
-# the writable diff rather than a whole image, but SETUP.md's measured figure
-# was ~2 GB each and a wrong answer here fills the disk. Narrow the blast radius
-# instead by naming an instance in the task: a task that names one snapshots one.
+# It is loaded and validated and then no code consumes the result. Corrected
+# 2026-08-19 because the comment here still described the world of 2026-08-10,
+# and this is the one knob an operator reaches for after reading about snapshot
+# retention — so a stale comment here does not merely sit there, it sends them
+# to a key that does nothing and leaves them believing they have set something.
+#
+# WHAT IT SAID, and why each half stopped being true:
+#
+#   "Passed to docker/snapshot.sh as KEEP"  — nothing passes it. Neither
+#   clawcius-snapshot.service nor hamachi-snapshot.service sets KEEP, so the
+#   script's own default of 8 is what is in force, per instance.
+#
+#   "Since 2026-08-10 one is taken before EVERY task, and the retention ring is
+#   shared with the nightly timer" — the per-task snapshot was RETIRED on
+#   2026-08-14 (ops/README.md § "Nothing is rolled back"). That retirement is
+#   also what silently ended hamachi's backups, since it was the only thing
+#   snapshotting instance 2 — Clawcius #87. There is no shared ring and no
+#   second writer.
+#
+# WHAT IS ACTUALLY IN FORCE, and the number worth knowing:
+#
+#   8 images per instance, from snapshot.sh's own default. With two instances
+#   that is up to 16 retained images at the repo's own measured figure of ~2 GB
+#   each (ops/README.md), so on the order of ~32 GB — roughly double what it was
+#   before hamachi-snapshot.timer, because instance 2 now keeps a ring of its
+#   own. Layers are shared between a snapshot and its base image but NOT between
+#   snapshots, so the count is the cost.
+#
+#   SETUP.md has a "Memory budget" section and no disk one. `df -h` before
+#   enabling the second timer, and again after the first week; SETUP.md § 3 says
+#   so next to the `enable --now`. To change retention, set `KEEP=` in the
+#   snapshot units — not here.
+#
+# The key still parses. It is left in place rather than deleted because removing
+# a key is a boot failure for anyone whose file still has it.
 snapshotKeep: 24
 
 # ── The host agent ────────────────────────────────────────────────────────
