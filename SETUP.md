@@ -86,6 +86,34 @@ memory, environment — do not reach a container that already exists. A changed
 `.env` is the common case, so it is detected and reported at startup rather
 than left to look like a credentials bug.
 
+The flags are not detected, because there is nothing to detect: on a reuse the
+answer is always "not applied". So the script says that outright and then
+prints what the container it found actually has — its id, when it was created,
+the image tag and the image id behind it, the runtime, `--init`, `--memory`
+and `--pids-limit`:
+
+```
+reusing clawcius-agent (already running)
+  NOTE: reused, not created — the docker run flags in this file were NOT
+        applied to it. --recreate applies them, and discards the writable
+        layer. What this container actually has:
+  id 7f3a91c2b0d4  created 2026-08-18T07:27:27Z  image clawcius-agent:latest (0f3d1a2b3c4d)
+  runtime runsc  init true  memory 2048m  pids-limit 512
+  clawcius-agent  Up 3 days  runtime-isolated
+```
+
+The same lines print on creation, so `journalctl -u clawcius-container` and
+`journalctl -u hamachi-container` answer "what does the running container have,
+and how old is it" without a `docker inspect` grant — which the host agent does
+not have for `HostConfig.Init` (`ops/clawcius-sudoers` enumerates that command
+by fixed field/container pairs). Reading the journal needs no sudo at all: it is
+`systemd-journal` group membership.
+
+It is a report and not a verdict. It does not compare the printed values against
+the flags in the file, because a partial comparison that looks complete is worse
+than none — read the printed line against `run-container.sh`, which is one
+scroll away.
+
 This is the only way the agent runs — there is no host mode. A local child
 process would have confined nothing but shell commands, leaving `Read`,
 `Write`, `WebFetch` and the agent process itself unconfined, which is a
