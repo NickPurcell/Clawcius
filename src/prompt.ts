@@ -38,15 +38,15 @@ function render(template: string, vars: Record<string, string>): string {
  * are the most recent thing in context.
  */
 export function buildSystemPrompt(): Options['systemPrompt'] {
-  const protocol = render(config.agent.prompts.protocol, {
-    cli: config.agent.paths.discordCli,
+  const protocol = render(config().agent.prompts.protocol, {
+    cli: config().agent.paths.discordCli,
   });
 
-  const layered = [protocol, config.agent.systemPrompt.append.trim()]
+  const layered = [protocol, config().agent.systemPrompt.append.trim()]
     .filter(Boolean)
     .join('\n\n');
 
-  if (config.agent.systemPrompt.useClaudeCodeDefault) {
+  if (config().agent.systemPrompt.useClaudeCodeDefault) {
     return { type: 'preset', preset: 'claude_code', append: layered };
   }
   return layered;
@@ -72,7 +72,7 @@ export function buildSpawnCharter(vars: {
   spawnedBy: string;
   instructions: string;
 }): string {
-  return render(config.agent.prompts.spawnCharter, vars);
+  return render(config().agent.prompts.spawnCharter, vars);
 }
 
 function clockOf(at: number): string {
@@ -81,8 +81,8 @@ function clockOf(at: number): string {
 
 /** The per-wake message handed to the agent. */
 export function buildWakeMessage(context: WakeContext): string {
-  const cli = config.agent.paths.discordCli;
-  const { prompts } = config.agent;
+  const cli = config().agent.paths.discordCli;
+  const { prompts } = config().agent;
 
   if (context.kind === 'mail') {
     return render(prompts.mailWake, {
