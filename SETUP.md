@@ -461,10 +461,11 @@ there is only ever one.
 
 **The cap and the timeout are orthogonal, and neither substitutes for the
 other.** The cap is the only thing that bounds *peak* residency: `acquire`
-throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:894`), so
-at most that many sessions are ever resident at once. `idleTimeoutMinutes` is
-the only thing that gives a slot *back* — and only a slot nobody is using:
-`#evictIdle` skips every session that is busy or was active within the timeout
+throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:894`), and
+nothing awaits between that check and the `#sessions.set` at `:952`, so no more
+than that many sessions are ever admitted at once. `idleTimeoutMinutes` is the
+only thing that reclaims a live session *on its own* — and only one nobody is
+using: `#evictIdle` skips every session that is busy or was active within the timeout
 (`src/agent.ts:1018`), and it runs on a 60-second sweep, never on the acquire
 path. **So eviction cannot bound a burst.** With `idleTimeoutMinutes: 5` and
 ten channels mentioned at once, ten sessions go live and all ten stay live,
@@ -473,12 +474,25 @@ bounds the peak. Turning eviction on does not make a cap of 10 safe against the
 limits above — it makes the pool recover afterwards.
 
 At `idleTimeoutMinutes: 0` the cap does both jobs badly: it still bounds the
-peak, but it returns a slot only on a restart, so it protects by locking rather
-than by refusing gracefully. That lockout is not an alternative to the bound —
-it is the same bound seen from the user's side. At `maxConcurrent: 1` hamachi's
-resident session memory really was bounded at one session; raising the cap
-trades that bound for headroom, which is the operator's call to make, but it is
-a trade and not the removal of a limit that was never there.
+peak, but nothing reclaims a slot in the ordinary course, so it protects by
+locking rather than by refusing gracefully. That lockout is not an alternative
+to the bound — it is the same bound seen from the user's side. At
+`maxConcurrent: 1` hamachi's resident session memory really was bounded at one
+session; raising the cap trades that bound for headroom, which is the operator's
+call to make, but it is a trade and not the removal of a limit that was never
+there.
+
+**A full pool is not only a restart away, and a user told otherwise waits for
+the wrong thing.** `SessionManager.release` (`src/agent.ts:1004`) is also
+reached by the `!reset` command (`src/daemon.ts:155`), so `!reset` in any one
+channel holding a live session frees that slot immediately — at the price of
+that channel's transcript, and only that: the registry row and its mailbox
+survive, since `clearSession` clears the session ID rather than the row. Two
+limits on it. It reaches only channels, so a spawned agent holding a slot
+cannot be freed this way (`src/daemon.ts:517`). And it is a remedy rather than
+a guard — someone has to notice and choose which conversation to spend, so it
+bounds nothing in advance. `idleTimeoutMinutes` remains the only *setting* that
+makes the pool recover without one.
 
 **What the raise changed is where the failure surfaces.** At the old caps the
 pool ran out first, and `atCapacityNotice` names `sessions.maxConcurrent`, so a
@@ -528,8 +542,9 @@ session and considerably more for a busy one (§ 5 has the measurements and why
 they do not reduce to one figure). Note that this also makes
 `sessions.maxConcurrent` a lifetime budget *as well as* a concurrency limit: it
 still bounds how many sessions are resident at once, and with nothing evicting
-it also bounds how many distinct channels can run at all, because the pool fills
-permanently and only a restart empties it.
+it also bounds how many distinct channels can run at all, because nothing
+reclaims a session on its own — the pool stays full until a restart, or until
+someone spends a channel's transcript with `!reset` (§ 5).
 Any positive value evicts after that many idle minutes and resumes
 from SQLite on the next mention; continuity is preserved either way, the
 difference is latency versus resident memory.
