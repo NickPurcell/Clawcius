@@ -568,7 +568,19 @@ function toolNames(mcpServers) {
       'this test reads them and the agent SDK has changed shape. Fix the reader; the rule it ' +
       'checks (CLAWSKY.md: "Spawn and kill: held by the coordinator alone") has not changed.',
   );
-  return Object.keys(registered).sort();
+  const names = Object.keys(registered).sort();
+  // Self-supporting, and the reason is OJ's on #136: an SDK that kept the field
+  // and left it empty would make every NEGATIVE assertion here — "an engineer is
+  // offered no spawn tool" — pass vacuously. The positive cases would still go
+  // red, so the file would fail either way; this makes each case fail on its
+  // own rather than leaning on its neighbours. Every caller has a mail store, so
+  // these two are always present: the no-mail case asserts `mcpServers === null`
+  // and never reaches here.
+  assert.ok(
+    names.includes('checkMail') && names.includes('sendMail'),
+    `a session with a mail store must always be offered the mail tools; got: ${names.join(', ')}`,
+  );
+  return names;
 }
 
 /**

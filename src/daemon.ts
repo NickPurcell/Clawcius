@@ -115,8 +115,8 @@ export type DiscordHandlers = {
 };
 
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
-  const { config, client, sessions, registry, mail, mailWaker, armedStore, github, windows } = deps;
-  const alwaysOnChannels = deps.alwaysOnChannels;
+  const { config, client, sessions, registry, mail, mailWaker } = deps;
+  const { armedStore, github, windows, alwaysOnChannels } = deps;
 
   /**
    * Anyone in the server may wake the agent — there is no per-user allowlist.

@@ -448,6 +448,61 @@ test('!status is answered by the waker and never reaches the agent', async () =>
   assert.match(msg.replies[0], /Mail: disabled/);
 });
 
+test('!stop actually interrupts the live turn, rather than only saying it did', async () => {
+  const { handlers, sessions, sent } = harness();
+  const msg = message({ content: `<@${BOT}> !stop`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  // The reply is the easy half and it is the half that would still be right if
+  // the interrupt were deleted. `!stop` is the one command that reaches into a
+  // live turn, so what it did is the assertion, not what it said.
+  assert.deepEqual(sessions.interrupted, [CHANNEL]);
+  assert.deepEqual(msg.replies, ['Interrupted.']);
+  // Acquired to look at the session, not to run a turn.
+  assert.equal(sessions.acquired.length, 1);
+  assert.deepEqual(sessions.acquired[0].woke, []);
+
+  // And with inert events, which is `silentEvents`' whole reason: there is no
+  // wake in flight to rescue here, so a respawn would be churn — and a `!stop`
+  // that respawned would restart the very turn it was asked to stop.
+  const { events } = sessions.acquired[0];
+  await captureStderr(async () => {
+    events.onNeedsRespawn(false);
+    events.onDone(authFailure());
+    events.onError(new Error('ignored'));
+    await settle();
+  });
+  assert.equal(sessions.acquired.length, 1, '`!stop` must not start anything');
+  assert.deepEqual(sessions.released, []);
+  assert.deepEqual(sessions.persisted, []);
+  assert.deepEqual(sent, []);
+});
+
+test('!stop with nothing running says so and does not create a session to stop', async () => {
+  const { handlers, sessions } = harness();
+  sessions.has = () => false;
+  const msg = message({ content: `<@${BOT}> !stop`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  assert.deepEqual(sessions.acquired, [], 'acquiring here would spawn a container to interrupt it');
+  assert.deepEqual(sessions.interrupted, []);
+  assert.deepEqual(msg.replies, ['Nothing running here.']);
+});
+
+test('answering a command extends the window rather than ending the conversation', async () => {
+  // The command path returns before the `if (mentioned)` extend below it, so
+  // without its own extend, asking `!status` mid-conversation would close the
+  // window that the mention before it had opened.
+  const { handlers, windows } = harness({ config: { discord: { followUpWindowSeconds: 300 } } });
+  assert.equal(windows.isOpen(CHANNEL), false);
+
+  const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  assert.equal(msg.replies.length, 1, 'the command has to have been handled for this to mean anything');
+  assert.equal(windows.isOpen(CHANNEL), true);
+});
+
 test('!reset clears the session and keeps the row, because the row is the mailbox', async () => {
   const { handlers, sessions, registry } = harness();
   const msg = message({ content: `<@${BOT}> !reset`, mentioned: true });
@@ -645,6 +700,28 @@ test('the same auth failure AFTER a respawn is announced', async () => {
 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /needs a look at the host/);
+});
+
+test('a dead transport drops the session, or the channel fails forever', async () => {
+  // The third event on that object, and the one whose failure mode is worst:
+  // a session whose child process is gone can never recover, so if it is left
+  // in the pool every later message in that channel acquires the same corpse.
+  // From Discord that is a channel that has silently stopped working until
+  // somebody restarts the unit — and `deliver`'s catch cannot help, because
+  // this arrives asynchronously long after `acquire` returned.
+  const { handlers, sessions, sent } = harness();
+  handlers.deliver(CHANNEL, buffered());
+
+  const log = await captureStderr(async () => {
+    sessions.acquired[0].events.onError(new Error('spawn docker ENOENT'));
+    await settle();
+  });
+
+  assert.deepEqual(sessions.released, [CHANNEL], 'the dead session must be dropped');
+  // And quietly: the bot narrating its own plumbing is worse than a dropped
+  // turn, and the next message spawns a fresh session and usually works.
+  assert.deepEqual(sent, []);
+  assert.match(log, /spawn docker ENOENT/);
 });
 
 // ── onNeedsRespawn: replay, and announcing exactly once ─────────────────────
