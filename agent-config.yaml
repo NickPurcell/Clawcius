@@ -438,14 +438,14 @@ sessions:
   #
   # The sessions are `claude` processes inside `clawcius-agent`, so what binds
   # is that container's limits, not the host's free RAM (11.7 GiB total,
-  # 8.65 GiB available on 2026-08-19 — the host is not the constraint).
+  # 8.65 GiB available on 2026-08-20 — the host is not the constraint).
   # `docker/run-container.sh` defaults MEMORY to 2g and
   # `systemd/clawcius-container.service` sets no CLAWCIUS_CONTAINER_MEMORY, so
   # this instance runs at 2 GiB, and at `--pids-limit=512` — hardcoded at
   # run-container.sh:600, with no environment override, unlike --memory.
   #
   # There is NO reliable per-session cost to multiply by 10, and this comment
-  # is not going to invent one. Measured 2026-08-19: this container was using
+  # is not going to invent one. Measured 2026-08-20: this container was using
   # 151.5 MiB / 2 GiB and 101 PIDs with no live sessions, while `hamachi-agent`
   # was using 997 MiB / 3 GiB and 242 PIDs with one. Cost is dominated by what
   # a session is doing, not by how many there are — SETUP.md § 5's ~400 MB is a

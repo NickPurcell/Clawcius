@@ -73,7 +73,7 @@ StateDirectoryMode=0750
 # scale with sessions.maxConcurrent — just not dominantly.
 #
 # That is worth more attention here than on instance 1: this instance went 1 -> 10
-# on 2026-08-19, the largest jump of the two, against the smaller TasksMax of the
+# on 2026-08-20, the largest jump of the two, against the smaller TasksMax of the
 # two units. Neither unit was resized. This is NOT a claim that 256 is now too
 # small — nobody has measured a `docker exec` client's threads or RSS — it is a
 # note that TasksMax is the thing to measure first if this unit starts refusing.

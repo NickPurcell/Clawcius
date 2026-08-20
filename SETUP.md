@@ -383,7 +383,7 @@ the bot can see.
 
 Measured on this box: one Claude Code process is ~383 MB RSS. That is the
 low end — a session carrying a large context measured **669 MB RSS** inside
-`hamachi-agent` on 2026-08-19. Budget with 400 MB as the floor, not the figure.
+`hamachi-agent` on 2026-08-20. Budget with 400 MB as the floor, not the figure.
 
 The original sizing, on the 4 GB box this section was written for:
 
@@ -417,7 +417,7 @@ the bot's heap. So `TasksMax` scales with `sessions.maxConcurrent` too. Nobody
 has measured a `docker exec` client's threads or RSS; this is a note about what
 to measure first, not a claim that either unit is undersized.
 
-Measured on the host, 2026-08-19:
+Measured on the host, 2026-08-20:
 
 | | `clawcius-agent` | `hamachi-agent` |
 |---|---|---|
@@ -452,7 +452,7 @@ instance. hamachi is at 47% of it with one session and 32% of memory, so PIDs
 run out first. Hitting it is a failing `fork()` somewhere unrelated, not a
 message about sessions.
 
-`sessions.maxConcurrent` is **10** in both configs since 2026-08-19, above
+`sessions.maxConcurrent` is **10** in both configs since 2026-08-20, above
 anything measured here. It is a policy ceiling, not a budget, and the operator
 set it knowing that: with `idleTimeoutMinutes: 0` the pool never gives a slot
 back, so a lower cap did not protect memory either — it just locked the pool
@@ -467,7 +467,7 @@ first instead, as an OOM kill or a failing `fork()` in something unrelated —
 attributed to nothing. That is a loss of legibility, not only of headroom.
 
 The host is **not** the constraint: 11.7 GiB total, 8.65 GiB available, 4 GiB
-of swap essentially untouched, 6 cores (2026-08-19). Two notes if you act on
+of swap essentially untouched, 6 cores (2026-08-20). Two notes if you act on
 any of this:
 
 - **Raising `CLAWCIUS_CONTAINER_MEMORY` is a recreate, not a restart.**

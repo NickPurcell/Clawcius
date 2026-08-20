@@ -597,7 +597,7 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    writing the row when the pool is full *and* nothing evicts, naming both
    settings; a full pool with eviction on is a wait and is reported as one.
    That is capacity, not policy — whether to raise the cap or enable eviction
-   is the operator's call. On 2026-08-19 they took the first: both configs went
+   is the operator's call. On 2026-08-20 they took the first: both configs went
    to `maxConcurrent: 10` — from 3 on instance 1 and from 1 on hamachi. That
    buys ten sessions before the lockout instead of three or one, and nothing
    else: `idleTimeoutMinutes` is still 0, so the pool still never recovers, and

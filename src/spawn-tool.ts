@@ -188,7 +188,7 @@ export type SpawnToolOptions = {
    * a slot in the ordinary course. `spawn` runs INSIDE the calling
    * coordinator's turn, so that coordinator is necessarily holding a slot when
    * the call happens. Both shipped configs set `maxConcurrent: 10` since
-   * 2026-08-19, up from 3 and 1 — which DEFERS this rather than fixing it.
+   * 2026-08-20, up from 3 and 1 — which DEFERS this rather than fixing it.
    * With `idleTimeoutMinutes` still 0 the pool never gives a slot back, so it
    * still fills permanently; it now takes ten sessions to get there instead of
    * three on instance 1 and one on hamachi.

@@ -29,11 +29,11 @@
 # sessions.maxConcurrent used to be listed here as a difference — 1 against
 # instance 1's 3, justified as "the VM has ~1.8 GB free". THAT PREMISE WAS
 # STALE: the box has been the 12 GB VPS since 2026-08-08, measured at 11.7 GiB
-# total and 8.65 GiB available on 2026-08-19. The host was not the constraint
+# total and 8.65 GiB available on 2026-08-20. The host was not the constraint
 # and had not been for months; the container's own 3g and 512 PIDs are.
 #
 # It is NOT a difference any more either: the operator set both instances to 10
-# on 2026-08-19. Only the comment above the key differs, because each names its
+# on 2026-08-20. Only the comment above the key differs, because each names its
 # own container's limits. Do not "restore" the 1 from memory.
 #
 # paths.discordCli and paths.skillsDir deliberately still point into
@@ -467,13 +467,13 @@ sessions:
   #
   # The sessions are `claude` processes inside `hamachi-agent`, so what binds
   # is that container's limits, not the host's free RAM (11.7 GiB total,
-  # 8.65 GiB available on 2026-08-19 — the host is not the constraint).
+  # 8.65 GiB available on 2026-08-20 — the host is not the constraint).
   # `systemd/hamachi-container.service` sets CLAWCIUS_CONTAINER_MEMORY=3g, and
   # `--pids-limit=512` is hardcoded at run-container.sh:600 with no environment
   # override, unlike --memory.
   #
   # There is NO reliable per-session cost to multiply by 10, and this comment
-  # is not going to invent one. Measured 2026-08-19: this container was using
+  # is not going to invent one. Measured 2026-08-20: this container was using
   # 997 MiB / 3 GiB and 242 PIDs with ONE live session, while `clawcius-agent`
   # was using 151.5 MiB / 2 GiB and 101 PIDs with none. Cost is dominated by
   # what a session is doing, not by how many there are — SETUP.md § 5's ~400 MB
