@@ -63,6 +63,19 @@ Requires=docker.service
 # minutes of automatic retry is worth 31 hours of visibility, and the trade only
 # looks close if you believe the loop was accomplishing something.
 #
+# THE ONE SELF-CLEARING TRANSIENT IN THIS START PATH, named so the burst has
+# something concrete to be sized against. Only two things throw at module scope
+# in ops/src/index.ts: the config load, which is permanent by nature, and
+# `takeLock`, which throws `another clawcius-ops is running as pid N` when the
+# lock file names a live process. `shutdown()` releases the lock synchronously
+# before exit, so that is NOT the supervised case — it is somebody on the box at
+# 2am running `npm start` by hand next to the running service. It clears itself
+# the moment their process exits, and it is also the case least likely to finish
+# inside two minutes: debugging by hand does not. Before this limit existed the
+# service came back on its own when they were done; now it is in `failed` until
+# `reset-failed`. That is the intended trade — a visible `failed` is the point —
+# and the operator who trips it is by definition already at the keyboard.
+#
 # RECOVERY, because a bounded limit needs one: a unit that has hit the limit
 # stays dead until it is reset, and `systemctl restart` alone will NOT start it.
 #
@@ -143,50 +156,63 @@ WorkingDirectory=/home/npurcell/clawcius/ops
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=OPS_CONFIG_PATH=/home/npurcell/clawcius/ops/ops-config.yaml
 
-# ── OPS_DRY_RUN — THIS IS THE LINE THAT MAKES THE EXECUTOR ACT ────────────
+# ── OPS_DRY_RUN IS DELIBERATELY NOT SET HERE ──────────────────────────────
 #
-# `false` means a Claude Code session with a shell and passwordless sudo runs
-# on this host when a coordinator DMs the host agent. `true` means it gets no
-# Bash tool at all and can only describe what it would have done. Read
-# ops/README.md § The trust model before changing it.
+# `OPS_DRY_RUN=false` is what makes the executor act: a Claude Code session
+# with a shell and passwordless sudo runs on this host when a coordinator DMs
+# the host agent. `true` means it gets no Bash tool at all and can only
+# describe what it would have done. Read ops/README.md § The trust model before
+# turning it on.
 #
-# It must be exactly `true` or `false`. The loader refuses anything else and
-# names this variable — it does NOT fall back, because `flase` or `0` quietly
-# resolving to "act" is the failure this line exists to prevent, and `0` is a
-# truthy string in JavaScript. Unset it entirely to take whatever
-# ops/ops-config.yaml says, which is `true`.
+# THIS FILE DOES NOT SET IT, AND THAT ABSENCE IS THE DESIGN. Installing this
+# unit is the first thing SETUP.md § Install tells an operator to do, and it
+# does it with `enable --now`, fifteen lines before it tells them to confirm the
+# boot line says DRY RUN. A committed `Environment=OPS_DRY_RUN=false` would make
+# that step produce a LIVE daemon at the point the guide promises a dry-run one.
+# Unset, this loader falls back to ops-config.yaml, which ships `true`: a fresh
+# checkout installs safe by construction rather than by remembering.
 #
-# ── WHY THIS IS HERE AND NOT IN ops-config.yaml ───────────────────────────
+# ── WHERE THIS HOST'S `false` LIVES: A DROP-IN, ALSO IN THIS REPOSITORY ────
 #
-# Because ops-config.yaml is tracked and is the same file everywhere, and this
-# is a fact about THIS MACHINE. Until 2026-08-19 the deployment expressed it by
-# hand-editing line 55 of that tracked file and never committing the edit. That
-# arrangement had no owner and no record: the difference existed only as a diff
-# nobody looked at, it aborted `git merge --ff-only` the first time anything
-# upstream touched the file — blocking a deploy of eight merged pull requests —
-# and resolving that conflict the obvious way would have reverted the executor
-# to dry run silently, leaving it accepting tasks and reporting success while
-# doing nothing.
+#   systemd/clawcius-ops.service.d/live.conf
+#     → /etc/systemd/system/clawcius-ops.service.d/live.conf
 #
-# Here it is a line in the repository, it survives every pull, and the deployed
-# value is readable two ways without a checkout:
+# That is the whole per-machine deviation, and it is one file the operator
+# copies in SETUP.md § Going live. Everything the committed line bought is kept:
+# it is tracked, so the deployed value has an owner and a record; the merged
+# value still answers `systemctl show clawcius-ops -p Environment`; and
+# `systemctl cat clawcius-ops` prints the drop-in below this unit, so a reader
+# on the host sees it without a checkout.
 #
-#   systemctl show clawcius-ops -p Environment
-#   journalctl -u clawcius-ops | grep 'SETTING: dryRun'
+# What it also buys is the direction of the failure. Forget the drop-in and the
+# daemon boots DRY RUN and says so in its first line. Forget it under a
+# committed `false` and the daemon boots LIVE and says so in a line nobody was
+# told to read yet. Only one of those two mistakes is safe, and it is now the
+# one that is easy to make.
 #
-# The executor names the value AND where it came from in its boot line, so
-# "config default" and "the environment overrode the file" are distinguishable
-# from the journal alone. That matters because the host agent can read journals
-# and deliberately cannot make an HTTP request.
+# ── WHY NOT JUST EDIT ops-config.yaml ─────────────────────────────────────
+#
+# Because that is what was being done, and it broke a deploy. Until 2026-08-19
+# the deployment expressed this by hand-editing line 55 of that tracked file and
+# never committing the edit. That arrangement had no owner and no record: the
+# difference existed only as a diff nobody looked at, it aborted
+# `git merge --ff-only` the first time anything upstream touched the file —
+# blocking a deploy of eight merged pull requests — and resolving that conflict
+# the obvious way would have reverted the executor to dry run silently, leaving
+# it accepting tasks and reporting success while doing nothing.
+#
+# The value must be exactly `true` or `false`. The loader refuses anything else
+# and names the variable — it does NOT fall back, because `flase` or `0` quietly
+# resolving to "act" is the failure this whole arrangement exists to prevent,
+# and `0` is a truthy string in JavaScript.
 #
 # The environment WINS over the file. That precedence is stated once, in
 # `DryRunSource` in ops/src/config.ts, and is not restated here on purpose.
 #
-# INSTALLING THIS FILE IS AN OPERATOR STEP. Committing this line changes
-# nothing on the host until someone runs `sudo install -m 0644 ...` and
+# INSTALLING ANY OF THIS IS AN OPERATOR STEP. Committing a unit or a drop-in
+# changes nothing on the host until someone copies it and runs
 # `systemctl daemon-reload && systemctl restart clawcius-ops` — see SETUP.md.
 # Until then the running unit keeps whatever environment it was started with.
-Environment=OPS_DRY_RUN=false
 
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
 

@@ -476,7 +476,24 @@ export const DRY_RUN_ENV = 'OPS_DRY_RUN';
  * *silently*, leaving it accepting tasks and reporting success while doing
  * nothing. The point of this variable is that the tracked file now always holds
  * the safe default and always matches upstream exactly, and the machine's
- * deviation is a line in a unit file that is itself in the repository.
+ * deviation is a *separate* tracked file that machine installs:
+ * `systemd/clawcius-ops.service.d/live.conf`, a systemd drop-in.
+ *
+ * Separate rather than a line in `clawcius-ops.service` itself, because
+ * SETUP.md § *Install* copies that unit and `enable --now`s it fifteen lines
+ * before it tells the operator to confirm the boot line says DRY RUN. A
+ * committed `false` in the unit would make the guide contradict what it
+ * produces; the drop-in keeps both "the deployed value is in the repository"
+ * and "a fresh checkout installs safe", and the failure mode of forgetting it
+ * is a daemon that comes up in dry run and says so.
+ *
+ * ── ONE PROCESS DELIBERATELY DOES NOT CONSULT ANY OF THIS ─────────────────
+ *
+ * `clawcius-snapshot-verify` reads this config and then ignores `dryRun`
+ * entirely: it restores into a throwaway container it creates and removes, so
+ * dry run protects nothing there, and a dry-run verify exits 0 having proved no
+ * restore path. `verify-main.ts` states that at length. Only the executor's
+ * mode is decided here.
  */
 export type DryRunSource = {
   /** Which of the three inputs above actually decided the value. */
@@ -674,6 +691,11 @@ const DEFAULTS: Omit<OpsConfig, 'dryRunSource'> = {
 export class OpsConfigError extends Error {
   constructor(path: string, message: string) {
     super(`ops-config.yaml: ${path} ${message}`);
+    // Without this, `Error.prototype.name` applies and node's uncaught-exception
+    // header reads `Error: ops-config.yaml: …`, which is what the journal
+    // actually holds for every one of #89's 22,675 failed starts. Subclassing
+    // Error does not set `name`; only this does.
+    this.name = 'OpsConfigError';
   }
 }
 
@@ -683,13 +705,22 @@ export class OpsConfigError extends Error {
  *
  * A separate class only so the message says where to go and fix it. Telling
  * somebody `ops-config.yaml: dryRun must be true or false` when the offending
- * text is on an `Environment=` line in a unit file sends them to the wrong
- * file, and the whole purpose of this variable is that the two layers are
+ * text is on an `Environment=` line in a systemd drop-in sends them to the
+ * wrong file, and the whole purpose of this variable is that the two layers are
  * distinguishable.
+ *
+ * That prefix is the ONLY thing the separate class buys: nothing in this
+ * repository catches either class, and until `this.name` was set below it did
+ * not even buy that — node printed `Error: OPS_DRY_RUN: …`, because subclassing
+ * `Error` leaves `Error.prototype.name` in place.
  */
 export class OpsEnvError extends Error {
   constructor(variable: string, message: string) {
     super(`${variable}: ${message}`);
+    // See `OpsConfigError`. Nothing in this repository catches either class, so
+    // the class buys exactly one thing — the prefix on the line node prints when
+    // this reaches the top — and it only buys it if `name` is set.
+    this.name = 'OpsEnvError';
   }
 }
 
@@ -804,8 +835,11 @@ function dryRunSetting(raw: unknown): { value: boolean; source: DryRunSource } {
         'whether the host agent session gets a shell on this machine, so it is not guessed ' +
         'at and it does not fall back: a typo that resolved to false would start a root ' +
         'daemon acting when somebody meant it to describe. Set it to exactly true or ' +
-        'exactly false on the Environment=OPS_DRY_RUN= line in ' +
-        'systemd/clawcius-ops.service, or unset it to take the value in ops-config.yaml.',
+        'exactly false on the Environment=OPS_DRY_RUN= line in the clawcius-ops drop-in ' +
+        '(/etc/systemd/system/clawcius-ops.service.d/live.conf, tracked as ' +
+        'systemd/clawcius-ops.service.d/live.conf), or DELETE that file to take the value ' +
+        'in ops-config.yaml. Blanking the value is what produces "" and lands you here; ' +
+        'clawcius-ops.service itself does not set this variable.',
     );
   }
 

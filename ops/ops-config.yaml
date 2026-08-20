@@ -61,10 +61,15 @@
 #
 # ── DO NOT EDIT THE LINE BELOW TO TURN DRY RUN OFF ON A MACHINE ───────────
 #
-# Set `OPS_DRY_RUN=false` in the environment instead. There is already an
-# `Environment=OPS_DRY_RUN=` line in systemd/clawcius-ops.service for exactly
-# this, and the environment WINS over this key. `ops/src/config.ts`
-# (`DryRunSource`) states the precedence and is the only place that does.
+# Set `OPS_DRY_RUN=false` in the environment instead, and set it by installing
+# systemd/clawcius-ops.service.d/live.conf — a drop-in that exists for exactly
+# this, and is tracked, so the deployed value has an owner and a record. The
+# environment WINS over this key. `ops/src/config.ts` (`DryRunSource`) states
+# the precedence and is the only place that does.
+#
+# Note that clawcius-ops.service itself does NOT carry the variable, on purpose:
+# SETUP.md § Install copies that unit and starts it, so a `false` committed
+# there would bring a fresh host up live at the step that promises dry run.
 #
 # This file is tracked, and it is the same file in every checkout and on every
 # machine. Editing this line in place without committing it is what happened

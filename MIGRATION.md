@@ -684,11 +684,35 @@ plumbing end to end. Stay in it until a week of the log contains nothing
 surprising.
 
 Dry run is decided by `OPS_DRY_RUN` in the environment when that variable is
-set, and by the file when it is not; the environment wins. So the way to stay in
-dry run for this step is to leave `Environment=OPS_DRY_RUN=` out of the installed
-`clawcius-ops.service`, or to set it to `true` — not to edit `ops-config.yaml`,
-which is tracked and shared. `ops/README.md` § *Where the deployed value
-actually comes from* is the full account of why.
+set, and by the file when it is not; the environment wins. **Nothing in
+`systemd/` sets it**, so staying in dry run for this step needs no command at
+all — it is what a host that has followed SETUP.md § *Install* is already doing.
+What turns it off is one tracked drop-in,
+`systemd/clawcius-ops.service.d/live.conf`, installed deliberately in SETUP.md
+§ *Going live*. If this host has been live before and you want it back in dry
+run, that is a `rm`:
+
+```sh
+sudo rm -f /etc/systemd/system/clawcius-ops.service.d/live.conf
+sudo systemctl daemon-reload && sudo systemctl restart clawcius-ops
+```
+
+Delete the file or delete the line; do **not** blank the value.
+`Environment=OPS_DRY_RUN=` sets the variable to the empty string, which is
+neither `true` nor `false`, which fails the boot — correctly, but the unit then
+loops for about two minutes before landing in `failed`. Editing
+`ops-config.yaml` is not an option either: it is tracked and shared.
+`ops/README.md` § *Where the deployed value actually comes from* is the full
+account of why.
+
+Confirm which mode you are in before reading anything into what comes back, and
+confirm it from the journal rather than from `ops-status.json` — that file is
+also written by the snapshot verifier, which does not share the daemon's
+environment:
+
+```sh
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+```
 
 **There is no command to type here, and that is the change.** Until 2026-08-16
 this step was a `printf` of a JSON request into `/var/lib/clawcius/run/ops`;
@@ -708,7 +732,7 @@ sudo tail -f /var/lib/clawcius-ops/journal.jsonl | jq -r 'select(.kind=="audit")
 The reply comes back to the coordinator as a DM; the journal is the durable copy
 and is the one to read. In dry run it will report the commands it *would* have
 run. To get the actual output, turn dry run off the way SETUP.md § *Going live*
-says — install the unit carrying `Environment=OPS_DRY_RUN=false`,
+says — install `systemd/clawcius-ops.service.d/live.conf` as a drop-in,
 `daemon-reload`, restart — then ask again and read the report. Confirm which
 mode you are actually in first; the boot line says so:
 
