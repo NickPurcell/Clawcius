@@ -52,6 +52,29 @@ export function buildSystemPrompt(): Options['systemPrompt'] {
   return layered;
 }
 
+/**
+ * The body of the mail a spawned agent wakes to — CLAWSKY.md phase 5.
+ *
+ * Here rather than in `spawn-tool.ts` because this is the module that renders
+ * text the agent receives, and because the template belongs in config with the
+ * other four: what a new engineer is told about itself is exactly the kind of
+ * thing an operator should be able to change without a rebuild.
+ *
+ * Every field but `instructions` is derived by the caller from the registry row
+ * it just wrote. `instructions` is the caller's prose and is substituted in a
+ * single pass, so a `{crew}` inside it stays literal rather than being read as
+ * a placeholder.
+ */
+export function buildSpawnCharter(vars: {
+  id: string;
+  role: string;
+  crew: string;
+  spawnedBy: string;
+  instructions: string;
+}): string {
+  return render(config.agent.prompts.spawnCharter, vars);
+}
+
 function clockOf(at: number): string {
   return new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 }

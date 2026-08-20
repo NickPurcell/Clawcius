@@ -21,7 +21,7 @@ import { Client, Events, GatewayIntentBits, Partials, type Message } from 'disco
 import { join } from 'node:path';
 import { config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
-import { SessionManager } from './agent.js';
+import { AtCapacityError, SessionManager } from './agent.js';
 import { MailStore } from './mail.js';
 import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
@@ -58,10 +58,14 @@ const registry = new AgentRegistry(config.storage.dbPath, { crew: config.agent.c
  * `checkMail` or `sendMail` tool is offered and the waker behaves exactly as it
  * did before any of this existed.
  *
- * The seeded agents are how a crew gets anyone but its Discord coordinator
- * before spawn exists (CLAWSKY.md phase 5). They are created if absent and
- * never overwritten, so the list is additive: an operator can name a poster
- * without disturbing rows that are already running.
+ * The seeded agents are how an OPERATOR puts an agent on a crew, by editing a
+ * file rather than by asking a coordinator. They predate spawn (CLAWSKY.md
+ * phase 5) and outlive it: the rows are identical either way — same table,
+ * same columns, `spawned_by` null instead of a coordinator's id — so a crew
+ * can be composed from config, from a coordinator's `spawn` calls, or from
+ * both. They are created if absent and never overwritten, so the list stays
+ * additive: an operator can name a poster without disturbing rows that are
+ * already running, spawned or not.
  */
 const mail = config.agent.clawsky.enabled ? new MailStore(registry) : null;
 if (config.agent.clawsky.enabled) {
@@ -116,7 +120,32 @@ const armedTools = armedStore
     }
   : null;
 
-const sessions = new SessionManager(registry, mail, armedTools);
+/**
+ * `spawn` — CLAWSKY.md phase 5, offered to coordinator sessions.
+ *
+ * Wired only when the board is on, and the reason is structural rather than
+ * tidy: a spawn's last step is delivering the new agent's first turn as mail,
+ * so without a board it would write a row that nothing could ever reach.
+ *
+ * The log function is the whole of what this passes in, because it is the
+ * whole of what this process adds. No POLICY caps or throttles spawning,
+ * deliberately — the operator would rather watch a runaway than pre-empt one —
+ * so the journal is where the cost shows up. Every line here names the
+ * coordinator that spawned, the agent it got, and whether the first turn
+ * actually started.
+ *
+ * The session cap binds regardless, and is not a policy about spawning: it is
+ * how many `claude` processes fit on this VM. `SessionManager` hands the tool
+ * that arithmetic so a spawn that could never run is refused rather than
+ * written — see `SpawnToolOptions.capacity`.
+ */
+const spawnLog = mail
+  ? (line: string): void => {
+      process.stdout.write(`[spawn] ${line}\n`);
+    }
+  : null;
+
+const sessions = new SessionManager(registry, mail, armedTools, spawnLog);
 
 /**
  * Mail wakes an idle agent — CLAWSKY.md phase 3.
@@ -365,6 +394,11 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           // Whether the ops executor has claimed its row. A coordinator that
           // is about to be told "unknown recipient" would rather find out here.
           mail ? `Host agent: ${describeHostAgent()}` : 'Host agent: unreachable (mail disabled)',
+          // The crew, by role. Spawning has no cap on purpose, so this is one
+          // of the places the cost is meant to be visible — a coordinator that
+          // has quietly accumulated nine engineers can see it from Discord
+          // rather than only from the status page.
+          mail ? `Crew: ${describeCrew()}` : 'Crew: not on a board (mail disabled)',
           // Whether watchPr can arm at all is a property of THIS process, and
           // the agent inside the container has no way to see it — its own
           // GITHUB_TOKEN says nothing about the waker's. So it is reported.
@@ -398,6 +432,48 @@ function describeHostAgent(): string {
       '(no board: block in ops-config.yaml, or it could not open the database)';
   }
   return `DM ${id} — coordinators only, enforced in code`;
+}
+
+/**
+ * Who is on this crew's board, by role, and how many of them were spawned.
+ *
+ * Read straight from the registry on every `!status` rather than counted as
+ * spawns happen: the rows are the record, and a tally kept alongside them would
+ * be a second one that can disagree after a restart or an operator edit.
+ *
+ * ROWS, and the word is chosen. A count of `coordinator` here is NOT the number
+ * of coordinators the crew has: sessions are keyed on `message.channelId`,
+ * which is per thread as well as per channel, and `#identityFor`'s fallback
+ * writes any id the registry has not heard of as a `coordinator`. So the number
+ * is "Discord conversations this bot has been woken in", and a line reading
+ * `9 coordinator` would be read by everybody as nine agents. The parenthetical
+ * is load-bearing; do not trim it.
+ *
+ * `host` is counted too, and named as not being a crew member, because it does
+ * sit on this board — leaving it out would make the total disagree with the
+ * status page for no stated reason.
+ */
+function describeCrew(): string {
+  const crew = config.agent.clawsky.crew;
+  const rows = registry.listByCrew(crew);
+  if (rows.length === 0) return `${crew} — no rows on the board`;
+
+  const byRole = new Map<string, number>();
+  for (const row of rows) byRole.set(row.role, (byRole.get(row.role) ?? 0) + 1);
+  const roles = [...byRole.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([role, n]) => `${n} ${role}`)
+    .join(', ');
+  const spawned = rows.filter((row) => row.spawnedBy !== null).length;
+
+  const notes: string[] = [];
+  if ((byRole.get('coordinator') ?? 0) > 1) {
+    notes.push('a coordinator row is one Discord channel or thread, not one agent');
+  }
+  if (byRole.has('host')) notes.push('the host runs outside the container and is not crew');
+  notes.push(spawned > 0 ? `${spawned} spawned` : 'none spawned');
+
+  return `${crew} — ${rows.length} row(s): ${roles} (${notes.join('; ')})`;
 }
 
 function silentEvents() {
@@ -613,11 +689,54 @@ function deliver(channelId: string, buffered: BufferedMessage[], afterRespawn = 
 
     session.wake(context);
   } catch (error) {
-    // Capacity or startup failure. Logged rather than announced — the bot
-    // staying quiet is preferable to it interrupting with its own plumbing.
     process.stderr.write(
       `[clawcius ${channelId}] could not wake: ` +
         `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    // A startup failure stays quiet — the bot narrating its own plumbing is
+    // worse than a dropped turn, and the next message usually works.
+    //
+    // A FULL POOL IS DIFFERENT and is the exception this earns. Nothing is
+    // wrong with the request, the channel or the credentials; the messages in
+    // this bundle are dropped and no later message in this channel will fare
+    // any better, because with `idleTimeoutMinutes: 0` nothing releases a
+    // session short of a restart. Silence there is indistinguishable from the
+    // bot being down — the same reading `announceOutage` exists to prevent —
+    // and spawn is what makes it reachable by a coordinator rather than only
+    // by the operator: a spawned agent that has taken a turn holds one of
+    // these slots and `!reset` cannot reach it to give it back.
+    if (error instanceof AtCapacityError) {
+      void announceAtCapacity(channelId, error);
+    }
+  }
+}
+
+/**
+ * Say, in the channel, that there was no session slot.
+ *
+ * Deliberately says the message was dropped rather than "try again": a retry
+ * is what a person would naturally do, and on the shipped configuration it
+ * cannot work. Naming the restart is the useful half.
+ */
+async function announceAtCapacity(channelId: string, error: AtCapacityError): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased() || !('send' in channel)) return;
+    const evicts = config.agent.sessions.idleTimeoutMinutes;
+    await channel.send(
+      `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
+        `pick that up and it was not queued. ` +
+        (evicts === 0
+          ? 'This deployment never evicts idle sessions, so this will not clear on its own: ' +
+            'it needs a restart on the host, or a higher `sessions.maxConcurrent`.'
+          : `A slot frees after ${evicts}m idle — say it again after that.`),
+    );
+  } catch (sendError) {
+    // Best effort, as in announceOutage. If Discord is unreachable too, the
+    // journal is the record, and throwing here would take the process down.
+    process.stderr.write(
+      `[clawcius ${channelId}] could not announce capacity: ` +
+        `${sendError instanceof Error ? sendError.message : String(sendError)}\n`,
     );
   }
 }

@@ -259,10 +259,12 @@ post are one table and the recipient is what separates them, so they are shown
 as one list split in two rather than as two systems.
 
 The feed will be empty, and the page says why rather than showing an empty box:
-only an agent with the `poster` role may write to it, no crew has one, and
-spawn is CLAWSKY.md phase 5, so there is no way to create one yet. That is read
-from the registry — `posterCount` — so it is a checkable statement rather than
-a reassuring one.
+only an agent with the `poster` role may write to it, and no crew has one. That
+is read from the registry — `posterCount` — so it is a checkable statement
+rather than a reassuring one. It is a statement about now and not about the
+future: a coordinator can spawn a poster (CLAWSKY.md phase 5,
+`src/spawn-tool.ts`), so the day one exists this box fills rather than becoming
+a sentence that is quietly wrong.
 
 Showing every DM deliberately reverses a reading of CLAWSKY.md's mail table,
 at the operator's request, and **the decision is recorded in CLAWSKY.md § Mail**

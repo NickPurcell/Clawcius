@@ -21,10 +21,11 @@ import { query, type McpServerConfig, type Options, type Query, type SDKMessage,
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
-import { buildSystemPrompt, buildWakeMessage } from './prompt.js';
+import { buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
+import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
 import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
@@ -176,6 +177,30 @@ function gitEnv(): Record<string, string> {
   });
   if (config.github.token) env['GITHUB_TOKEN'] = config.github.token;
   return env;
+}
+
+/**
+ * `acquire` had no session slot left.
+ *
+ * A class rather than a bare `Error` so callers can tell this apart from a
+ * spawn failure or a dead transport without matching on a message string. That
+ * distinction only started mattering when it became something a *user* should
+ * hear about: it is the one `acquire` failure where nothing is wrong with the
+ * request, the channel or the credentials, and the only remedy is on the host.
+ *
+ * `live` and `max` are carried because the sentence a person reads should
+ * contain the numbers, and the catch site has no other way to get them.
+ */
+export class AtCapacityError extends Error {
+  readonly live: number;
+  readonly max: number;
+
+  constructor(live: number, max: number) {
+    super(`at capacity (${max} concurrent sessions, ${live} live)`);
+    this.name = 'AtCapacityError';
+    this.live = live;
+    this.max = max;
+  }
 }
 
 export type AgentEvents = {
@@ -659,30 +684,62 @@ export class SessionManager {
    * options rather than the tools keeps that split explicit.
    */
   #armed: ArmedToolOptions | null;
+  /**
+   * Where a spawn writes its line, or null when spawn is not offered at all.
+   *
+   * A function rather than a boolean because there is nothing else to
+   * configure: spawn needs the registry and the mail store, and this class
+   * already holds both. Null is the off switch, and index.ts is where the
+   * decision is made — spawn without a board is a row nothing can be delivered
+   * to, so it is only wired when mail is.
+   */
+  #spawnLog: ((line: string) => void) | null;
   #sweeper: NodeJS.Timeout;
 
   constructor(
     registry: AgentRegistry,
     mail: MailStore | null = null,
     armed: ArmedToolOptions | null = null,
+    spawnLog: ((line: string) => void) | null = null,
   ) {
     this.#registry = registry;
     this.#mail = mail;
     this.#armed = armed;
+    this.#spawnLog = spawnLog;
     this.#sweeper = setInterval(() => void this.#evictIdle(), 60_000);
     this.#sweeper.unref();
   }
 
   /**
-   * What a channel's agent is, if the registry has never heard of it.
+   * The identity to write for an agent, and where it comes from.
    *
-   * `coordinator`, because the only agents that existed before the registry
-   * were the ones Discord wakes, and Discord stays with the coordinator. The
-   * id is the channel id: that is what every caller here looks a session up
-   * by, and minting a prettier name would detach live sessions from their
-   * channels for nothing.
+   * The ROW WINS whenever there is one. This used to return `coordinator`
+   * unconditionally, which was harmless while every row was a Discord channel
+   * and `recordSession` happened never to update the role column — two
+   * accidents holding each other up. It stops being harmless the moment agents
+   * are spawned: `persist` runs after every turn, and the one row that would
+   * be written from these defaults is a row that had gone missing, so an
+   * engineer would come back as a coordinator. Coordinator is the one role
+   * that may DM the host agent, so that is a privilege the waker would be
+   * handing out on the way past.
+   *
+   * The fallback remains `coordinator`, for a channel the registry has never
+   * heard of: the only agents that existed before the registry were the ones
+   * Discord wakes, and Discord stays with the coordinator. The id is the
+   * channel id — that is what every caller here looks a session up by, and
+   * minting a prettier name would detach live sessions from their channels for
+   * nothing.
    */
-  #identityFor(workspacePath: string): AgentIdentity {
+  #identityFor(agentId: string, workspacePath: string): AgentIdentity {
+    const row = this.#registry.get(agentId);
+    if (row) {
+      return {
+        crew: row.crew,
+        role: row.role,
+        workspacePath,
+        spawnedBy: row.spawnedBy,
+      };
+    }
     return {
       crew: config.agent.clawsky.crew,
       role: 'coordinator',
@@ -693,6 +750,30 @@ export class SessionManager {
 
   get liveCount(): number {
     return this.#sessions.size;
+  }
+
+  /**
+   * How full the session pool is, and whether anything ever empties it.
+   *
+   * Read by `spawn`, which has to know before it writes a row: a spawned agent
+   * is woken by mail and by nothing else, so if `acquire` can never find it a
+   * slot then the row can never take a turn. The two numbers are not enough on
+   * their own — a full pool with eviction ON is a wait, and a full pool with
+   * eviction OFF is forever — so the timeout comes with them rather than the
+   * caller guessing.
+   *
+   * `live` is `liveCount` by another name and carries its caveat: with
+   * eviction off it is a high-water mark rather than a measure of activity.
+   * That is the right number HERE, where the question is only whether
+   * `acquire` would throw — and the wrong one for "is anybody
+   * mid-conversation", which is `busyCount` below.
+   */
+  get capacity(): { live: number; max: number; idleTimeoutMinutes: number } {
+    return {
+      live: this.#sessions.size,
+      max: config.agent.sessions.maxConcurrent,
+      idleTimeoutMinutes: config.agent.sessions.idleTimeoutMinutes,
+    };
   }
 
   /**
@@ -754,9 +835,7 @@ export class SessionManager {
     }
 
     if (this.#sessions.size >= config.agent.sessions.maxConcurrent) {
-      throw new Error(
-        `at capacity (${config.agent.sessions.maxConcurrent} concurrent sessions)`,
-      );
+      throw new AtCapacityError(this.#sessions.size, config.agent.sessions.maxConcurrent);
     }
 
     const persisted = this.#registry.get(channelId);
@@ -767,7 +846,10 @@ export class SessionManager {
     // mail is addressed to, and the id below is what `sendMail` closes over, so
     // a channel whose first turn is in flight can already be written to and can
     // already write — rather than acquiring a mailbox once it happens to finish.
-    this.#registry.ensure(channelId, this.#identityFor(workspacePath));
+    const identity = this.#registry.ensure(
+      channelId,
+      this.#identityFor(channelId, workspacePath),
+    );
 
     const session = new AgentSession(
       channelId,
@@ -783,7 +865,28 @@ export class SessionManager {
             this.#mail,
             channelId,
             hostAgentId(config.agent.clawsky.crew),
-            this.#armed ? buildArmedTools(channelId, this.#armed) : [],
+            [
+              ...(this.#armed ? buildArmedTools(channelId, this.#armed) : []),
+              // Offered to a coordinator and to nobody else — CLAWSKY.md,
+              // "Spawn and kill: held by the coordinator alone". The tool
+              // checks the row again when it runs, so this is which tools a
+              // session is given rather than where the rule lives; a session
+              // built before an operator edited a role must not out-live the
+              // edit.
+              ...(this.#mail && this.#spawnLog && identity.role === 'coordinator'
+                ? buildSpawnTools(channelId, {
+                    registry: this.#registry,
+                    mail: this.#mail,
+                    workspaceRoot: config.agent.sessions.workspaceRoot,
+                    charter: buildSpawnCharter,
+                    wakesOnMail: config.agent.clawsky.wakeOnMail,
+                    // A getter, not a snapshot: the tool is built once per
+                    // session and the pool moves under it.
+                    capacity: () => this.capacity,
+                    log: this.#spawnLog,
+                  })
+                : []),
+            ],
           )
         : null,
     );
@@ -796,15 +899,48 @@ export class SessionManager {
     return session;
   }
 
+  /**
+   * Write the session id back to the row, and only to a row that exists.
+   *
+   * The absent-row check is the whole of the fix, and preferring the row in
+   * `#identityFor` is not a substitute for it. `recordSession` is an upsert:
+   * when the row is missing it takes the plain-INSERT branch and writes
+   * `identity.role` — so the case worth worrying about, a row that went missing
+   * between the wake and the persist, is exactly the case that reaches
+   * `#identityFor`'s fallback and gets `coordinator`, which is the one role
+   * that may DM the host agent. Reading the row first narrows nothing there,
+   * because there is no row to read.
+   *
+   * So a turn ending for an agent with no row now writes nothing at all,
+   * whatever role it would have picked. An agent is a row; a turn is not a
+   * thing that may create one.
+   *
+   * NOT REACHABLE TODAY, and said out loud so nobody reads it as a live hole:
+   * nothing in the tree deletes from `agents`, and `!reset` clears the session
+   * id rather than the row. It is a guard against a future delete, and against
+   * the day somebody adds one without thinking about which code paths mint
+   * rows. The loud line is deliberate — silence here would hide the delete that
+   * made it reachable.
+   */
   persist(channelId: string): void {
     const session = this.#sessions.get(channelId);
     if (!session) return;
     if (!isResumable(session.sessionId)) return;
+
+    if (this.#registry.get(channelId) === undefined) {
+      process.stderr.write(
+        `[clawcius ${channelId}] finished a turn with no registry row — not creating one. ` +
+          'Its session id is lost and the next wake starts cold. Something deleted the row, ' +
+          'which nothing in this tree does.\n',
+      );
+      return;
+    }
+
     this.#registry.recordSession(
       channelId,
       session.sessionId,
       session.workspacePath,
-      this.#identityFor(session.workspacePath),
+      this.#identityFor(channelId, session.workspacePath),
     );
   }
 

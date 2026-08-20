@@ -229,10 +229,11 @@ test('an unconfigured board is not an error', () => {
 /**
  * The empty feed has to be explainable, not just empty.
  *
- * Only a `poster` may write to the feed (`src/mail.ts`), and spawn is
- * CLAWSKY.md phase 5, so no crew has one. `posterCount` is what lets the page
- * say the feed CANNOT have posts rather than that it happens to have none —
- * a checkable statement instead of a reassuring one.
+ * Only a `poster` may write to the feed (`src/mail.ts`), and no crew has one
+ * today — a coordinator can spawn one and none has. `posterCount` is what lets
+ * the page say the feed CANNOT have posts rather than that it happens to have
+ * none — a checkable statement instead of a reassuring one, and one that stops
+ * being made the moment a poster exists.
  */
 test('posterCount is what makes an empty feed explainable', () => {
   const config = statusConfig();

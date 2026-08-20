@@ -249,12 +249,63 @@ export class AgentRegistry {
   }
 
   /**
+   * Create a row for an agent that must not already exist.
+   *
+   * The counterpart of `ensure`, and separate from it because the two want
+   * opposite answers to the same collision. `ensure` is idempotent by design —
+   * a wake must not disturb a row that is already there — so an id that is
+   * taken comes back as somebody else's agent, silently. That is exactly the
+   * wrong answer for a spawn: the caller believes it has a new agent, its mail
+   * lands in an existing inbox, and two identities share one row.
+   *
+   * So this throws. `spawn` mints an ordinal by looking for the first free one
+   * (src/spawn-tool.ts), and the throw is what catches the case where the look
+   * and the insert disagree — a second process on the same board, or a row
+   * written between the two statements.
+   */
+  create(id: string, identity: AgentIdentity): AgentRecord {
+    const existing = this.get(id);
+    if (existing) {
+      throw new Error(
+        `agent "${id}" already exists (${existing.role} of crew ${existing.crew}) — ` +
+          'an id is an identity and is never reused',
+      );
+    }
+
+    const now = Date.now();
+    // Plain INSERT, not INSERT OR IGNORE: a PRIMARY KEY conflict here is the
+    // race the check above cannot see, and it must surface rather than vanish.
+    this.#db
+      .prepare(
+        `INSERT INTO agents
+           (id, crew, role, session_id, workspace_path, status,
+            spawned_by, spawned_at, last_active_at)
+         VALUES (?, ?, ?, '', ?, 'live', ?, ?, ?)`,
+      )
+      .run(
+        id,
+        identity.crew,
+        identity.role,
+        identity.workspacePath,
+        identity.spawnedBy ?? null,
+        now,
+        now,
+      );
+    return this.get(id) as AgentRecord;
+  }
+
+  /**
    * Record the session the agent is now running under.
    *
    * Upserts rather than updates because the Discord path used to create rows
    * here and must keep working if `ensure` was somehow skipped; a wake that
    * silently failed to persist its session id is a conversation that goes cold
    * at the next restart.
+   *
+   * The conflict clause updates the session and nothing else, which is what
+   * makes that upsert safe now that rows are spawned rather than only woken:
+   * `role`, `crew` and `spawned_by` are identity, and a turn recording its
+   * session id must not be able to rewrite whose turn it was.
    */
   recordSession(id: string, sessionId: string, workspacePath: string, identity: AgentIdentity): void {
     const now = Date.now();

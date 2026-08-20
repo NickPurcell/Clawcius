@@ -570,12 +570,20 @@ clawsky:
   # cannot argue fast. Set false to go back to the phase-2 behaviour, where mail
   # is only read by an agent that ran for some other reason.
   wakeOnMail: true
-  # Agents that exist before spawn does (phase 5). Added if absent, never
-  # overwritten, so this list is additive and safe to edit while running.
+  # Agents the OPERATOR puts on this crew, by editing this file. Added if
+  # absent, never overwritten, so the list is additive and safe to edit while
+  # running.
   #
-  # Empty on purpose. The only writer to the feed is a `poster`, and no agent
-  # has been spawned in one of these crews yet — a seeded row with no session
-  # behind it is a mailbox nothing reads.
+  # This is no longer the only way to get one. A coordinator's `spawn` tool
+  # (CLAWSKY.md phase 5, src/spawn-tool.ts) writes the same kind of row — same
+  # table, same columns, `spawned_by` set to the coordinator instead of null —
+  # so a crew can be composed from here, from spawn, or from both. What this
+  # list still does that spawn cannot is bootstrap — a crew with no coordinator
+  # has nobody to spawn anything — and name a `coordinator`, which spawn
+  # refuses because only a coordinator may DM the host agent.
+  #
+  # Empty on purpose: nobody has needed a seeded row yet, and a seeded row that
+  # no one writes to is a mailbox nothing reads.
   agents: []
 
 # ── Armed conditions: remindMe and watchPr ────────────────────────────────

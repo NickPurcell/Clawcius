@@ -219,3 +219,109 @@ test('nothing outside this suite writes a status — the status page says so', a
       'status/README.md all say nothing does — update them in the same change.',
   );
 });
+
+// ── create(): the row a spawn writes ────────────────────────────────────────
+
+test('create writes a spawned row and records who spawned it', () => {
+  const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
+
+  const row = registry.create('hamachi-engineer1', {
+    crew: 'hamachi',
+    role: 'engineer',
+    workspacePath: '/var/lib/hamachi/workspaces/hamachi-engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  assert.equal(row.role, 'engineer');
+  assert.equal(row.crew, 'hamachi');
+  assert.equal(row.status, 'live');
+  assert.equal(row.spawnedBy, 'hamachi-coordinator');
+  assert.equal(row.sessionId, '', 'a session id does not exist until the session starts');
+  assert.equal(registry.get('hamachi-engineer1').role, 'engineer');
+  registry.close();
+});
+
+test('create refuses an id that is taken, where ensure would adopt it', () => {
+  const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
+  registry.create('hamachi-engineer1', {
+    crew: 'hamachi',
+    role: 'engineer',
+    workspacePath: '/w/1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  // The difference that makes them two methods. `ensure` is idempotent because
+  // a wake must not disturb a row that is already there; for a spawn the same
+  // answer would hand a new agent somebody else's inbox.
+  const adopted = registry.ensure('hamachi-engineer1', {
+    crew: 'hamachi',
+    role: 'researcher',
+    workspacePath: '/w/other',
+  });
+  assert.equal(adopted.role, 'engineer');
+
+  assert.throws(
+    () =>
+      registry.create('hamachi-engineer1', {
+        crew: 'hamachi',
+        role: 'researcher',
+        workspacePath: '/w/other',
+        spawnedBy: 'hamachi-coordinator',
+      }),
+    /already exists/,
+  );
+  assert.equal(registry.get('hamachi-engineer1').workspacePath, '/w/1', 'and nothing was rewritten');
+  registry.close();
+});
+
+test('recording a session does not rewrite who an agent is', () => {
+  // The upsert in `recordSession` runs after every turn. Its conflict clause
+  // touches the session and nothing else, which is what keeps a spawned
+  // engineer an engineer — `coordinator` is the role that may DM the host
+  // agent, so a role rewritten on the way past would be a privilege handed out
+  // by the waker.
+  const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
+  registry.create('hamachi-engineer1', {
+    crew: 'hamachi',
+    role: 'engineer',
+    workspacePath: '/w/1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  registry.recordSession('hamachi-engineer1', '0b3f4d1e-1111-4222-8333-444455556666', '/w/1', {
+    crew: 'hamachi',
+    role: 'coordinator',
+    workspacePath: '/w/1',
+    spawnedBy: null,
+  });
+
+  const row = registry.get('hamachi-engineer1');
+  assert.equal(row.role, 'engineer');
+  assert.equal(row.spawnedBy, 'hamachi-coordinator');
+  assert.equal(row.sessionId, '0b3f4d1e-1111-4222-8333-444455556666');
+  registry.close();
+});
+
+test('the upsert mints a row when there is none — which is why persist must not call it', () => {
+  // Pinning the behaviour that makes `SessionManager.persist`'s absent-row
+  // guard necessary rather than decorative. `recordSession` is an upsert, so
+  // with no row it takes the plain-INSERT branch and writes `identity.role`
+  // verbatim — and the identity a missing row produces is the `coordinator`
+  // fallback, which is the one role that may DM the host agent. Preferring the
+  // row in `#identityFor` cannot narrow that: there is no row to prefer.
+  //
+  // The guard lives in agent.ts because that is where the decision belongs; the
+  // store stays a store. If this test ever starts failing because the upsert
+  // became an update, the guard is redundant and can go.
+  const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
+
+  registry.recordSession('hamachi-engineer1', '0b3f4d1e-1111-4222-8333-444455556666', '/w/1', {
+    crew: 'hamachi',
+    role: 'coordinator',
+    workspacePath: '/w/1',
+    spawnedBy: null,
+  });
+
+  assert.equal(registry.get('hamachi-engineer1').role, 'coordinator');
+  registry.close();
+});
