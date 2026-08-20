@@ -456,8 +456,8 @@ message about sessions.
 anything measured here. It is a policy ceiling, deliberately set past what the
 measurements support, and the operator chose it knowing that. Nothing enforces
 this section; the container's limits do, by killing something. `browse` adds
-~410 MB peak (`browser-cli/README.md` § Memory) and holds an exclusive lock, so
-there is only ever one.
+~410 MB peak (`browser-cli/README.md` § Memory) and holds an exclusive lock,
+so there is only ever one.
 
 **The cap and the timeout are orthogonal, and neither substitutes for the
 other.** The cap is the only thing that bounds *peak* residency: `acquire`
@@ -465,34 +465,39 @@ throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:894`), and
 nothing awaits between that check and the `#sessions.set` at `:952`, so no more
 than that many sessions are ever admitted at once. `idleTimeoutMinutes` is the
 only thing that reclaims a live session *on its own* — and only one nobody is
-using: `#evictIdle` skips every session that is busy or was active within the timeout
-(`src/agent.ts:1018`), and it runs on a 60-second sweep, never on the acquire
-path. **So eviction cannot bound a burst.** With `idleTimeoutMinutes: 5` and
-ten channels mentioned at once, ten sessions go live and all ten stay live,
-because none of them is idle. Eviction bounds accumulation over time; the cap
-bounds the peak. Turning eviction on does not make a cap of 10 safe against the
-limits above — it makes the pool recover afterwards.
+using: `#evictIdle` skips every session that is busy or was active within the
+timeout (`src/agent.ts:1018`), and it runs on a 60-second sweep, never on the
+acquire path. **So eviction cannot bound a burst.** With
+`idleTimeoutMinutes: 5` and ten channels mentioned at once, ten sessions go
+live and all ten stay live, because none of them is idle. Eviction bounds
+accumulation over time; the cap bounds the peak. Turning eviction on does not
+make a cap of 10 safe against the limits above — it makes the pool recover
+afterwards.
 
 At `idleTimeoutMinutes: 0` the cap does both jobs badly: it still bounds the
 peak, but nothing reclaims a slot in the ordinary course, so it protects by
 locking rather than by refusing gracefully. That lockout is not an alternative
 to the bound — it is the same bound seen from the user's side. At
 `maxConcurrent: 1` hamachi's resident session memory really was bounded at one
-session; raising the cap trades that bound for headroom, which is the operator's
-call to make, but it is a trade and not the removal of a limit that was never
-there.
+session; raising the cap trades that bound for headroom, which is the
+operator's call to make, but it is a trade and not the removal of a limit that
+was never there.
 
 **A full pool is not only a restart away, and a user told otherwise waits for
 the wrong thing.** `SessionManager.release` (`src/agent.ts:1004`) is also
 reached by the `!reset` command (`src/daemon.ts:155`), so `!reset` in any one
-channel holding a live session frees that slot immediately — at the price of
-that channel's transcript, and only that: the registry row and its mailbox
-survive, since `clearSession` clears the session ID rather than the row. Two
-limits on it. It reaches only channels, so a spawned agent holding a slot
-cannot be freed this way (`src/daemon.ts:517`). And it is a remedy rather than
-a guard — someone has to notice and choose which conversation to spend, so it
-bounds nothing in advance. `idleTimeoutMinutes` remains the only *setting* that
-makes the pool recover without one.
+channel holding a live session frees that slot at once — though a session
+that is mid-turn keeps its process until the turn drains, since `close()`
+(`src/agent.ts:691`) closes the prompt queue rather than interrupting the way
+`!stop` does. The slot frees before the memory does, which makes this a remedy
+for a locked pool and not for memory pressure. It costs that channel's
+transcript and only that: `clearSession` clears the session ID rather than the
+row, so the mailbox survives, and a turn finishing after the reset does not
+write its ID back either, because `persist` returns early once the map entry is
+gone (`src/agent.ts:983`). Two limits on it. It reaches only channels, so a
+spawned agent holding a slot cannot be freed this way (`src/daemon.ts:517`).
+And it is a remedy rather than a guard — someone has to notice and choose
+which conversation to spend, so it bounds nothing in advance.
 
 **What the raise changed is where the failure surfaces.** At the old caps the
 pool ran out first, and `atCapacityNotice` names `sessions.maxConcurrent`, so a

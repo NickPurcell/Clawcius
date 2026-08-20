@@ -502,8 +502,10 @@ sessions:
   #     that is busy or was active within the timeout (src/agent.ts:1018), and
   #     it runs on a 60s sweep, never on the acquire path. `!reset` in a channel
   #     also frees that channel's slot (src/daemon.ts:155), at the cost of its
-  #     transcript — but it is a remedy someone has to invoke, not a guard, and
-  #     it cannot reach a spawned agent's slot (src/daemon.ts:517).
+  #     transcript — but it is a remedy someone has to invoke, not a guard, it
+  #     cannot reach a spawned agent's slot (src/daemon.ts:517), and it frees
+  #     the SLOT before the memory: `close()` drains a mid-turn session rather
+  #     than interrupting it, so the entry is gone while the process is not.
   #
   # So eviction cannot bound a burst. Ten channels mentioned at once put ten
   # sessions live and none of them is idle, whatever the timeout is set to.
