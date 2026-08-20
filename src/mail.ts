@@ -84,7 +84,7 @@ export class MailStore {
    * This is what makes mail wake anybody: without it the board is a table
    * nobody looks at until an agent happens to run. It is set by the waker and
    * fires synchronously inside `deliver`, so the subscriber must not throw —
-   * the caller is a directory sweep in the middle of a batch. index.ts wraps
+   * the caller is a directory sweep in the middle of a batch. daemon.ts wraps
    * it for the same reason it wraps the status publisher.
    *
    * It carries the message rather than just the recipient because a feed post

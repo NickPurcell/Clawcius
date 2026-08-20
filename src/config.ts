@@ -12,18 +12,20 @@
  * the environment was read and validated, and `loadAgentConfig()` went to disk
  * for the YAML. Either can throw, and both did — so every module that imported
  * this one, transitively, was unloadable without a live deployment underneath
- * it. That is `agent.ts` and `index.ts`: the session pool and the whole Discord
- * handler, which between them own most of what can go wrong at runtime and
- * could not be reached by a single test (Clawcius #130). Three defects and
- * three fixes landed in that area in #128 with no test able to touch any of
- * them.
+ * it. That is `agent.ts` and what was then `index.ts`: the session pool and the
+ * whole Discord handler, which between them own most of what can go wrong at
+ * runtime and could not be reached by a single test (Clawcius #130). Three
+ * defects and three fixes landed in that area in #128 with no test able to
+ * touch any of them.
  *
  * Loading is now something the entry point DOES, rather than something that
- * happens to it. `loadConfig()` is the first statement in the body of
- * `index.ts`, ahead of `preflight()` and of anything that touches Discord, so a
- * daemon with no `DISCORD_TOKEN` still refuses to start, at the same point in
- * startup and with the same message. What changed is that `import` alone no
- * longer has an opinion.
+ * happens to it. `loadConfig()` is the first statement of `main()` in
+ * `daemon.ts`, which is the first statement of `index.ts`, and it runs ahead of
+ * `preflight()` and of anything that touches Discord — so a daemon with no
+ * `DISCORD_TOKEN` still refuses to start, at the same point in startup and with
+ * the same message. What changed is that `import` alone no longer has an
+ * opinion. (`main()` being a function the entry point calls is the other half of
+ * the same convention, and is #131.)
  *
  * This is the shape `ops/` and `status/` already use — `loadOpsConfig`,
  * `loadStatusConfig`. The root package was the outlier.
@@ -132,7 +134,7 @@ export function config(): Config {
  *
  * This is what a test uses, and saying so is more honest than a name that
  * pretends otherwise. It is not a way to make the daemon start without a
- * token: `index.ts` calls `loadConfig()` and nothing calls this.
+ * token: `main()` calls `loadConfig()` and nothing calls this.
  *
  * The tests are plain JavaScript, so one that only touches the session pool
  * passes only the keys the session pool reads, and that is deliberate: a

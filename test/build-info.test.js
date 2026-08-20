@@ -500,12 +500,18 @@ test('an unwritable output stops the build, with a sentence rather than a stack'
 });
 
 test('the banner is printed even when the process is about to die in its config loader', () => {
-  // The point of the whole mechanism. `loadConfig()` is the first statement in
-  // the body of `index.ts` and throws on a missing environment variable, so
-  // this is a waker that cannot start — the #89 shape, where 22,675
-  // consecutive failed starts said nothing about which `dist/` was failing. The
-  // banner has to come out of that process anyway, which is why it lives in a
-  // module imported ahead of everything rather than in the body of index.ts.
+  // The point of the whole mechanism. `await main()` is the first statement in
+  // the body of `index.ts` and `loadConfig()` is the first statement of
+  // `main()`, which throws on a missing environment variable — so this is a
+  // waker that cannot start, the #89 shape, where 22,675 consecutive failed
+  // starts said nothing about which `dist/` was failing. The banner has to come
+  // out of that process anyway, which is why it lives in a module imported ahead
+  // of everything rather than in the body of index.ts.
+  //
+  // #131 moved the program into `daemon.ts` and left this test alone on purpose.
+  // `./daemon.js` is now index.ts's SECOND import, so the whole program — every
+  // module it pulls in — is evaluated after the banner has printed, which is a
+  // strictly stronger version of what the last assertion here pins.
   //
   // ── What is load-bearing here, and what stopped being ────────────────────
   //
