@@ -308,6 +308,10 @@ work closed three weeks ago. Delivered as turn one it replays on resume as
 *history*, so the agent can see what it was originally asked to do without
 being told it is still current. **Identity is the role; work arrives as mail.**
 
+`spawn` is built — `src/spawn-tool.ts`, and see build order 5 below for what
+already existed and what did not. `kill` and `resurrect` are not, and are held
+back on the question of who owns the verb rather than on the work.
+
 A killed engineer's worktree stays on disk. Kill is instant and uncommitted
 work is not; disk is cheap, an orphaned branch is recoverable, and a swept one
 isn't. Agents are told to push, or file an issue, or otherwise make work
@@ -560,7 +564,28 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    (`Executor#writeWakeFile`), so removing one alone would have made results
    vanish into a directory nobody read.
 5. **Long-lived crew.** Spawn/kill/resurrect, role prompts, subagent removal
-   from the coordinator.
+   from the coordinator. **Spawn is done** — `src/spawn-tool.ts`, offered to
+   coordinator sessions only. It turned out to be four small steps on top of
+   what phases 1–3 already built: mint the id, create the workspace, write the
+   row, and deliver the instructions as ordinary mail. Nothing new starts a
+   session, because `MailWaker` does not care whether the agent it is waking
+   has ever run — a fresh row and an idle veteran are the same case to it.
+   The charter it wakes to is `prompts.spawnCharter` in agent-config.yaml.
+
+   **Kill and resurrect are not built, and it is not merely unbuilt work.**
+   The mechanism is already here — `status` distinguishes live from dead, the
+   waker refuses to wake a dead agent, `AgentRegistry.setStatus` writes the
+   word — but who holds the verb is unsettled. A coordinator being able to kill
+   what it spawned is the obvious reading, since otherwise it cannot clean up
+   after itself; the operator has not said so, and a killed agent is work
+   stopped rather than a row tidied. Until that is answered, `spawn` says in
+   its own description that there is no way to take it back, so a coordinator
+   finds an honest "not yet" rather than silence.
+
+   There is deliberately **no cap and no throttle** on spawning. The cost is
+   made visible instead: a journal line per spawn, `spawned_by`/`spawned_at`
+   on the row, a crew-by-role summary in `!status`, and the status page's
+   agent card, which already renders `spawned by <id>`.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
    user, the sudoers file and the privilege drop untouched. **Done** —
    `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a

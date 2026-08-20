@@ -58,10 +58,14 @@ const registry = new AgentRegistry(config.storage.dbPath, { crew: config.agent.c
  * `checkMail` or `sendMail` tool is offered and the waker behaves exactly as it
  * did before any of this existed.
  *
- * The seeded agents are how a crew gets anyone but its Discord coordinator
- * before spawn exists (CLAWSKY.md phase 5). They are created if absent and
- * never overwritten, so the list is additive: an operator can name a poster
- * without disturbing rows that are already running.
+ * The seeded agents are how an OPERATOR puts an agent on a crew, by editing a
+ * file rather than by asking a coordinator. They predate spawn (CLAWSKY.md
+ * phase 5) and outlive it: the rows are identical either way — same table,
+ * same columns, `spawned_by` null instead of a coordinator's id — so a crew
+ * can be composed from config, from a coordinator's `spawn` calls, or from
+ * both. They are created if absent and never overwritten, so the list stays
+ * additive: an operator can name a poster without disturbing rows that are
+ * already running, spawned or not.
  */
 const mail = config.agent.clawsky.enabled ? new MailStore(registry) : null;
 if (config.agent.clawsky.enabled) {
@@ -116,7 +120,27 @@ const armedTools = armedStore
     }
   : null;
 
-const sessions = new SessionManager(registry, mail, armedTools);
+/**
+ * `spawn` — CLAWSKY.md phase 5, offered to coordinator sessions.
+ *
+ * Wired only when the board is on, and the reason is structural rather than
+ * tidy: a spawn's last step is delivering the new agent's first turn as mail,
+ * so without a board it would write a row that nothing could ever reach.
+ *
+ * The log function is the whole of what this passes in, because it is the
+ * whole of what this process adds. There is no cap and no throttle on
+ * spawning, deliberately — the operator would rather watch a runaway than
+ * pre-empt one — so the journal is where the cost shows up. Every line here
+ * names the coordinator that spawned, the agent it got, and whether the first
+ * turn actually started.
+ */
+const spawnLog = mail
+  ? (line: string): void => {
+      process.stdout.write(`[spawn] ${line}\n`);
+    }
+  : null;
+
+const sessions = new SessionManager(registry, mail, armedTools, spawnLog);
 
 /**
  * Mail wakes an idle agent — CLAWSKY.md phase 3.
@@ -365,6 +389,11 @@ async function handleCommand(message: Message, command: string): Promise<boolean
           // Whether the ops executor has claimed its row. A coordinator that
           // is about to be told "unknown recipient" would rather find out here.
           mail ? `Host agent: ${describeHostAgent()}` : 'Host agent: unreachable (mail disabled)',
+          // The crew, by role. Spawning has no cap on purpose, so this is one
+          // of the places the cost is meant to be visible — a coordinator that
+          // has quietly accumulated nine engineers can see it from Discord
+          // rather than only from the status page.
+          mail ? `Crew: ${describeCrew()}` : 'Crew: not on a board (mail disabled)',
           // Whether watchPr can arm at all is a property of THIS process, and
           // the agent inside the container has no way to see it — its own
           // GITHUB_TOKEN says nothing about the waker's. So it is reported.
@@ -398,6 +427,27 @@ function describeHostAgent(): string {
       '(no board: block in ops-config.yaml, or it could not open the database)';
   }
   return `DM ${id} — coordinators only, enforced in code`;
+}
+
+/**
+ * Who is on this crew's board, by role, and how many of them were spawned.
+ *
+ * Read straight from the registry on every `!status` rather than counted as
+ * spawns happen: the rows are the record, and a tally kept alongside them
+ * would be a second one that can disagree after a restart or an operator edit.
+ */
+function describeCrew(): string {
+  const crew = config.agent.clawsky.crew;
+  const rows = registry.listByCrew(crew);
+  if (rows.length === 0) return `${crew} — no rows on the board`;
+
+  const byRole = new Map<string, number>();
+  for (const row of rows) byRole.set(row.role, (byRole.get(row.role) ?? 0) + 1);
+  const roles = [...byRole.entries()].map(([role, n]) => `${n} ${role}`).join(', ');
+  const spawned = rows.filter((row) => row.spawnedBy !== null).length;
+
+  return `${crew} — ${rows.length} agent(s): ${roles}` +
+    (spawned > 0 ? ` (${spawned} spawned)` : '');
 }
 
 function silentEvents() {

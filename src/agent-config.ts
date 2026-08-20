@@ -59,6 +59,24 @@ export type PromptTemplates = {
    * is trying not to do. No `{roleNotice}` for the same reason.
    */
   mailWake: string;
+  /**
+   * The first message a spawned agent receives — CLAWSKY.md phase 5.
+   *
+   * It is a MAIL BODY, not a system prompt, and that is the whole design.
+   * Every agent shares one system prompt (`buildSystemPrompt` takes no
+   * arguments), so an agent's role cannot be baked into it; and baking a task
+   * into identity would mean a resurrected engineer wakes believing it still
+   * owns work that closed three weeks ago. Delivered as turn one it replays on
+   * resume as *history*: the agent can see what it was originally asked to do
+   * without being told it is still current.
+   *
+   * `{id}`, `{role}`, `{crew}` and `{spawnedBy}` are derived by the waker from
+   * the row it just wrote. `{instructions}` is the only part the caller
+   * supplies, and it can say anything at all — including that the agent is
+   * something it is not. That is not a hole: mail policy reads the ROW, so an
+   * engineer told it is a poster still cannot write to the feed.
+   */
+  spawnCharter: string;
 };
 
 /** Placeholders each template may use. Anything else is a startup error. */
@@ -68,6 +86,7 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
   messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
   mailWake: ['mail', 'count', 'plural'],
+  spawnCharter: ['id', 'role', 'crew', 'spawnedBy', 'instructions'],
 };
 
 export type AgentConfig = {
@@ -215,10 +234,13 @@ export type AgentConfig = {
     /**
      * Agents that exist before there is anything to spawn them.
      *
-     * Spawn/kill/resurrect are phase 5. Until then this is how a crew gets
-     * anyone but the coordinator: the rows are created at startup if absent
-     * and never overwritten, so an operator edit adds an agent without
-     * disturbing the ones already running.
+     * This was the only way to get one before `spawn` (phase 5) existed, and
+     * it is still how an OPERATOR adds one: the rows are created at startup if
+     * absent and never overwritten, so an edit here adds an agent without
+     * disturbing the ones already running. A spawned row is the same row with
+     * `spawned_by` set, so the two compose rather than competing — and this
+     * list is what bootstraps a crew, since a crew with no coordinator has
+     * nobody to call `spawn`.
      */
     agents: Array<{ id: string; role: AgentRole }>;
   };
@@ -357,6 +379,45 @@ To reply to the latest:
   mailWake: `checkMail →
 
 {mail}`,
+
+  spawnCharter: `You are {id} — a {role} of crew {crew}, spawned by {spawnedBy}.
+
+That name is your identity on the board and it does not change. Your ROLE is
+who you are; your WORK arrives as mail.
+
+## What you were spawned for
+
+{instructions}
+
+Read that as history rather than as a standing order. It is what {spawnedBy}
+asked for at the moment it spawned you, and it stays in your transcript so a
+later turn can see where you came from. Whether it is still what is wanted is a
+question about your inbox, not about this message.
+
+## How you run
+
+You are long-lived, and you are a row on disk rather than a process. Between
+turns nothing of you is running. That is your normal state and it is not death:
+a restart of the host loses nothing, your transcript is resumed, and mail sent
+while you were down is waiting when you next wake.
+
+A DM or a feed post starts a turn, which opens with the mail already read.
+\`checkMail\` is the same thing on demand. Ending a turn is free — you are not
+expected to stay busy, and you do not need to hold a task open to keep
+existing. When the next thing arrives you will be here.
+
+Because nothing is watching between turns, ANYTHING YOU HAVE NOT MADE DURABLE
+IS AT RISK. Push the branch, open the pull request, file the issue, write it
+down — before the turn ends, not when you next think of it.
+
+## Reaching people
+
+\`sendMail\` reaches any agent of crew {crew}. There is no "from" argument, so
+what you send is stamped as yours and nothing else can be stamped as yours.
+Crews talk to each other in public, on the feed.
+
+If you need something you are not permitted to do yourself, say so to
+{spawnedBy}. Asking is the mechanism here, not a fallback.`,
 };
 
 /**
@@ -698,6 +759,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
       messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
       mailWake: template(prompts['mailWake'], 'mailWake', DEFAULT_PROMPTS.mailWake),
+      spawnCharter: template(
+        prompts['spawnCharter'],
+        'spawnCharter',
+        DEFAULT_PROMPTS.spawnCharter,
+      ),
     },
     model: str(root['model'], 'model', DEFAULTS.model),
     maxTurns: num(root['maxTurns'], 'maxTurns', DEFAULTS.maxTurns, 0),

@@ -1678,8 +1678,8 @@ async function viewClawsky() {
           'placeholder',
           instance.posterCount === 0
             ? 'Empty, and that is correct: only an agent with the poster role may write to the ' +
-                'feed, and this crew has none. Spawn is CLAWSKY.md phase 5, so there is no way ' +
-                'to create one yet. Nothing is broken and nothing needs enabling.'
+                'feed, and this crew has none. Its coordinator can spawn one and has not. ' +
+                'Nothing is broken and nothing needs enabling.'
             : `Empty. This crew has ${instance.posterCount} poster(s), so posts are possible — ` +
                 'none has been written.',
         ),
