@@ -489,12 +489,13 @@ reached by the `!reset` command (`src/daemon.ts:155`), so `!reset` in any one
 channel holding a live session frees that slot at once — though a session
 that is mid-turn keeps its process until the turn drains, since `close()`
 (`src/agent.ts:691`) closes the prompt queue rather than interrupting the way
-`!stop` does. The slot frees before the memory does, which makes this a remedy
-for a locked pool and not for memory pressure. It costs that channel's
-transcript and only that: `clearSession` clears the session ID rather than the
-row, so the mailbox survives, and a turn finishing after the reset does not
-write its ID back either, because `persist` returns early once the map entry is
-gone (`src/agent.ts:983`). Two limits on it. It reaches only channels, so a
+`!stop` does. So it frees a slot faster than it frees memory when the session
+is mid-turn; on an idle one — which is what a pool at `idleTimeoutMinutes: 0`
+mostly holds — both come back together. It costs that channel's transcript
+and only that: `clearSession` clears the session ID rather than the row, so
+the mailbox survives, and a turn finishing after the reset does not write its
+ID back either, because `persist` returns early once the map entry is gone
+(`src/agent.ts:983`). Two limits on it. It reaches only channels, so a
 spawned agent holding a slot cannot be freed this way (`src/daemon.ts:517`).
 And it is a remedy rather than a guard — someone has to notice and choose
 which conversation to spend, so it bounds nothing in advance.
