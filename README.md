@@ -112,7 +112,11 @@ person's decision, with the VPS snapshot and git.
 See [`ops/README.md`](ops/README.md) — the trust model section is the honest
 account — and [`MIGRATION.md`](MIGRATION.md), which is how the host gets from
 one to the other and has not been run yet. It ships in dry-run, and in dry-run
-the session has no shell at all.
+the session has no shell at all — but **the deployed executor runs with dry run
+off**, set by `OPS_DRY_RUN` on an `Environment=` line in
+`systemd/clawcius-ops.service` rather than in the tracked config, which keeps
+the safe default. The boot line in `journalctl -u clawcius-ops` names the value
+in force and which of the two decided it.
 
 ## Configuration
 
@@ -120,7 +124,8 @@ the session has no shell at all.
 |---|---|---|
 | `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
 | `squid/squid.conf` | The egress policy — the only copy. A blocklist, not an allowlist, since 2026-08-01 | yes |
-| `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do | yes |
+| `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do. Ships `dryRun: true` and keeps saying it | yes |
+| `systemd/clawcius-ops.service` | `Environment=OPS_DRY_RUN=false` — the one setting that legitimately differs between this repository and this machine, and the reason it is here rather than as an uncommitted edit to the file above | yes; installing it is an operator step |
 | `ops/clawcius-sudoers` | What the host agent may do with sudo, by exact command and exact unit name, and why | yes |
 | `MIGRATION.md` | Creating the host agent's service account, the shared group, the deploy key — with a rollback path. **Not yet executed.** | yes |
 | `status/status-config.yaml` | Transcript roots, per-instance board databases, port, liveness thresholds | yes |

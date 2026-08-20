@@ -671,10 +671,18 @@ sudo jq .hostAgent /var/lib/clawcius-ops/ops-status.json
 
 ## 8. The first task, in dry run
 
-`ops-config.yaml` ships `dryRun: true` and should stay that way until a week of
-the log contains nothing surprising. In dry run the session has no Bash tool at
-all — it is removed by the permission system, not asked for politely — so this
-is a safe way to prove the identity plumbing end to end.
+`ops-config.yaml` ships `dryRun: true` and **that file keeps saying `true`**. In
+dry run the session has no Bash tool at all — it is removed by the permission
+system, not asked for politely — so this is a safe way to prove the identity
+plumbing end to end. Stay in it until a week of the log contains nothing
+surprising.
+
+Dry run is decided by `OPS_DRY_RUN` in the environment when that variable is
+set, and by the file when it is not; the environment wins. So the way to stay in
+dry run for this step is to leave `Environment=OPS_DRY_RUN=` out of the installed
+`clawcius-ops.service`, or to set it to `true` — not to edit `ops-config.yaml`,
+which is tracked and shared. `ops/README.md` § *Where the deployed value
+actually comes from* is the full account of why.
 
 **There is no command to type here, and that is the change.** Until 2026-08-16
 this step was a `printf` of a JSON request into `/var/lib/clawcius/run/ops`;
@@ -693,8 +701,16 @@ sudo tail -f /var/lib/clawcius-ops/journal.jsonl | jq -r 'select(.kind=="audit")
 
 The reply comes back to the coordinator as a DM; the journal is the durable copy
 and is the one to read. In dry run it will report the commands it *would* have
-run. Turn `dryRun` off and ask again to get the actual output, and read the
-report. `id` should say **all three groups**:
+run. To get the actual output, turn dry run off the way SETUP.md § *Going live*
+says — install the unit carrying `Environment=OPS_DRY_RUN=false`,
+`daemon-reload`, restart — then ask again and read the report. Confirm which
+mode you are actually in first; the boot line says so:
+
+```sh
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+```
+
+`id` should say **all three groups**:
 
 ```
 uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)

@@ -89,7 +89,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { loadOpsConfig, type OpsConfig } from './config.js';
+import { DRY_RUN_ENV, loadOpsConfig, type OpsConfig } from './config.js';
 import { sanitiseTask, sanitiseTaskText } from './host-agent.js';
 import { Board, BoardError } from './board.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -1357,6 +1357,152 @@ test('two instances may not name one snapshot timer', () => {
       ),
     /is named by both/,
   );
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// dryRun from the environment — the one per-machine setting
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Run `body` with `OPS_DRY_RUN` set to exactly `value`, or unset for `null`.
+ *
+ * Restored in a `finally` including on a throw, because half these cases ARE
+ * throws and a leaked variable would silently change what every later
+ * `loadOpsConfig` in this file resolves to.
+ */
+function withDryRunEnv<T>(value: string | null, body: () => T): T {
+  const previous = process.env[DRY_RUN_ENV];
+  if (value === null) delete process.env[DRY_RUN_ENV];
+  else process.env[DRY_RUN_ENV] = value;
+  try {
+    return body();
+  } finally {
+    if (previous === undefined) delete process.env[DRY_RUN_ENV];
+    else process.env[DRY_RUN_ENV] = previous;
+  }
+}
+
+test('a malformed OPS_DRY_RUN fails the boot instead of becoming false', () => {
+  // The whole point. Every string below is either a typo or a value that some
+  // other system would accept, and `0`, `no` and `off` are all TRUTHY strings
+  // in JavaScript — so a truthiness check would read three of these as "yes,
+  // give the root daemon's session a shell". None of them may produce a
+  // config at all, let alone one with dryRun false.
+  for (const bad of ['flase', '0', '1', 'no', 'off', 'yes', 'on', 'FALSE ish', '', 'null']) {
+    withDryRunEnv(bad, () => {
+      const path = writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')]);
+      assert.throws(
+        () => loadOpsConfig(path),
+        (error: Error) => {
+          assert.match(error.message, /^OPS_DRY_RUN: /, 'the variable must be named first');
+          assert.match(error.message, /is set to "/, 'the offending value must be quoted');
+          assert.match(error.message, /clawcius-ops\.service/, 'say which file to fix');
+          return true;
+        },
+        `OPS_DRY_RUN=${JSON.stringify(bad)} must be refused, not interpreted`,
+      );
+    });
+  }
+});
+
+test('OPS_DRY_RUN overrides the file, and the boot line says so', () => {
+  // The deployed shape: the tracked file keeps the safe default and this
+  // machine says otherwise in its unit. Both facts have to survive into the
+  // banner, because journalctl is the only channel anyone here can read.
+  const live = withDryRunEnv('false', () =>
+    loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(live.dryRun, false);
+  assert.equal(live.dryRunSource.from, 'environment');
+  assert.match(live.dryRunSource.detail, /dryRun=false/);
+  assert.match(live.dryRunSource.detail, /OPS_DRY_RUN="false"/);
+  assert.match(live.dryRunSource.detail, /OVERRIDES/);
+  assert.match(
+    live.dryRunSource.detail,
+    /ops-config\.yaml.*says true/,
+    'the banner must say what it displaced, not only what won',
+  );
+
+  // And the other direction, which is the one that matters if somebody ever
+  // ships a config with dryRun: false: the environment can put a machine back
+  // into dry run without touching the tracked file.
+  const dry = withDryRunEnv('true', () =>
+    loadOpsConfig(writeConfig(['dryRun: false', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(dry.dryRun, true);
+  assert.equal(dry.dryRunSource.from, 'environment');
+  assert.match(dry.dryRunSource.detail, /says false/);
+});
+
+test('OPS_DRY_RUN takes the two spellings a unit file actually produces', () => {
+  // Case and surrounding whitespace are what `Environment=OPS_DRY_RUN= False`
+  // gives you when somebody is being tidy. They are not cleverness and they
+  // are not a widening: the accepted set is still exactly two words.
+  for (const spelling of ['false', 'FALSE', 'False', ' false ', '\tfalse\n']) {
+    const config = withDryRunEnv(spelling, () =>
+      loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+    );
+    assert.equal(config.dryRun, false, `${JSON.stringify(spelling)} should mean false`);
+  }
+  for (const spelling of ['true', 'TRUE', ' True ']) {
+    const config = withDryRunEnv(spelling, () =>
+      loadOpsConfig(writeConfig(['dryRun: false', ...MINIMAL_INSTANCE('/var/lib/x')])),
+    );
+    assert.equal(config.dryRun, true, `${JSON.stringify(spelling)} should mean true`);
+  }
+});
+
+test('an unset OPS_DRY_RUN falls back to the file, and absence is safe', () => {
+  // Absence must never be the thing that turns this on. The shipped file says
+  // true and an empty file defaults to true, and the banner distinguishes the
+  // two so "the operator asked for dry run" and "nobody said anything" are not
+  // the same sentence in the journal.
+  const stated = withDryRunEnv(null, () =>
+    loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(stated.dryRun, true);
+  assert.equal(stated.dryRunSource.from, 'ops-config.yaml');
+  assert.match(stated.dryRunSource.detail, /dryRun=true/);
+  assert.match(stated.dryRunSource.detail, /OPS_DRY_RUN is not set/);
+
+  const silent = withDryRunEnv(null, () =>
+    loadOpsConfig(writeConfig([...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(silent.dryRun, true, 'the built-in default is dry run');
+  assert.equal(silent.dryRunSource.from, 'built-in default');
+  assert.match(silent.dryRunSource.detail, /built-in default/);
+
+  // A malformed KEY is still refused the way it always was — adding an
+  // environment layer must not have made the file's own validation optional.
+  assert.throws(
+    () =>
+      withDryRunEnv(null, () =>
+        loadOpsConfig(writeConfig(['dryRun: "false"', ...MINIMAL_INSTANCE('/var/lib/x')])),
+      ),
+    /ops-config\.yaml: dryRun must be true or false/,
+  );
+});
+
+test('the tracked ops-config.yaml still ships dry run on', () => {
+  // The file in this repository is the safe default and stays the safe
+  // default; the machine's deviation lives in the unit. If this ever goes red,
+  // somebody has put a per-machine value back into the shared file and the
+  // next merge conflict is already written.
+  // This file compiles to <repo>/ops/dist/selftest.js.
+  const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+  const shipped = readFileSync(join(repo, 'ops', 'ops-config.yaml'), 'utf8');
+  assert.match(
+    shipped,
+    /^dryRun: true$/m,
+    'ops/ops-config.yaml must ship dryRun: true — set OPS_DRY_RUN on the machine instead',
+  );
+  assert.doesNotMatch(shipped, /^dryRun: false$/m);
+
+  // And the deployment is expressed in the repository rather than in somebody's
+  // shell history. Installing it is still an operator step.
+  const unit = readFileSync(join(repo, 'systemd', 'clawcius-ops.service'), 'utf8');
+  assert.match(unit, /^Environment=OPS_DRY_RUN=(true|false)$/m);
 });
 
 // ══════════════════════════════════════════════════════════════════════════

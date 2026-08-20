@@ -31,6 +31,12 @@
 # Every key has a default in src/config.ts and the loader validates types, so a
 # typo fails the boot with the offending key named. Override the path with
 # OPS_CONFIG_PATH.
+#
+# ONE key can also be set from the environment: `dryRun`, from `OPS_DRY_RUN`,
+# and the environment wins. It is the only one, and the reason it is the only
+# one is written where the precedence is — `DryRunSource` in src/config.ts.
+# Nothing else here legitimately differs between this repository and one
+# machine; if something ever does, that is the shape to copy.
 
 # ── Dry run ───────────────────────────────────────────────────────────────
 # SHIPS ON, AND SHOULD STAY ON UNTIL YOU HAVE READ THE LOG.
@@ -52,6 +58,28 @@
 # Turn it off once `journalctl -u clawcius-ops` for a week contains nothing
 # that surprises you. This is a root daemon that starts a shell session with
 # sudo; the first task should be observable before it is trusted.
+#
+# ── DO NOT EDIT THE LINE BELOW TO TURN DRY RUN OFF ON A MACHINE ───────────
+#
+# Set `OPS_DRY_RUN=false` in the environment instead. There is already an
+# `Environment=OPS_DRY_RUN=` line in systemd/clawcius-ops.service for exactly
+# this, and the environment WINS over this key. `ops/src/config.ts`
+# (`DryRunSource`) states the precedence and is the only place that does.
+#
+# This file is tracked, and it is the same file in every checkout and on every
+# machine. Editing this line in place without committing it is what happened
+# here until 2026-08-19: the deployed executor ran live because of an
+# uncommitted hand edit to this file that had no owner and no record. It
+# existed only as a diff nobody looked at; it aborted `git merge --ff-only` the
+# first time anything upstream touched this file, blocking a deploy of eight
+# merged pull requests; and the obvious resolution — take upstream's copy —
+# would have put the executor back into dry run SILENTLY, leaving it accepting
+# tasks and reporting success while doing nothing.
+#
+# So this value stays `true`. It is the safe default and it is what upstream
+# says. A machine that differs says so in its unit file, and the executor names
+# the value it is running under, and where that value came from, in its boot
+# line — `journalctl -u clawcius-ops`.
 dryRun: true
 
 # ── Directories ───────────────────────────────────────────────────────────

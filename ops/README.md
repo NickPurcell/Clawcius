@@ -400,8 +400,67 @@ more, neither snapshot service passes a `KEEP`, and the script's own default of
 
 ## Dry run — on by default, and genuinely unable to act
 
-`ops-config.yaml` ships with `dryRun: true`, **and it should stay that way until
-you have read the log.**
+`ops-config.yaml` ships with `dryRun: true`, **and that file should keep saying
+`true` forever.** It is tracked, it is the same file in every checkout, and it
+is the safe default. A machine that runs live says so in its own environment.
+
+### Where the deployed value actually comes from
+
+**The executor on this host runs with dry run OFF.** Nothing in
+`ops-config.yaml` says so, deliberately. The value in force comes from
+`OPS_DRY_RUN`, set on an `Environment=` line in
+`systemd/clawcius-ops.service` — the same mechanism that already carries
+`OPS_CONFIG_PATH` for this unit.
+
+**Precedence, and it is stated in exactly one place:** `DryRunSource` in
+`src/config.ts`. `OPS_DRY_RUN` beats the `dryRun:` key, which beats the built-in
+default of `true`. The environment wins because it is the per-machine layer and
+the file is the shared one. Do not restate that ordering anywhere else; point
+at it.
+
+Three things follow, and each is the point of the arrangement:
+
+- **A malformed value fails the boot with the variable named.** `OPS_DRY_RUN`
+  must be exactly `true` or `false` (case and surrounding whitespace are
+  forgiven; nothing else is). `flase`, `0`, `no` and `off` are refused rather
+  than interpreted — three of those are *truthy strings* in JavaScript, and a
+  typo resolving to "give the root daemon's session a shell" is the single
+  failure this setting exists to prevent. It does not fall back. Unsetting it,
+  which is the only safe absence, falls back to the file.
+- **The value and its origin are in the boot line.** `journalctl -u
+  clawcius-ops` is the only channel by which anyone on this host can check —
+  the host agent can read journals and deliberately cannot make an HTTP
+  request:
+
+  ```sh
+  journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+  systemctl show clawcius-ops -p Environment
+  ```
+
+  The line says which input decided the value and what it displaced, so "the
+  file said dry run" and "the environment overrode a file that said dry run"
+  are distinguishable after the fact. A setting that moved somewhere more
+  correct and became less visible would not be an improvement.
+- **Installing the unit is an operator step.** Committing the `Environment=`
+  line changes nothing on the host until someone copies the unit,
+  `daemon-reload`s and restarts. SETUP.md § Going live has the commands.
+
+**Why not just edit the file?** Because that is what was being done, and it
+broke a deploy. Until 2026-08-19 this host carried an uncommitted hand edit to
+line 55 of the tracked `ops-config.yaml`. It sat there for weeks with no owner
+and no record — the difference existed only as a diff nobody looked at. The
+first time anything upstream touched the file, `git merge --ff-only` aborted
+with *"Your local changes to the following files would be overwritten by
+merge"* and eight merged pull requests could not be deployed. Worse than the
+block was the trap in the obvious fix: taking upstream's copy resolves the
+conflict instantly and **silently reverts the executor to dry run**, leaving it
+accepting tasks and reporting success while doing nothing at all.
+
+`OPS_DRY_RUN` is currently the only key that can be set this way, and that is
+on purpose — nothing else in `ops-config.yaml` legitimately differs between this
+repository and one machine. If something ever does, this is the shape to copy.
+
+### What dry run actually removes
 
 The executor still makes every decision it would really make. The difference
 from every other dry-run in this repository is that the session is not asked
@@ -1464,6 +1523,14 @@ and the loader validates types and cross-field invariants, so a typo fails the
 boot with the offending key named rather than producing an executor that quietly
 does nothing.
 
+**One key is also settable from the environment, and it is the only one:**
+`dryRun`, from `OPS_DRY_RUN`, which wins over the file. That is not a general
+mechanism and should not become one without the same argument being made again —
+it exists because `dryRun` legitimately differs between this repository and this
+machine, and nothing else here does. § *Where the deployed value actually comes
+from* has the whole of it; `DryRunSource` in `src/config.ts` states the
+precedence and is the only place that does.
+
 The cross-field checks worth knowing about, because they are security properties
 rather than tidiness. Every one of the containment checks is asked against
 `join(instance.stateDir, 'run')` — the single directory
@@ -1740,9 +1807,13 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` is **62 tests** — measured on `main` at `208dafb`, which is
-the only state that claim is made about; run it rather than trusting this line,
-and if it disagrees the suite is right. It runs with no docker, no systemd, no
+`npm run selftest` is **83 tests** — measured on this branch, and it was **78**
+on `main` at `1ac316d`, also measured. Those are the only states the claim is
+made about; run it rather than trusting this line, and if it disagrees the suite
+is right. (It said 62 at `208dafb` until 2026-08-19, which had stopped being
+true some commits earlier — a number in prose is a claim that outlives the state
+that produced it unless somebody re-derives it.) It runs with no docker, no
+systemd, no
 npm and no real `claude`. It was 129 before 2026-08-16 and 61 after, both
 measured by running it: sixty-eight fewer, from seventy-five titles going and
 seven arriving. No count is put on the list that follows, because at least one
@@ -1771,6 +1842,17 @@ What is covered now:
 - **a config still carrying the retired keys boots**, and the notices name each
   one. That is the whole of the migration promise and it is asserted rather than
   described;
+- **`OPS_DRY_RUN`**, which is the one per-machine setting: a malformed value
+  fails the boot naming the variable rather than becoming `false` — asserted
+  against `flase`, `0`, `1`, `no`, `off`, `yes`, `on` and the empty string, half
+  of which are truthy in JavaScript; the environment overrides the file in both
+  directions and the boot line says what it displaced, not just what won; an
+  unset variable falls back to the file and a silent file falls back to dry run;
+  a malformed `dryRun:` *key* is still refused the way it always was; and the
+  tracked `ops-config.yaml` is read off disk to assert it still ships
+  `dryRun: true` while the unit file carries the `Environment=` line — so the
+  next person to "fix" the deploy by editing the shared file goes red here
+  instead of at the next merge;
 - **the board**: it is opened or refused, never created, and the host agent takes
   its own row and will not take anybody else's;
 - **the lock**: a second task is refused while one is running, and the refusal

@@ -211,7 +211,17 @@ executor.journal.write({
       ? 'DRY RUN — the session has no Bash tool and cannot execute anything; it plans and ' +
         'the plan is logged.'
       : 'LIVE — a Claude Code session with a shell and sudo will run on this host, and ' +
-        'every command it issues is written into journal.jsonl before its result is known.'),
+        'every command it issues is written into journal.jsonl before its result is known.') +
+    // WHERE that came from, not just what it is. Since 2026-08-19 `dryRun` can
+    // be set from OPS_DRY_RUN, which means the tracked ops-config.yaml no
+    // longer tells you what the deployed executor is doing — and the previous
+    // arrangement, an uncommitted hand edit to line 55 of that file, told you
+    // even less. `journalctl -u clawcius-ops` is the only channel by which
+    // anyone here can check: the host agent can read journals and cannot make
+    // an HTTP request, and #98 made the startup banner the verification
+    // mechanism for the whole system. A setting that moved somewhere more
+    // correct and became less visible would not be an improvement.
+    ` SETTING: ${config.dryRunSource.detail}`,
 });
 
 // Deprecation notices go in the journal, not just to stdout, because the whole

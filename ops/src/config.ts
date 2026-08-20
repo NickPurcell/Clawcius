@@ -438,6 +438,58 @@ export type HostAgentConfig = {
   envPassthrough: string[];
 };
 
+/**
+ * The environment variable that decides `dryRun` on a particular machine.
+ *
+ * Named after `OPS_CONFIG_PATH`, which is the only other thing this loader
+ * reads out of the environment and is already on an `Environment=` line in
+ * `systemd/clawcius-ops.service`. Exported because the boot banner, the
+ * refusal text and the self-test all name it, and a variable name that is
+ * spelled out in four places is a variable name that gets renamed in three.
+ */
+export const DRY_RUN_ENV = 'OPS_DRY_RUN';
+
+/**
+ * Where the `dryRun` in force came from.
+ *
+ * ── PRECEDENCE, STATED HERE AND INFERRED NOWHERE ─────────────────────────
+ *
+ *   1. `OPS_DRY_RUN` in the environment, if it is set at all. It must be
+ *      exactly `true` or `false`; anything else fails the boot.
+ *   2. the `dryRun:` key in `ops-config.yaml`.
+ *   3. the built-in default, which is `true`.
+ *
+ * **The environment wins, and it wins because it is the per-machine layer.**
+ * `ops-config.yaml` is tracked, shared, and is the same file on every machine
+ * and in every checkout; the environment is set by this host's copy of the unit
+ * file and is a property of this host. A value that legitimately differs
+ * between the repository and one machine belongs in the layer that machine
+ * owns.
+ *
+ * That ordering is not free-standing preference. Before 2026-08-19 the
+ * deployed executor ran live because somebody had hand-edited line 55 of the
+ * tracked `ops-config.yaml` and never committed it. That edit had no owner and
+ * no record: it existed only as a diff nobody looked at, it aborted
+ * `git merge --ff-only` the first time anything upstream touched the file —
+ * blocking a deploy of eight merged pull requests — and the obvious resolution,
+ * taking upstream's copy, would have reverted the executor to dry-run
+ * *silently*, leaving it accepting tasks and reporting success while doing
+ * nothing. The point of this variable is that the tracked file now always holds
+ * the safe default and always matches upstream exactly, and the machine's
+ * deviation is a line in a unit file that is itself in the repository.
+ */
+export type DryRunSource = {
+  /** Which of the three inputs above actually decided the value. */
+  from: 'environment' | 'ops-config.yaml' | 'built-in default';
+  /**
+   * One line for the boot banner: what decided the value, and what it
+   * displaced. This is the whole reason the source is carried rather than
+   * discarded — see `index.ts`, and #98 for why a startup banner is the
+   * verification mechanism for this system rather than a nicety.
+   */
+  detail: string;
+};
+
 export type OpsConfig = {
   /**
    * Log what would be run, run nothing.
@@ -446,8 +498,23 @@ export type OpsConfig = {
    * observable before it is trusted, and the log it produces in this mode is
    * exactly the argv it would otherwise have executed — so you can read a
    * week of it and know precisely what you are turning on.
+   *
+   * Settable from `OPS_DRY_RUN` since 2026-08-19, and the environment wins.
+   * `DryRunSource` above states the precedence and why; do not restate it.
    */
   dryRun: boolean;
+  /**
+   * Where `dryRun` came from, so the boot banner can say so.
+   *
+   * A setting that moved somewhere more correct and became less visible is not
+   * an improvement, and `dryRun` is the setting that decides whether a root
+   * daemon's session gets a shell. `journalctl -u clawcius-ops` is the only
+   * channel by which anyone on this host can check which value is in force —
+   * the host agent can read journals and deliberately cannot make an HTTP
+   * request — so the answer has to be in the boot line rather than inferable
+   * from `systemctl show` by someone who thought to look.
+   */
+  dryRunSource: DryRunSource;
   /**
    * Executor state: journal, audit, freeze flag, status JSON.
    *
@@ -539,7 +606,15 @@ export type OpsConfig = {
  */
 export const DEFAULT_MAX_AGE_HOURS = 48;
 
-const DEFAULTS: OpsConfig = {
+/**
+ * `Omit<..., 'dryRunSource'>` because a source is not a default.
+ *
+ * Every other field here is "what you get if the file is silent". `dryRunSource`
+ * is a statement about a particular load — which of three inputs won this time —
+ * and there is no honest value for it in a table of shipped defaults. The
+ * loader computes it in `dryRunSetting` and nowhere else.
+ */
+const DEFAULTS: Omit<OpsConfig, 'dryRunSource'> = {
   dryRun: true,
   stateDir: '/var/lib/clawcius-ops',
   pollSeconds: 5,
@@ -602,6 +677,22 @@ export class OpsConfigError extends Error {
   }
 }
 
+/**
+ * The same rudeness as `OpsConfigError`, for a setting that came from the
+ * environment rather than from the file.
+ *
+ * A separate class only so the message says where to go and fix it. Telling
+ * somebody `ops-config.yaml: dryRun must be true or false` when the offending
+ * text is on an `Environment=` line in a unit file sends them to the wrong
+ * file, and the whole purpose of this variable is that the two layers are
+ * distinguishable.
+ */
+export class OpsEnvError extends Error {
+  constructor(variable: string, message: string) {
+    super(`${variable}: ${message}`);
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -630,6 +721,93 @@ function bool(raw: unknown, path: string, fallback: boolean): boolean {
   if (raw === undefined || raw === null) return fallback;
   if (typeof raw !== 'boolean') throw new OpsConfigError(path, 'must be true or false');
   return raw;
+}
+
+/**
+ * `dryRun`, resolved across the environment, the file and the default.
+ *
+ * The precedence and the reasoning are on `DryRunSource`. This function is the
+ * only place that implements them.
+ *
+ * ── A MALFORMED VALUE MUST NOT BECOME `false` ────────────────────────────
+ *
+ * This is the entire reason the parse is written out rather than done with
+ * `=== 'true'` or, worse, with truthiness. `OPS_DRY_RUN=0` is a truthy string
+ * in JavaScript and `OPS_DRY_RUN=flase` is a typo; either one deciding that a
+ * root daemon should start handing out shells is exactly the failure this
+ * setting exists to prevent. So the accepted set is two exact strings, after
+ * trimming whitespace and lowercasing — `True` and ` false ` are what an
+ * `Environment=` line produces when somebody is being helpful, not attempts to
+ * be clever — and everything else fails the boot with the variable named, the
+ * value quoted and both legal spellings given.
+ *
+ * Note which way an *unset* variable falls: back to the file, which ships
+ * `true`. Absence is safe. Only a deliberate, correctly spelled `false` turns
+ * this executor live, and only ever from a file somebody had to install.
+ *
+ * ── Yes, this can fail the boot, and yes, that was weighed ───────────────
+ *
+ * `clawcius-ops.service` is `Restart=always` with no start limit, so a throw in
+ * this loader is a five-second restart loop rather than one loud error — the
+ * shape of #7, and the reason a RETIRED key here is tolerated and reported
+ * instead of refused. It is still the right answer for this one, on the same
+ * grounds the loader already refuses a malformed `dryRun:` *key*:
+ *
+ *   - a retired key is tolerated because it arrives by drift, in an old file
+ *     nobody has updated. This value cannot arrive by drift. It is set by an
+ *     `Environment=` line that somebody installed on purpose this week;
+ *   - the loop is visible where #89's was not. `build-banner.ts` prints from a
+ *     process that is about to fail, on every one of those starts, and this
+ *     refusal prints after it;
+ *   - and the alternative is worse in the direction that matters. Falling back
+ *     would mean the operator who typed `flase` gets a dry-run executor that
+ *     reports success and does nothing, which is the precise outcome the whole
+ *     change exists to stop being possible silently.
+ */
+function dryRunSetting(raw: unknown): { value: boolean; source: DryRunSource } {
+  const fromFile = bool(raw, 'dryRun', DEFAULTS.dryRun);
+  const stated = raw !== undefined && raw !== null;
+  const where = stated ? 'the dryRun: key in ops-config.yaml' : 'the built-in default in config.ts';
+  const fromEnv = process.env[DRY_RUN_ENV];
+
+  if (fromEnv === undefined) {
+    return {
+      value: fromFile,
+      source: {
+        from: stated ? 'ops-config.yaml' : 'built-in default',
+        detail:
+          `dryRun=${fromFile}, from ${where}. ${DRY_RUN_ENV} is not set in this ` +
+          "process's environment, so nothing overrode it.",
+      },
+    };
+  }
+
+  const normalised = fromEnv.trim().toLowerCase();
+  if (normalised !== 'true' && normalised !== 'false') {
+    throw new OpsEnvError(
+      DRY_RUN_ENV,
+      `is set to "${fromEnv}", which is neither "true" nor "false". This variable decides ` +
+        'whether the host agent session gets a shell on this machine, so it is not guessed ' +
+        'at and it does not fall back: a typo that resolved to false would start a root ' +
+        'daemon acting when somebody meant it to describe. Set it to exactly true or ' +
+        'exactly false on the Environment=OPS_DRY_RUN= line in ' +
+        'systemd/clawcius-ops.service, or unset it to take the value in ops-config.yaml.',
+    );
+  }
+
+  const value = normalised === 'true';
+  return {
+    value,
+    source: {
+      from: 'environment',
+      detail:
+        `dryRun=${value}, from ${DRY_RUN_ENV}="${fromEnv}" in this process's environment, ` +
+        `which OVERRIDES ${where} (that says ${fromFile}). The environment is the ` +
+        'per-machine layer and ops-config.yaml is the shared one; see DryRunSource in ' +
+        'ops/src/config.ts. Check the deployed value with ' +
+        `\`systemctl show clawcius-ops -p Environment\`.`,
+    },
+  };
 }
 
 function num(raw: unknown, path: string, fallback: number, min: number, max?: number): number {
@@ -1066,8 +1244,11 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
     }
   }
 
+  const dryRun = dryRunSetting(root['dryRun']);
+
   const config: OpsConfig = {
-    dryRun: bool(root['dryRun'], 'dryRun', DEFAULTS.dryRun),
+    dryRun: dryRun.value,
+    dryRunSource: dryRun.source,
     stateDir: absPath(root['stateDir'], 'stateDir', DEFAULTS.stateDir),
     pollSeconds: num(root['pollSeconds'], 'pollSeconds', DEFAULTS.pollSeconds, 1, 3600),
     runContainerScript: absPath(

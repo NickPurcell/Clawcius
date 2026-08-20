@@ -541,6 +541,13 @@ entirely — verified against the real CLI, not assumed. The session investigate
 with read-only tools and writes out the list of commands it would have run.
 Leave it on until a week of `journalctl -u clawcius-ops` holds no surprises.
 
+**The deployed executor on this host runs with dry run OFF**, and that is not
+what `ops/ops-config.yaml` says — the tracked file keeps the safe default on
+purpose. The live value comes from `Environment=OPS_DRY_RUN=false` in
+`systemd/clawcius-ops.service`, the environment wins over the file, and the boot
+line in `journalctl -u clawcius-ops` says which of the two decided it.
+[Going live](#going-live) below has the commands and the reasoning.
+
 ### `pull` builds, and the build is not run as root
 
 Nothing in `systemd/` compiles anything — every unit here starts `node
@@ -715,14 +722,48 @@ absent. Note that it does **not** grant docker: npurcell reaches docker through
 group membership, which is root-equivalent, so the sudoers scoping is about
 keeping the easy path the audited one rather than about containment.
 
-Then set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Know
-what that turns on: from that moment a task runs a shell with sudo on this host
-and **nothing rolls it back**. The health sample either side reports; it does
-not repair.
+Then turn dry run off. Know what that turns on: from that moment a task runs a
+shell with sudo on this host and **nothing rolls it back**. The health sample
+either side reports; it does not repair.
+
+**Do not edit `ops/ops-config.yaml`.** That file is tracked and ships
+`dryRun: true`, and it stays that way. The deployed value lives on an
+`Environment=` line in `systemd/clawcius-ops.service`, which is already in the
+repository with `OPS_DRY_RUN=false` on it — so turning it on is installing the
+unit, not editing a file:
 
 ```sh
+sudo cp /home/npurcell/clawcius/systemd/clawcius-ops.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl restart clawcius-ops
 ```
+
+Then check that it took, from the two places that can answer without a checkout:
+
+```sh
+systemctl show clawcius-ops -p Environment          # …OPS_DRY_RUN=false…
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+# SETTING: dryRun=false, from OPS_DRY_RUN="false" in this process's environment,
+# which OVERRIDES the dryRun: key in ops-config.yaml (that says true). …
+```
+
+The executor names the value **and where it came from** in its boot line, so
+"the file said so" and "the environment overrode the file" are different
+sentences in the journal. If the grep comes back saying `dryRun=true, from the
+dryRun: key`, the unit that is running is the old one and the `cp` above has not
+been done — a `daemon-reload` alone does not restart the service.
+
+The variable must be exactly `true` or `false`. Anything else — `flase`, `0`,
+`yes` — **fails the boot naming the variable** rather than falling back, because
+a typo resolving to "act" is the whole failure this arrangement exists to
+prevent. Unset it to take whatever `ops-config.yaml` says.
+
+Why it works this way, in one line: this value legitimately differs between the
+repository and this machine, and a value like that must not live as an
+uncommitted edit to a tracked file. It used to. That edit had no owner and no
+record, it blocked every pull that touched the file, and resolving the conflict
+the obvious way would have reverted the executor to dry run without saying so.
+`DryRunSource` in `ops/src/config.ts` is the full statement of the precedence.
 
 ### When it freezes
 

@@ -88,6 +88,51 @@ WorkingDirectory=/home/npurcell/clawcius/ops
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=OPS_CONFIG_PATH=/home/npurcell/clawcius/ops/ops-config.yaml
 
+# ── OPS_DRY_RUN — THIS IS THE LINE THAT MAKES THE EXECUTOR ACT ────────────
+#
+# `false` means a Claude Code session with a shell and passwordless sudo runs
+# on this host when a coordinator DMs the host agent. `true` means it gets no
+# Bash tool at all and can only describe what it would have done. Read
+# ops/README.md § The trust model before changing it.
+#
+# It must be exactly `true` or `false`. The loader refuses anything else and
+# names this variable — it does NOT fall back, because `flase` or `0` quietly
+# resolving to "act" is the failure this line exists to prevent, and `0` is a
+# truthy string in JavaScript. Unset it entirely to take whatever
+# ops/ops-config.yaml says, which is `true`.
+#
+# ── WHY THIS IS HERE AND NOT IN ops-config.yaml ───────────────────────────
+#
+# Because ops-config.yaml is tracked and is the same file everywhere, and this
+# is a fact about THIS MACHINE. Until 2026-08-19 the deployment expressed it by
+# hand-editing line 55 of that tracked file and never committing the edit. That
+# arrangement had no owner and no record: the difference existed only as a diff
+# nobody looked at, it aborted `git merge --ff-only` the first time anything
+# upstream touched the file — blocking a deploy of eight merged pull requests —
+# and resolving that conflict the obvious way would have reverted the executor
+# to dry run silently, leaving it accepting tasks and reporting success while
+# doing nothing.
+#
+# Here it is a line in the repository, it survives every pull, and the deployed
+# value is readable two ways without a checkout:
+#
+#   systemctl show clawcius-ops -p Environment
+#   journalctl -u clawcius-ops | grep 'SETTING: dryRun'
+#
+# The executor names the value AND where it came from in its boot line, so
+# "config default" and "the environment overrode the file" are distinguishable
+# from the journal alone. That matters because the host agent can read journals
+# and deliberately cannot make an HTTP request.
+#
+# The environment WINS over the file. That precedence is stated once, in
+# `DryRunSource` in ops/src/config.ts, and is not restated here on purpose.
+#
+# INSTALLING THIS FILE IS AN OPERATOR STEP. Committing this line changes
+# nothing on the host until someone runs `sudo install -m 0644 ...` and
+# `systemctl daemon-reload && systemctl restart clawcius-ops` — see SETUP.md.
+# Until then the running unit keeps whatever environment it was started with.
+Environment=OPS_DRY_RUN=false
+
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
 
 Restart=always
