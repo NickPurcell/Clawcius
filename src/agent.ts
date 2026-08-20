@@ -179,6 +179,30 @@ function gitEnv(): Record<string, string> {
   return env;
 }
 
+/**
+ * `acquire` had no session slot left.
+ *
+ * A class rather than a bare `Error` so callers can tell this apart from a
+ * spawn failure or a dead transport without matching on a message string. That
+ * distinction only started mattering when it became something a *user* should
+ * hear about: it is the one `acquire` failure where nothing is wrong with the
+ * request, the channel or the credentials, and the only remedy is on the host.
+ *
+ * `live` and `max` are carried because the sentence a person reads should
+ * contain the numbers, and the catch site has no other way to get them.
+ */
+export class AtCapacityError extends Error {
+  readonly live: number;
+  readonly max: number;
+
+  constructor(live: number, max: number) {
+    super(`at capacity (${max} concurrent sessions, ${live} live)`);
+    this.name = 'AtCapacityError';
+    this.live = live;
+    this.max = max;
+  }
+}
+
 export type AgentEvents = {
   /** Fired for each tool the agent runs — used for logging and send-detection. */
   onToolUse: (toolName: string, input: Record<string, unknown>) => void;
@@ -729,6 +753,30 @@ export class SessionManager {
   }
 
   /**
+   * How full the session pool is, and whether anything ever empties it.
+   *
+   * Read by `spawn`, which has to know before it writes a row: a spawned agent
+   * is woken by mail and by nothing else, so if `acquire` can never find it a
+   * slot then the row can never take a turn. The two numbers are not enough on
+   * their own — a full pool with eviction ON is a wait, and a full pool with
+   * eviction OFF is forever — so the timeout comes with them rather than the
+   * caller guessing.
+   *
+   * `live` is `liveCount` by another name and carries its caveat: with
+   * eviction off it is a high-water mark rather than a measure of activity.
+   * That is the right number HERE, where the question is only whether
+   * `acquire` would throw — and the wrong one for "is anybody
+   * mid-conversation", which is `busyCount` below.
+   */
+  get capacity(): { live: number; max: number; idleTimeoutMinutes: number } {
+    return {
+      live: this.#sessions.size,
+      max: config.agent.sessions.maxConcurrent,
+      idleTimeoutMinutes: config.agent.sessions.idleTimeoutMinutes,
+    };
+  }
+
+  /**
    * Sessions with a turn actually in flight.
    *
    * Distinct from `liveCount` and the distinction is load-bearing for the ops
@@ -743,24 +791,6 @@ export class SessionManager {
    * but idle session costs nothing to recreate: it is resumed from SQLite on
    * the next mention.
    */
-  /**
-   * How full the session pool is, and whether anything ever empties it.
-   *
-   * Read by `spawn`, which has to know before it writes a row: a spawned agent
-   * is woken by mail and by nothing else, so if `acquire` can never find it a
-   * slot then the row can never take a turn. The two numbers are not enough on
-   * their own — a full pool with eviction ON is a wait, and a full pool with
-   * eviction OFF is forever — so the timeout comes with them rather than the
-   * caller guessing.
-   */
-  get capacity(): { live: number; max: number; idleTimeoutMinutes: number } {
-    return {
-      live: this.#sessions.size,
-      max: config.agent.sessions.maxConcurrent,
-      idleTimeoutMinutes: config.agent.sessions.idleTimeoutMinutes,
-    };
-  }
-
   get busyCount(): number {
     let busy = 0;
     for (const session of this.#sessions.values()) if (session.busy) busy += 1;
@@ -805,9 +835,7 @@ export class SessionManager {
     }
 
     if (this.#sessions.size >= config.agent.sessions.maxConcurrent) {
-      throw new Error(
-        `at capacity (${config.agent.sessions.maxConcurrent} concurrent sessions)`,
-      );
+      throw new AtCapacityError(this.#sessions.size, config.agent.sessions.maxConcurrent);
     }
 
     const persisted = this.#registry.get(channelId);

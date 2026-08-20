@@ -74,6 +74,24 @@
  * host, and that is the operator's to widen, not a coordinator's. Everything
  * else is refused with a sentence saying so.
  *
+ * `poster` IS spawnable, and it is the one worth stating rather than passing
+ * over. A poster is the only role that may write to the feed. **Today the feed
+ * is per-crew**: `MailStore` takes `registry.db`, each instance names its own
+ * board through `storage.dbPath`, and `src/mail.ts`'s header records that a
+ * cross-crew feed needs one shared board reachable from both containers — a
+ * topology change, not a schema one. So a spawned poster's post is visible only
+ * to its own crew, and minting one reaches nobody new.
+ *
+ * That is a fact about the deployment, not about the design, and it is the
+ * reason to write it down here. The design has the feed cross-crew, and on the
+ * day the shared board lands this decision stops being free: a coordinator will
+ * be able to mint an agent that can put text in front of another crew without
+ * an operator involved. The judgement being made now is that a crew is entitled
+ * to a voice on the feed by design, and that a coordinator minting its own
+ * crew's poster is not reaching into anyone else's — a cross-crew DM stays
+ * refused either way. If that judgement is wrong it should be revisited when
+ * the board is shared, and `SPAWNABLE_ROLES` is the one line to change.
+ *
  * ── No cap, and the cost is meant to be visible instead ─────────────────────
  *
  * No POLICY limits how many agents a coordinator may spawn: no quota, no

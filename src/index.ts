@@ -21,7 +21,7 @@ import { Client, Events, GatewayIntentBits, Partials, type Message } from 'disco
 import { join } from 'node:path';
 import { config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
-import { SessionManager } from './agent.js';
+import { AtCapacityError, SessionManager } from './agent.js';
 import { MailStore } from './mail.js';
 import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
@@ -689,11 +689,54 @@ function deliver(channelId: string, buffered: BufferedMessage[], afterRespawn = 
 
     session.wake(context);
   } catch (error) {
-    // Capacity or startup failure. Logged rather than announced — the bot
-    // staying quiet is preferable to it interrupting with its own plumbing.
     process.stderr.write(
       `[clawcius ${channelId}] could not wake: ` +
         `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    // A startup failure stays quiet — the bot narrating its own plumbing is
+    // worse than a dropped turn, and the next message usually works.
+    //
+    // A FULL POOL IS DIFFERENT and is the exception this earns. Nothing is
+    // wrong with the request, the channel or the credentials; the messages in
+    // this bundle are dropped and no later message in this channel will fare
+    // any better, because with `idleTimeoutMinutes: 0` nothing releases a
+    // session short of a restart. Silence there is indistinguishable from the
+    // bot being down — the same reading `announceOutage` exists to prevent —
+    // and spawn is what makes it reachable by a coordinator rather than only
+    // by the operator: a spawned agent that has taken a turn holds one of
+    // these slots and `!reset` cannot reach it to give it back.
+    if (error instanceof AtCapacityError) {
+      void announceAtCapacity(channelId, error);
+    }
+  }
+}
+
+/**
+ * Say, in the channel, that there was no session slot.
+ *
+ * Deliberately says the message was dropped rather than "try again": a retry
+ * is what a person would naturally do, and on the shipped configuration it
+ * cannot work. Naming the restart is the useful half.
+ */
+async function announceAtCapacity(channelId: string, error: AtCapacityError): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased() || !('send' in channel)) return;
+    const evicts = config.agent.sessions.idleTimeoutMinutes;
+    await channel.send(
+      `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
+        `pick that up and it was not queued. ` +
+        (evicts === 0
+          ? 'This deployment never evicts idle sessions, so this will not clear on its own: ' +
+            'it needs a restart on the host, or a higher `sessions.maxConcurrent`.'
+          : `A slot frees after ${evicts}m idle — say it again after that.`),
+    );
+  } catch (sendError) {
+    // Best effort, as in announceOutage. If Discord is unreachable too, the
+    // journal is the record, and throwing here would take the process down.
+    process.stderr.write(
+      `[clawcius ${channelId}] could not announce capacity: ` +
+        `${sendError instanceof Error ? sendError.message : String(sendError)}\n`,
     );
   }
 }
