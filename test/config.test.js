@@ -1,23 +1,30 @@
 /**
  * That importing this package does not require a deployment underneath it.
  *
- * This is the test the rest of `test/sessions.test.js` rests on, and it is
- * worth having on its own because it is the property that keeps getting lost.
- * `config.ts` used to build its object in the module body, so the environment
- * was read and `agent-config.yaml` was opened at IMPORT time. Every module that
- * imported it transitively — `agent.ts`, holding the session pool, and
- * `index.ts`, holding the Discord handler — could not be loaded by a test at
- * all. Three defects and three fixes went through that area in Clawcius #128
- * with nothing able to reach any of them; #130 is the argument.
+ * This is the test the rest of `test/sessions.test.js` and `test/handlers.test.js`
+ * rest on, and it is worth having on its own because it is the property that
+ * keeps getting lost. `config.ts` used to build its object in the module body,
+ * so the environment was read and `agent-config.yaml` was opened at IMPORT time.
+ * Every module that imported it transitively — `agent.ts`, holding the session
+ * pool, and `index.ts`, holding the Discord handler — could not be loaded by a
+ * test at all. Three defects and three fixes went through that area in Clawcius
+ * #128 with nothing able to reach any of them; #130 is the argument.
+ *
+ * That was half the coupling. The other half was `index.ts` itself: its module
+ * body was the program and ended in `await client.login(...)`, so importing it
+ * started a Discord bot however clean the environment was. #131 moved the body
+ * into `main()` in `daemon.ts`, which is why `dist/daemon.js` is asserted here
+ * alongside `dist/agent.js`.
  *
  * So there are two halves here and they pull against each other:
  *
- *   - `dist/agent.js` imports with an empty environment, and
- *   - `loadConfig()` still refuses a missing variable.
+ *   - `dist/agent.js` and `dist/daemon.js` import with an empty environment, and
+ *   - `loadConfig()` still refuses a missing variable, and `dist/index.js` still
+ *     dies on it.
  *
  * Satisfying the check instead of removing the coupling — a `DISCORD_TOKEN=test`
- * in the harness — would pass the first and quietly give up the second. The
- * second test below is what stops that being a way to make this file green.
+ * in the harness — would pass the first and quietly give up the second. The last
+ * two tests below are what stop that being a way to make this file green.
  */
 
 import { test } from 'node:test';
@@ -53,6 +60,16 @@ test('dist/agent.js loads with no Discord token, no guild and no config path', (
   assert.equal(out, 'LOADED');
 });
 
+test('dist/daemon.js loads with no Discord token either — importing it starts nothing', () => {
+  // The #131 half. `daemon.js` holds `main()` AND every Discord handler, so if
+  // this regresses, `test/handlers.test.js` cannot exist: the announce-once
+  // rule, the replay rule and the channel gates all go back to being reasoned
+  // about. A module that starts a gateway connection on import would either hang
+  // this child or fail it — either way, not `LOADED`.
+  const out = importIn('./dist/daemon.js', { PATH: process.env['PATH'] });
+  assert.equal(out, 'LOADED');
+});
+
 test('the startup check survives: loadConfig() still refuses a missing DISCORD_TOKEN', () => {
   const saved = process.env['DISCORD_TOKEN'];
   delete process.env['DISCORD_TOKEN'];
@@ -65,9 +82,14 @@ test('the startup check survives: loadConfig() still refuses a missing DISCORD_T
 });
 
 test('the entry point still dies on a missing token, and says so before it dies', () => {
-  // `dist/index.js` is the daemon. It must NOT have become loadable — the point
-  // was never that nothing throws, it is that the throw belongs to the entry
-  // point rather than to `import`.
+  // `dist/index.js` is the entry point. It must NOT have become loadable — the
+  // point was never that nothing throws, it is that the throw belongs to the
+  // entry point rather than to `import`, and #131 did not change that: index.js
+  // calls `main()` unconditionally, so importing it is running the daemon.
+  //
+  // This is also the assertion that stops #131 being "cured" by deleting the
+  // `await main()` from index.ts. That would make every test in this repository
+  // pass and ship a service that starts, prints a banner and does nothing.
   let failed = false;
   try {
     importIn('./dist/index.js', { PATH: process.env['PATH'] });

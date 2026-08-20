@@ -39,7 +39,7 @@ function board() {
     start: (agent, context) => started.push({ id: agent.id, context }),
     log: () => {},
   });
-  // What index.ts wires: a delivery is the fast path into a sweep.
+  // What `main()` in daemon.ts wires: a delivery is the fast path into a sweep.
   mail.onDelivered = (message) => waker.onDelivered(message.recipient);
 
   return { registry, mail, waker, busy, started, add };
@@ -91,7 +91,7 @@ test('the turn that follows a busy one picks up what arrived during it', () => {
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'two'));
   assert.equal(started.length, 0);
 
-  // The turn ends. index.ts sweeps on every busy-count change.
+  // The turn ends. `main()` sweeps on every busy-count change.
   busy.delete('hamachi-engineer1');
   waker.sweep();
 

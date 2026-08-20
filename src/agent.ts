@@ -212,12 +212,15 @@ export class AtCapacityError extends Error {
  * session short of a restart. Naming the restart is the useful half.
  *
  * Here, and taking the timeout as an argument, rather than reading `config()`
- * inside `announceAtCapacity` in index.ts. The branch is the part worth
+ * inside `announceAtCapacity` in daemon.ts. The branch is the part worth
  * getting right — "this will not clear on its own" and "say it again in a
- * minute" are opposite instructions, chosen by a number — and index.ts is not
- * importable by a test, so a branch that lived there could only be reasoned
- * about. It was reasoned about, in #128, and shipped unexercised (Clawcius
- * #130). What stays in index.ts is the Discord plumbing around it.
+ * minute" are opposite instructions, chosen by a number — and when this was
+ * written the Discord handler was the body of index.ts, so a branch that lived
+ * there could only be reasoned about. It was reasoned about, in #128, and
+ * shipped unexercised (Clawcius #130). The handler became importable in #131
+ * and `announceAtCapacity` is exercised now too; the split still earns itself,
+ * because the sentence needs no Discord client to test. What stays in daemon.ts
+ * is the plumbing around it.
  */
 export function atCapacityNotice(error: AtCapacityError, idleTimeoutMinutes: number): string {
   return (
@@ -716,9 +719,9 @@ export class SessionManager {
    *
    * A function rather than a boolean because there is nothing else to
    * configure: spawn needs the registry and the mail store, and this class
-   * already holds both. Null is the off switch, and index.ts is where the
-   * decision is made — spawn without a board is a row nothing can be delivered
-   * to, so it is only wired when mail is.
+   * already holds both. Null is the off switch, and `main()` in daemon.ts is
+   * where the decision is made — spawn without a board is a row nothing can be
+   * delivered to, so it is only wired when mail is.
    */
   #spawnLog: ((line: string) => void) | null;
   #sweeper: NodeJS.Timeout;
@@ -829,7 +832,7 @@ export class SessionManager {
    *
    * Set by the waker to the ops status publisher. A callback rather than an
    * EventEmitter because there is exactly one subscriber and it must never be
-   * able to throw into session handling — see the wrapper in index.ts.
+   * able to throw into session handling — see the wrapper in daemon.ts.
    */
   onCountsChanged: () => void = () => {};
 

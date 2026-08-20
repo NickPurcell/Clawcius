@@ -6,18 +6,20 @@
  *
  * ES module bodies run in dependency order, and every import in `index.ts` is
  * evaluated before the first statement of `index.ts` itself. The first
- * statement of `index.ts` is `loadConfig()`, which throws on a missing
- * environment variable or an unreadable `agent-config.yaml` — and a config
- * loader is exactly what dies in the case this exists for: `clawcius-ops`
- * failed to start 22,675 consecutive times inside its config loader on a
- * `dist/` that predated its own config, and nothing escalated (Clawcius #89).
- * A banner printed after that call would have appeared zero of those 22,675
- * times.
+ * statement of `index.ts` is `await main()`, whose own first statement is
+ * `loadConfig()` — which throws on a missing environment variable or an
+ * unreadable `agent-config.yaml`, and a config loader is exactly what dies in
+ * the case this exists for: `clawcius-ops` failed to start 22,675 consecutive
+ * times inside its config loader on a `dist/` that predated its own config, and
+ * nothing escalated (Clawcius #89). A banner printed after that call would have
+ * appeared zero of those 22,675 times.
  *
  * Being an import rather than two lines at the top of `index.ts` also puts it
  * ahead of every OTHER import, any of which could throw at load — which is
  * where the waker's own config used to throw, until #130 moved it into the
- * body.
+ * body. `./daemon.js` is one of those other imports as of #131, and it is
+ * imported second: everything the program is made of is evaluated after this
+ * line has been printed.
  *
  * So this is imported FIRST, it depends on nothing but the generated constant,
  * and it prints as a side effect. The line comes out of a process that is about

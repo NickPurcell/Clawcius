@@ -16,6 +16,12 @@
  *   - The at-capacity announcement, added to fix the second, was reasoned about
  *     and shipped unexercised.
  *
+ * The last section is Clawcius #132: WHICH TOOLS `acquire` gives a session, and
+ * in particular that the spawn tool is offered to a coordinator and to nobody
+ * else. That became testable in #133 — `newSession` receives the built
+ * `mcpServers` as its fifth argument — and was not tested in it. CLAWSKY.md:
+ * "Spawn and kill: held by the coordinator alone."
+ *
  * Run against `dist/`, like every other test here: Node's type stripping does
  * not resolve a `.js` specifier to a `.ts` file, and testing the built output
  * is also what catches the stale-dist failure this repo keeps hitting.
@@ -30,6 +36,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
 import { AgentRegistry } from '../dist/store.js';
+import { MailStore } from '../dist/mail.js';
 import { setConfig } from '../dist/config.js';
 
 const CREW = 'hamachi';
@@ -534,5 +541,173 @@ test('a stored UUID is resumed and a placeholder is not', async () => {
   assert.equal(registry.get('b').sessionId, '');
   manager.acquire('b', events);
   assert.equal(built[1].sessionId, 'pending-b');
+  await manager.shutdown();
+});
+
+// ── which in-process tools a session is given ───────────────────────────────
+
+/**
+ * The tool names on the MCP server `acquire` built for a session.
+ *
+ * `acquire` hands `newSession` the result of `buildMailServer`, which is an SDK
+ * server config wrapping a live `McpServer`. There is no public accessor for
+ * what is registered on one, so this reaches for `instance._registeredTools` —
+ * and asserts that it found it, loudly. That direction matters: an SDK that
+ * renames the field makes this throw rather than quietly return `[]`, which
+ * would turn "an engineer is offered no spawn tool" into a test that passes
+ * because nobody is offered anything.
+ */
+function toolNames(mcpServers) {
+  assert.ok(mcpServers, 'acquire built no MCP servers for this session at all');
+  const server = mcpServers.clawsky;
+  assert.ok(server, `no \`clawsky\` server, only: ${Object.keys(mcpServers).join(', ')}`);
+  const registered = server.instance?._registeredTools;
+  assert.ok(
+    registered && typeof registered === 'object',
+    'could not read the tools off the SDK MCP server — `instance._registeredTools` is how ' +
+      'this test reads them and the agent SDK has changed shape. Fix the reader; the rule it ' +
+      'checks (CLAWSKY.md: "Spawn and kill: held by the coordinator alone") has not changed.',
+  );
+  const names = Object.keys(registered).sort();
+  // Self-supporting, and the reason is OJ's on #136: an SDK that kept the field
+  // and left it empty would make every NEGATIVE assertion here — "an engineer is
+  // offered no spawn tool" — pass vacuously. The positive cases would still go
+  // red, so the file would fail either way; this makes each case fail on its
+  // own rather than leaning on its neighbours. Every caller has a mail store, so
+  // these two are always present: the no-mail case asserts `mcpServers === null`
+  // and never reaches here.
+  assert.ok(
+    names.includes('checkMail') && names.includes('sendMail'),
+    `a session with a mail store must always be offered the mail tools; got: ${names.join(', ')}`,
+  );
+  return names;
+}
+
+/**
+ * A pool with a real board behind it, and the built `mcpServers` captured.
+ *
+ * `spawnLog` is what `main()` passes when — and only when — mail is on, so it
+ * is the second half of the gate under test alongside the role.
+ */
+function boardPool(options = {}) {
+  const { maxConcurrent = 4, spawnLog = () => {}, mail: withMail = true } = options;
+  const workspaceRoot = tempDir('clawsky-workspaces-');
+  installConfig({ maxConcurrent, idleTimeoutMinutes: 0, workspaceRoot });
+
+  const registry = new AgentRegistry(join(tempDir('clawsky-tools-'), 'clawcius.db'), { crew: CREW });
+  const mail = withMail ? new MailStore(registry) : null;
+  const manager = new SessionManager(registry, mail, null, spawnLog);
+
+  const built = [];
+  manager.newSession = (channelId, workspacePath, resumeSessionId, _events, mcpServers) => {
+    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+    session.mcpServers = mcpServers;
+    built.push(session);
+    return session;
+  };
+  return { manager, registry, mail, built };
+}
+
+test("a coordinator's session is offered the spawn tool", async () => {
+  const { manager, registry, built } = boardPool();
+  registry.ensure('hamachi-coordinator', {
+    crew: CREW,
+    role: 'coordinator',
+    workspacePath: '/w/coordinator',
+  });
+
+  manager.acquire('hamachi-coordinator', events);
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail', 'spawn']);
+  await manager.shutdown();
+});
+
+test("an engineer's session is not, and that is the whole of CLAWSKY.md's rule", async () => {
+  const { manager, registry, built } = boardPool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/w/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  manager.acquire('hamachi-engineer1', events);
+  // "Spawn and kill: held by the coordinator alone." The tool re-reads the row
+  // when it runs, so this is defence in depth rather than the only gate — which
+  // is exactly the sort of thing that rots unnoticed. An engineer that could
+  // spawn could mint a colleague, and #128's argument for refusing to spawn a
+  // coordinator is that spawning widens who may DM the host agent.
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail']);
+  await manager.shutdown();
+});
+
+test('a poster gets mail and nothing else either', async () => {
+  const { manager, registry, built } = boardPool();
+  registry.ensure('hamachi-poster', { crew: CREW, role: 'poster', workspacePath: '/w/poster' });
+  manager.acquire('hamachi-poster', events);
+  // Not just "not an engineer": every role that is not `coordinator`.
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail']);
+  await manager.shutdown();
+});
+
+test('with no spawn log wired, not even a coordinator is offered spawn', async () => {
+  // `spawnLog` is null when the board is off, and `main()` in daemon.ts is
+  // where that is decided: a spawn's last step is delivering the new agent's
+  // first turn as mail, so without a board it would write a row nothing could
+  // reach.
+  const { manager, registry, built } = boardPool({ spawnLog: null });
+  registry.ensure('hamachi-coordinator', {
+    crew: CREW,
+    role: 'coordinator',
+    workspacePath: '/w/coordinator',
+  });
+
+  manager.acquire('hamachi-coordinator', events);
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail']);
+  await manager.shutdown();
+});
+
+test('with no mail store there are no in-process tools at all', async () => {
+  const { manager, registry, built } = boardPool({ mail: false });
+  registry.ensure('hamachi-coordinator', {
+    crew: CREW,
+    role: 'coordinator',
+    workspacePath: '/w/coordinator',
+  });
+
+  manager.acquire('hamachi-coordinator', events);
+  // `clawsky.enabled: false` is a supported state: no checkMail, no sendMail,
+  // and the waker behaves as it did before any of this existed.
+  assert.equal(built[0].mcpServers, null);
+  await manager.shutdown();
+});
+
+test('a Discord channel the registry has never heard of DOES get spawn', async () => {
+  // Stated because it is surprising and it is a privilege. `#identityFor`'s
+  // fallback is `coordinator` — Discord stays with the coordinator — so the
+  // first mention in a brand-new channel or thread is offered the tool. The
+  // widening is real and bounded by who can talk to the bot at all, which is
+  // `allowedChannelIds`. If that ever stops being the intent, this test is
+  // where it is written down.
+  const { manager, built } = boardPool();
+  manager.acquire('9876543210', events);
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail', 'spawn']);
+  await manager.shutdown();
+});
+
+test('the role acted on is the row, not the identity the fallback would have picked', async () => {
+  // The two halves together: an engineer row exists, so `#identityFor` prefers
+  // it, so `ensure` returns it, so the gate reads `engineer`. Mutating
+  // `#identityFor` back to an unconditional `coordinator` — the #128 bug —
+  // hands an engineer the spawn tool, and this is the assertion that says so.
+  const { manager, registry, built } = boardPool();
+  registry.ensure('hamachi-engineer2', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/w/engineer2',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  manager.acquire('hamachi-engineer2', events);
+  assert.equal(toolNames(built[0].mcpServers).includes('spawn'), false);
   await manager.shutdown();
 });

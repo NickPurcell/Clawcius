@@ -21,8 +21,10 @@ NotifyAccess=all
 # every turn would fail on auth.
 #
 # Note both instances therefore share one credential. A fresh process reads it
-# correctly, which is what the respawn-on-stale-token path in index.ts relies
-# on; but a re-login on the host is still a single point of failure for both.
+# correctly, which is what the respawn-on-stale-token path relies on —
+# `deliver`'s `onNeedsRespawn` in src/daemon.ts, which moved out of src/index.ts
+# in Clawcius #131; but a re-login on the host is still a single point of
+# failure for both.
 User=npurcell
 Group=npurcell
 

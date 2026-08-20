@@ -78,7 +78,7 @@ const spawnBoard = () => {
 };
 
 /**
- * The same crew with the waker wired as index.ts wires it — a delivery is the
+ * The same crew with the waker wired as `main()` in daemon.ts wires it — a delivery is the
  * fast path into a sweep — and `start` recorded instead of run.
  */
 const wakingBoard = () => {
