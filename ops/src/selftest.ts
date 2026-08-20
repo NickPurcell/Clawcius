@@ -1665,6 +1665,17 @@ test('the executor boot line carries where dryRun came from', () => {
   // index.js for real needs a lock, two board databases and a live config, and a
   // test that heavy to pin one journal field is not worth what it would cost to
   // maintain. tsc preserves the template literal verbatim.
+  //
+  // KNOW WHAT THIS IS COUPLED TO BEFORE YOU TIDY index.ts. It matches the FORM
+  // of the expression, not only its output: the boot detail has to stay a
+  // template literal with `config.dryRunSource.detail` interpolated after the
+  // literal ` SETTING: `. Rewriting that one term as plain string concatenation
+  // — which is what the twenty lines around it use, so it is the natural tidy —
+  // produces exactly the same journal line and turns this test red. That is the
+  // safe direction to fail in, and it is why this is worth saying rather than
+  // loosening: a pattern that tolerated both forms would also tolerate the
+  // interpolation being dropped. If you do rewrite it, change the regex in the
+  // same commit and check the compiled output rather than the source.
   const dist = dirname(fileURLToPath(import.meta.url));
   const compiled = readFileSync(join(dist, 'index.js'), 'utf8');
   assert.match(
@@ -1691,27 +1702,41 @@ test('clawcius-ops can still express a permanent failure', () => {
   const unit = readFileSync(join(repoRoot(), 'systemd', 'clawcius-ops.service'), 'utf8');
 
   //
-  // Matched as `\S+` rather than `\d+`, and checked against a bare `0` rather
-  // than parsed. StartLimitIntervalSec is a systemd TIME SPAN: `600`, `600s` and
-  // `10min` are all valid and identical, and `StartLimitInterval=` is still
-  // accepted as an alias. A digits-only pattern makes every one of those look
-  // like a missing directive, and the failure would send the next person hunting
-  // for a line that is right there in front of them. The property is "not
-  // disabled", and only a literal `0` disables it.
+  // Matched as `\S+` rather than `\d+`, and read as a NUMBER rather than
+  // compared against the string `0`. StartLimitIntervalSec is a systemd TIME
+  // SPAN: `600`, `600s` and `10min` are all valid and identical, and
+  // `StartLimitInterval=` is still accepted as an alias. A digits-only pattern
+  // makes every one of those look like a missing directive, and the failure
+  // would send the next person hunting for a line that is right there in front
+  // of them.
+  //
+  // But `!== '0'` is the same mistake wearing the other hat: `0s` and `00` both
+  // disable rate limiting in systemd and neither is the string `0`, so a test
+  // whose entire job is to catch a silent disable would have passed the silent
+  // disable. `\d+` caught `00` and missed `600s`; `!== '0'` caught `600s` and
+  // missed `00`. `parseFloat(…) > 0` catches both and every other spelling of
+  // zero, because it stops at the unit suffix — `600s` is 600, `10min` is 10,
+  // `0s` is 0, `00` is 0 — and NaN fails the comparison, so a value this cannot
+  // read at all goes red rather than through. The property asserted is "the
+  // limit is not disabled", not any particular spelling of it.
   const interval = /^StartLimitIntervalSec=(\S+)$/m.exec(unit);
   const burst = /^StartLimitBurst=(\S+)$/m.exec(unit);
   assert.ok(interval, 'clawcius-ops.service must set StartLimitIntervalSec');
   assert.ok(burst, 'clawcius-ops.service must set StartLimitBurst');
-  assert.notEqual(
-    interval[1],
-    '0',
-    'StartLimitIntervalSec=0 disables the start limit — the unit could never reach `failed`',
-  );
-  assert.notEqual(
-    burst[1],
-    '0',
-    'StartLimitBurst=0 disables the start limit — the unit could never reach `failed`',
-  );
+  //
+  // `?? ''` only to satisfy the capture's `string | undefined` type — a group
+  // that matched cannot be undefined at runtime. It is not a fallback: it
+  // parses to NaN, which fails the comparison, so the impossible case goes red
+  // like every other unreadable value rather than through.
+  const notDisabled = (directive: string, value: string | undefined): void => {
+    assert.ok(
+      Number.parseFloat(value ?? '') > 0,
+      `${directive}=${value} disables the start limit — every zero spelling does, ` +
+        'and the unit could then never reach `failed`',
+    );
+  };
+  notDisabled('StartLimitIntervalSec', interval[1]);
+  notDisabled('StartLimitBurst', burst[1]);
 
   // In [Unit], before [Service] begins. Moving them is a silent downgrade to
   // systemd's own much tighter default, not a no-op.
