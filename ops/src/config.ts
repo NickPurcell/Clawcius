@@ -745,24 +745,38 @@ function bool(raw: unknown, path: string, fallback: boolean): boolean {
  * `true`. Absence is safe. Only a deliberate, correctly spelled `false` turns
  * this executor live, and only ever from a file somebody had to install.
  *
- * ── Yes, this can fail the boot, and yes, that was weighed ───────────────
+ * ── Yes, this can fail the boot. Read the next paragraph before copying it. ──
  *
- * `clawcius-ops.service` is `Restart=always` with no start limit, so a throw in
- * this loader is a five-second restart loop rather than one loud error — the
- * shape of #7, and the reason a RETIRED key here is tolerated and reported
- * instead of refused. It is still the right answer for this one, on the same
- * grounds the loader already refuses a malformed `dryRun:` *key*:
+ * Refusing is right, because the alternative is worse in the direction that
+ * matters: falling back would hand the operator who typed `flase` a dry-run
+ * executor that reports success and does nothing, which is the precise outcome
+ * this whole change exists to stop being possible silently.
  *
- *   - a retired key is tolerated because it arrives by drift, in an old file
- *     nobody has updated. This value cannot arrive by drift. It is set by an
- *     `Environment=` line that somebody installed on purpose this week;
- *   - the loop is visible where #89's was not. `build-banner.ts` prints from a
- *     process that is about to fail, on every one of those starts, and this
- *     refusal prints after it;
- *   - and the alternative is worse in the direction that matters. Falling back
- *     would mean the operator who typed `flase` gets a dry-run executor that
- *     reports success and does nothing, which is the precise outcome the whole
- *     change exists to stop being possible silently.
+ * But a throw in this loader is a RESTART LOOP, not one loud error, because
+ * `clawcius-ops.service` is `Restart=always`. That is why a RETIRED key here is
+ * tolerated and reported rather than refused.
+ *
+ * The first version of this comment justified the difference by saying a
+ * retired key arrives by drift while an `Environment=` line is installed
+ * deliberately. **That argument is wrong and it is worth leaving the correction
+ * here.** `wakeChannelId` was a deliberate config change too, and it is
+ * Clawcius #89: this unit failing to start 22,675 consecutive times over 31
+ * hours with the host agent dead and nothing escalating. Deliberateness does
+ * not make an input safe to refuse; it says nothing about whether anyone finds
+ * out.
+ *
+ * What makes refusing safe here is not a property of this input. It is that the
+ * unit can now express a permanent failure: `StartLimitIntervalSec=600` and
+ * `StartLimitBurst=20`, added on 2026-08-19 in the same change that added this
+ * variable, so roughly two minutes of a genuine config error puts the unit in
+ * `failed` where `systemctl --failed` will show it. Before that limit existed
+ * this refusal really would have been another way to reach #89.
+ *
+ * SO: if you add a second thing to this loader that throws, the question to ask
+ * is not "is this input trustworthy" — it is "does the unit this runs under
+ * still have a finite start limit". `build-banner.ts` printing from a process
+ * about to fail is necessary and was never sufficient; somebody has to be
+ * looking at the journal for a banner to help, and for 31 hours nobody was.
  */
 function dryRunSetting(raw: unknown): { value: boolean; source: DryRunSource } {
   const fromFile = bool(raw, 'dryRun', DEFAULTS.dryRun);
@@ -896,9 +910,11 @@ const INSTANCE_KEYS = new Set([
  * THE SAME LIST the deprecation notice is built from, deliberately — these keys
  * must survive the unknown-key check in order to reach it, and two lists would
  * mean a key that is refused at the boot it is supposed to be reported at.
- * `clawcius-ops.service` is `Restart=always` with no start limit, so a config
- * the loader rejects is not one loud error, it is a root daemon in a
- * five-second restart loop.
+ * `clawcius-ops.service` is `Restart=always`, so a config the loader rejects is
+ * not one loud error, it is a root daemon in a restart loop — bounded at
+ * 600s/20 since 2026-08-19, so it ends in `failed` after about two minutes
+ * rather than running forever, which is a floor under the damage and not a
+ * reason to start rejecting things.
  *
  * (The check below found this the honest way: it refused `wakeSpoolDir` and the
  * existing "retired spool keys still boot" test went red.)

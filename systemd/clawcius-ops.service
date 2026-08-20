@@ -13,12 +13,67 @@ Requires=docker.service
 # which is the exact failure the separate daemon exists to avoid. It has to
 # outlive the units it acts on.
 
-# Never give up. [Unit] directives, not [Service]: in [Service] systemd ignores
-# them with a warning and leaves the default of 5 starts per 10s, after which
-# the unit stays dead. This one holds rollback deadlines; it staying dead is
-# how a broken rebuild becomes a permanent outage.
-StartLimitIntervalSec=0
-StartLimitBurst=0
+# ── A BOUNDED start limit. This said "never give up" until 2026-08-19. ────
+#
+# [Unit] directives, not [Service], and that part is unchanged and still
+# hard-won: in [Service] systemd IGNORES them with a warning and silently
+# leaves the default of 5 starts per 10s. If you move these two lines you have
+# not tightened the limit, you have replaced it with a much tighter one you did
+# not choose.
+#
+# What changed is the values. They were both 0 — either one being 0 disables
+# rate limiting entirely — and the reason given was: "This one holds rollback
+# deadlines; it staying dead is how a broken rebuild becomes a permanent
+# outage."
+#
+# THAT JUSTIFICATION EXPIRED ON 2026-08-16 AND NOBODY CAME BACK FOR THIS LINE.
+# The check-in deadlines, the automatic rollback and the wake that drove them
+# all went with the ops spool. Nothing arms a deadline any more — the only
+# caller of `StateStore.arm()` left in the tree is the self-test — and
+# `reportRetiredDeadlines()` runs at boot for the express purpose of CLEARING
+# any deadline an older build left behind. This unit no longer holds anything
+# that expires while it is down. It is a mailbox and a unit desk, and both of
+# those are simply unavailable whether it is looping or dead.
+#
+# ── AND UNLIMITED RETRIES WERE NEVER BUYING AVAILABILITY ──────────────────
+#
+# This is the part worth keeping. A unit in a five-second restart loop is not
+# more available than a unit in `failed` — it is doing no work in either state.
+# What the loop buys is the APPEARANCE of availability: `Restart=always` with
+# no limit means the unit never enters `failed`, so it never appears in
+# `systemctl --failed`, which is the channel this project already relies on to
+# send someone to read a failure (see ops/src/verify.ts). A permanent config
+# error becomes indistinguishable from a healthy service to everything that
+# watches.
+#
+# That is not hypothetical. Clawcius #89 is this unit failing to start 22,675
+# consecutive times over 31 hours, inside the config loader, with the host
+# agent dead the whole while and nothing escalating. #89 recommended a start
+# limit and nobody did it.
+#
+# ── The numbers, and the arithmetic behind them ───────────────────────────
+#
+# RestartSec=5 and a config refusal dies in well under a second, so a genuine
+# permanent failure cycles about every 5-6 seconds: 20 starts is roughly TWO
+# MINUTES before the unit lands in `failed` where it can be seen. A transient
+# that clears within those 20 attempts is ridden out exactly as before.
+#
+# Widen the burst if a real transient on this host is ever observed to need
+# more than two minutes; do not set either value back to 0. Losing four extra
+# minutes of automatic retry is worth 31 hours of visibility, and the trade only
+# looks close if you believe the loop was accomplishing something.
+#
+# RECOVERY, because a bounded limit needs one: a unit that has hit the limit
+# stays dead until it is reset, and `systemctl restart` alone will NOT start it.
+#
+#   systemctl status clawcius-ops        # the refusal is in the journal above
+#   systemctl reset-failed clawcius-ops
+#   systemctl start clawcius-ops
+#
+# Fix the cause first. A reset with the bad config still in place buys another
+# two minutes of looping and the same `failed`.
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=simple

@@ -1075,10 +1075,12 @@ test('the host agent takes its own row and will not take anybody else\'s', () =>
 
 test('a config still carrying the retired spool keys boots, and is told they are inert', () => {
   // Reported, never refused, and the distinction is the whole point of the
-  // test. `clawcius-ops.service` is Restart=always with no start limit, so a
-  // config the loader rejects is not one loud error — it is a root daemon in a
-  // five-second restart loop. And an in-place rollback to the previous `dist/`
-  // has to find a config that build can still read.
+  // test. `clawcius-ops.service` is Restart=always, so a config the loader
+  // rejects is not one loud error — it is a root daemon in a restart loop.
+  // (Bounded at 600s/20 since 2026-08-19, so that loop ends in `failed`. It
+  // still should not happen for a key that arrives by drift in an un-updated
+  // file: two minutes of downtime is two minutes.) And an in-place rollback to
+  // the previous `dist/` has to find a config that build can still read.
   //
   // Silence would be worse than either: an operator whose file says
   // `mayRequest:` believes an instance is restricted and it is not.
@@ -1370,6 +1372,19 @@ test('two instances may not name one snapshot timer', () => {
  * throws and a leaked variable would silently change what every later
  * `loadOpsConfig` in this file resolves to.
  */
+/**
+ * The checkout these tests are running out of.
+ *
+ * This file compiles to `<repo>/ops/dist/selftest.js`. Used by the two tests
+ * that assert on TRACKED files rather than on behaviour — the shipped
+ * `dryRun: true` and the unit's start limit — because both are properties the
+ * repository has to keep, and the failure they guard against is somebody
+ * editing the file rather than the code.
+ */
+function repoRoot(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
 function withDryRunEnv<T>(value: string | null, body: () => T): T {
   const previous = process.env[DRY_RUN_ENV];
   if (value === null) delete process.env[DRY_RUN_ENV];
@@ -1488,10 +1503,7 @@ test('the tracked ops-config.yaml still ships dry run on', () => {
   // default; the machine's deviation lives in the unit. If this ever goes red,
   // somebody has put a per-machine value back into the shared file and the
   // next merge conflict is already written.
-  // This file compiles to <repo>/ops/dist/selftest.js.
-  const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-
-  const shipped = readFileSync(join(repo, 'ops', 'ops-config.yaml'), 'utf8');
+  const shipped = readFileSync(join(repoRoot(), 'ops', 'ops-config.yaml'), 'utf8');
   assert.match(
     shipped,
     /^dryRun: true$/m,
@@ -1501,8 +1513,47 @@ test('the tracked ops-config.yaml still ships dry run on', () => {
 
   // And the deployment is expressed in the repository rather than in somebody's
   // shell history. Installing it is still an operator step.
-  const unit = readFileSync(join(repo, 'systemd', 'clawcius-ops.service'), 'utf8');
+  const unit = readFileSync(join(repoRoot(), 'systemd', 'clawcius-ops.service'), 'utf8');
   assert.match(unit, /^Environment=OPS_DRY_RUN=(true|false)$/m);
+});
+
+test('clawcius-ops can still express a permanent failure', () => {
+  // A malformed OPS_DRY_RUN fails the boot (above), and this unit is
+  // Restart=always — so the refusal is a restart loop, and a loop is only
+  // acceptable if it can END. With no start limit the unit never enters
+  // `failed`, never appears in `systemctl --failed`, and a permanent config
+  // error is indistinguishable from a healthy service to everything that
+  // watches. Clawcius #89 is 22,675 consecutive failed starts over 31 hours of
+  // exactly that.
+  //
+  // Both values must be non-zero: systemd disables rate limiting if EITHER is
+  // 0, which is why this asserts on both rather than on the presence of a
+  // limit. And both must be in [Unit] — in [Service] systemd ignores them with
+  // a warning and silently applies its own default of 5 starts per 10s.
+  const unit = readFileSync(join(repoRoot(), 'systemd', 'clawcius-ops.service'), 'utf8');
+
+  const interval = /^StartLimitIntervalSec=(\d+)$/m.exec(unit);
+  const burst = /^StartLimitBurst=(\d+)$/m.exec(unit);
+  assert.ok(interval, 'clawcius-ops.service must set StartLimitIntervalSec');
+  assert.ok(burst, 'clawcius-ops.service must set StartLimitBurst');
+  assert.ok(
+    Number(interval[1]) > 0,
+    'StartLimitIntervalSec=0 disables the start limit — the unit could never reach `failed`',
+  );
+  assert.ok(
+    Number(burst[1]) > 0,
+    'StartLimitBurst=0 disables the start limit — the unit could never reach `failed`',
+  );
+
+  // In [Unit], before [Service] begins. Moving them is a silent downgrade to
+  // systemd's own much tighter default, not a no-op.
+  const service = unit.indexOf('\n[Service]');
+  assert.ok(service > 0, 'expected a [Service] section');
+  assert.ok(
+    unit.indexOf('\nStartLimitIntervalSec=') < service &&
+      unit.indexOf('\nStartLimitBurst=') < service,
+    'the start limit directives must stay in [Unit]; in [Service] systemd ignores them',
+  );
 });
 
 // ══════════════════════════════════════════════════════════════════════════

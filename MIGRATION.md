@@ -654,12 +654,18 @@ If anything is wrong you get a banner instead, with the fix in it:
 ```
 
 The daemon stays up and keeps answering — with that refusal — while that is
-true. It is deliberately not a boot failure: this unit is `Restart=always` with
-no start limit, so refusing to boot would be a five-second restart loop, and a
-daemon in one cannot tell anybody why it is refusing. That is the shape of #7.
-(Until 2026-08-16 the argument was stronger: a restart loop also left every
-armed rollback deadline unhonoured. There are no deadlines now, and the weaker
-version still holds.)
+true. It is deliberately not a boot failure: this unit is `Restart=always`, so
+refusing to boot would be a restart loop, and a daemon in one cannot tell
+anybody why it is refusing. That is the shape of #7.
+
+(Two corrections that have accumulated on this paragraph. Until 2026-08-16 the
+argument was stronger: a restart loop also left every armed rollback deadline
+unhonoured — there are no deadlines now, and the weaker version still holds.
+And it said "with no start limit" until 2026-08-19; the unit now carries
+`StartLimitIntervalSec=600` / `StartLimitBurst=20`, so a loop it *cannot* avoid
+ends in `failed` where `systemctl --failed` shows it. Neither changes the
+verdict here: a bad account is repairable on a running host, and staying up to
+say so beats two minutes of looping followed by silence.)
 
 The status file says the same thing, which is what the status page reads:
 

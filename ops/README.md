@@ -679,9 +679,13 @@ design decision.** The membership this is guarding against —
 **running** host. A boot-time check on a unit that stays up for weeks would
 never see it.
 
-**It does not `exit(1)`.** This unit is `Restart=always` with
-`StartLimitIntervalSec=0`; refusing to boot would be a five-second restart loop,
-which is the shape of #7. The daemon comes up, holds its mailboxes, answers the
+**It does not `exit(1)`.** This unit is `Restart=always`; refusing to boot would
+be a restart loop, which is the shape of #7. (The unit gained a bounded start
+limit on 2026-08-19, so that loop now ends in `failed` rather than running
+forever — but a daemon that can still serve its mailboxes and explain the
+problem should not be exiting in the first place. The limit is a floor under the
+worst case, not a licence to reach for `exit(1)`.) The daemon comes up, holds its
+mailboxes, answers the
 coordinator that asked — and refuses every task, loudly, with the fix in the
 reply. That is exactly what `hostAgent.enabled: false` already does, and this
 codebase already argues it is strictly better than stopping the unit. The older
@@ -1332,12 +1336,23 @@ stdout — naming the key, the instance, and what stands in its place. Delete th
 once you have read the notice. Nothing on disk was touched on their account.
 
 **It is not a boot failure, and that decision is older than these keys.** It was
-first made on 2026-08-10 for the legacy top-level `spoolDir`, and the reasoning
-transfers unchanged: `clawcius-ops.service` is `Restart=always` with
-`StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up. A rejected
-config does not produce one loud failure; it produces a root daemon in a
-five-second restart loop. That is the shape of #7, and this repository has
-already agreed not to ship it again. `git pull` also updates `ops-config.yaml`
+first made on 2026-08-10 for the legacy top-level `spoolDir`, and the core of the
+reasoning transfers unchanged: `clawcius-ops.service` is `Restart=always`, so a
+rejected config does not produce one loud failure, it produces a root daemon in a
+restart loop. That is the shape of #7, and this repository has already agreed not
+to ship it again.
+
+One clause of that argument is out of date and the correction matters: the unit
+carried `StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up — until
+2026-08-19, and it now carries `600`/`20`. So the loop is no longer infinite; a
+permanent failure reaches `failed` in about two minutes and shows up in
+`systemctl --failed`. **That does not make refusing the right answer for a
+retired key.** A key that arrives by drift in an un-updated file should not stop
+a host agent at all, and two minutes of downtime is still two minutes. What the
+limit changes is the *worst* case, not the desired one — see § *The systemd
+units, audited*.
+
+`git pull` also updates `ops-config.yaml`
 under a running process that will not re-read it until somebody restarts it, so
 the new file routinely lands under the old code and the old file under the new.
 
@@ -1490,7 +1505,11 @@ failing intermittently at head with a message that pointed at no test in
 particular: an `# cancelled 1` and a `not ok 1 - dist/selftest.js`, which reads
 like a hang rather than a clock. Raised to 120000 on 2026-08-19, with the suite
 at 78 tests and runs observed between 21s and 31s — the top of that range is
-above the old ceiling, so this was not a margin worth leaving. Anything here
+above the old ceiling, so this was not a margin worth leaving. A later data
+point the same day, at 84 tests: 30s idle, and 55s with the root suite running
+concurrently on the same box. The ceiling is still comfortable; the point of
+recording the second number is that the figure that matters is the one measured
+under load, and it is roughly twice the idle one. Anything here
 that waits out `startTimeoutSeconds` costs at least five seconds of real
 polling, so prefer a failure mode that fails immediately when both reach the
 same branch.
@@ -1712,6 +1731,63 @@ unit in this directory was read line by line on 2026-08-10 looking for
 directives with the same character: things that read as sensible hardening and
 are incompatible with what the process actually does.
 
+### The start limit, and 31 hours of invisible restarts (2026-08-19)
+
+`clawcius-ops.service` carried `StartLimitIntervalSec=0` and
+`StartLimitBurst=0` — *never give up*. It now carries `600` and `20`.
+
+The stated reason for unlimited retries was: *"This one holds rollback
+deadlines; it staying dead is how a broken rebuild becomes a permanent
+outage."* **That justification expired on 2026-08-16** and nobody came back for
+the line. The check-in deadlines, the automatic rollback and the wake that drove
+them all went with the ops spool. Nothing arms a deadline any more — the only
+caller of `StateStore.arm()` left in the tree is the self-test — and
+`reportRetiredDeadlines()` runs at boot for the express purpose of *clearing*
+any deadline an older build left. This unit no longer holds anything that
+expires while it is down.
+
+The deeper point, which is the one worth keeping: **unlimited retries were never
+buying availability.** A unit in a five-second restart loop is not more
+available than a unit in `failed`; it is doing no work in either state. What the
+loop buys is the *appearance* of availability. `Restart=always` with no limit
+means the unit never enters `failed`, so it never appears in
+`systemctl --failed` — the channel this project already relies on to send
+someone to read a failure — and a permanent config error becomes
+indistinguishable from a healthy service to everything that watches.
+
+That is Clawcius #89: this unit failing to start **22,675 consecutive times over
+31 hours**, inside the config loader, with the host agent dead the whole while
+and nothing escalating. #89 recommended a start limit and nobody did it.
+`build-banner.ts` fixed the *which artefact is this* half; it was necessary and
+never sufficient, because somebody has to be looking at the journal for a banner
+to help, and for 31 hours nobody was.
+
+`RestartSec=5` and a config refusal dies in well under a second, so a permanent
+failure cycles about every 5–6 seconds: **20 starts is roughly two minutes**
+before the unit lands in `failed`. A transient that clears inside those 20
+attempts is ridden out exactly as before. Widen the burst if a real transient on
+this host is ever seen to need more than two minutes; do not set either value
+back to `0`, and note that **setting either one to 0 disables rate limiting
+entirely** — which is why the self-test asserts on both.
+
+They are `[Unit]` directives, not `[Service]`, and that is load-bearing: in
+`[Service]` systemd ignores them with a warning and silently applies its own
+default of 5 starts per 10s. Moving them does not remove the limit, it replaces
+it with a much tighter one nobody chose. The self-test asserts they stay in
+`[Unit]` for that reason.
+
+Recovery, because a bounded limit needs one — a unit that has hit the limit
+stays dead, and `systemctl restart` alone will **not** start it:
+
+```sh
+systemctl status clawcius-ops        # the refusal is in the journal above
+systemctl reset-failed clawcius-ops
+systemctl start clawcius-ops
+```
+
+Fix the cause first; a reset with the bad config still in place buys another two
+minutes of looping and the same `failed`.
+
 **`clawcius-ops.service` had one, and it was the same kind of mistake.**
 `ProtectHome=read-only`. It reads like obvious hygiene for a root daemon. The
 checkout is `/home/npurcell/clawcius`: `git pull` writes `.git/`, `npm ci`
@@ -1807,7 +1883,7 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` is **83 tests** — measured on this branch, and it was **78**
+`npm run selftest` is **84 tests** — measured on this branch, and it was **78**
 on `main` at `1ac316d`, also measured. Those are the only states the claim is
 made about; run it rather than trusting this line, and if it disagrees the suite
 is right. (It said 62 at `208dafb` until 2026-08-19, which had stopped being
@@ -1853,6 +1929,13 @@ What is covered now:
   `dryRun: true` while the unit file carries the `Environment=` line — so the
   next person to "fix" the deploy by editing the shared file goes red here
   instead of at the next merge;
+- **the unit can still express a permanent failure**: `clawcius-ops.service` is
+  read off disk and its `StartLimitIntervalSec` and `StartLimitBurst` are both
+  asserted non-zero — either being `0` disables rate limiting and the unit could
+  never reach `failed` — and asserted to still live in `[Unit]`, because in
+  `[Service]` systemd ignores them and applies a much tighter default nobody
+  chose. This one guards the *refusal* above: a boot that fails is only
+  acceptable if the loop it causes can end;
 - **the board**: it is opened or refused, never created, and the host agent takes
   its own row and will not take anybody else's;
 - **the lock**: a second task is refused while one is running, and the refusal
