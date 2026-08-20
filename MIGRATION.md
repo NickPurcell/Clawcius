@@ -654,12 +654,18 @@ If anything is wrong you get a banner instead, with the fix in it:
 ```
 
 The daemon stays up and keeps answering — with that refusal — while that is
-true. It is deliberately not a boot failure: this unit is `Restart=always` with
-no start limit, so refusing to boot would be a five-second restart loop, and a
-daemon in one cannot tell anybody why it is refusing. That is the shape of #7.
-(Until 2026-08-16 the argument was stronger: a restart loop also left every
-armed rollback deadline unhonoured. There are no deadlines now, and the weaker
-version still holds.)
+true. It is deliberately not a boot failure: this unit is `Restart=always`, so
+refusing to boot would be a restart loop, and a daemon in one cannot tell
+anybody why it is refusing. That is the shape of #7.
+
+(Two corrections that have accumulated on this paragraph. Until 2026-08-16 the
+argument was stronger: a restart loop also left every armed rollback deadline
+unhonoured — there are no deadlines now, and the weaker version still holds.
+And it said "with no start limit" until 2026-08-19; the unit now carries
+`StartLimitIntervalSec=600` / `StartLimitBurst=20`, so a loop it *cannot* avoid
+ends in `failed` where `systemctl --failed` shows it. Neither changes the
+verdict here: a bad account is repairable on a running host, and staying up to
+say so beats two minutes of looping followed by silence.)
 
 The status file says the same thing, which is what the status page reads:
 
@@ -671,10 +677,42 @@ sudo jq .hostAgent /var/lib/clawcius-ops/ops-status.json
 
 ## 8. The first task, in dry run
 
-`ops-config.yaml` ships `dryRun: true` and should stay that way until a week of
-the log contains nothing surprising. In dry run the session has no Bash tool at
-all — it is removed by the permission system, not asked for politely — so this
-is a safe way to prove the identity plumbing end to end.
+`ops-config.yaml` ships `dryRun: true` and **that file keeps saying `true`**. In
+dry run the session has no Bash tool at all — it is removed by the permission
+system, not asked for politely — so this is a safe way to prove the identity
+plumbing end to end. Stay in it until a week of the log contains nothing
+surprising.
+
+Dry run is decided by `OPS_DRY_RUN` in the environment when that variable is
+set, and by the file when it is not; the environment wins. **Nothing in
+`systemd/` sets it**, so staying in dry run for this step needs no command at
+all — it is what a host that has followed SETUP.md § *Install* is already doing.
+What turns it off is one tracked drop-in,
+`systemd/clawcius-ops.service.d/live.conf`, installed deliberately in SETUP.md
+§ *Going live*. If this host has been live before and you want it back in dry
+run, that is a `rm`:
+
+```sh
+sudo rm -f /etc/systemd/system/clawcius-ops.service.d/live.conf
+sudo systemctl daemon-reload && sudo systemctl restart clawcius-ops
+```
+
+Delete the file or delete the line; do **not** blank the value.
+`Environment=OPS_DRY_RUN=` sets the variable to the empty string, which is
+neither `true` nor `false`, which fails the boot — correctly, but the unit then
+loops for about two minutes before landing in `failed`. Editing
+`ops-config.yaml` is not an option either: it is tracked and shared.
+`ops/README.md` § *Where the deployed value actually comes from* is the full
+account of why.
+
+Confirm which mode you are in before reading anything into what comes back, and
+confirm it from the journal rather than from `ops-status.json` — that file is
+also written by the snapshot verifier, which does not share the daemon's
+environment:
+
+```sh
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+```
 
 **There is no command to type here, and that is the change.** Until 2026-08-16
 this step was a `printf` of a JSON request into `/var/lib/clawcius/run/ops`;
@@ -693,8 +731,16 @@ sudo tail -f /var/lib/clawcius-ops/journal.jsonl | jq -r 'select(.kind=="audit")
 
 The reply comes back to the coordinator as a DM; the journal is the durable copy
 and is the one to read. In dry run it will report the commands it *would* have
-run. Turn `dryRun` off and ask again to get the actual output, and read the
-report. `id` should say **all three groups**:
+run. To get the actual output, turn dry run off the way SETUP.md § *Going live*
+says — install `systemd/clawcius-ops.service.d/live.conf` as a drop-in,
+`daemon-reload`, restart — then ask again and read the report. Confirm which
+mode you are actually in first; the boot line says so:
+
+```sh
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+```
+
+`id` should say **all three groups**:
 
 ```
 uid=997(clawcius-ops) gid=988(clawcius-ops) groups=988(clawcius-ops),1500(clawcius-dev),999(systemd-journal)

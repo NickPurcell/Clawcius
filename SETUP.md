@@ -541,6 +541,18 @@ entirely — verified against the real CLI, not assumed. The session investigate
 with read-only tools and writes out the list of commands it would have run.
 Leave it on until a week of `journalctl -u clawcius-ops` holds no surprises.
 
+**Following this guide gets you a dry-run daemon, and that is what § *Install*
+below produces.** Nothing in `systemd/` sets `OPS_DRY_RUN`, so the executor
+falls back to `ops/ops-config.yaml`, which says `true`.
+
+**Turning it off is a separate, deliberate file.** The value that runs this host
+live is `Environment=OPS_DRY_RUN=false` in a systemd *drop-in* —
+`systemd/clawcius-ops.service.d/live.conf`, which is tracked, and which the
+operator installs in [Going live](#going-live) below. The environment wins over
+the file, and the boot line in `journalctl -u clawcius-ops` says which of the
+three inputs decided the value. Copying the unit alone never turns this on; that
+is the point of the drop-in being its own file.
+
 ### `pull` builds, and the build is not run as root
 
 Nothing in `systemd/` compiles anything — every unit here starts `node
@@ -586,6 +598,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now clawcius-ops.service
 sudo systemctl enable --now clawcius-snapshot-verify.timer
 ```
+
+**This starts the executor in dry run, and the three files above are all you
+copy.** None of them sets `OPS_DRY_RUN`, so the executor takes
+`ops/ops-config.yaml`'s `dryRun: true`. The live value lives in a drop-in that
+§ *Going live* installs separately — do not copy `systemd/` wholesale, and do
+not add the variable to a unit to save a step later. The verify oneshot is the
+one exception and does not need the variable: it is unconditionally live,
+because it restores into a throwaway container it creates and removes, and a
+dry-run verify would exit 0 having proved nothing (`ops/src/verify-main.ts`).
 
 **There is no spool.** Until 2026-08-16 each instance had one — a directory
 inside its own `run/` mount that the executor swept — and a request was a JSON
@@ -715,14 +736,74 @@ absent. Note that it does **not** grant docker: npurcell reaches docker through
 group membership, which is root-equivalent, so the sudoers scoping is about
 keeping the easy path the audited one rather than about containment.
 
-Then set `dryRun: false` in `ops/ops-config.yaml` and restart the executor. Know
-what that turns on: from that moment a task runs a shell with sudo on this host
-and **nothing rolls it back**. The health sample either side reports; it does
-not repair.
+Then turn dry run off. Know what that turns on: from that moment a task runs a
+shell with sudo on this host and **nothing rolls it back**. The health sample
+either side reports; it does not repair.
+
+**Do not edit `ops/ops-config.yaml`.** That file is tracked and ships
+`dryRun: true`, and it stays that way. The deployed value lives in a systemd
+drop-in, which is also in the repository — so turning dry run off is installing
+one file, not editing one:
 
 ```sh
+sudo mkdir -p /etc/systemd/system/clawcius-ops.service.d
+sudo install -m 0644 -o root -g root \
+    /home/npurcell/clawcius/systemd/clawcius-ops.service.d/live.conf \
+    /etc/systemd/system/clawcius-ops.service.d/live.conf
+sudo systemctl daemon-reload
 sudo systemctl restart clawcius-ops
 ```
+
+That file is two lines and a long comment: `[Service]` and
+`Environment=OPS_DRY_RUN=false`. It is separate from `clawcius-ops.service`
+on purpose — § *Install* copies that unit and `enable --now`s it, so a `false`
+committed there would have brought this host up live at the step above that
+promises dry run, and this step would have been a no-op. Forgetting the drop-in
+leaves the daemon in dry run and it says so in its first line; there is no way
+to forget your way into a live one.
+
+Then check that it took, from the three places that answer without a checkout:
+
+```sh
+systemctl cat clawcius-ops | tail -5                # the drop-in, under the unit
+systemctl show clawcius-ops -p Environment          # …OPS_DRY_RUN=false… (merged)
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+# SETTING: dryRun=false, from OPS_DRY_RUN="false" in this process's environment,
+# which OVERRIDES the dryRun: key in ops-config.yaml (that says true). …
+```
+
+The executor names the value **and where it came from** in its boot line, so
+"the file said so" and "the environment overrode the file" are different
+sentences in the journal. If the grep comes back saying `dryRun=true, from the
+dryRun: key`, the running unit has not picked the drop-in up — check
+`systemctl cat`, and note that a `daemon-reload` alone does not restart the
+service.
+
+The variable must be exactly `true` or `false`. Anything else — `flase`, `0`,
+`yes` — **fails the boot naming the variable** rather than falling back, because
+a typo resolving to "act" is the whole failure this arrangement exists to
+prevent. That includes the *empty* string, so do not blank the value to go back
+to dry run — the boot will refuse, and the unit will land in `failed` about two
+minutes later. **To return to dry run, delete the drop-in:**
+
+```sh
+sudo rm /etc/systemd/system/clawcius-ops.service.d/live.conf
+sudo systemctl daemon-reload && sudo systemctl restart clawcius-ops
+journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1   # says `from the dryRun: key`
+```
+
+**The snapshot verifier is not affected by any of this and never was.**
+`clawcius-snapshot-verify.service` is unconditionally live — it restores into a
+throwaway container it creates and removes, so dry run protects nothing there,
+and a dry-run verify exits 0 having proved no restore path. It prints its own
+`SETTING:` line saying so. Do not give it the variable or a drop-in.
+
+Why it works this way, in one line: this value legitimately differs between the
+repository and this machine, and a value like that must not live as an
+uncommitted edit to a tracked file. It used to. That edit had no owner and no
+record, it blocked every pull that touched the file, and resolving the conflict
+the obvious way would have reverted the executor to dry run without saying so.
+`DryRunSource` in `ops/src/config.ts` is the full statement of the precedence.
 
 ### When it freezes
 

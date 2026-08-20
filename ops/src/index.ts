@@ -132,16 +132,28 @@ const executor = new Executor(config);
  * already running, and a check evaluated once at boot on a unit that stays up
  * for weeks would never see it.
  *
- * Note what does NOT happen here: `process.exit(1)`. This unit is
- * `Restart=always` with `StartLimitIntervalSec=0` and `StartLimitBurst=0` — it
- * holds the rollback deadlines and must never stay dead — so refusing the boot
- * would not produce one loud failure, it would produce a root daemon in a
- * five-second restart loop with every armed deadline unhonoured. That is the
- * shape of #7 and this repository has agreed twice not to ship it again. The
- * daemon comes up, holds its deadlines, answers check-ins, performs rollbacks,
- * and refuses every task with the reason and the fix — which is exactly the
- * behaviour `hostAgent.enabled: false` already has, and which this codebase
- * already argues is strictly better than stopping the unit.
+ * Note what does NOT happen here: `process.exit(1)`. The daemon comes up and
+ * refuses every task with the reason and the fix — exactly the behaviour
+ * `hostAgent.enabled: false` already has, and strictly better than stopping the
+ * unit, because a bad account is a condition somebody can repair on a running
+ * host while the unit desk and the status file keep working.
+ *
+ * ── This paragraph used to give a different reason, and it was stale ──────
+ *
+ * It said the unit was `Restart=always` with `StartLimitIntervalSec=0` and
+ * `StartLimitBurst=0` because "it holds the rollback deadlines and must never
+ * stay dead", and that refusing the boot would leave "every armed deadline
+ * unhonoured". Both halves stopped being true on 2026-08-16: nothing arms a
+ * deadline any more, and `reportRetiredDeadlines()` below exists to clear the
+ * ones an older build left. The unit got a bounded start limit on 2026-08-19
+ * (600s/20) so that a permanent failure can reach `failed` and be seen —
+ * Clawcius #89 was 22,675 invisible restarts over 31 hours — and the unit file
+ * carries that argument in full.
+ *
+ * The verdict here is unchanged and the distinction matters: a start limit is
+ * about a daemon that CANNOT START. This is a daemon that started fine and has
+ * one broken sub-capability, which is not the same thing and must not become
+ * an exit just because the retry budget is now finite.
  */
 const identity = executor.resolveAgentIdentity();
 if (config.hostAgent.enabled) {
@@ -211,7 +223,17 @@ executor.journal.write({
       ? 'DRY RUN — the session has no Bash tool and cannot execute anything; it plans and ' +
         'the plan is logged.'
       : 'LIVE — a Claude Code session with a shell and sudo will run on this host, and ' +
-        'every command it issues is written into journal.jsonl before its result is known.'),
+        'every command it issues is written into journal.jsonl before its result is known.') +
+    // WHERE that came from, not just what it is. Since 2026-08-19 `dryRun` can
+    // be set from OPS_DRY_RUN, which means the tracked ops-config.yaml no
+    // longer tells you what the deployed executor is doing — and the previous
+    // arrangement, an uncommitted hand edit to line 55 of that file, told you
+    // even less. `journalctl -u clawcius-ops` is the only channel by which
+    // anyone here can check: the host agent can read journals and cannot make
+    // an HTTP request, and #98 made the startup banner the verification
+    // mechanism for the whole system. A setting that moved somewhere more
+    // correct and became less visible would not be an improvement.
+    ` SETTING: ${config.dryRunSource.detail}`,
 });
 
 // Deprecation notices go in the journal, not just to stdout, because the whole
@@ -323,10 +345,13 @@ process.stdout.write(
  *     "polling only", and the poller cannot deliver on that promise if the
  *     process has already exited.
  *
- * `clawcius-ops.service` is `Restart=always` with `StartLimitBurst=0`, so an
- * immediate exit is not one loud failure — it is a five-second restart loop,
- * which is the exact shape of #7 and the thing the retired-key handling in
- * config.ts exists to avoid.
+ * `clawcius-ops.service` is `Restart=always`, so an immediate exit is not one
+ * loud failure — it is a restart loop, which is the exact shape of #7 and the
+ * thing the retired-key handling in config.ts exists to avoid. (This said
+ * `StartLimitBurst=0` until 2026-08-19; the unit now bounds the loop at 600s/20
+ * so it ends in `failed`. A keepalive that exists so the daemon does not exit
+ * while it still has work is not made unnecessary by that — the limit decides
+ * how a wrong exit is *noticed*, not whether it was wrong.)
  *
  * And it would be a loop over a process that still has work to do. The comment
  * on the mailbox loop above says a mistyped database path "must not be what

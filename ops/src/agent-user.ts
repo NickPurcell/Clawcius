@@ -52,12 +52,17 @@
  * first design and it is wrong here, for two reasons and the second is the one
  * that matters:
  *
- *   1. `clawcius-ops.service` is `Restart=always` with `StartLimitIntervalSec=0`
- *      and `StartLimitBurst=0` — never give up — because it holds the rollback
- *      deadlines. A refused boot is therefore not one loud failure, it is a
- *      root daemon in a five-second restart loop with every armed deadline
- *      unhonoured. That is the exact shape of #7, and this repository has
- *      already agreed twice not to ship it again.
+ *   1. `clawcius-ops.service` is `Restart=always`, so a refused boot is not one
+ *      loud failure, it is a root daemon in a restart loop. That is the exact
+ *      shape of #7, and this repository has already agreed twice not to ship it
+ *      again. (This clause used to add "with `StartLimitIntervalSec=0` and
+ *      `StartLimitBurst=0` — never give up — because it holds the rollback
+ *      deadlines", and "with every armed deadline unhonoured". Both went stale:
+ *      nothing has armed a deadline since 2026-08-16, and the unit took a
+ *      bounded start limit of 600s/20 on 2026-08-19 so that a loop it cannot
+ *      avoid at least ends in `failed`. The verdict is unaffected — two minutes
+ *      of looping followed by a dead unit is still worse than a daemon that
+ *      stays up and names the account and the `gpasswd -d` to run.)
  *   2. **A boot-time check is evaluated once and is then stale for as long as
  *      the process lives**, which for this unit is weeks. The `usermod` this
  *      check exists to catch is precisely the thing somebody does to a *running*

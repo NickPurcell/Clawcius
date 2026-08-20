@@ -31,6 +31,37 @@ WorkingDirectory=/home/npurcell/clawcius/ops
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=OPS_CONFIG_PATH=/home/npurcell/clawcius/ops/ops-config.yaml
 
+# ── NO OPS_DRY_RUN HERE, AND NO DROP-IN EITHER: THIS UNIT IS ALWAYS LIVE ───
+#
+# `dryRun` is a per-machine setting for the EXECUTOR, which runs a shell with
+# sudo against this host's real services. It is not a setting for this unit, and
+# since 2026-08-20 verify-main.ts does not read it: it builds its Runner with
+# dry run off unconditionally and says so in its own SETTING: line. Setting
+# OPS_DRY_RUN in this unit's environment would change nothing.
+#
+# TWO REASONS, and the second is why this is not merely a default.
+#
+# There is nothing here for dry run to protect. Everything this oneshot does to
+# the machine is `docker run` of a restored snapshot into a throwaway container
+# it names, creates and removes — no --restart, no --env-file, no -v, on the
+# internal network under gVisor. It touches no live instance, no unit and no
+# spool. "Describe instead of doing" is not a safety property here; it is the
+# absence of the only thing this unit does.
+#
+# And a dry-run verify is worse than no verify. verify.ts returns
+# `ok: true, finding: 'dry-run'` for a healthy instance, verify-main.ts counts
+# only failures, and the process exits 0 — so systemd marks this oneshot
+# successful and `systemctl --failed` stays clean while nothing was restored and
+# nothing was proven. That is the same defect as the unbounded start limit this
+# repository just removed from clawcius-ops: a failure that never reaches
+# `failed` is invisible to the one channel anyone watches. It arrives here as a
+# green light instead of a silent loop, which is worse, because this is the only
+# thing in the repository that ever attempts a restore.
+#
+# Staleness would still have been measured — `docker images` is a probe and runs
+# in either mode — so what a dry-run verify silently drops is exactly "does the
+# newest image restore and start", which is the whole reason this unit exists.
+
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/verify-main.js
 
 # Exits non-zero when any instance's restore path is broken, so the unit shows

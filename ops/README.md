@@ -400,8 +400,98 @@ more, neither snapshot service passes a `KEEP`, and the script's own default of
 
 ## Dry run — on by default, and genuinely unable to act
 
-`ops-config.yaml` ships with `dryRun: true`, **and it should stay that way until
-you have read the log.**
+`ops-config.yaml` ships with `dryRun: true`, **and that file should keep saying
+`true` forever.** It is tracked, it is the same file in every checkout, and it
+is the safe default. A machine that runs live says so in its own environment.
+
+### Where the deployed value actually comes from
+
+**The executor on this host runs with dry run OFF.** Nothing in
+`ops-config.yaml` says so, deliberately. The value in force comes from
+`OPS_DRY_RUN`, set on an `Environment=` line in a systemd **drop-in**:
+
+```
+systemd/clawcius-ops.service.d/live.conf   →   /etc/systemd/system/clawcius-ops.service.d/live.conf
+```
+
+**Not in `clawcius-ops.service` itself, and that is the whole reason it is a
+separate file.** SETUP.md § *Install* copies the units and runs `enable --now`
+on the executor, fifteen lines before it tells the operator to confirm the boot
+line reads `DRY RUN`. A committed `Environment=OPS_DRY_RUN=false` in the unit
+would make that step produce a LIVE daemon at the point the guide promises a
+dry-run one, and would make § *Going live*'s dry-run switch a no-op for anyone
+who followed § *Install*. "The deployed value is in the repository" and "a fresh
+checkout installs safe" cannot both hold with `false` in the unit; with the
+drop-in they both do.
+
+The failure directions are what settle it. Forget the drop-in and you get a
+dry-run daemon that announces itself as one in its first journal line. Forget it
+under a committed `false` and you get a live daemon announcing itself in a line
+nobody has been told to read yet. Only one of those is a safe mistake, and the
+drop-in makes that the one you can make.
+
+`systemctl show` still reports the merged value, so nothing is lost on the
+visibility side — see below.
+
+**Precedence, and it is stated in exactly one place:** `DryRunSource` in
+`src/config.ts`. `OPS_DRY_RUN` beats the `dryRun:` key, which beats the built-in
+default of `true`. The environment wins because it is the per-machine layer and
+the file is the shared one. Do not restate that ordering anywhere else; point
+at it.
+
+Three things follow, and each is the point of the arrangement:
+
+- **A malformed value fails the boot with the variable named.** `OPS_DRY_RUN`
+  must be exactly `true` or `false` (case and surrounding whitespace are
+  forgiven; nothing else is). `flase`, `0`, `no` and `off` are refused rather
+  than interpreted — **all four are *truthy strings* in JavaScript**, since
+  every non-empty string is, so a truthiness check would have read every one of
+  them as "give the root daemon's session a shell". That is the single failure
+  this setting exists to prevent. It does not fall back. The empty string is
+  refused too, so blanking the line is not a way back to dry run; deleting the
+  drop-in is, and that is the only safe absence.
+- **The value and its origin are in the boot line.** `journalctl -u
+  clawcius-ops` is the only channel by which anyone on this host can check —
+  the host agent can read journals and deliberately cannot make an HTTP
+  request:
+
+  ```sh
+  journalctl -u clawcius-ops | grep -o 'SETTING: dryRun.*' | tail -1
+  systemctl show clawcius-ops -p Environment
+  ```
+
+  The line says which input decided the value and what it displaced, so "the
+  file said dry run" and "the environment overrode a file that said dry run"
+  are distinguishable after the fact. A setting that moved somewhere more
+  correct and became less visible would not be an improvement.
+- **Installing the drop-in is an operator step.** Committing it changes nothing
+  on the host until someone copies it into
+  `/etc/systemd/system/clawcius-ops.service.d/`, `daemon-reload`s and restarts.
+  SETUP.md § Going live has the commands, and § Going live is now a real step
+  rather than a restatement of what § Install already did. Going back is
+  `rm` of that one file plus a reload and a restart — **not** blanking the
+  value, which sets it to `""` and fails the boot.
+- **`systemctl cat clawcius-ops` prints the drop-in under the unit**, so a
+  reader on the host sees the deviation and its comment without a checkout, and
+  `systemctl show clawcius-ops -p Environment` reports the merged value systemd
+  will actually use. Neither property was lost by moving out of the unit.
+
+**Why not just edit the file?** Because that is what was being done, and it
+broke a deploy. Until 2026-08-19 this host carried an uncommitted hand edit to
+line 55 of the tracked `ops-config.yaml`. It sat there for weeks with no owner
+and no record — the difference existed only as a diff nobody looked at. The
+first time anything upstream touched the file, `git merge --ff-only` aborted
+with *"Your local changes to the following files would be overwritten by
+merge"* and eight merged pull requests could not be deployed. Worse than the
+block was the trap in the obvious fix: taking upstream's copy resolves the
+conflict instantly and **silently reverts the executor to dry run**, leaving it
+accepting tasks and reporting success while doing nothing at all.
+
+`OPS_DRY_RUN` is currently the only key that can be set this way, and that is
+on purpose — nothing else in `ops-config.yaml` legitimately differs between this
+repository and one machine. If something ever does, this is the shape to copy.
+
+### What dry run actually removes
 
 The executor still makes every decision it would really make. The difference
 from every other dry-run in this repository is that the session is not asked
@@ -620,9 +710,13 @@ design decision.** The membership this is guarding against —
 **running** host. A boot-time check on a unit that stays up for weeks would
 never see it.
 
-**It does not `exit(1)`.** This unit is `Restart=always` with
-`StartLimitIntervalSec=0`; refusing to boot would be a five-second restart loop,
-which is the shape of #7. The daemon comes up, holds its mailboxes, answers the
+**It does not `exit(1)`.** This unit is `Restart=always`; refusing to boot would
+be a restart loop, which is the shape of #7. (The unit gained a bounded start
+limit on 2026-08-19, so that loop now ends in `failed` rather than running
+forever — but a daemon that can still serve its mailboxes and explain the
+problem should not be exiting in the first place. The limit is a floor under the
+worst case, not a licence to reach for `exit(1)`.) The daemon comes up, holds its
+mailboxes, answers the
 coordinator that asked — and refuses every task, loudly, with the fix in the
 reply. That is exactly what `hostAgent.enabled: false` already does, and this
 codebase already argues it is strictly better than stopping the unit. The older
@@ -1273,12 +1367,23 @@ stdout — naming the key, the instance, and what stands in its place. Delete th
 once you have read the notice. Nothing on disk was touched on their account.
 
 **It is not a boot failure, and that decision is older than these keys.** It was
-first made on 2026-08-10 for the legacy top-level `spoolDir`, and the reasoning
-transfers unchanged: `clawcius-ops.service` is `Restart=always` with
-`StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up. A rejected
-config does not produce one loud failure; it produces a root daemon in a
-five-second restart loop. That is the shape of #7, and this repository has
-already agreed not to ship it again. `git pull` also updates `ops-config.yaml`
+first made on 2026-08-10 for the legacy top-level `spoolDir`, and the core of the
+reasoning transfers unchanged: `clawcius-ops.service` is `Restart=always`, so a
+rejected config does not produce one loud failure, it produces a root daemon in a
+restart loop. That is the shape of #7, and this repository has already agreed not
+to ship it again.
+
+One clause of that argument is out of date and the correction matters: the unit
+carried `StartLimitIntervalSec=0` and `StartLimitBurst=0` — never give up — until
+2026-08-19, and it now carries `600`/`20`. So the loop is no longer infinite; a
+permanent failure reaches `failed` in about two minutes and shows up in
+`systemctl --failed`. **That does not make refusing the right answer for a
+retired key.** A key that arrives by drift in an un-updated file should not stop
+a host agent at all, and two minutes of downtime is still two minutes. What the
+limit changes is the *worst* case, not the desired one — see § *The systemd
+units, audited*.
+
+`git pull` also updates `ops-config.yaml`
 under a running process that will not re-read it until somebody restarts it, so
 the new file routinely lands under the old code and the old file under the new.
 
@@ -1359,7 +1464,7 @@ one:
 | `unbootable` | did not start, did not reach `running`, or failed the probe | fix the image; the schedule may be fine |
 | `unreadable-stamp` | tag matches the shape, is not a real instant | something other than `snapshot.sh` wrote it |
 | `future-stamp` | tag dated ahead of now | check the host clock — the error hides staleness |
-| `dry-run` | nothing was restored, age was still read | turn `dryRun` off to learn the rest |
+| `dry-run` | nothing was restored, age was still read | **unreachable from `clawcius-snapshot-verify`** — see below. If you are seeing it, something other than that unit called `verifyAll` in dry run |
 
 Two of those are worth spelling out. A **stale** snapshot passes the restore
 test — that is what makes it dangerous — so calling it "restore test failed"
@@ -1379,16 +1484,49 @@ that names no timer is told so in those words, which is a truer thing to print
 than a guess — and is itself the likeliest diagnosis, since an instance with
 nothing scheduled to snapshot it produces exactly that reading.
 
-The age is measured from a `probe`, before anything is started, so **a dry-run
-host still reports a stopped snapshot schedule.** That is deliberate: the
-shipped config is `dryRun: true`, and staleness is the one property this
-verifier can establish honestly in that mode. The corollary is that under
-`dryRun` the summary line **may not say a restore works**, because none was
-attempted — it said `1 restore(s) work and are older than the configured
-ceiling` two lines below a detail line correctly reporting that whether the
-image boots was untested. The summary is the line most likely to be the only
-one read. `summariseVerify()` lives in `verify.ts` rather than in the oneshot
-precisely so it has a test.
+### The verifier has no dry-run mode, and that is a decision
+
+`clawcius-snapshot-verify` is **unconditionally live**. `verify-main.ts` fixes
+its own `dryRun` at `false` and does not read the config key or `OPS_DRY_RUN`;
+the unit carries neither, and giving it either would change nothing.
+
+Two reasons, and the second is why this is not merely a default. **There is
+nothing here for dry run to protect** — everything this oneshot does to the
+machine is a `docker run` of a restored snapshot into a throwaway container it
+names, creates and removes, with no `--restart`, no `--env-file` and no `-v`, on
+the internal network under gVisor. It touches no live instance, no unit and no
+spool. "Describe instead of doing" is not a safety property here; it is the
+absence of the only thing this unit does.
+
+**And a dry-run verify is worse than no verify.** For a healthy instance
+`verify.ts` returns `ok: true, finding: 'dry-run'`, the oneshot counts only
+failures, and it exits `0` — so systemd marks it successful and `systemctl
+--failed` stays clean while nothing was restored and nothing was proven. That is
+the same defect as an unbounded start limit on `clawcius-ops`: a failure that
+never reaches `failed` is invisible to the one channel anyone here watches. It
+arrives as a green light rather than as a silent loop, which is worse, because
+`verifyAll` has exactly one non-test caller and nothing else in this repository
+ever attempts a restore.
+
+Before 2026-08-20 this unit followed `config.dryRun`. That was harmless only
+while both processes read the same file; once the executor's value moved into
+its own drop-in, the two units silently disagreed and the verifier would have
+read the tracked `dryRun: true` for ever. Copying the deviation into a second
+file would have fixed the symptom and kept the disease. The `dry-run` branch
+stays in `verify.ts` because that is a library the self-test drives — it is what
+makes the paragraph above checkable rather than asserted — but it is unreachable
+from the shipped unit. It also prints its own `SETTING:` line, so the journal
+says which mode it ran in without anyone having to infer it.
+
+The age is measured from a `probe`, before anything is started, which is why a
+dry-run caller **would still report a stopped snapshot schedule**: staleness is
+the one property `verifyAll` can establish honestly without restoring. The
+corollary is that in that mode the summary line **may not say a restore works**,
+because none was attempted — it said `1 restore(s) work and are older than the
+configured ceiling` two lines below a detail line correctly reporting that
+whether the image boots was untested. The summary is the line most likely to be
+the only one read. `summariseVerify()` lives in `verify.ts` rather than in the
+oneshot precisely so it has a test.
 
 Two smaller properties, both there because the alternative reads as a bug in the
 check rather than as a fact about the host:
@@ -1431,7 +1569,13 @@ failing intermittently at head with a message that pointed at no test in
 particular: an `# cancelled 1` and a `not ok 1 - dist/selftest.js`, which reads
 like a hang rather than a clock. Raised to 120000 on 2026-08-19, with the suite
 at 78 tests and runs observed between 21s and 31s — the top of that range is
-above the old ceiling, so this was not a margin worth leaving. Anything here
+above the old ceiling, so this was not a margin worth leaving. A later data
+point the same day, at 84 tests: 30s idle, and 55s with the root suite running
+concurrently on the same box. At 87 tests on 2026-08-20 it was 27s idle — the
+three tests added there read files and do not spawn. The ceiling is still
+comfortable; the point of
+recording the second number is that the figure that matters is the one measured
+under load, and it is roughly twice the idle one. Anything here
 that waits out `startTimeoutSeconds` costs at least five seconds of real
 polling, so prefer a failure mode that fails immediately when both reach the
 same branch.
@@ -1463,6 +1607,14 @@ containment checks say the mounts are. Every key has a default in `src/config.ts
 and the loader validates types and cross-field invariants, so a typo fails the
 boot with the offending key named rather than producing an executor that quietly
 does nothing.
+
+**One key is also settable from the environment, and it is the only one:**
+`dryRun`, from `OPS_DRY_RUN`, which wins over the file. That is not a general
+mechanism and should not become one without the same argument being made again —
+it exists because `dryRun` legitimately differs between this repository and this
+machine, and nothing else here does. § *Where the deployed value actually comes
+from* has the whole of it; `DryRunSource` in `src/config.ts` states the
+precedence and is the only place that does.
 
 The cross-field checks worth knowing about, because they are security properties
 rather than tidiness. Every one of the containment checks is asked against
@@ -1645,6 +1797,63 @@ unit in this directory was read line by line on 2026-08-10 looking for
 directives with the same character: things that read as sensible hardening and
 are incompatible with what the process actually does.
 
+### The start limit, and 31 hours of invisible restarts (2026-08-19)
+
+`clawcius-ops.service` carried `StartLimitIntervalSec=0` and
+`StartLimitBurst=0` — *never give up*. It now carries `600` and `20`.
+
+The stated reason for unlimited retries was: *"This one holds rollback
+deadlines; it staying dead is how a broken rebuild becomes a permanent
+outage."* **That justification expired on 2026-08-16** and nobody came back for
+the line. The check-in deadlines, the automatic rollback and the wake that drove
+them all went with the ops spool. Nothing arms a deadline any more — the only
+caller of `StateStore.arm()` left in the tree is the self-test — and
+`reportRetiredDeadlines()` runs at boot for the express purpose of *clearing*
+any deadline an older build left. This unit no longer holds anything that
+expires while it is down.
+
+The deeper point, which is the one worth keeping: **unlimited retries were never
+buying availability.** A unit in a five-second restart loop is not more
+available than a unit in `failed`; it is doing no work in either state. What the
+loop buys is the *appearance* of availability. `Restart=always` with no limit
+means the unit never enters `failed`, so it never appears in
+`systemctl --failed` — the channel this project already relies on to send
+someone to read a failure — and a permanent config error becomes
+indistinguishable from a healthy service to everything that watches.
+
+That is Clawcius #89: this unit failing to start **22,675 consecutive times over
+31 hours**, inside the config loader, with the host agent dead the whole while
+and nothing escalating. #89 recommended a start limit and nobody did it.
+`build-banner.ts` fixed the *which artefact is this* half; it was necessary and
+never sufficient, because somebody has to be looking at the journal for a banner
+to help, and for 31 hours nobody was.
+
+`RestartSec=5` and a config refusal dies in well under a second, so a permanent
+failure cycles about every 5–6 seconds: **20 starts is roughly two minutes**
+before the unit lands in `failed`. A transient that clears inside those 20
+attempts is ridden out exactly as before. Widen the burst if a real transient on
+this host is ever seen to need more than two minutes; do not set either value
+back to `0`, and note that **setting either one to 0 disables rate limiting
+entirely** — which is why the self-test asserts on both.
+
+They are `[Unit]` directives, not `[Service]`, and that is load-bearing: in
+`[Service]` systemd ignores them with a warning and silently applies its own
+default of 5 starts per 10s. Moving them does not remove the limit, it replaces
+it with a much tighter one nobody chose. The self-test asserts they stay in
+`[Unit]` for that reason.
+
+Recovery, because a bounded limit needs one — a unit that has hit the limit
+stays dead, and `systemctl restart` alone will **not** start it:
+
+```sh
+systemctl status clawcius-ops        # the refusal is in the journal above
+systemctl reset-failed clawcius-ops
+systemctl start clawcius-ops
+```
+
+Fix the cause first; a reset with the bad config still in place buys another two
+minutes of looping and the same `failed`.
+
 **`clawcius-ops.service` had one, and it was the same kind of mistake.**
 `ProtectHome=read-only`. It reads like obvious hygiene for a root daemon. The
 checkout is `/home/npurcell/clawcius`: `git pull` writes `.git/`, `npm ci`
@@ -1740,9 +1949,13 @@ client — the 2 GB container it starts lives in docker's cgroup, not the unit's
 
 ## What has and has not been tested
 
-`npm run selftest` is **62 tests** — measured on `main` at `208dafb`, which is
-the only state that claim is made about; run it rather than trusting this line,
-and if it disagrees the suite is right. It runs with no docker, no systemd, no
+`npm run selftest` is **87 tests** — measured on this branch, and it was **78**
+on `main` at `1ac316d`, also measured. Those are the only states the claim is
+made about; run it rather than trusting this line, and if it disagrees the suite
+is right. (It said 62 at `208dafb` until 2026-08-19, which had stopped being
+true some commits earlier — a number in prose is a claim that outlives the state
+that produced it unless somebody re-derives it.) It runs with no docker, no
+systemd, no
 npm and no real `claude`. It was 129 before 2026-08-16 and 61 after, both
 measured by running it: sixty-eight fewer, from seventy-five titles going and
 seven arriving. No count is put on the list that follows, because at least one
@@ -1771,6 +1984,46 @@ What is covered now:
 - **a config still carrying the retired keys boots**, and the notices name each
   one. That is the whole of the migration promise and it is asserted rather than
   described;
+- **`OPS_DRY_RUN`**, which is the one per-machine setting: a malformed value
+  fails the boot naming the variable, and the drop-in to fix, rather than
+  becoming `false` — asserted against `flase`, `0`, `1`, `no`, `off`, `yes`,
+  `on` and the empty string, every non-empty one of which is truthy in
+  JavaScript; the environment overrides the file in both directions and the boot
+  line says what it displaced, not just what won; an unset variable falls back to
+  the file and a silent file falls back to dry run; a malformed `dryRun:` *key*
+  is still refused the way it always was, and both refusals now carry their own
+  class name rather than printing as bare `Error:`;
+- **the tracked files still ship the safe shape**, all three read off disk:
+  `ops-config.yaml` still says `dryRun: true`, `clawcius-ops.service.d/live.conf`
+  carries the per-machine `Environment=` line under `[Service]` (systemd ignores
+  it in `[Unit]`), and **neither `clawcius-ops.service` nor
+  `clawcius-snapshot-verify.service` sets `OPS_DRY_RUN` at all** — the last of
+  those is what keeps SETUP.md § *Install* producing a dry-run daemon, and it is
+  an absence, which is the kind of property that comes back one convenient edit
+  at a time. Mutation-tested in all three directions;
+- **the snapshot verifier is unconditionally live**, asserted on the compiled
+  `dist/verify-main.js`: it builds its Runner from a constant rather than from
+  `config.dryRun`, and it prints a `SETTING:` clause. This suite has no docker,
+  so the restore itself cannot be run here; what is pinned is the edit that would
+  reintroduce a verifier exiting `0` having restored nothing;
+- **the boot banner carries the source**, likewise on the compiled
+  `dist/index.js`: the literal `SETTING: ` followed by `dryRunSource.detail`.
+  SETUP.md and MIGRATION.md both tell operators to grep the journal for that
+  exact string, which makes the spelling an interface;
+- **the suite is hermetic in `OPS_DRY_RUN`**. It deletes the variable before any
+  test runs, because SETUP.md § *Install* tells the operator to run
+  `npm run selftest` on the very host where they are setting it, and with an
+  ambient value four unrelated tests changed behaviour — including the one that
+  asserts dry run removes the Bash tool, which was silently built LIVE and stopped
+  making its assertion. Measured at 87 pass in all three of unset, `true` and
+  `false`;
+- **the unit can still express a permanent failure**: `clawcius-ops.service` is
+  read off disk and its `StartLimitIntervalSec` and `StartLimitBurst` are both
+  asserted non-zero — either being `0` disables rate limiting and the unit could
+  never reach `failed` — and asserted to still live in `[Unit]`, because in
+  `[Service]` systemd ignores them and applies a much tighter default nobody
+  chose. This one guards the *refusal* above: a boot that fails is only
+  acceptable if the loop it causes can end;
 - **the board**: it is opened or refused, never created, and the host agent takes
   its own row and will not take anybody else's;
 - **the lock**: a second task is refused while one is running, and the refusal

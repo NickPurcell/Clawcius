@@ -89,7 +89,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { loadOpsConfig, type OpsConfig } from './config.js';
+import { DRY_RUN_ENV, loadOpsConfig, type OpsConfig } from './config.js';
 import { sanitiseTask, sanitiseTaskText } from './host-agent.js';
 import { Board, BoardError } from './board.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -148,6 +148,24 @@ import {
   validateUnitName,
   MAX_UNIT_BYTES,
 } from './units.js';
+
+// ── This suite is hermetic in OPS_DRY_RUN, and has to be ──────────────────
+//
+// SETUP.md § Install tells the operator to run `npm run selftest` on the very
+// host where this variable is being configured, so `OPS_DRY_RUN=false npm run
+// selftest` is exactly what somebody checking their new setting types. With an
+// ambient value, four pre-existing tests that never opt in change behaviour,
+// and one of them is the test that proves the safety property: 'dry-run removes
+// the ability to act rather than asking it not to' writes `dryRun: true`, loads
+// it, and asserts `Bash` is in the session's deny list — with `OPS_DRY_RUN=false`
+// in the environment the session is built LIVE and that assertion silently stops
+// being made. Measured, both directions, 2 failures each.
+//
+// So the variable is removed once, here, before any test runs. `withDryRunEnv`
+// below is then the only thing in this file that ever sets it, and it restores
+// in a `finally`. Nothing in the suite reads the operator's value for anything,
+// so deleting it loses no coverage.
+delete process.env[DRY_RUN_ENV];
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -1075,10 +1093,12 @@ test('the host agent takes its own row and will not take anybody else\'s', () =>
 
 test('a config still carrying the retired spool keys boots, and is told they are inert', () => {
   // Reported, never refused, and the distinction is the whole point of the
-  // test. `clawcius-ops.service` is Restart=always with no start limit, so a
-  // config the loader rejects is not one loud error — it is a root daemon in a
-  // five-second restart loop. And an in-place rollback to the previous `dist/`
-  // has to find a config that build can still read.
+  // test. `clawcius-ops.service` is Restart=always, so a config the loader
+  // rejects is not one loud error — it is a root daemon in a restart loop.
+  // (Bounded at 600s/20 since 2026-08-19, so that loop ends in `failed`. It
+  // still should not happen for a key that arrives by drift in an un-updated
+  // file: two minutes of downtime is two minutes.) And an in-place rollback to
+  // the previous `dist/` has to find a config that build can still read.
   //
   // Silence would be worse than either: an operator whose file says
   // `mayRequest:` believes an instance is restricted and it is not.
@@ -1356,6 +1376,376 @@ test('two instances may not name one snapshot timer', () => {
         ]),
       ),
     /is named by both/,
+  );
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// dryRun from the environment — the one per-machine setting
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Run `body` with `OPS_DRY_RUN` set to exactly `value`, or unset for `null`.
+ *
+ * Restored in a `finally` including on a throw, because half these cases ARE
+ * throws and a leaked variable would silently change what every later
+ * `loadOpsConfig` in this file resolves to.
+ */
+/**
+ * The checkout these tests are running out of.
+ *
+ * This file compiles to `<repo>/ops/dist/selftest.js`. Used by the two tests
+ * that assert on TRACKED files rather than on behaviour — the shipped
+ * `dryRun: true` and the unit's start limit — because both are properties the
+ * repository has to keep, and the failure they guard against is somebody
+ * editing the file rather than the code.
+ */
+function repoRoot(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
+function withDryRunEnv<T>(value: string | null, body: () => T): T {
+  const previous = process.env[DRY_RUN_ENV];
+  if (value === null) delete process.env[DRY_RUN_ENV];
+  else process.env[DRY_RUN_ENV] = value;
+  try {
+    return body();
+  } finally {
+    if (previous === undefined) delete process.env[DRY_RUN_ENV];
+    else process.env[DRY_RUN_ENV] = previous;
+  }
+}
+
+test('a malformed OPS_DRY_RUN fails the boot instead of becoming false', () => {
+  // The whole point. Every string below is either a typo or a value that some
+  // other system would accept, and `0`, `no` and `off` are all TRUTHY strings
+  // in JavaScript — so a truthiness check would read three of these as "yes,
+  // give the root daemon's session a shell". None of them may produce a
+  // config at all, let alone one with dryRun false.
+  for (const bad of ['flase', '0', '1', 'no', 'off', 'yes', 'on', 'FALSE ish', '', 'null']) {
+    withDryRunEnv(bad, () => {
+      const path = writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')]);
+      assert.throws(
+        () => loadOpsConfig(path),
+        (error: Error) => {
+          assert.match(error.message, /^OPS_DRY_RUN: /, 'the variable must be named first');
+          assert.match(error.message, /is set to "/, 'the offending value must be quoted');
+          // The file to fix is the DROP-IN, not the unit: clawcius-ops.service
+          // does not carry this variable, so sending somebody there leaves them
+          // grepping a file that will never contain what they are looking for.
+          assert.match(
+            error.message,
+            /clawcius-ops\.service\.d\/live\.conf/,
+            'say which file to fix, and it is the drop-in',
+          );
+          // And it prints as `OpsEnvError: …` rather than `Error: …`.
+          // Subclassing Error does not set `name`; the constructor has to, and
+          // it did not until 2026-08-20 — so the header node writes above the
+          // stack said `Error:` while the doc comment claimed a distinguishable
+          // class. Nothing catches this class, so the prefix is the only thing
+          // it buys and it is worth having it be true.
+          assert.equal(error.name, 'OpsEnvError');
+          return true;
+        },
+        `OPS_DRY_RUN=${JSON.stringify(bad)} must be refused, not interpreted`,
+      );
+    });
+  }
+});
+
+test('OPS_DRY_RUN overrides the file, and the boot line says so', () => {
+  // The deployed shape: the tracked file keeps the safe default and this
+  // machine says otherwise in its unit. Both facts have to survive into the
+  // banner, because journalctl is the only channel anyone here can read.
+  const live = withDryRunEnv('false', () =>
+    loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(live.dryRun, false);
+  assert.equal(live.dryRunSource.from, 'environment');
+  assert.match(live.dryRunSource.detail, /dryRun=false/);
+  assert.match(live.dryRunSource.detail, /OPS_DRY_RUN="false"/);
+  assert.match(live.dryRunSource.detail, /OVERRIDES/);
+  assert.match(
+    live.dryRunSource.detail,
+    /ops-config\.yaml.*says true/,
+    'the banner must say what it displaced, not only what won',
+  );
+
+  // And the other direction, which is the one that matters if somebody ever
+  // ships a config with dryRun: false: the environment can put a machine back
+  // into dry run without touching the tracked file.
+  const dry = withDryRunEnv('true', () =>
+    loadOpsConfig(writeConfig(['dryRun: false', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(dry.dryRun, true);
+  assert.equal(dry.dryRunSource.from, 'environment');
+  assert.match(dry.dryRunSource.detail, /says false/);
+});
+
+test('OPS_DRY_RUN takes the two spellings a unit file actually produces', () => {
+  // Case and surrounding whitespace are what `Environment=OPS_DRY_RUN= False`
+  // gives you when somebody is being tidy. They are not cleverness and they
+  // are not a widening: the accepted set is still exactly two words.
+  for (const spelling of ['false', 'FALSE', 'False', ' false ', '\tfalse\n']) {
+    const config = withDryRunEnv(spelling, () =>
+      loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+    );
+    assert.equal(config.dryRun, false, `${JSON.stringify(spelling)} should mean false`);
+  }
+  for (const spelling of ['true', 'TRUE', ' True ']) {
+    const config = withDryRunEnv(spelling, () =>
+      loadOpsConfig(writeConfig(['dryRun: false', ...MINIMAL_INSTANCE('/var/lib/x')])),
+    );
+    assert.equal(config.dryRun, true, `${JSON.stringify(spelling)} should mean true`);
+  }
+});
+
+test('an unset OPS_DRY_RUN falls back to the file, and absence is safe', () => {
+  // Absence must never be the thing that turns this on. The shipped file says
+  // true and an empty file defaults to true, and the banner distinguishes the
+  // two so "the operator asked for dry run" and "nobody said anything" are not
+  // the same sentence in the journal.
+  const stated = withDryRunEnv(null, () =>
+    loadOpsConfig(writeConfig(['dryRun: true', ...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(stated.dryRun, true);
+  assert.equal(stated.dryRunSource.from, 'ops-config.yaml');
+  assert.match(stated.dryRunSource.detail, /dryRun=true/);
+  assert.match(stated.dryRunSource.detail, /OPS_DRY_RUN is not set/);
+
+  const silent = withDryRunEnv(null, () =>
+    loadOpsConfig(writeConfig([...MINIMAL_INSTANCE('/var/lib/x')])),
+  );
+  assert.equal(silent.dryRun, true, 'the built-in default is dry run');
+  assert.equal(silent.dryRunSource.from, 'built-in default');
+  assert.match(silent.dryRunSource.detail, /built-in default/);
+
+  // A malformed KEY is still refused the way it always was — adding an
+  // environment layer must not have made the file's own validation optional.
+  assert.throws(
+    () =>
+      withDryRunEnv(null, () =>
+        loadOpsConfig(writeConfig(['dryRun: "false"', ...MINIMAL_INSTANCE('/var/lib/x')])),
+      ),
+    (error: Error) => {
+      assert.match(error.message, /ops-config\.yaml: dryRun must be true or false/);
+      // Same omission as OpsEnvError and fixed in the same change: without
+      // `this.name` the journal reads `Error: ops-config.yaml: …`, which is
+      // what every one of #89's 22,675 failed starts actually printed.
+      assert.equal(error.name, 'OpsConfigError');
+      return true;
+    },
+  );
+});
+
+test('the tracked ops-config.yaml still ships dry run on', () => {
+  // The file in this repository is the safe default and stays the safe
+  // default; the machine's deviation lives in the unit. If this ever goes red,
+  // somebody has put a per-machine value back into the shared file and the
+  // next merge conflict is already written.
+  const shipped = readFileSync(join(repoRoot(), 'ops', 'ops-config.yaml'), 'utf8');
+  assert.match(
+    shipped,
+    /^dryRun: true$/m,
+    'ops/ops-config.yaml must ship dryRun: true — set OPS_DRY_RUN on the machine instead',
+  );
+  assert.doesNotMatch(shipped, /^dryRun: false$/m);
+
+  // And the deployment is expressed in the repository rather than in somebody's
+  // shell history. Installing it is still an operator step.
+  const dropIn = readFileSync(
+    join(repoRoot(), 'systemd', 'clawcius-ops.service.d', 'live.conf'),
+    'utf8',
+  );
+  assert.match(
+    dropIn,
+    /^Environment=OPS_DRY_RUN=(true|false)$/m,
+    'the per-machine value must stay in the tracked drop-in, not in somebody`s shell history',
+  );
+  // In [Service]. systemd ignores Environment= in [Unit], so a drop-in that put
+  // it there would install cleanly, reload cleanly, and do nothing — the daemon
+  // would come up in dry run with a file on disk saying it should not.
+  const service = dropIn.indexOf('\n[Service]');
+  assert.ok(service > 0, 'the drop-in must have a [Service] section');
+  assert.ok(
+    dropIn.indexOf('\nEnvironment=OPS_DRY_RUN=') > service,
+    'Environment= must be under [Service]; systemd ignores it in [Unit]',
+  );
+});
+
+test('clawcius-ops.service itself does not ship a dry-run value', () => {
+  // The property that keeps SETUP.md honest, and it is an ABSENCE, which is
+  // exactly the kind of thing that comes back one convenient edit at a time.
+  //
+  // § Install copies this unit and runs `enable --now` on it, then fifteen
+  // lines later tells the operator to confirm the boot line reads DRY RUN.
+  // Committing `Environment=OPS_DRY_RUN=false` here makes that step produce a
+  // LIVE daemon at the point the guide promises a dry-run one, and makes
+  // § Going live a no-op for anyone who followed § Install. The per-machine
+  // value lives in the drop-in asserted above; unset, this loader falls back to
+  // ops-config.yaml, which the test above pins at `true`.
+  const unit = readFileSync(join(repoRoot(), 'systemd', 'clawcius-ops.service'), 'utf8');
+  assert.doesNotMatch(
+    unit,
+    /^Environment=OPS_DRY_RUN=/m,
+    'clawcius-ops.service must not set OPS_DRY_RUN — a fresh SETUP.md § Install would ' +
+      'then come up LIVE at the step that promises dry run. Put it in ' +
+      'systemd/clawcius-ops.service.d/live.conf, which § Going live installs.',
+  );
+
+  // The verifier is the other unit that loads this config, and it must not
+  // acquire the variable either: verify-main.ts ignores dryRun outright, so a
+  // line here would be a second copy of a per-machine setting that changes
+  // nothing — the drift this whole arrangement exists to remove.
+  const verify = readFileSync(
+    join(repoRoot(), 'systemd', 'clawcius-snapshot-verify.service'),
+    'utf8',
+  );
+  assert.doesNotMatch(
+    verify,
+    /^Environment=OPS_DRY_RUN=/m,
+    'clawcius-snapshot-verify.service must not set OPS_DRY_RUN — verify-main.ts is ' +
+      'unconditionally live and ignores it',
+  );
+});
+
+test('the snapshot verifier is unconditionally live, and says so', () => {
+  // The failure this guards is silent in the worst way: verify.ts returns
+  // `ok: true, finding: 'dry-run'` for a healthy instance, verify-main.ts counts
+  // only failures, and the process exits 0 — systemd green, `systemctl --failed`
+  // clean, nothing restored, nothing proved. `verifyAll` has exactly one
+  // non-test caller and it is this file, so that is the only thing in the
+  // repository that ever attempts a restore reporting success while doing
+  // nothing.
+  //
+  // Asserted on the COMPILED artefact rather than on a live run, and that
+  // limitation is the honest one to state: this suite has no docker, so the
+  // restore path cannot be executed here at all (see the header). What this
+  // does prove is that the shipped `dist/verify-main.js` builds its Runner from
+  // a constant and not from the config, which is the exact edit that would
+  // reintroduce the defect.
+  const dist = dirname(fileURLToPath(import.meta.url));
+  const compiled = readFileSync(join(dist, 'verify-main.js'), 'utf8');
+
+  assert.match(
+    compiled,
+    /const DRY_RUN = false;/,
+    'verify-main.js must fix its own mode rather than take it from the config',
+  );
+  assert.doesNotMatch(
+    compiled,
+    /new Runner\(config\.dryRun/,
+    'the verifier`s Runner must not be built from config.dryRun — that is how a host ' +
+      'running live got a verifier that restored nothing and exited 0',
+  );
+  assert.doesNotMatch(
+    compiled,
+    /summariseVerify\(outcomes, config\.dryRun\)/,
+    'the summary line must describe the run that happened, not the config',
+  );
+
+  // And the mode reaches the journal, which is the only channel anyone on this
+  // host can read. Until 2026-08-20 this process printed nothing about its mode
+  // at all.
+  assert.match(
+    compiled,
+    /SETTING: dryRun=false, always/,
+    'verify-main.js must print a SETTING: clause; journalctl is the only channel here',
+  );
+});
+
+test('the executor boot line carries where dryRun came from', () => {
+  // `dryRunSource.detail` is well covered as a string by the loader tests above,
+  // but the one line that CONSUMES it had nothing pinning it — and the whole
+  // argument for carrying a source rather than a boolean is that the journal is
+  // the only channel anyone here can read. SETUP.md and MIGRATION.md both tell
+  // operators to grep for the literal string `SETTING: dryRun`, so that spelling
+  // is now an interface.
+  //
+  // On the compiled artefact, for the same reason as the test above: booting
+  // index.js for real needs a lock, two board databases and a live config, and a
+  // test that heavy to pin one journal field is not worth what it would cost to
+  // maintain. tsc preserves the template literal verbatim.
+  //
+  // KNOW WHAT THIS IS COUPLED TO BEFORE YOU TIDY index.ts. It matches the FORM
+  // of the expression, not only its output: the boot detail has to stay a
+  // template literal with `config.dryRunSource.detail` interpolated after the
+  // literal ` SETTING: `. Rewriting that one term as plain string concatenation
+  // — which is what the twenty lines around it use, so it is the natural tidy —
+  // produces exactly the same journal line and turns this test red. That is the
+  // safe direction to fail in, and it is why this is worth saying rather than
+  // loosening: a pattern that tolerated both forms would also tolerate the
+  // interpolation being dropped. If you do rewrite it, change the regex in the
+  // same commit and check the compiled output rather than the source.
+  const dist = dirname(fileURLToPath(import.meta.url));
+  const compiled = readFileSync(join(dist, 'index.js'), 'utf8');
+  assert.match(
+    compiled,
+    /SETTING: \$\{config\.dryRunSource\.detail\}/,
+    'the boot entry must carry dryRunSource.detail after the literal `SETTING: ` — ' +
+      'SETUP.md tells operators to grep the journal for exactly that',
+  );
+});
+
+test('clawcius-ops can still express a permanent failure', () => {
+  // A malformed OPS_DRY_RUN fails the boot (above), and this unit is
+  // Restart=always — so the refusal is a restart loop, and a loop is only
+  // acceptable if it can END. With no start limit the unit never enters
+  // `failed`, never appears in `systemctl --failed`, and a permanent config
+  // error is indistinguishable from a healthy service to everything that
+  // watches. Clawcius #89 is 22,675 consecutive failed starts over 31 hours of
+  // exactly that.
+  //
+  // Both values must be non-zero: systemd disables rate limiting if EITHER is
+  // 0, which is why this asserts on both rather than on the presence of a
+  // limit. And both must be in [Unit] — in [Service] systemd ignores them with
+  // a warning and silently applies its own default of 5 starts per 10s.
+  const unit = readFileSync(join(repoRoot(), 'systemd', 'clawcius-ops.service'), 'utf8');
+
+  //
+  // Matched as `\S+` rather than `\d+`, and read as a NUMBER rather than
+  // compared against the string `0`. StartLimitIntervalSec is a systemd TIME
+  // SPAN: `600`, `600s` and `10min` are all valid and identical, and
+  // `StartLimitInterval=` is still accepted as an alias. A digits-only pattern
+  // makes every one of those look like a missing directive, and the failure
+  // would send the next person hunting for a line that is right there in front
+  // of them.
+  //
+  // But `!== '0'` is the same mistake wearing the other hat: `0s` and `00` both
+  // disable rate limiting in systemd and neither is the string `0`, so a test
+  // whose entire job is to catch a silent disable would have passed the silent
+  // disable. `\d+` caught `00` and missed `600s`; `!== '0'` caught `600s` and
+  // missed `00`. `parseFloat(…) > 0` catches both and every other spelling of
+  // zero, because it stops at the unit suffix — `600s` is 600, `10min` is 10,
+  // `0s` is 0, `00` is 0 — and NaN fails the comparison, so a value this cannot
+  // read at all goes red rather than through. The property asserted is "the
+  // limit is not disabled", not any particular spelling of it.
+  const interval = /^StartLimitIntervalSec=(\S+)$/m.exec(unit);
+  const burst = /^StartLimitBurst=(\S+)$/m.exec(unit);
+  assert.ok(interval, 'clawcius-ops.service must set StartLimitIntervalSec');
+  assert.ok(burst, 'clawcius-ops.service must set StartLimitBurst');
+  //
+  // `?? ''` only to satisfy the capture's `string | undefined` type — a group
+  // that matched cannot be undefined at runtime. It is not a fallback: it
+  // parses to NaN, which fails the comparison, so the impossible case goes red
+  // like every other unreadable value rather than through.
+  const notDisabled = (directive: string, value: string | undefined): void => {
+    assert.ok(
+      Number.parseFloat(value ?? '') > 0,
+      `${directive}=${value} disables the start limit — every zero spelling does, ` +
+        'and the unit could then never reach `failed`',
+    );
+  };
+  notDisabled('StartLimitIntervalSec', interval[1]);
+  notDisabled('StartLimitBurst', burst[1]);
+
+  // In [Unit], before [Service] begins. Moving them is a silent downgrade to
+  // systemd's own much tighter default, not a no-op.
+  const service = unit.indexOf('\n[Service]');
+  assert.ok(service > 0, 'expected a [Service] section');
+  assert.ok(
+    unit.indexOf('\nStartLimitIntervalSec=') < service &&
+      unit.indexOf('\nStartLimitBurst=') < service,
+    'the start limit directives must stay in [Unit]; in [Service] systemd ignores them',
   );
 });
 
