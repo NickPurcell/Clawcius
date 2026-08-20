@@ -458,8 +458,37 @@ sessions:
   #
   # So what happens at the ceiling is NOT a refused acquire — the container
   # hits `--memory` or `--pids-limit` first, and that is an OOM kill or a
-  # failing fork(), neither of which is attributed to this setting. The honest
-  # guard is `idleTimeoutMinutes`, not this number; see below.
+  # failing fork(), neither of which is attributed to this setting.
+  #
+  # That is an argument about where 10 fails. It is NOT an argument that this
+  # number does nothing, and the difference matters because the two settings
+  # here are orthogonal and neither substitutes for the other:
+  #
+  #   - This number is the only thing that bounds PEAK residency. `acquire`
+  #     throws at `#sessions.size >= maxConcurrent` (src/agent.ts:894) with no
+  #     await before the `#sessions.set` at :952, so no more than this many are
+  #     ever admitted at once.
+  #   - `idleTimeoutMinutes` is the only thing that reclaims a live session ON
+  #     ITS OWN, and only one nobody is using: `#evictIdle` skips every session
+  #     that is busy or was active within the timeout (src/agent.ts:1018), and
+  #     it runs on a 60s sweep, never on the acquire path. `!reset` in a channel
+  #     also frees that channel's slot (src/daemon.ts:155), at the cost of its
+  #     transcript — but it is a remedy someone has to invoke, not a guard, it
+  #     cannot reach a spawned agent's slot (src/daemon.ts:517), and it frees
+  #     the SLOT before the memory: `close()` drains a mid-turn session rather
+  #     than interrupting it, so the entry is gone while the process is not.
+  #
+  # So eviction cannot bound a burst. Ten channels mentioned at once put ten
+  # sessions live and none of them is idle, whatever the timeout is set to.
+  # Eviction bounds accumulation over time; this number bounds the peak.
+  # Turning eviction on does NOT make 10 safe against the limits above — it
+  # makes the pool recover afterwards. At the old `maxConcurrent: 3` this
+  # crew's resident session memory really was bounded at three sessions, and
+  # the lockout was that same bound seen from the user's side; raising to 10
+  # trades the bound for headroom rather than removing a limit that was never
+  # there. Worth saying here in particular: this is the 2 GiB container against
+  # hamachi's 3, so instance 1 gave up its bound with LESS headroom to absorb
+  # the result.
   maxConcurrent: 10
   # 0 = never evict. Sessions stay alive for the life of the process, so the
   # agent is always warm and never pays Claude Code startup on a mention.
@@ -467,9 +496,10 @@ sessions:
   # and materially more for a busy one — see the measurements above.
   #
   # This is what makes maxConcurrent a permanent ceiling rather than a busy
-  # moment: nothing ever gives a slot back, so once `maxConcurrent` sessions
-  # have run, the pool is full until the process restarts. Raising the cap
-  # defers that lockout, it does not remove it.
+  # moment: nothing reclaims a session on its own, so once `maxConcurrent`
+  # sessions have run, the pool stays full until the process restarts — or
+  # until someone spends a channel's transcript with `!reset`, as above.
+  # Raising the cap defers that lockout, it does not remove it.
   #
   # Any positive value evicts after that many idle minutes; the session ID
   # survives in SQLite and is resumed on the next mention, so conversation
