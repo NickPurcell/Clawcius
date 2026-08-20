@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { loadStatusConfig } from '../dist/config.js';
 import { TranscriptStore } from '../dist/transcripts.js';
-import { buildAgentOverview, buildRoster } from '../dist/views.js';
+import { buildInstanceOverview, buildRoster } from '../dist/views.js';
 
 const AGENT_WORKSPACE = '/var/lib/hamachi/workspaces/1467070145343258628';
 const AGENT_SLUG = '-var-lib-hamachi-workspaces-1467070145343258628';
@@ -349,7 +349,7 @@ test('without a board the page says so instead of listing directories as agents'
 
 test('the overview counts agents and directories as different things', async () => {
   const { config, store, agent, now } = fixture();
-  const overview = await buildAgentOverview(store, agent, config, now);
+  const overview = await buildInstanceOverview(store, agent, config, now);
 
   assert.equal(overview.registeredAgentCount, 5);
   assert.equal(overview.declaredLiveCount, 4);
@@ -357,6 +357,90 @@ test('the overview counts agents and directories as different things', async () 
   assert.equal(overview.unattributedSessionCount, 1);
   assert.equal(overview.registryError, null);
   assert.equal(overview.registryConfigured, true);
+});
+
+/**
+ * The front page lists agents, with the CREW role on each.
+ *
+ * The operator's complaint was that the page showed `general-purpose`,
+ * `Explore` and `workflow-subagent` where they expected `engineer` and
+ * `researcher`. Those first three are `subagent_type`; the roles are in the
+ * registry, and this asserts they are what reaches the wire.
+ */
+test('the overview lists registry agents, labelled by crew role', async () => {
+  const { config, store, agent, now } = fixture();
+  const overview = await buildInstanceOverview(store, agent, config, now);
+
+  assert.deepEqual(
+    overview.agents.map((row) => [row.id, row.role]),
+    [
+      ['hamachi-engineer0', 'engineer'],
+      ['hamachi-engineer1', 'engineer'],
+      ['hamachi-host', 'host'],
+      ['hamachi-poster', 'poster'],
+      ['hamachi-ghost', 'researcher'],
+    ],
+  );
+  assert.equal(overview.agents.length, overview.registeredAgentCount);
+
+  // No `subagent_type` anywhere on the front page's payload. This is the
+  // assertion that fails if someone reintroduces the confusion by adding
+  // subagents back onto this list.
+  const wire = JSON.stringify(overview.agents);
+  for (const harnessType of ['general-purpose', 'Explore', 'workflow-subagent', 'subagentType']) {
+    assert.equal(wire.includes(harnessType), false, `front page carries ${harnessType}`);
+  }
+});
+
+/**
+ * Living and dead stay distinguishable, and by two independent signals.
+ *
+ * `declaredStatus` is written and can be stale; `liveness` is observed off a
+ * file mtime. The fixture's engineer0 is declared dead, and the fixture's
+ * engineer1 has transcripts written an hour ago. Neither column alone is the
+ * answer, which is why both are on the row.
+ */
+test('the overview carries declared status and observed liveness per agent', async () => {
+  const { config, store, agent, now } = fixture();
+  const overview = await buildInstanceOverview(store, agent, config, now);
+  const byId = new Map(overview.agents.map((row) => [row.id, row]));
+
+  const engineer1 = byId.get('hamachi-engineer1');
+  assert.equal(engineer1.declaredStatus, 'live');
+  assert.equal(engineer1.sessionCount, 2);
+  // From the NEWEST of its two transcripts — the old session, written 60s ago,
+  // not the current one written an hour ago. An agent's liveness is the last
+  // time anything of its wrote, which is why this is not read off `sessionId`.
+  assert.equal(engineer1.liveness, 'running');
+  assert.equal(
+    Math.round((now - Date.parse(engineer1.lastActivity)) / 1000),
+    60,
+  );
+
+  const dead = byId.get('hamachi-engineer0');
+  assert.equal(dead.declaredStatus, 'dead');
+  // Declared dead AND never wrote a transcript. `unknown` rather than `stale`:
+  // an agent with no transcripts has not gone quiet, it has never spoken.
+  assert.equal(dead.liveness, 'unknown');
+  assert.equal(dead.lastActivity, null);
+  assert.equal(dead.sessionCount, 0);
+
+  // The probe directory is a directory, not an agent, and no row claims it.
+  assert.equal(
+    overview.agents.some((row) => row.projectSlug === PROBE_SLUG),
+    false,
+  );
+});
+
+/** No registry, no agents — and the sessions are still counted and reported. */
+test('an instance with no registry lists no agents rather than guessing', async () => {
+  const { config, store, agent, now } = fixture({ withBoard: false });
+  const overview = await buildInstanceOverview(store, agent, config, now);
+
+  assert.deepEqual(overview.agents, []);
+  assert.equal(overview.registryConfigured, false);
+  assert.equal(overview.sessionCount, 3);
+  assert.equal(overview.unattributedSessionCount, 3);
 });
 
 /**
@@ -385,8 +469,12 @@ test('when the registry cannot be read the transcripts still render', { skip: pr
     );
     assert.equal(roster.error, null);
 
-    const overview = await buildAgentOverview(store, agent, config, now);
+    const overview = await buildInstanceOverview(store, agent, config, now);
     assert.equal(overview.registeredAgentCount, 0);
+    // And no agent rows either. An unreadable board must not produce a front
+    // page listing agents it could not read — an empty list beside a rendered
+    // error is the honest shape.
+    assert.deepEqual(overview.agents, []);
     assert.match(overview.registryError, /not readable by this service/);
     // Which is what the overview tiles have to qualify rather than print flat:
     // zero agents and every session unattributed is not a fact about the crew.

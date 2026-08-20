@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { loadStatusConfig } from '../dist/config.js';
 import { TranscriptStore, isValidWorkflowRunId } from '../dist/transcripts.js';
@@ -112,10 +113,42 @@ function fixture({ descriptor = true, badRunDir = false, secrets = false, hugeSu
     );
   }
 
+  // A one-row board, so the roll-up can be asked whose subagents these are.
+  // Without it every scope reads as "this instance has no registry", which is
+  // a true sentence about a fixture and no test of the case that matters.
+  const boardDb = join(base, 'hamachi.db');
+  const db = new DatabaseSync(boardDb);
+  db.exec(`
+    CREATE TABLE agents (
+      id             TEXT PRIMARY KEY,
+      crew           TEXT NOT NULL,
+      role           TEXT NOT NULL,
+      session_id     TEXT NOT NULL DEFAULT '',
+      workspace_path TEXT NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'live',
+      spawned_by     TEXT,
+      spawned_at     INTEGER NOT NULL,
+      last_active_at INTEGER NOT NULL
+    )
+  `);
+  db.prepare(
+    `INSERT INTO agents (id, crew, role, session_id, workspace_path, status,
+                         spawned_by, spawned_at, last_active_at)
+     VALUES (?, ?, ?, ?, ?, 'live', NULL, ?, ?)`,
+  ).run('hamachi-engineer1', 'hamachi', 'engineer', SESSION, WORKSPACE, now, now);
+  db.close();
+
   const configPath = join(base, 'status-config.yaml');
   writeFileSync(
     configPath,
-    ['agents:', '  - id: hamachi', '    label: Hamachi', `    projectsRoot: ${projectsRoot}`, ''].join('\n'),
+    [
+      'agents:',
+      '  - id: hamachi',
+      '    label: Hamachi',
+      `    projectsRoot: ${projectsRoot}`,
+      `    boardDb: ${boardDb}`,
+      '',
+    ].join('\n'),
   );
   const config = loadStatusConfig(configPath);
   return { config, store: new TranscriptStore(config), agent: config.agents[0], now };
@@ -183,14 +216,14 @@ test('a run in flight has agents on disk and no descriptor, and that is not an e
   assert.equal((await store.subagents(sessions[0])).length, 5);
 });
 
-test('the roll-up groups by role and says how many came from workflows', async () => {
+test('the roll-up groups by subagent type and says how many came from workflows', async () => {
   const { config, store, agent, now } = fixture();
   const rollup = await buildSubagentRollup(store, agent, config, now);
 
   assert.equal(rollup.total, 5);
   assert.equal(rollup.fromWorkflows, 3);
   assert.deepEqual(
-    rollup.roles.map((group) => [group.role, group.count]),
+    rollup.types.map((group) => [group.subagentType, group.count]),
     [
       ['workflow-subagent', 3],
       ['Explore', 1],
@@ -199,6 +232,76 @@ test('the roll-up groups by role and says how many came from workflows', async (
   );
   assert.equal(rollup.workflows.length, 1);
   assert.equal(rollup.workflows[0].observedAgents, 3);
+
+  // Unscoped, and it says so on the wire. "5 on this instance" and "5 for this
+  // agent" are different claims and the page has to be able to tell them apart.
+  assert.equal(rollup.projectSlug, null);
+  assert.equal(rollup.scopeNote, null);
+
+  // `subagent_type` is not called a role anywhere in this payload. That
+  // conflation is the whole bug — `general-purpose` shown where a person came
+  // looking for `engineer`.
+  assert.equal(JSON.stringify(rollup).includes('"role"'), false);
+});
+
+/**
+ * Scoping to one agent, without any transcript becoming unreachable.
+ *
+ * Clawcius #80 was 58 of 104 subagent transcripts living in a directory
+ * nothing read. Moving subagents off the front page must not do that again, so
+ * this asserts the property directly: every entry the unscoped roll-up returns
+ * is returned by exactly one scope, and the scopes together are the whole.
+ */
+test('a scoped roll-up partitions the unscoped one — nothing is unreachable', async () => {
+  const { config, store, agent, now } = fixture();
+  const all = await buildSubagentRollup(store, agent, config, now);
+  const everyId = all.types.flatMap((group) => group.subagents.map((entry) => entry.agentId));
+  assert.equal(everyId.length, 5);
+
+  const slugs = [...new Set(all.types.flatMap((group) =>
+    group.subagents.map((entry) => entry.projectSlug),
+  ))];
+
+  const reached = new Set();
+  for (const slug of slugs) {
+    const scoped = await buildSubagentRollup(store, agent, config, now, { projectSlug: slug });
+    assert.equal(scoped.projectSlug, slug);
+    for (const group of scoped.types) {
+      for (const entry of group.subagents) {
+        assert.equal(entry.projectSlug, slug);
+        assert.equal(reached.has(entry.agentId), false, 'an entry appeared under two scopes');
+        reached.add(entry.agentId);
+      }
+    }
+  }
+
+  assert.deepEqual([...reached].sort(), [...everyId].sort());
+});
+
+test('scoping to a registered agent needs no note — the two sources agree', async () => {
+  const { config, store, agent, now } = fixture();
+  const scoped = await buildSubagentRollup(store, agent, config, now, { projectSlug: SLUG });
+
+  assert.equal(scoped.projectSlug, SLUG);
+  // Null because a registry row does claim this directory. The note exists for
+  // the case where they DISAGREE, and a note on every page is a note nobody
+  // reads.
+  assert.equal(scoped.scopeNote, null);
+  assert.equal(scoped.total, 5);
+});
+
+test('a scope that matches nothing is an empty roll-up, not an error', async () => {
+  const { config, store, agent, now } = fixture();
+  const scoped = await buildSubagentRollup(store, agent, config, now, {
+    projectSlug: '-var-lib-nobody',
+  });
+
+  assert.equal(scoped.total, 0);
+  assert.deepEqual(scoped.types, []);
+  assert.equal(scoped.error, null);
+  // And it says the scope belongs to no agent, rather than captioning an empty
+  // list with a name the registry never gave it.
+  assert.match(scoped.scopeNote, /No agent in the registry/);
 });
 
 /**
@@ -212,7 +315,7 @@ test('the roll-up groups by role and says how many came from workflows', async (
 test('a workflow subagent carries its run name, and no invented description', async () => {
   const { config, store, agent, now } = fixture();
   const rollup = await buildSubagentRollup(store, agent, config, now);
-  const group = rollup.roles.find((candidate) => candidate.role === 'workflow-subagent');
+  const group = rollup.types.find((candidate) => candidate.subagentType === 'workflow-subagent');
 
   for (const entry of group.subagents) {
     assert.equal(entry.description, '');
@@ -224,7 +327,7 @@ test('a workflow subagent carries its run name, and no invented description', as
 test('without a descriptor the run name is null rather than guessed at', async () => {
   const { config, store, agent, now } = fixture({ descriptor: false });
   const rollup = await buildSubagentRollup(store, agent, config, now);
-  const group = rollup.roles.find((candidate) => candidate.role === 'workflow-subagent');
+  const group = rollup.types.find((candidate) => candidate.subagentType === 'workflow-subagent');
 
   assert.equal(group.count, 3);
   for (const entry of group.subagents) assert.equal(entry.workflowName, null);
@@ -251,7 +354,7 @@ test('descriptions and workflow prose are redacted, like every other rendered st
   assert.doesNotMatch(run.phases[0].detail, /sk-ant-A{20}/);
 
   const rollup = await buildSubagentRollup(store, agent, config, now);
-  const described = rollup.roles
+  const described = rollup.types
     .flatMap((group) => group.subagents)
     .find((entry) => entry.description.includes('[redacted]'));
   assert.notEqual(described, undefined, 'a subagent description was redacted');
@@ -281,6 +384,20 @@ test('the session tree carries the workflow agents too, labelled by their run', 
 
   assert.equal(detail.subagentCount, 5);
   const all = [...detail.subagents, ...detail.orphans];
+
+  // Each node says how it was SPAWNED, on a field named for that. Not `role`:
+  // a subagent has no registry row, so it has no crew role, and the field that
+  // used to carry this name is what put `general-purpose` in front of an
+  // operator looking for `engineer`.
+  assert.deepEqual(
+    all.map((node) => node.subagentType).sort(),
+    ['Explore', 'general-purpose', 'workflow-subagent', 'workflow-subagent', 'workflow-subagent'],
+  );
+  assert.equal(
+    all.every((node) => !Object.prototype.hasOwnProperty.call(node, 'role')),
+    true,
+  );
+
   const workflowNodes = all.filter((node) => node.workflowRunId === RUN);
   assert.equal(workflowNodes.length, 3);
   for (const node of workflowNodes) assert.equal(node.workflowName, 'sudoers-audit');

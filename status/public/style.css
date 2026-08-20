@@ -3,14 +3,20 @@
  *
  * The palette is not improvised. Surfaces, inks and the four status colours are
  * the validated dark-mode steps from the house data-viz palette, and the eight
- * categorical slots used for subagent roles are in their fixed validated order
+ * categorical slots used for subagent TYPES are in their fixed validated order
  * — that order is the colour-blind-safety mechanism, not decoration, so slots
- * are assigned by role in a stable sequence and never cycled. A ninth role
+ * are assigned by type in a stable sequence and never cycled. A ninth type
  * folds into "other" rather than inventing a hue.
+ *
+ * Types, not roles: the categorical hues belong to `general-purpose`,
+ * `Explore` and `workflow-subagent`, which are how a subagent was spawned. A
+ * CREW role — engineer, researcher, coordinator, poster, host — is never a
+ * colour here, because there is no palette that can say "engineer" and because
+ * the two were confusable enough already.
  *
  * Status colour never carries meaning alone: every liveness dot is accompanied
  * by its word ("running", "idle", "stale"), and every swimlane bar sits on a
- * row that names its role in text.
+ * row that names its subagent type in text.
  */
 
 :root {
@@ -222,6 +228,23 @@ h2 {
   letter-spacing: 0.07em;
   color: var(--ink-muted);
   margin: 26px 0 10px;
+}
+
+/* A count riding along on a section heading. Not uppercase and not tracked out
+   — it is a number, and the heading's letter-spacing makes digits unreadable. */
+.instance-line {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.h2-note {
+  margin-left: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  color: var(--baseline);
 }
 
 .subtitle {
@@ -484,7 +507,9 @@ a.card:hover {
   overflow: hidden;
 }
 
-.lane-role {
+/* The subagent TYPE in a swimlane row label. Named for what it is: the crew
+   roles live on the front page and are not drawn as lanes. */
+.lane-type {
   font-size: 12px;
   font-weight: 600;
   color: var(--ink);
@@ -717,6 +742,24 @@ a.chip:hover {
 .chip[aria-current="true"] {
   border-color: var(--series-1);
   color: var(--ink);
+}
+
+/* A chip standing in for something that is not there. Dimmed and italic so it
+   never reads as a value — "no role in the registry" must not look like a role
+   called "no role in the registry". */
+.chip[data-absent="true"] {
+  color: var(--ink-muted);
+  border-style: dashed;
+  font-style: italic;
+}
+
+/* The crew role, on the front page and on an agent's card. One weight for all
+   five values: colouring engineer differently from researcher would invent a
+   hierarchy the system does not have. */
+.chip[data-role] {
+  color: var(--ink);
+  border-color: var(--baseline);
+  font-weight: 600;
 }
 
 .tag {

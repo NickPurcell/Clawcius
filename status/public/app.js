@@ -154,19 +154,23 @@ function liveness(state) {
   ]);
 }
 
-// ── Role colours ────────────────────────────────────────────────────────────
+// ── Subagent-type colours ───────────────────────────────────────────────────
 
 /**
- * Subagent roles get categorical slots in a FIXED order.
+ * Subagent TYPES get categorical slots in a FIXED order.
+ *
+ * Types, not roles. `general-purpose`, `Explore`, `workflow-subagent` — how a
+ * subagent was spawned. Nothing coloured here is a crew role; the crew roles
+ * are on the front page and are not a palette.
  *
  * The order is the colour-blind-safety property of the palette — adjacent
- * slots are the pairs validated for separation — so roles are sorted and
+ * slots are the pairs validated for separation — so types are sorted and
  * assigned deterministically per session rather than in whatever order the
  * filesystem listed them. Two loads of the same session therefore paint the
- * same roles the same colours, which matters when you are comparing a page you
+ * same types the same colours, which matters when you are comparing a page you
  * left open to the one you just refreshed.
  *
- * Past eight roles, everything else is one muted "other" colour. Generating a
+ * Past eight types, everything else is one muted "other" colour. Generating a
  * ninth hue would produce a pair nobody validated.
  */
 const SERIES = [
@@ -181,13 +185,27 @@ const SERIES = [
 ];
 const OTHER_COLOR = '#898781';
 
-function roleColors(roles) {
-  const ordered = [...new Set(roles)].sort();
+function subagentTypeColors(types) {
+  const ordered = [...new Set(types)].sort();
   const map = new Map();
-  ordered.forEach((role, index) => {
-    map.set(role, index < SERIES.length ? SERIES[index] : OTHER_COLOR);
+  ordered.forEach((subagentType, index) => {
+    map.set(subagentType, index < SERIES.length ? SERIES[index] : OTHER_COLOR);
   });
   return map;
+}
+
+/**
+ * What to print for a subagent whose type nobody recorded.
+ *
+ * Not "unknown" on its own. That word in a column of agent-ish things reads as
+ * a value that ought to be there and is missing — and next to a page where
+ * `role` means engineer or researcher, it reads as a missing ROLE. This says
+ * what is actually absent: the sidecar, or a spawning call naming it.
+ */
+const NO_SUBAGENT_TYPE = 'type not recorded';
+
+function subagentTypeLabel(subagentType) {
+  return subagentType || NO_SUBAGENT_TYPE;
 }
 
 // ── API ─────────────────────────────────────────────────────────────────────
@@ -253,6 +271,55 @@ function tile(label, value, sub) {
   ]);
 }
 
+/**
+ * The crew role of one registry row, as a chip.
+ *
+ * `role` is the registry's column — coordinator, engineer, researcher, poster,
+ * host — and this is the only place on the page that renders a word under the
+ * heading "Role". Nothing derives it, nothing falls back to a `subagent_type`,
+ * and a row that has none says so in words rather than showing a blank cell or
+ * borrowing "unknown" from somewhere it would look like a value.
+ */
+function roleChip(role) {
+  if (!role) {
+    return el('span', { class: 'chip', dataset: { absent: 'true' } }, [
+      'no role in the registry',
+    ]);
+  }
+  return el('span', { class: 'chip', dataset: { role } }, [role]);
+}
+
+/**
+ * The front page: every crew agent on this host, by crew role.
+ *
+ * ── What this used to be ───────────────────────────────────────────────────
+ *
+ * Two cards, "Clawcius" and "Hamachi", under a heading reading "Agents on this
+ * host". Those are containers, not agents; the roles were a click away and the
+ * only words on the page that looked like an agent's type were a subagent's —
+ * `general-purpose`, `Explore`, `workflow-subagent`. The operator asked to see
+ * "the types of agents, so like engineer or researcher", which is the registry
+ * column those three words are not.
+ *
+ * So the page is now the registry's rows, grouped by the instance they belong
+ * to, with the role in a column of its own. The instance survives as a
+ * grouping and keeps its own warnings — an unreadable board has to be visible
+ * next to the crew it emptied — but it is no longer the thing being listed.
+ *
+ * ── Why there are no subagents on it ───────────────────────────────────────
+ *
+ * Because a subagent is not an agent that happens to be small. It has no
+ * registry row, no mailbox, no persistence, and it dies with its parent;
+ * CLAWSKY.md's rule is that it inherits its parent's identity and "is an
+ * extension of the named agent". Listing one here would file part of an
+ * engineer as a colleague of that engineer, and give it a column headed Role
+ * that it can never have a value for.
+ *
+ * They are not deleted and they are not hidden. Their transcripts hang off the
+ * agent that spawned them, one click down, and the whole-instance roll-up that
+ * reaches every one of them — including the 58 that #80 found in
+ * `subagents/workflows/<runId>/` — is still one link from the instance page.
+ */
 async function viewOverview() {
   const data = await api('/api/overview');
   const frag = document.createDocumentFragment();
@@ -268,14 +335,14 @@ async function viewOverview() {
     ),
   );
 
-  const running = data.agents.filter((agent) => agent.liveness === 'running').length;
-  const stale = data.agents.filter((agent) => agent.liveness === 'stale').length;
-  const sessions = data.agents.reduce((sum, agent) => sum + agent.sessionCount, 0);
-  const subagents = data.agents.reduce((sum, agent) => sum + agent.subagentCount, 0);
-  const registered = data.agents.reduce((sum, agent) => sum + agent.registeredAgentCount, 0);
-  const declaredLive = data.agents.reduce((sum, agent) => sum + agent.declaredLiveCount, 0);
-  const unattributed = data.agents.reduce(
-    (sum, agent) => sum + agent.unattributedSessionCount,
+  const instances = data.instances;
+  const allAgents = instances.flatMap((instance) => instance.agents);
+  const runningAgents = allAgents.filter((agent) => agent.liveness === 'running').length;
+  const sessions = instances.reduce((sum, instance) => sum + instance.sessionCount, 0);
+  const registered = instances.reduce((sum, instance) => sum + instance.registeredAgentCount, 0);
+  const declaredLive = instances.reduce((sum, instance) => sum + instance.declaredLiveCount, 0);
+  const unattributed = instances.reduce(
+    (sum, instance) => sum + instance.unattributedSessionCount,
     0,
   );
 
@@ -284,7 +351,9 @@ async function viewOverview() {
   // falls into "unattributable", so a tile that did not say so would be the
   // "empty roster reads as a host with no agents" failure this page is built
   // to avoid — in the one place that summarises everything.
-  const blind = data.agents.filter((agent) => agent.registryError || !agent.registryConfigured);
+  const blind = instances.filter(
+    (instance) => instance.registryError || !instance.registryConfigured,
+  );
   const blindNote = blind.length > 0 ? ` · ${blind.length} instance(s) not counted` : '';
 
   frag.append(
@@ -293,10 +362,12 @@ async function viewOverview() {
       // Conflating the two is what made this page report 49 of something.
       tile(
         'Agents',
-        blind.length === data.agents.length ? '—' : fmtCount(registered),
+        blind.length === instances.length ? '—' : fmtCount(registered),
         `${declaredLive} declared live${blindNote || ' · across all crews'}`,
       ),
-      tile('Instances', String(data.agents.length), `${running} running · ${stale} stale`),
+      // Observed, beside the declared number above, and never instead of it.
+      tile('Writing now', fmtCount(runningAgents), 'transcript written in the running window'),
+      tile('Crews', String(instances.length), 'one container each'),
       tile(
         'Sessions',
         fmtCount(sessions),
@@ -304,69 +375,146 @@ async function viewOverview() {
           ? `${unattributed} unattributed, including every session of ${blind.length} instance(s)`
           : `${unattributed} not attributable to an agent`,
       ),
-      tile('Subagents', fmtCount(subagents), 'transcripts on disk'),
     ]),
   );
 
-  for (const agent of blind) {
+  for (const instance of blind) {
     frag.append(
       text(
         'div',
         'warning-row',
-        agent.registryError ??
-          `${agent.label} has no boardDb in status-config.yaml, so it has no registry here and ` +
-            'none of its agents are counted above.',
+        instance.registryError ??
+          `${instance.label} has no boardDb in status-config.yaml, so it has no registry here ` +
+            'and none of its agents are counted above.',
       ),
     );
   }
 
-  frag.append(el('h2', {}, ['Instances']));
-  const cards = el('div', { class: 'cards' });
-
-  for (const agent of data.agents) {
-    const card = el('a', { class: 'card', href: `#/agent/${encodeURIComponent(agent.id)}` }, [
-      el('div', { class: 'card-head' }, [
-        text('span', 'card-title', agent.label),
-        liveness(agent.liveness),
-      ]),
-      text('div', 'card-path mono', agent.projectsRoot),
-      el('div', { class: 'card-stats' }, [
-        el('div', {}, [
-          text('div', 'card-stat-label', 'Agents'),
-          text('div', 'card-stat-value', fmtCount(agent.registeredAgentCount)),
-        ]),
-        el('div', {}, [
-          text('div', 'card-stat-label', 'Sessions'),
-          text('div', 'card-stat-value', fmtCount(agent.sessionCount)),
-        ]),
-        el('div', {}, [
-          text('div', 'card-stat-label', 'Active'),
-          text('div', 'card-stat-value', fmtCount(agent.activeSessionCount)),
-        ]),
-        el('div', {}, [
-          text('div', 'card-stat-label', 'Subagents'),
-          text('div', 'card-stat-value', fmtCount(agent.subagentCount)),
-        ]),
-        el('div', {}, [
-          text('div', 'card-stat-label', 'Last activity'),
-          text('div', 'card-stat-value', fmtAgo(agent.lastActivity)),
+  for (const instance of instances) {
+    frag.append(
+      el('h2', {}, [
+        instance.label,
+        el('span', { class: 'h2-note' }, [
+          `${instance.agents.length} agent(s) · ${fmtCount(instance.sessionCount)} session(s), ` +
+            `${fmtCount(instance.activeSessionCount)} written recently`,
         ]),
       ]),
-    ]);
+      // The instance's own liveness and root, kept because they are facts
+      // about the container rather than about any one agent — an instance
+      // whose whole root has gone quiet is a different problem from an idle
+      // engineer, and the path is what you need to go and look.
+      el('div', { class: 'instance-line' }, [
+        liveness(instance.liveness),
+        text('span', 'card-path mono', instance.projectsRoot),
+      ]),
+    );
 
-    if (agent.error) card.append(text('div', 'warning-row', agent.error));
-    // Short here, because the full sentence is already a warning row under the
-    // tiles it qualifies. This is only so you can tell WHICH card it was about.
-    if (agent.registryError) {
-      card.append(text('div', 'warning-row', 'Registry unreadable — see above.'));
-    } else if (!agent.registryConfigured) {
-      card.append(text('div', 'warning-row', 'No registry configured — directories only.'));
+    if (instance.error) frag.append(text('div', 'warning-row', instance.error));
+    if (instance.registryError) {
+      frag.append(text('div', 'warning-row', 'Registry unreadable — see above.'));
+    } else if (!instance.registryConfigured) {
+      frag.append(
+        text(
+          'div',
+          'warning-row',
+          'No boardDb configured for this instance, so there is no registry to list its agents ' +
+            'from. Its transcript directories are under the instance page.',
+        ),
+      );
     }
-    cards.append(card);
+
+    if (instance.agents.length === 0) {
+      frag.append(
+        text(
+          'p',
+          'placeholder',
+          instance.registryConfigured && !instance.registryError
+            ? 'This instance has a readable registry with no agents in it.'
+            : 'No agents can be listed for this instance.',
+        ),
+      );
+    } else {
+      frag.append(agentTable(instance));
+    }
+
+    frag.append(
+      el('div', { class: 'chips' }, [
+        el('a', { class: 'chip', href: `#/agent/${encodeURIComponent(instance.id)}` }, [
+          'Sessions and unclaimed directories →',
+        ]),
+        // The whole-instance roll-up, linked from the front page as well as
+        // from the instance page. Subagents are off this list, and "off the
+        // list" has to keep meaning "one link away" — a directory nothing
+        // links to is how #80 happened.
+        el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(instance.id)}` }, [
+          'All subagent transcripts →',
+        ]),
+      ]),
+    );
   }
 
-  frag.append(cards);
   main.replaceChildren(frag);
+}
+
+/** One instance's registry rows: id, crew role, and both kinds of aliveness. */
+function agentTable(instance) {
+  const table = el('table', { class: 'table' }, [
+    el('thead', {}, [
+      el('tr', {}, [
+        el('th', {}, ['Agent']),
+        el('th', {}, ['Role']),
+        el('th', {}, ['Crew']),
+        el('th', {}, ['State']),
+        el('th', {}, ['Declared']),
+        el('th', {}, ['Sessions']),
+        el('th', {}, ['Last write']),
+        el('th', {}, ['Last spoke']),
+      ]),
+    ]),
+  ]);
+
+  const body = el('tbody');
+  for (const agent of instance.agents) {
+    body.append(
+      el('tr', {}, [
+        el('td', { class: 'strong' }, [
+          el(
+            'a',
+            {
+              class: 'mono',
+              href:
+                `#/agent/${encodeURIComponent(instance.id)}/` +
+                `${encodeURIComponent(agent.projectSlug)}`,
+            },
+            [agent.id],
+          ),
+        ]),
+        el('td', {}, [roleChip(agent.role)]),
+        el('td', {}, [agent.crew]),
+        // Two columns, not one, and this is the reason. `State` is observed —
+        // a file was written N seconds ago. `Declared` is the registry's
+        // `status`, which a kill writes and a crash does not, so it can say
+        // `live` about a process that is gone. Living and dead stay
+        // distinguishable only while both are on the row.
+        el('td', {}, [liveness(agent.liveness)]),
+        el('td', {}, [
+          el('span', { class: 'declared-word', dataset: { status: agent.declaredStatus } }, [
+            agent.declaredStatus || 'not recorded',
+          ]),
+        ]),
+        el('td', { class: 'num' }, [fmtCount(agent.sessionCount)]),
+        el('td', {}, [fmtAgo(agent.lastActivity)]),
+        el('td', {}, [fmtAgo(agent.lastActiveAt)]),
+      ]),
+    );
+  }
+
+  table.append(body);
+  return el(
+    'div',
+    { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': 'Agents' },
+    [table],
+  );
 }
 
 /**
@@ -476,17 +624,131 @@ function declaredStatus(agent) {
 }
 
 /**
- * One instance: its agents from the registry, then everything else.
+ * One registry agent's card: who it is, its crew role, and its sessions.
+ *
+ * Shared by the instance roster and by the per-agent page, so the two cannot
+ * drift into telling different stories about the same row.
+ */
+function agentCard(instanceId, agent) {
+  const card = el('div', { class: 'card' }, [
+    el('div', { class: 'card-head' }, [
+      el('div', { class: 'card-head-left' }, [
+        text('span', 'card-title mono', agent.id),
+        roleChip(agent.role),
+        el('span', { class: 'chip' }, [agent.crew]),
+      ]),
+      liveness(agent.liveness),
+    ]),
+    el('div', { class: 'card-sub' }, [declaredStatus(agent)]),
+    text('div', 'card-path mono', `${agent.workspacePath}  →  ${agent.projectSlug}`),
+  ]);
+
+  const chips = el('div', { class: 'chips' });
+  if (agent.spawnedBy) chips.append(el('span', { class: 'chip' }, [`spawned by ${agent.spawnedBy}`]));
+
+  // This agent's subagents, and the sentence that says whose they are. A
+  // subagent inherits its parent's identity, so the transcripts of the ones
+  // this agent spawned are this agent's work — which is why the link lives on
+  // its card and not on a list of agents.
+  chips.append(
+    agent.subagentCount > 0
+      ? el(
+          'a',
+          {
+            class: 'chip',
+            href:
+              `#/subagents/${encodeURIComponent(instanceId)}/` +
+              `${encodeURIComponent(agent.projectSlug)}`,
+          },
+          [`${fmtCount(agent.subagentCount)} subagent transcript(s) →`],
+        )
+      : el('span', { class: 'chip', dataset: { absent: 'true' } }, [
+          agent.role === 'coordinator' || agent.role === 'poster'
+            ? 'no subagents — this role has no subagent tool'
+            : 'no subagent transcripts',
+        ]),
+  );
+  card.append(chips);
+
+  if (agent.sessions.length > 0) {
+    card.append(sessionTable(instanceId, agent.sessions, agent.sessionId));
+  } else {
+    // What this says is what it can check. The previous copy concluded "it
+    // has not run a turn", which this page has no way of knowing and which
+    // is false today for both boards on this host: `<crew>-host` has a
+    // registry row whose `last_active_at` the ops daemon stamps on every
+    // boot, so the card said "last spoke 4m ago" directly above "it has not
+    // run a turn". Its transcripts are real and are written by root under a
+    // different config dir entirely.
+    //
+    // So: report the absence, which is true and checkable, and let the
+    // reason be a separate sentence that only claims what is known.
+    card.append(
+      text(
+        'p',
+        'placeholder',
+        `No transcripts under this instance's projects root for ${agent.projectSlug}.`,
+      ),
+    );
+    card.append(
+      text(
+        'p',
+        'placeholder',
+        agent.role === 'host'
+          ? 'The host agent runs on the VPS itself rather than in this instance\'s container, ' +
+            'and writes its sessions outside every projects root this page reads. Expect this ' +
+            'card to have no transcripts however busy it is; its last-active time above is the ' +
+            'board\'s own record and is the honest signal for it.'
+          : 'It has an identity and a mailbox here. Whether it has ever run is not something ' +
+            'this page can see from an empty directory.',
+      ),
+    );
+  }
+
+  // Outside the branch above, not inside it. A row with a session id and no
+  // matching transcripts is the registry's own record that the agent DID run
+  // — so it is exactly the case that must not be told it has not — and it is
+  // also what this whole page degrades into if the slug join ever stops
+  // matching. Having the contradiction visible on the card is the difference
+  // between finding that out here and finding it out from a page confidently
+  // reporting that every agent has never run.
+  if (agent.sessionId && !agent.currentSessionPresent) {
+    card.append(
+      text(
+        'div',
+        'warning-row',
+        `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
+          `transcript with that id is under ${agent.projectSlug}. ` +
+          (agent.sessions.length === 0
+            ? 'It has no transcripts there at all — if that is true of every agent here, the ' +
+              'slug join has stopped matching and the sessions are under "other" below.'
+            : 'Its other sessions are listed above.'),
+      ),
+    );
+  }
+  return card;
+}
+
+/**
+ * One instance: its agents from the registry, then everything else. With
+ * `slug`, one agent of that instance on its own.
  *
  * The list is NOT the directories under the projects root. That was Clawcius
  * #14 — Clawcius showed 49 of them, and three of Hamachi's five were `/tmp`
  * paths where an engineer ran permission probes. Those still appear, under
  * "Other transcripts", because they are real and readable; they are just not
  * agents.
+ *
+ * The `slug` form is filtered from the same response rather than fetched from
+ * a narrower endpoint. That keeps one shape of data on this page, and it means
+ * a slug that matches nothing renders a page that can say what it looked for
+ * and what the instance actually has — rather than a 404 that cannot.
  */
-async function viewAgent(agentId) {
+async function viewAgent(agentId, slug = null) {
   const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
   const frag = document.createDocumentFragment();
+
+  if (slug !== null) return viewOneAgent(agentId, slug, data, frag);
 
   const otherSessions = data.other.reduce((sum, group) => sum + group.sessions.length, 0);
 
@@ -503,11 +765,14 @@ async function viewAgent(agentId) {
 
   frag.append(
     el('div', { class: 'chips' }, [
-      el(
-        'a',
-        { class: 'chip', href: `#/subagents/${encodeURIComponent(agentId)}` },
-        ['Subagents by role →'],
-      ),
+      // Unscoped, and it stays unscoped. Every subagent transcript under this
+      // root is reachable through this one link whether or not any registry
+      // row claims the directory it sits in — which is the property #80 was
+      // about, and the per-agent links below cannot provide on their own
+      // because three of the five directories here belong to no agent.
+      el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(agentId)}` }, [
+        'All subagent transcripts →',
+      ]),
     ]),
   );
 
@@ -543,83 +808,7 @@ async function viewAgent(agentId) {
   }
 
   for (const agent of data.agents) {
-    const card = el('div', { class: 'card' }, [
-      el('div', { class: 'card-head' }, [
-        el('div', { class: 'card-head-left' }, [
-          text('span', 'card-title mono', agent.id),
-          el('span', { class: 'chip' }, [agent.role]),
-          el('span', { class: 'chip' }, [agent.crew]),
-        ]),
-        liveness(agent.liveness),
-      ]),
-      el('div', { class: 'card-sub' }, [declaredStatus(agent)]),
-      text('div', 'card-path mono', `${agent.workspacePath}  →  ${agent.projectSlug}`),
-    ]);
-
-    if (agent.spawnedBy) {
-      card.append(el('div', { class: 'chips' }, [
-        el('span', { class: 'chip' }, [`spawned by ${agent.spawnedBy}`]),
-      ]));
-    }
-
-    if (agent.sessions.length > 0) {
-      card.append(sessionTable(data.agent, agent.sessions, agent.sessionId));
-    } else {
-      // What this says is what it can check. The previous copy concluded "it
-      // has not run a turn", which this page has no way of knowing and which
-      // is false today for both boards on this host: `<crew>-host` has a
-      // registry row whose `last_active_at` the ops daemon stamps on every
-      // boot, so the card said "last spoke 4m ago" directly above "it has not
-      // run a turn". Its transcripts are real and are written by root under a
-      // different config dir entirely.
-      //
-      // So: report the absence, which is true and checkable, and let the
-      // reason be a separate sentence that only claims what is known.
-      card.append(
-        text(
-          'p',
-          'placeholder',
-          `No transcripts under this instance's projects root for ${agent.projectSlug}.`,
-        ),
-      );
-      card.append(
-        text(
-          'p',
-          'placeholder',
-          agent.role === 'host'
-            ? 'The host agent runs on the VPS itself rather than in this instance\'s container, ' +
-              'and writes its sessions outside every projects root this page reads. Expect this ' +
-              'card to have no transcripts however busy it is; its last-active time above is the ' +
-              'board\'s own record and is the honest signal for it.'
-            : 'It has an identity and a mailbox here. Whether it has ever run is not something ' +
-              'this page can see from an empty directory.',
-        ),
-      );
-    }
-
-    // Outside the branch above, not inside it. A row with a session id and no
-    // matching transcripts is the registry's own record that the agent DID run
-    // — so it is exactly the case that must not be told it has not — and it is
-    // also what this whole page degrades into if the slug join ever stops
-    // matching. Having the contradiction visible on the card is the difference
-    // between finding that out here and finding it out from a page confidently
-    // reporting that every agent has never run.
-    if (agent.sessionId && !agent.currentSessionPresent) {
-      card.append(
-        text(
-          'div',
-          'warning-row',
-          `The registry says this agent resumes session ${agent.sessionId.slice(0, 8)}, and no ` +
-            `transcript with that id is under ${agent.projectSlug}. ` +
-            (agent.sessions.length === 0
-              ? 'It has no transcripts there at all — if that is true of every agent here, the ' +
-                'slug join has stopped matching and the sessions are under "other" below.'
-              : 'Its other sessions are listed above.'),
-        ),
-      );
-    }
-
-    frag.append(card);
+    frag.append(agentCard(data.agent, agent));
   }
 
   if (data.other.length > 0) {
@@ -634,17 +823,126 @@ async function viewAgent(agentId) {
     );
 
     for (const group of data.other) {
+      const subagents = group.sessions.reduce(
+        (sum, session) => sum + session.subagentCount,
+        0,
+      );
       frag.append(
         el('div', { class: 'card' }, [
           el('div', { class: 'card-head' }, [
             text('span', 'card-title mono', group.projectSlug),
             liveness(group.liveness),
           ]),
+          // These directories get the same scoped link an agent's card gets.
+          // They have no agent to hang off, which is exactly why they need
+          // their own way in: a subagent transcript reachable only through the
+          // agent that owns the directory is unreachable when nobody does.
+          el('div', { class: 'chips' }, [
+            subagents > 0
+              ? el(
+                  'a',
+                  {
+                    class: 'chip',
+                    href:
+                      `#/subagents/${encodeURIComponent(data.agent)}/` +
+                      `${encodeURIComponent(group.projectSlug)}`,
+                  },
+                  [`${fmtCount(subagents)} subagent transcript(s) →`],
+                )
+              : el('span', { class: 'chip', dataset: { absent: 'true' } }, [
+                  'no subagent transcripts',
+                ]),
+          ]),
           sessionTable(data.agent, group.sessions, null),
         ]),
       );
     }
   }
+
+  main.replaceChildren(frag);
+}
+
+/**
+ * One agent of one instance, reached from the front page.
+ *
+ * This is where a subagent goes once it is off the list of agents: under the
+ * agent whose identity it borrowed. The card carries its own link to that
+ * agent's subagent transcripts, and this page carries the unscoped one as
+ * well, so no path here is a dead end for a transcript that exists.
+ *
+ * A slug that matches no registry row is answered, not 404'd. The registry and
+ * the transcript directories are two different lists and they are allowed to
+ * disagree; when they do, the page says which one it is showing rather than
+ * implying the agent was deleted.
+ */
+function viewOneAgent(instanceId, slug, data, frag) {
+  const agent = data.agents.find((row) => row.projectSlug === slug);
+
+  frag.append(
+    crumbs([
+      { label: 'Agents', href: '#/overview' },
+      { label: data.label, href: `#/agent/${encodeURIComponent(instanceId)}` },
+      { label: agent ? agent.id : slug },
+    ]),
+  );
+
+  if (!agent) {
+    frag.append(
+      el('h1', {}, ['No such agent']),
+      text(
+        'div',
+        'warning-row',
+        `No agent in ${data.label}'s registry has ${slug} as its transcript directory. ` +
+          (data.registryError
+            ? 'The registry could not be read at all, so this may be a real agent — see below.'
+            : `The registry has ${data.agents.length} agent(s); this page lists them.`),
+      ),
+    );
+    if (data.registryError) frag.append(text('div', 'warning-row', data.registryError));
+    frag.append(
+      el('div', { class: 'chips' }, [
+        el('a', { class: 'chip', href: `#/agent/${encodeURIComponent(instanceId)}` }, [
+          `All of ${data.label} →`,
+        ]),
+        // Offered even here. If the slug is a real directory with no registry
+        // row — the `/tmp` probe case — its transcripts are still on disk and
+        // this is the link that reaches them.
+        el(
+          'a',
+          {
+            class: 'chip',
+            href: `#/subagents/${encodeURIComponent(instanceId)}/${encodeURIComponent(slug)}`,
+          },
+          [`Subagent transcripts under ${slug} →`],
+        ),
+      ]),
+    );
+    main.replaceChildren(frag);
+    return;
+  }
+
+  frag.append(
+    el('h1', {}, [agent.id]),
+    text(
+      'p',
+      'subtitle',
+      `${agent.role || 'no role recorded'} · ${agent.crew} · ` +
+        `${agent.sessions.length} session(s) on disk`,
+    ),
+  );
+
+  frag.append(agentCard(instanceId, agent));
+
+  frag.append(
+    el('div', { class: 'chips' }, [
+      el('a', { class: 'chip', href: `#/agent/${encodeURIComponent(instanceId)}` }, [
+        `All of ${data.label} →`,
+      ]),
+      el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(instanceId)}` }, [
+        'All subagent transcripts on this instance →',
+      ]),
+    ]),
+  );
 
   main.replaceChildren(frag);
 }
@@ -736,7 +1034,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
   if (spanEnd <= spanStart) spanEnd = spanStart + 1000;
   const spanMs = spanEnd - spanStart;
 
-  const colors = roleColors(nodes.map((node) => node.role));
+  const colors = subagentTypeColors(nodes.map((node) => node.subagentType));
   const lanes = el('div', { class: 'lanes' });
 
   // Eight ticks, matching the eight background grid columns of every track, so
@@ -755,7 +1053,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
   lanes.append(axis);
 
   for (const node of nodes) {
-    const color = colors.get(node.role) ?? OTHER_COLOR;
+    const color = colors.get(node.subagentType) ?? OTHER_COLOR;
     const startMs = Date.parse(node.startedAt ?? '') || spanStart;
     const endMs = Date.parse(node.endedAt ?? '') || startMs;
 
@@ -775,7 +1073,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     });
 
     attachTooltip(bar, [
-      ['role', node.role],
+      ['subagent type', subagentTypeLabel(node.subagentType)],
       ['task', node.description],
       ['started', fmtClock(node.startedAt)],
       ['ended', node.active ? 'still running' : fmtClock(node.endedAt)],
@@ -796,12 +1094,12 @@ function renderLanes(detail, nodes, agentId, sessionId) {
       el(
         'a',
         {
-          class: 'lane-role',
+          class: 'lane-type',
           href:
             `#/transcript/${encodeURIComponent(agentId)}/${encodeURIComponent(sessionId)}` +
             `/${encodeURIComponent(node.agentId)}`,
         },
-        [node.role],
+        [subagentTypeLabel(node.subagentType)],
       ),
       // A workflow subagent carries no description; the run's name is what it
       // was for, and an anonymous bar is what this view exists not to draw.
@@ -818,15 +1116,15 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     lanes.append(el('div', { class: 'lane' }, [label, el('div', { class: 'lane-track' }, [bar])]));
   }
 
-  // Legend for identity, always — the row labels already name each role in
-  // text, so colour is never the only channel, but the legend makes the
-  // role→colour mapping readable at a glance across many rows.
+  // Legend for identity, always — the row labels already name each subagent
+  // type in text, so colour is never the only channel, but the legend makes
+  // the type→colour mapping readable at a glance across many rows.
   const legend = el('div', { class: 'legend' });
-  for (const [role, color] of colors) {
+  for (const [subagentType, color] of colors) {
     legend.append(
       el('span', { class: 'legend-item' }, [
         el('span', { class: 'legend-swatch', style: { background: color } }),
-        role,
+        subagentTypeLabel(subagentType),
       ]),
     );
   }
@@ -958,48 +1256,94 @@ async function viewTranscript(agentId, sessionId, subagentId) {
 // ── Subagents ───────────────────────────────────────────────────────────────
 
 /**
- * Every subagent an instance has run, grouped by role.
+ * Every subagent an instance has run, grouped by `subagent_type` — or one
+ * agent's, when `slug` scopes it.
+ *
+ * ── The page this is, and the page it is not ───────────────────────────────
  *
  * The session view draws one run's tree over a time axis and answers "what
  * happened here". It cannot answer "where is the transcript of the thing that
  * died at 4am" unless you already know which session it belonged to — which is
- * Clawcius #22, and is what this list is for. Roles are ordered by count
+ * Clawcius #22, and is what this list is for. Types are ordered by count
  * because "what does this system spend its subagents on" is the question you
- * arrive with; within a role, newest first, because the next question is
+ * arrive with; within a type, newest first, because the next question is
  * always "what was the last one doing".
+ *
+ * It is NOT a list of agents, and the heading used to say "By role", which
+ * made it look like one. A subagent has no crew role: it has no registry row
+ * to carry one, it shares its parent's identity and it dies with its parent.
+ * What it has is a `subagent_type` — the argument its parent passed when it
+ * spawned it — and that is what is grouped here, under that name.
+ *
+ * The UNSCOPED form of this page is the one that reaches everything. Scoped to
+ * an agent it shows that agent's; scoped to a directory no agent claims it
+ * shows that directory's and says so. Both are filters over the same walk, so
+ * "reachable from here" does not depend on the registry being right.
  */
-async function viewSubagents(agentId) {
-  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/subagents`);
+async function viewSubagents(agentId, slug = null) {
+  const query = slug === null ? '' : `?slug=${encodeURIComponent(slug)}`;
+  const data = await api(`/api/agents/${encodeURIComponent(agentId)}/subagents${query}`);
   const frag = document.createDocumentFragment();
 
   frag.append(
     crumbs([
       { label: 'Agents', href: '#/overview' },
       { label: data.label, href: `#/agent/${encodeURIComponent(agentId)}` },
-      { label: 'Subagents' },
+      { label: slug === null ? 'Subagents' : `Subagents of ${slug}` },
     ]),
     el('h1', {}, ['Subagents']),
     text(
       'p',
       'subtitle',
-      `${fmtCount(data.total)} transcript(s) across ${data.roles.length} role(s) · ` +
+      (slug === null
+        ? `Every subagent transcript under ${data.label}. `
+        : `Scoped to ${slug}. `) +
+        `${fmtCount(data.total)} transcript(s) across ${data.types.length} subagent type(s) · ` +
         `${fmtCount(data.fromWorkflows)} from workflow runs`,
+    ),
+    text(
+      'p',
+      'subtitle',
+      'A subagent type is how the parent spawned it. It is not a crew role — a subagent has ' +
+        'no registry row and no identity of its own, so it has none.',
     ),
   );
 
   if (data.error) frag.append(text('div', 'warning-row', data.error));
+  // The registry and the directories disagreeing is a real state, not a fault,
+  // and the page names which of the two this scope came from when they do.
+  if (data.scopeNote) frag.append(text('div', 'warning-row', data.scopeNote));
+
+  if (slug !== null) {
+    frag.append(
+      el('div', { class: 'chips' }, [
+        el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(agentId)}` }, [
+          `Every subagent transcript under ${data.label} →`,
+        ]),
+      ]),
+    );
+  }
 
   if (data.total === 0) {
-    frag.append(text('p', 'placeholder', 'No subagent transcripts under this root yet.'));
+    frag.append(
+      text(
+        'p',
+        'placeholder',
+        slug === null
+          ? 'No subagent transcripts under this root yet.'
+          : `No subagent transcripts under ${slug}. The unscoped list above covers the ` +
+            'whole instance.',
+      ),
+    );
     main.replaceChildren(frag);
     return;
   }
 
-  const colors = roleColors(data.roles.map((group) => group.role));
+  const colors = subagentTypeColors(data.types.map((group) => group.subagentType));
 
   frag.append(
     el('div', { class: 'tiles' }, [
-      tile('Subagents', fmtCount(data.total), `${data.roles.length} distinct role(s)`),
+      tile('Subagents', fmtCount(data.total), `${data.types.length} distinct type(s)`),
       tile(
         'From workflows',
         fmtCount(data.fromWorkflows),
@@ -1081,15 +1425,15 @@ async function viewSubagents(agentId) {
     }
   }
 
-  frag.append(el('h2', {}, ['By role']));
+  frag.append(el('h2', {}, ['By subagent type']));
 
-  for (const group of data.roles) {
-    const color = colors.get(group.role) ?? OTHER_COLOR;
+  for (const group of data.types) {
+    const color = colors.get(group.subagentType) ?? OTHER_COLOR;
     const card = el('div', { class: 'card' }, [
       el('div', { class: 'card-head' }, [
         el('div', { class: 'card-head-left' }, [
           el('span', { class: 'lane-swatch', style: { background: color } }),
-          text('span', 'card-title', group.role),
+          text('span', 'card-title', subagentTypeLabel(group.subagentType)),
         ]),
         text('span', 'tile-sub', `${fmtCount(group.count)} transcript(s)`),
       ]),
@@ -1447,9 +1791,15 @@ async function render() {
   }
 
   try {
-    if (route.name === 'agent' && route.args[0]) await viewAgent(route.args[0]);
-    else if (route.name === 'subagents' && route.args[0]) await viewSubagents(route.args[0]);
-    else if (route.name === 'clawsky') await viewClawsky();
+    // `#/agent/<instance>` is the whole instance; `#/agent/<instance>/<slug>`
+    // is one agent of it. Same for `#/subagents/`. The second segment is a
+    // project slug, which is `slug(workspace_path)` and identifies exactly one
+    // registry row — an id would have needed a lookup the client cannot do.
+    if (route.name === 'agent' && route.args[0]) {
+      await viewAgent(route.args[0], route.args[1] ?? null);
+    } else if (route.name === 'subagents' && route.args[0]) {
+      await viewSubagents(route.args[0], route.args[1] ?? null);
+    } else if (route.name === 'clawsky') await viewClawsky();
     else if (route.name === 'session' && route.args[0] && route.args[1])
       await viewSession(route.args[0], route.args[1]);
     else if (route.name === 'transcript' && route.args[0] && route.args[1])

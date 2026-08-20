@@ -244,7 +244,19 @@ export type LineMeta = {
 /** A Task/Agent tool call seen in a transcript — one subagent being spawned. */
 export type SpawnRecord = {
   toolUseId: string;
-  /** The ROLE. `subagent_type` from the tool input. */
+  /**
+   * `subagent_type` from the tool input — `general-purpose`, `Explore`,
+   * `Plan`, `workflow-subagent`.
+   *
+   * NOT a crew role. This comment used to say "the ROLE", in a repository
+   * where `role` means one of CLAWSKY.md's four — coordinator, engineer,
+   * researcher, poster — plus `host`. Those live in the registry
+   * (`registry.ts`, column `role`) and belong to agents with an identity and a
+   * mailbox. This one is the harness's word for how a *subagent* was spawned,
+   * it comes from a tool argument the parent chose, and it is meaningless to
+   * anyone reading this page for the crew. Calling both of them "role" is what
+   * put `general-purpose` on a page the operator went to for `engineer`.
+   */
   subagentType: string;
   description: string;
   /** Model override on the spawn, when the caller named one. */
