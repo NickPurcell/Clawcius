@@ -23,9 +23,18 @@
 #   PLUMBING
 #     container.name          hamachi-agent          (its own sandbox)
 #     container.execEnvDir    /var/lib/hamachi/exec-env
-#     sessions.maxConcurrent  1                      (the VM has ~1.8 GB free)
 #     sessions.workspaceRoot  /var/lib/hamachi/workspaces
 #     discord.allowed/followUpChannelIds   the test channel
+#
+# sessions.maxConcurrent used to be listed here as a difference — 1 against
+# instance 1's 3, justified as "the VM has ~1.8 GB free". THAT PREMISE WAS
+# STALE: the box has been the 12 GB VPS since 2026-08-08, measured at 11.7 GiB
+# total and 8.65 GiB available on 2026-08-20. The host was not the constraint
+# and had not been for months; the container's own 3g and 512 PIDs are.
+#
+# It is NOT a difference any more either: the operator set both instances to 10
+# on 2026-08-20. Only the comment above the key differs, because each names its
+# own container's limits. Do not "restore" the 1 from memory.
 #
 # paths.discordCli and paths.skillsDir deliberately still point into
 # /home/npurcell/clawcius — that is the repo, shared by both instances, not
@@ -453,11 +462,43 @@ systemPrompt:
     </issue-tracking>
 
 sessions:
-  # Bounded by RAM. One Claude Code process is ~400 MB — see SETUP.md § 5.
-  maxConcurrent: 1
+  # NOT bounded by RAM any more. This is a policy ceiling, deliberately set
+  # above what the container can hold, and the operator chose it knowing that.
+  #
+  # The sessions are `claude` processes inside `hamachi-agent`, so what binds
+  # is that container's limits, not the host's free RAM (11.7 GiB total,
+  # 8.65 GiB available on 2026-08-20 — the host is not the constraint).
+  # `systemd/hamachi-container.service` sets CLAWCIUS_CONTAINER_MEMORY=3g, and
+  # `--pids-limit=512` is hardcoded at run-container.sh:600 with no environment
+  # override, unlike --memory.
+  #
+  # There is NO reliable per-session cost to multiply by 10, and this comment
+  # is not going to invent one. Measured 2026-08-20: this container was using
+  # 997 MiB / 3 GiB and 242 PIDs with ONE live session, while `clawcius-agent`
+  # was using 151.5 MiB / 2 GiB and 101 PIDs with none. Cost is dominated by
+  # what a session is doing, not by how many there are — SETUP.md § 5's ~400 MB
+  # is a floor, and that one live session measured 669 MB RSS.
+  #
+  # What can be said without estimating past the evidence: one busy session
+  # already accounts for a third of this container's memory and 47% of its
+  # PIDs, so ten concurrent sessions is not a load it has been shown to
+  # survive, and PIDs look likelier to run out first. `browse` adds ~410 MB
+  # peak on top (browser-cli/README.md § Memory) and holds an exclusive lock.
+  #
+  # So what happens at the ceiling is NOT a refused acquire — the container
+  # hits `--memory` or `--pids-limit` first, and that is an OOM kill or a
+  # failing fork(), neither of which is attributed to this setting. The honest
+  # guard is `idleTimeoutMinutes`, not this number; see below.
+  maxConcurrent: 10
   # 0 = never evict. Sessions stay alive for the life of the process, so the
   # agent is always warm and never pays Claude Code startup on a mention.
-  # Costs ~400 MB RSS per live session, standing, whether busy or not.
+  # Costs at least ~400 MB RSS per live session, standing, whether busy or not,
+  # and materially more for a busy one — see the measurements above.
+  #
+  # This is what makes maxConcurrent a permanent ceiling rather than a busy
+  # moment: nothing ever gives a slot back, so once `maxConcurrent` sessions
+  # have run, the pool is full until the process restarts. Raising the cap
+  # defers that lockout, it does not remove it.
   #
   # Any positive value evicts after that many idle minutes; the session ID
   # survives in SQLite and is resumed on the next mention, so conversation

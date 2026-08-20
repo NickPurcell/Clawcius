@@ -10,9 +10,12 @@
  *
  *   - `#identityFor` returned `coordinator` unconditionally. An engineer whose
  *     row went missing came back as the one role that may DM the host agent.
- *   - Under the shipped caps a spawned agent could never take a turn, because
- *     `acquire` had no slot for it and `idleTimeoutMinutes: 0` means no slot is
- *     ever given back.
+ *   - Under the caps shipped at the time (3 and 1) a spawned agent could never
+ *     take a turn, because `acquire` had no slot for it and
+ *     `idleTimeoutMinutes: 0` means no slot is ever given back. Both configs
+ *     went to 10 on 2026-08-20, so a spawn now succeeds until ten sessions have
+ *     run; the second half of that sentence is untouched, and it is the half
+ *     that makes the pool fill permanently rather than briefly.
  *   - The at-capacity announcement, added to fix the second, was reasoned about
  *     and shipped unexercised.
  *

@@ -381,7 +381,11 @@ the bot can see.
 
 ## 5. Memory budget
 
-Measured on this box: one Claude Code process is ~383 MB RSS.
+Measured on this box: one Claude Code process is ~383 MB RSS. That is the
+low end — a session carrying a large context measured **669 MB RSS** inside
+`hamachi-agent` on 2026-08-20. Budget with 400 MB as the floor, not the figure.
+
+The original sizing, on the 4 GB box this section was written for:
 
 ```
   180 MB   bot process (Node + discord.js)
@@ -397,11 +401,89 @@ Squid adds ~97 MB (measured on this box with
 caching off — see `squid/README.md`). It comes out of the OS slice above, not
 the agents'.
 
-`sessions.maxConcurrent: 3` in `agent-config.yaml` is sized for this. Two
-ceilings back it up: `MemoryMax=2400M` on the waker unit, and `--memory=2g` on
-the agent container (plus 256m for Squid). The container limit is the one that
-matters now — the agents live there. gVisor adds roughly 50–100 MB per container on top.
-Raise both together, never one alone.
+**The container limit is the one that matters — the agents live there, as
+`claude` processes under `docker exec`, and a container that reaches its
+`--memory` is OOM-killed rather than told no.** The bot process is not in it:
+the waker is a host unit (`clawcius.service`, `MemoryHigh=3G`/`MemoryMax=4G`,
+`TasksMax=512`; `hamachi.service`, `2G`/`3G`, `TasksMax=256`), so the container
+budget is agents plus whatever tools they run. gVisor adds roughly 50–100 MB per
+container on top.
+
+The waker units are not unaffected by the cap, though they are not the primary
+bound. Each live session holds a standing host-side `docker exec` client in the
+waker's cgroup — one per session, not per turn, which is what "always warm"
+buys — plus a per-session SDK message stream and in-process MCP mail servers in
+the bot's heap. So `TasksMax` scales with `sessions.maxConcurrent` too. Nobody
+has measured a `docker exec` client's threads or RSS; this is a note about what
+to measure first, not a claim that either unit is undersized.
+
+Measured on the host, 2026-08-20:
+
+| | `clawcius-agent` | `hamachi-agent` |
+|---|---|---|
+| `--memory` | 2 GiB (`run-container.sh` default; no override set) | 3 GiB (`hamachi-container.service`) |
+| `--pids-limit` | 512 | 512 |
+| live sessions at the time | 0 | 1 |
+| memory in use | 151.5 MiB (7.4%) | 997 MiB (32.5%) |
+| PIDs in use | 101 | 242 (47%) |
+
+**This does not reduce to a per-session figure.** One instance was idle and the
+other had a single busy session; cost is dominated by what a session is doing,
+not by how many there are, so a number derived from either container is wrong
+for the other and should not be multiplied.
+
+It does bracket the order of magnitude, and that is worth writing down. **If**
+the two containers share a baseline and marginal cost is constant — neither is
+established, and both are exactly what the paragraph above refuses to assume —
+the rows imply ~845 MiB and ~140 tasks per session, giving:
+
+```
+  memory   (3072 − 151) / 845  ≈ 3.4 sessions
+  PIDs     ( 512 − 101) / 140  ≈ 2.9 sessions
+```
+
+Two independent columns landing near **3**. Treat it as an order of magnitude,
+not a count. `sessions.maxConcurrent: 10` is roughly 3× past it.
+
+**`--pids-limit` is the ceiling to watch, and it is the one you cannot
+configure.** `--memory` is parameterised through `CLAWCIUS_CONTAINER_MEMORY`;
+`--pids-limit=512` is hardcoded at `docker/run-container.sh:600` for every
+instance. hamachi is at 47% of it with one session and 32% of memory, so PIDs
+run out first. Hitting it is a failing `fork()` somewhere unrelated, not a
+message about sessions.
+
+`sessions.maxConcurrent` is **10** in both configs since 2026-08-20, above
+anything measured here. It is a policy ceiling, not a budget, and the operator
+set it knowing that: with `idleTimeoutMinutes: 0` the pool never gives a slot
+back, so a lower cap did not protect memory either — it just locked the pool
+sooner. Nothing enforces this section; the container's limits do, by killing
+something. `browse` adds ~410 MB peak (`browser-cli/README.md` § Memory) and
+holds an exclusive lock, so there is only ever one.
+
+**What the raise changed is where the failure surfaces.** At the old caps the
+pool ran out first, and `atCapacityNotice` names `sessions.maxConcurrent`, so a
+user who lost a turn learned which file to look in. Past ~3 the container gives
+first instead, as an OOM kill or a failing `fork()` in something unrelated —
+attributed to nothing. That is a loss of legibility, not only of headroom.
+
+The host is **not** the constraint: 11.7 GiB total, 8.65 GiB available, 4 GiB
+of swap essentially untouched, 6 cores (2026-08-20). Two notes if you act on
+any of this:
+
+- **Raising `CLAWCIUS_CONTAINER_MEMORY` is a recreate, not a restart.**
+  `run-container.sh` reuses an existing container (`docker/up.sh:9`), so a
+  `systemctl restart` will not change a limit. Raising `--pids-limit` means
+  editing `run-container.sh`, which has no per-instance override for it.
+- **`sessions.idleTimeoutMinutes` is the only setting that makes the pool
+  recover**, and it costs a cold start rather than continuity — the session ID
+  survives in SQLite and resumes on the next mention.
+
+> Reading limits from inside a container is normally useless — without lxcfs,
+> `/proc/meminfo` shows the host's figures. **These containers run gVisor
+> (`runtime runsc`), whose sentry synthesises `/proc/meminfo` from the sandbox
+> limit**, so an in-container `MemTotal` of 3145728 kB is exactly the `3g` cap
+> and not the host's 11.7 GiB. That is what makes `browser-cli`'s
+> MemAvailable-trough method valid here. It would not be under `runc`.
 
 After the reboot, drop swappiness — swapping a Node heap costs hundreds of ms
 on the next tool call:
@@ -421,8 +503,12 @@ fire on every message in every channel it can see.
 One session per channel or thread, persistent across mentions and resumed from
 SQLite after a restart. With `sessions.idleTimeoutMinutes: 0` (the default)
 sessions are **never evicted** — the agent stays warm and skips Claude Code
-startup on every mention, at a standing cost of roughly 400 MB RSS per live
-session. Any positive value evicts after that many idle minutes and resumes
+startup on every mention, at a standing cost of **at least** 400 MB RSS per live
+session and considerably more for a busy one (§ 5 has the measurements and why
+they do not reduce to one figure). Note that this also makes
+`sessions.maxConcurrent` a lifetime budget rather than a concurrency limit: with
+nothing evicting, the pool fills permanently and only a restart empties it.
+Any positive value evicts after that many idle minutes and resumes
 from SQLite on the next mention; continuity is preserved either way, the
 difference is latency versus resident memory.
 

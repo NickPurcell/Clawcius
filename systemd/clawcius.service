@@ -68,7 +68,19 @@ StateDirectoryMode=0750
 # MemoryHigh throttles and reclaims first; MemoryMax is the hard stop. The gap
 # between MemoryMax and total RAM is deliberate — a ceiling close to total
 # would squeeze the OS instead of stopping the runaway agent. Raise both
-# together with sessions.maxConcurrent, never one alone.
+# together, never one alone.
+#
+# This used to say to raise these alongside sessions.maxConcurrent, which named
+# the wrong PRIMARY limit: the agent itself runs in `clawcius-agent`, so that
+# container's --memory (2g) and --pids-limit (512) are what bind first, and the
+# setting that moves with maxConcurrent is CLAWCIUS_CONTAINER_MEMORY.
+#
+# But these do still scale with it, just not dominantly. Each live session holds
+# a standing host-side `docker exec` client in THIS cgroup — `AgentSession.#start`
+# opens one streaming-input `query()` per session whose spawner lives until
+# close(), per session and not per turn, which is what "always warm" buys — plus
+# a per-session SDK message stream and in-process MCP mail servers in the bot's
+# heap. So when the cap moves, TasksMax is worth a look. See SETUP.md § 5.
 MemoryHigh=3G
 MemoryMax=4G
 TasksMax=512

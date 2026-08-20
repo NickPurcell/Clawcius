@@ -422,10 +422,12 @@ test('a spawned agent survives the process that spawned it', async () => {
 test('spawn refuses when the session pool is full and nothing ever empties it', async () => {
   const { registry, mail, spawnOf, capacity, logged } = spawnBoard();
 
-  // `agent-config.hamachi.yaml`: maxConcurrent 1, idleTimeoutMinutes 0. `spawn`
-  // runs inside the calling coordinator's turn, so the coordinator is always
-  // holding that one slot — the pool is full by construction at every spawn,
-  // not just at a busy moment.
+  // The shipped shape: idleTimeoutMinutes 0, so nothing ever gives a slot
+  // back. `spawn` runs inside the calling coordinator's turn, so a slot is
+  // always held when the call happens, and once the pool has filled it stays
+  // full until the process restarts — not just a busy moment. 1/1 is the
+  // smallest case that says it; both configs now set maxConcurrent 10, which
+  // moves when this happens and not whether.
   capacity.live = 1;
   capacity.max = 1;
   capacity.idleTimeoutMinutes = 0;

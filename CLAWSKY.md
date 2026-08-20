@@ -590,15 +590,27 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    **The session cap is a separate thing and it does bind.** `acquire` throws
    at `sessions.maxConcurrent`, `#evictIdle` does nothing while
    `sessions.idleTimeoutMinutes` is 0, and both shipped configs set it to 0 —
-   so on `maxConcurrent: 1` the pool is full at every spawn, because the
-   calling coordinator is holding the only slot. A spawned agent is woken by
+   so the pool fills permanently and stays full until the process restarts,
+   because nothing ever gives a slot back. A spawned agent is woken by
    mail and by nothing else, so that row could never take a turn, and with no
    kill verb it could not be removed either. `spawn` therefore refuses before
    writing the row when the pool is full *and* nothing evicts, naming both
    settings; a full pool with eviction on is a wait and is reported as one.
    That is capacity, not policy — whether to raise the cap or enable eviction
-   is the operator's call, and on a 1.8 GB VM holding a `claude` process at
-   ~400 MB it is a real one.
+   is the operator's call. On 2026-08-20 they took the first: both configs went
+   to `maxConcurrent: 10` — from 3 on instance 1 and from 1 on hamachi. That
+   buys ten sessions before the lockout instead of three or one, and nothing
+   else: `idleTimeoutMinutes` is still 0, so the pool still never recovers, and
+   eviction remains the only one of the three that would make it.
+
+   It also moves where the failure shows up, which is the part worth knowing.
+   At `maxConcurrent: 1` hamachi was structurally incapable of a second session
+   and said so — `atCapacityNotice` names the setting, so a user who lost a turn
+   learned which file to look in. At 10, on the measurements in SETUP.md § 5,
+   the container's `--memory` or `--pids-limit` is the likelier thing to give
+   first, and that is an OOM kill or a failing `fork()` in something unrelated,
+   which nothing attributes to this setting. The trade is legibility, not just
+   headroom.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
    user, the sudoers file and the privilege drop untouched. **Done** —
    `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a
