@@ -194,18 +194,36 @@ function subagentTypeColors(types) {
   return map;
 }
 
-/**
- * What to print for a subagent whose type nobody recorded.
+/*
+ * An empty `subagentType` means two DIFFERENT things depending on which view
+ * produced it, so there are two labels and not one.
  *
- * Not "unknown" on its own. That word in a column of agent-ish things reads as
- * a value that ought to be there and is missing — and next to a page where
- * `role` means engineer or researcher, it reads as a missing ROLE. This says
- * what is actually absent: the sidecar, or a spawning call naming it.
+ * The session view (`buildSessionDetail`) reads the sidecar AND the
+ * `subagent_type` on the `Task` call that spawned it. Empty there means both
+ * were silent — nothing recorded a type anywhere we look.
+ *
+ * The roll-up (`buildSubagentRollup`) reads the sidecar only, because the
+ * spawning call lives in the parent transcript and reading it would mean
+ * indexing, which that view is built not to do. Empty there means "no
+ * sidecar", and the session view may well know the answer.
+ *
+ * Printing "type not recorded" for the second would be the page asserting
+ * something it did not check — the same defect this whole change is about, one
+ * layer down. Neither says "unknown": that word in a column of agent-ish
+ * things reads as a missing value, and beside a page where `role` means
+ * engineer or researcher it reads as a missing ROLE.
  */
-const NO_SUBAGENT_TYPE = 'type not recorded';
+const NO_TYPE_ANYWHERE = 'type not recorded';
+const NO_TYPE_IN_SIDECAR = 'no sidecar';
 
-function subagentTypeLabel(subagentType) {
-  return subagentType || NO_SUBAGENT_TYPE;
+/** For the swimlane, where both sources were tried. */
+function laneTypeLabel(subagentType) {
+  return subagentType || NO_TYPE_ANYWHERE;
+}
+
+/** For the roll-up, where only the sidecar was read. */
+function rollupTypeLabel(subagentType) {
+  return subagentType || NO_TYPE_IN_SIDECAR;
 }
 
 // ── API ─────────────────────────────────────────────────────────────────────
@@ -662,10 +680,16 @@ function agentCard(instanceId, agent) {
           },
           [`${fmtCount(agent.subagentCount)} subagent transcript(s) →`],
         )
+      // "None here", and nothing about why. It read "this role has no subagent
+      // tool" for a coordinator or poster, which CLAWSKY.md does say — under
+      // phase 5, unmarked, while phase 6 is Done — but there is no
+      // `disallowedTools`, `allowedTools` or `canUseTool` anywhere in `src/`
+      // today. So it was the page stating as mechanism something that is
+      // currently prompt text. It could only render at a count of zero, so it
+      // never visibly contradicted itself; that makes it the kind of wrong
+      // sentence that survives, not the kind that gets caught.
       : el('span', { class: 'chip', dataset: { absent: 'true' } }, [
-          agent.role === 'coordinator' || agent.role === 'poster'
-            ? 'no subagents — this role has no subagent tool'
-            : 'no subagent transcripts',
+          'no subagent transcripts',
         ]),
   );
   card.append(chips);
@@ -1073,7 +1097,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     });
 
     attachTooltip(bar, [
-      ['subagent type', subagentTypeLabel(node.subagentType)],
+      ['subagent type', laneTypeLabel(node.subagentType)],
       ['task', node.description],
       ['started', fmtClock(node.startedAt)],
       ['ended', node.active ? 'still running' : fmtClock(node.endedAt)],
@@ -1099,7 +1123,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
             `#/transcript/${encodeURIComponent(agentId)}/${encodeURIComponent(sessionId)}` +
             `/${encodeURIComponent(node.agentId)}`,
         },
-        [subagentTypeLabel(node.subagentType)],
+        [laneTypeLabel(node.subagentType)],
       ),
       // A workflow subagent carries no description; the run's name is what it
       // was for, and an anonymous bar is what this view exists not to draw.
@@ -1124,7 +1148,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     legend.append(
       el('span', { class: 'legend-item' }, [
         el('span', { class: 'legend-swatch', style: { background: color } }),
-        subagentTypeLabel(subagentType),
+        laneTypeLabel(subagentType),
       ]),
     );
   }
@@ -1433,11 +1457,30 @@ async function viewSubagents(agentId, slug = null) {
       el('div', { class: 'card-head' }, [
         el('div', { class: 'card-head-left' }, [
           el('span', { class: 'lane-swatch', style: { background: color } }),
-          text('span', 'card-title', subagentTypeLabel(group.subagentType)),
+          text('span', 'card-title', rollupTypeLabel(group.subagentType)),
         ]),
         text('span', 'tile-sub', `${fmtCount(group.count)} transcript(s)`),
       ]),
     ]);
+
+    // The one group that is an absence rather than a type. It says what is
+    // missing and where the answer may still be, because this list reads the
+    // sidecar only and the session view reads the spawning call as well — so
+    // these are not subagents whose type is lost, they are subagents whose
+    // type this page did not go and look for.
+    if (!group.subagentType) {
+      card.append(
+        text(
+          'p',
+          'block-prose',
+          'These have no `.meta.json` beside them, which older transcripts on this host do ' +
+            'not. This list reads that sidecar and nothing else — deliberately, since the ' +
+            'alternative is indexing every parent transcript to render a heading. Open a ' +
+            'session below and its subagent branching view will recover the type from the ' +
+            'call that spawned it, where the call is still on disk.',
+        ),
+      );
+    }
 
     const list = el('div', { class: 'subagent-list' });
     for (const entry of group.subagents) {

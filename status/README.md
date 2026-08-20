@@ -223,6 +223,16 @@ made a list of things with no identity look like a list of agents. A subagent
 type is how the parent spawned it; the crew roles are on the Overview and are a
 different column of a different table.
 
+**This list reads the `.meta.json` sidecar and nothing else**, so a subagent
+without one is grouped under **"no sidecar"** rather than under a type. That is
+not the same claim as "nothing recorded a type": there is a second source — the
+`subagent_type` on the `Task` call that spawned it, in the *parent* transcript
+— and *Subagent branching* uses it, because that view indexes and this one is
+built not to. So the same subagent can read `no sidecar` here and `Explore`
+there, and neither is wrong. The card says so and points at the session view.
+Only the swimlane, where both sources have been tried, says **"type not
+recorded"**.
+
 The scoped form is a filter over the same walk, never a narrower walk — which
 is the check that keeps the bug below fixed. The unscoped form is linked from
 the Overview and from each instance page, and every directory under a projects

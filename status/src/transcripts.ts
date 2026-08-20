@@ -1014,9 +1014,11 @@ async function readSubagentMeta(dir: string, jsonlName: string): Promise<Subagen
     const record = asRecord(parsed);
     if (!record) return null;
     return {
-      // agentType is a role name and reaches the page as a heading and a colour
-      // key; description is free prose. Both are rendered, so both go through
-      // the same door.
+      // agentType is a `subagent_type` — how this subagent was spawned, NOT a
+      // crew role; see `SpawnRecord.subagentType` above for the distinction and
+      // why it matters. It reaches the page as a heading and a colour key, and
+      // description is free prose. Both are rendered, so both go through the
+      // same door.
       agentType: metaText(record['agentType']),
       description: metaText(record['description']),
       toolUseId: asString(record['toolUseId']),

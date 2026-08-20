@@ -230,8 +230,7 @@ h2 {
   margin: 26px 0 10px;
 }
 
-/* A count riding along on a section heading. Not uppercase and not tracked out
-   — it is a number, and the heading's letter-spacing makes digits unreadable. */
+/* The instance's own liveness and projects root, under its heading. */
 .instance-line {
   display: flex;
   align-items: baseline;
@@ -239,6 +238,8 @@ h2 {
   margin-bottom: 10px;
 }
 
+/* A count riding along on a section heading. Not uppercase and not tracked out
+   — it is a number, and the heading's letter-spacing makes digits unreadable. */
 .h2-note {
   margin-left: 10px;
   text-transform: none;

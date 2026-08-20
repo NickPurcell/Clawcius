@@ -884,10 +884,23 @@ export type SubagentEntry = {
    */
   projectSlug: string;
   /**
-   * `agentType` from the sidecar, or `subagent_type` from the spawning call.
+   * `agentType` from the sidecar. NOT a crew role, and no longer called one.
    *
-   * NOT a crew role, and no longer called one. Empty when neither source
-   * recorded it, which older transcripts on this host do not.
+   * ── Empty means "no sidecar", and only that ────────────────────────────
+   *
+   * ONE source, deliberately. `buildSessionDetail` has a second — the
+   * `subagent_type` on the `Task` call that spawned it — and recovers a type
+   * this field leaves empty. That is not an oversight to be tidied up: the
+   * spawning call is inside the PARENT transcript, so reading it means
+   * indexing, and the header above commits this roll-up to a readdir, a stat
+   * and a sidecar read for all 104 transcripts under Hamachi's root.
+   *
+   * So the honest reading of the empty string here is "this subagent has no
+   * sidecar", NOT "nothing anywhere recorded a type" — the session view may
+   * well know, and the UI says so rather than claiming the type is lost. The
+   * doc used to assert the two-source fallback that `buildNode` has and this
+   * does not, which is a sentence outrunning its code, in a change whose whole
+   * subject is sentences outrunning their code.
    */
   subagentType: string;
   description: string;
@@ -984,9 +997,16 @@ export type SubagentRollup = {
  * still links, returns all of them.
  *
  * A `projectSlug` matching nothing yields an empty roll-up rather than an
- * error. An agent that has spawned no subagents is a perfectly ordinary state
- * and the poster and coordinator cannot spawn one at all (CLAWSKY.md: they
- * lose the tool), so "none" is the expected answer for two rows of every crew.
+ * error. An agent that has spawned no subagents is a perfectly ordinary state,
+ * so "none" is an answer and not a fault.
+ *
+ * This used to add that the coordinator and poster "cannot spawn one at all
+ * (CLAWSKY.md: they lose the tool)". CLAWSKY.md does say the tool is removed
+ * from those two, but it says it under phase 5, which is unmarked while phase
+ * 6 is Done, and there is no `disallowedTools`, `allowedTools` or `canUseTool`
+ * anywhere in `src/` today. So it is the intent, written down, and not yet a
+ * mechanism — and a comment asserting it is this file claiming a guarantee the
+ * code does not make. Removed rather than hedged: "none" needs no explanation.
  */
 export async function buildSubagentRollup(
   store: TranscriptStore,
@@ -1025,8 +1045,9 @@ export async function buildSubagentRollup(
         agentId: ref.agentId,
         sessionId: session.sessionId,
         projectSlug: session.projectSlug,
-        // Empty rather than `'unknown'` — the same change as `buildNode`, and
-        // for the same reason: the column it sat in was headed "role".
+        // The sidecar and nothing else — see the field's doc. Empty here means
+        // "no sidecar", which is weaker than `buildNode`'s empty and is
+        // labelled differently on the page for exactly that reason.
         subagentType: ref.meta?.agentType ?? '',
         description: ref.meta?.description ?? '',
         model: ref.meta?.model ?? null,
@@ -1077,6 +1098,15 @@ export async function buildSubagentRollup(
 }
 
 /**
+ * `slug('/tmp/…')`. The leading dash is the slugified leading slash — see
+ * `slugifyWorkspace`, where every non-alphanumeric becomes one — so this is a
+ * statement about the path the directory was named after, not a guess.
+ */
+function isTmpSlug(projectSlug: string): boolean {
+  return projectSlug === '-tmp' || projectSlug.startsWith('-tmp-');
+}
+
+/**
  * Say which of the two disagreeing sources the scope came from, when they
  * disagree.
  *
@@ -1105,8 +1135,19 @@ function describeScope(agent: AgentRoot, projectSlug: string | null): string | n
   if (owner) return null;
   return (
     `No agent in the registry has ${projectSlug} as its workspace, so these subagents are ` +
-    'attributed to a directory rather than to an agent. On this host those are the `/tmp` ' +
-    'paths where engineers ran permission probes — real transcripts, no owner.'
+    'attributed to a directory rather than to an agent. ' +
+    // Read off the slug in hand, not asserted about "this host". The sentence
+    // this replaces named the /tmp permission probes on EVERY unclaimed slug,
+    // which made it wrong in the case that matters most: a directory that did
+    // belong to an agent the registry no longer carries, which is exactly what
+    // an operator scopes to when something has gone wrong. What is left is
+    // checkable from the string, and the alternatives are offered as
+    // alternatives instead of one of them being reported as an observation.
+    (isTmpSlug(projectSlug)
+      ? 'That directory is under /tmp, which on this host is where engineers have run ' +
+        'permission probes — real transcripts, no owner.'
+      : 'It may be a cwd somebody ran Claude Code in, or an agent this registry no longer ' +
+        'carries. Nothing here can tell those apart: the directory is all there is.')
   );
 }
 
