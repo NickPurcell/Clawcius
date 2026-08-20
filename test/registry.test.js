@@ -301,3 +301,27 @@ test('recording a session does not rewrite who an agent is', () => {
   assert.equal(row.sessionId, '0b3f4d1e-1111-4222-8333-444455556666');
   registry.close();
 });
+
+test('the upsert mints a row when there is none — which is why persist must not call it', () => {
+  // Pinning the behaviour that makes `SessionManager.persist`'s absent-row
+  // guard necessary rather than decorative. `recordSession` is an upsert, so
+  // with no row it takes the plain-INSERT branch and writes `identity.role`
+  // verbatim — and the identity a missing row produces is the `coordinator`
+  // fallback, which is the one role that may DM the host agent. Preferring the
+  // row in `#identityFor` cannot narrow that: there is no row to prefer.
+  //
+  // The guard lives in agent.ts because that is where the decision belongs; the
+  // store stays a store. If this test ever starts failing because the upsert
+  // became an update, the guard is redundant and can go.
+  const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
+
+  registry.recordSession('hamachi-engineer1', '0b3f4d1e-1111-4222-8333-444455556666', '/w/1', {
+    crew: 'hamachi',
+    role: 'coordinator',
+    workspacePath: '/w/1',
+    spawnedBy: null,
+  });
+
+  assert.equal(registry.get('hamachi-engineer1').role, 'coordinator');
+  registry.close();
+});

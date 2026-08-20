@@ -42,6 +42,22 @@
  * on a collision rather than adopting the existing row — because mail is
  * addressed to the id, and reusing one would hand a new agent an old inbox.
  *
+ * ── What a role does and does not decide ────────────────────────────────────
+ *
+ * Role is a boundary in `src/mail.ts` and, today, nowhere else. `#buildOptions`
+ * puts `DISCORD_TOKEN`, `DISCORD_GUILD_ID` and `GITHUB_TOKEN` into every
+ * session's environment and `linkSkills` symlinks the discord-cli skill into
+ * every workspace, regardless of role — so a spawned engineer can post to
+ * Discord as the bot and can push to GitHub. There is no `allowedTools`,
+ * `disallowedTools` or `canUseTool` anywhere in `src/`.
+ *
+ * That does not weaken the argument below for refusing `coordinator` and
+ * `host`, which is about who may DM the host agent and rests on mail policy
+ * alone. It does mean the argument is about MAIL, and the sentence "an engineer
+ * told it is a poster still cannot write to the feed" should be read as the
+ * narrow claim it is. The shared-container half of this — one uid, one process
+ * table per crew — is Clawcius #31 and #35, recorded in `src/mail.ts`.
+ *
  * ── Who may spawn, and what ─────────────────────────────────────────────────
  *
  * A coordinator. The tool is only built for a coordinator session (see
@@ -60,8 +76,8 @@
  *
  * ── No cap, and the cost is meant to be visible instead ─────────────────────
  *
- * There is no limit on how many agents a coordinator may spawn, no throttle
- * and no cooldown, and that is a decision rather than an omission: from the
+ * No POLICY limits how many agents a coordinator may spawn: no quota, no
+ * throttle, no cooldown. That is a decision rather than an omission — from the
  * design record, "a coordinator spawning 100 engineers is annoying but
  * interesting behaviour if it does occur". What replaces the limiter is
  * legibility. Every spawn writes a line to the journal naming who spawned
@@ -69,6 +85,13 @@
  * already renders both — an agent card shows `spawned by <id>` beside its role
  * without a line of change here. A hundred engineers would be a hundred rows
  * on the roster, which is exactly what watching a runaway looks like.
+ *
+ * THE MACHINE STILL LIMITS IT, and conflating the two would be the mistake.
+ * The session cap is not a policy about spawning and does not become one by
+ * being enforced here; it is the number of `claude` processes this VM can hold
+ * at once. `SpawnToolOptions.capacity` is how that arithmetic reaches the tool,
+ * and the refusal it produces says "there is no room", not "you have had
+ * enough".
  *
  * ── There is no kill verb yet ───────────────────────────────────────────────
  *
@@ -136,6 +159,26 @@ export type SpawnToolOptions = {
    * never fire is worse than no watch, because the agent then waits for it.
    */
   wakesOnMail: boolean;
+  /**
+   * How full the session pool is — `SessionManager.capacity`.
+   *
+   * The session cap is the second thing that can make a spawned row unrunnable,
+   * and it is less obvious than `wakeOnMail` because it depends on arithmetic
+   * rather than on a boolean. `acquire` throws at
+   * `#sessions.size >= sessions.maxConcurrent`, `#evictIdle` returns
+   * immediately when `sessions.idleTimeoutMinutes` is 0, and nothing else frees
+   * a slot in the ordinary course. `spawn` runs INSIDE the calling
+   * coordinator's turn, so that coordinator is necessarily holding a slot when
+   * the call happens — which on `maxConcurrent: 1` means the pool is full by
+   * construction at every spawn, forever.
+   *
+   * A full pool is not automatically fatal, and the distinction is why this
+   * carries the timeout rather than just two numbers: with eviction ON a slot
+   * frees itself and the ten-second sweep picks the agent up, which is an
+   * honest "queued". With eviction OFF nothing ever frees one, and "queued"
+   * would be a lie the caller could not check.
+   */
+  capacity: () => { live: number; max: number; idleTimeoutMinutes: number };
   /** Journal, so a spawn is legible from outside the turn that did it. */
   log: (line: string) => void;
 };
@@ -193,16 +236,25 @@ function describeSpawn(agentId: string): string {
     '',
     'AN AGENT YOU SPAWN IS LONG-LIVED. It does not end when its task does, and it is',
     'not a subagent: it is a row on disk with its own inbox, its own transcript and its',
-    'own session, and it survives restarts. Between turns nothing of it is running,',
-    'which is its normal state and costs nothing. So the next piece of work for someone',
+    'own session, and it survives restarts. Being idle is its normal state and it is not',
+    'death — but it is not free either: depending on how this deployment is configured',
+    'an agent that has run may hold a session slot and its memory until the process',
+    'restarts. So the next piece of work for someone',
     'you already have is a DM, not another spawn — keep the engineer who already has',
     'the context for that domain. Researchers are the ones it is reasonable to spawn',
     'freely; engineers are not.',
     '',
-    'There is no limit on how many you may spawn and nothing will stop you. What there',
-    'is instead is a record: a line in the journal per spawn, `spawned by <you>` on the',
-    "agent's card on the status page, and a count by role in `!status`. The cost is",
-    'made visible rather than capped.',
+    'No POLICY limits how many you may spawn — there is no quota, no throttle and no',
+    'cooldown, and the cost is made visible instead: a line in the journal per spawn,',
+    "`spawned by <you>` on the agent's card on the status page, and a count by role in",
+    '`!status`.',
+    '',
+    'THE MACHINE LIMITS YOU EVEN SO, and it is not the same thing. Every agent that is',
+    'mid-conversation holds one of a fixed number of session slots, your own turn',
+    'included. If there is no free slot and this deployment never evicts idle ones, a',
+    'spawned agent could never take a turn — so `spawn` refuses, and says so, rather',
+    'than writing a row that is stuck forever. That refusal is capacity, not policy:',
+    'nothing is rationing you, there is simply no room.',
     '',
     'THERE IS NO KILL VERB YET. Nothing here or anywhere else can set an agent dead,',
     'and who should hold that — you, over what you spawned, or the operator alone — is',
@@ -224,7 +276,15 @@ export function buildSpawnTools(
   // `any` for the same reason as mail-tool.ts and armed-tool.ts: the SDK's own
   // signature for a heterogeneous tool list.
 ): SdkMcpToolDefinition<any>[] {
-  const { registry, mail, workspaceRoot, charter: renderCharter, wakesOnMail, log } = options;
+  const {
+    registry,
+    mail,
+    workspaceRoot,
+    charter: renderCharter,
+    wakesOnMail,
+    capacity,
+    log,
+  } = options;
 
   const spawn = tool(
     'spawn',
@@ -263,6 +323,24 @@ export function buildSpawnTools(
         );
       }
 
+      // The other way a row can turn out to be unrunnable, and it is arithmetic
+      // rather than a setting. See `SpawnToolOptions.capacity`: a full pool with
+      // nothing that empties it means `acquire` throws at every sweep, forever,
+      // and there is no kill verb with which to clean up after the attempt.
+      const pool = capacity();
+      const free = pool.max - pool.live;
+      if (free <= 0 && pool.idleTimeoutMinutes === 0) {
+        return refuse(
+          `Not spawned — there is no session slot for it and nothing will free one. ` +
+            `${pool.live} of ${pool.max} sessions are live (\`sessions.maxConcurrent\`), and ` +
+            '`sessions.idleTimeoutMinutes` is 0, so a session is never evicted — the pool only ' +
+            'empties on a restart. Your own turn is holding one of those slots, so this is the ' +
+            'state at every spawn, not a busy moment. The row would be written and could never ' +
+            'take a turn, and there is no kill verb to remove it afterwards. The operator has ' +
+            'to raise the cap or turn eviction on.',
+        );
+      }
+
       const wanted = typeof role === 'string' ? role.trim().toLowerCase() : '';
       if (!(SPAWNABLE_ROLES as readonly string[]).includes(wanted)) {
         // Named separately from a typo, because they are different answers.
@@ -297,7 +375,10 @@ export function buildSpawnTools(
       const workspacePath = join(workspaceRoot, id);
 
       // Before the row: a row pointing at a directory that could not be
-      // created is an agent that fails at every wake, forever.
+      // created is an agent that fails at every wake, forever. The cost of that
+      // ordering is that a `create` which throws just below leaves an empty
+      // directory behind — worth naming, and still the right way round, since a
+      // stray directory is inert and a broken row is not.
       try {
         mkdirSync(workspacePath, { recursive: true });
       } catch (error) {
@@ -363,9 +444,17 @@ export function buildSpawnTools(
       // dead transport — and the ten-second sweep will retry. Reported rather
       // than asserted, because "spawned and running" and "spawned and queued"
       // are different situations for the caller.
-      const stillWaiting = mail.unread(id).length;
-      const started = stillWaiting === 0;
-      log(`${id} first turn ${started ? 'started' : 'queued — the waker will retry'}`);
+      const started = mail.unread(id).length === 0;
+      // And WHY it is queued, because the two reasons have different remedies.
+      // The refusal above rules out the hopeless case, so a full pool here
+      // means eviction is on and a slot genuinely frees itself; anything else
+      // is the sweep's ordinary retry.
+      const queuedBecause =
+        free <= 0
+          ? `waiting for a session slot — ${pool.live} of ${pool.max} are live and one frees ` +
+            `after ${pool.idleTimeoutMinutes}m idle`
+          : 'the waker could not start it this moment and the sweep retries every ~10s';
+      log(`${id} first turn ${started ? 'started' : `queued: ${queuedBecause}`}`);
 
       return say(
         [
@@ -375,7 +464,7 @@ export function buildSpawnTools(
           `  first turn ${
             started
               ? 'has started; it woke with your instructions already read'
-              : 'is queued — the waker could not start it this moment and retries within ~10s'
+              : `is queued — ${queuedBecause}`
           }`,
           '',
           `Reach it with sendMail to ${id}. It is long-lived: it stays on the board between`,

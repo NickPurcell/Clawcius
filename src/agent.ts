@@ -743,6 +743,24 @@ export class SessionManager {
    * but idle session costs nothing to recreate: it is resumed from SQLite on
    * the next mention.
    */
+  /**
+   * How full the session pool is, and whether anything ever empties it.
+   *
+   * Read by `spawn`, which has to know before it writes a row: a spawned agent
+   * is woken by mail and by nothing else, so if `acquire` can never find it a
+   * slot then the row can never take a turn. The two numbers are not enough on
+   * their own — a full pool with eviction ON is a wait, and a full pool with
+   * eviction OFF is forever — so the timeout comes with them rather than the
+   * caller guessing.
+   */
+  get capacity(): { live: number; max: number; idleTimeoutMinutes: number } {
+    return {
+      live: this.#sessions.size,
+      max: config.agent.sessions.maxConcurrent,
+      idleTimeoutMinutes: config.agent.sessions.idleTimeoutMinutes,
+    };
+  }
+
   get busyCount(): number {
     let busy = 0;
     for (const session of this.#sessions.values()) if (session.busy) busy += 1;
@@ -834,6 +852,9 @@ export class SessionManager {
                     workspaceRoot: config.agent.sessions.workspaceRoot,
                     charter: buildSpawnCharter,
                     wakesOnMail: config.agent.clawsky.wakeOnMail,
+                    // A getter, not a snapshot: the tool is built once per
+                    // session and the pool moves under it.
+                    capacity: () => this.capacity,
                     log: this.#spawnLog,
                   })
                 : []),
@@ -850,10 +871,43 @@ export class SessionManager {
     return session;
   }
 
+  /**
+   * Write the session id back to the row, and only to a row that exists.
+   *
+   * The absent-row check is the whole of the fix, and preferring the row in
+   * `#identityFor` is not a substitute for it. `recordSession` is an upsert:
+   * when the row is missing it takes the plain-INSERT branch and writes
+   * `identity.role` — so the case worth worrying about, a row that went missing
+   * between the wake and the persist, is exactly the case that reaches
+   * `#identityFor`'s fallback and gets `coordinator`, which is the one role
+   * that may DM the host agent. Reading the row first narrows nothing there,
+   * because there is no row to read.
+   *
+   * So a turn ending for an agent with no row now writes nothing at all,
+   * whatever role it would have picked. An agent is a row; a turn is not a
+   * thing that may create one.
+   *
+   * NOT REACHABLE TODAY, and said out loud so nobody reads it as a live hole:
+   * nothing in the tree deletes from `agents`, and `!reset` clears the session
+   * id rather than the row. It is a guard against a future delete, and against
+   * the day somebody adds one without thinking about which code paths mint
+   * rows. The loud line is deliberate — silence here would hide the delete that
+   * made it reachable.
+   */
   persist(channelId: string): void {
     const session = this.#sessions.get(channelId);
     if (!session) return;
     if (!isResumable(session.sessionId)) return;
+
+    if (this.#registry.get(channelId) === undefined) {
+      process.stderr.write(
+        `[clawcius ${channelId}] finished a turn with no registry row — not creating one. ` +
+          'Its session id is lost and the next wake starts cold. Something deleted the row, ' +
+          'which nothing in this tree does.\n',
+      );
+      return;
+    }
+
     this.#registry.recordSession(
       channelId,
       session.sessionId,

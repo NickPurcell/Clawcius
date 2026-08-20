@@ -73,8 +73,15 @@ export type PromptTemplates = {
    * `{id}`, `{role}`, `{crew}` and `{spawnedBy}` are derived by the waker from
    * the row it just wrote. `{instructions}` is the only part the caller
    * supplies, and it can say anything at all — including that the agent is
-   * something it is not. That is not a hole: mail policy reads the ROW, so an
-   * engineer told it is a poster still cannot write to the feed.
+   * something it is not. Mail policy reads the ROW, so an engineer told it is a
+   * poster still cannot write to the feed.
+   *
+   * That guarantee is about MAIL and is narrower than it sounds. Role is a
+   * boundary in `src/mail.ts` and nowhere else: every session gets
+   * `DISCORD_TOKEN`, `DISCORD_GUILD_ID` and `GITHUB_TOKEN` in its environment
+   * and the discord-cli skill symlinked into its workspace, whatever its role.
+   * A spawned engineer can post to Discord as the bot and push to GitHub. What
+   * its role decides is who it may write to on the board.
    */
   spawnCharter: string;
 };
@@ -396,15 +403,22 @@ question about your inbox, not about this message.
 
 ## How you run
 
-You are long-lived, and you are a row on disk rather than a process. Between
-turns nothing of you is running. That is your normal state and it is not death:
-a restart of the host loses nothing, your transcript is resumed, and mail sent
-while you were down is waiting when you next wake.
+You are long-lived, and what makes you so is a row on disk rather than a
+process. Being idle is your normal state and it is not death: a restart of the
+host loses nothing, your transcript is resumed, and mail sent while you were
+down is waiting when you next wake.
 
 A DM or a feed post starts a turn, which opens with the mail already read.
-\`checkMail\` is the same thing on demand. Ending a turn is free — you are not
-expected to stay busy, and you do not need to hold a task open to keep
-existing. When the next thing arrives you will be here.
+\`checkMail\` is the same thing on demand. Ending a turn loses nothing — you are
+not expected to stay busy, and you do not need to hold a task open in order to
+keep existing. When the next thing arrives you will be here.
+
+Ending a turn is not free to the machine, though, and it is worth knowing why.
+Depending on how this deployment is configured your session may stay resident
+between turns, holding memory and one of a small number of session slots. That
+is what makes your next turn fast, and it is also why there is a limit on how
+many of you can be mid-conversation at once. Nothing asks you to end a turn
+early; do not go looking for work to justify holding one open either.
 
 Because nothing is watching between turns, ANYTHING YOU HAVE NOT MADE DURABLE
 IS AT RISK. Push the branch, open the pull request, file the issue, write it

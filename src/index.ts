@@ -128,11 +128,16 @@ const armedTools = armedStore
  * so without a board it would write a row that nothing could ever reach.
  *
  * The log function is the whole of what this passes in, because it is the
- * whole of what this process adds. There is no cap and no throttle on
- * spawning, deliberately — the operator would rather watch a runaway than
- * pre-empt one — so the journal is where the cost shows up. Every line here
- * names the coordinator that spawned, the agent it got, and whether the first
- * turn actually started.
+ * whole of what this process adds. No POLICY caps or throttles spawning,
+ * deliberately — the operator would rather watch a runaway than pre-empt one —
+ * so the journal is where the cost shows up. Every line here names the
+ * coordinator that spawned, the agent it got, and whether the first turn
+ * actually started.
+ *
+ * The session cap binds regardless, and is not a policy about spawning: it is
+ * how many `claude` processes fit on this VM. `SessionManager` hands the tool
+ * that arithmetic so a spawn that could never run is refused rather than
+ * written — see `SpawnToolOptions.capacity`.
  */
 const spawnLog = mail
   ? (line: string): void => {
@@ -433,8 +438,20 @@ function describeHostAgent(): string {
  * Who is on this crew's board, by role, and how many of them were spawned.
  *
  * Read straight from the registry on every `!status` rather than counted as
- * spawns happen: the rows are the record, and a tally kept alongside them
- * would be a second one that can disagree after a restart or an operator edit.
+ * spawns happen: the rows are the record, and a tally kept alongside them would
+ * be a second one that can disagree after a restart or an operator edit.
+ *
+ * ROWS, and the word is chosen. A count of `coordinator` here is NOT the number
+ * of coordinators the crew has: sessions are keyed on `message.channelId`,
+ * which is per thread as well as per channel, and `#identityFor`'s fallback
+ * writes any id the registry has not heard of as a `coordinator`. So the number
+ * is "Discord conversations this bot has been woken in", and a line reading
+ * `9 coordinator` would be read by everybody as nine agents. The parenthetical
+ * is load-bearing; do not trim it.
+ *
+ * `host` is counted too, and named as not being a crew member, because it does
+ * sit on this board — leaving it out would make the total disagree with the
+ * status page for no stated reason.
  */
 function describeCrew(): string {
   const crew = config.agent.clawsky.crew;
@@ -443,11 +460,20 @@ function describeCrew(): string {
 
   const byRole = new Map<string, number>();
   for (const row of rows) byRole.set(row.role, (byRole.get(row.role) ?? 0) + 1);
-  const roles = [...byRole.entries()].map(([role, n]) => `${n} ${role}`).join(', ');
+  const roles = [...byRole.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([role, n]) => `${n} ${role}`)
+    .join(', ');
   const spawned = rows.filter((row) => row.spawnedBy !== null).length;
 
-  return `${crew} — ${rows.length} agent(s): ${roles}` +
-    (spawned > 0 ? ` (${spawned} spawned)` : '');
+  const notes: string[] = [];
+  if ((byRole.get('coordinator') ?? 0) > 1) {
+    notes.push('a coordinator row is one Discord channel or thread, not one agent');
+  }
+  if (byRole.has('host')) notes.push('the host runs outside the container and is not crew');
+  notes.push(spawned > 0 ? `${spawned} spawned` : 'none spawned');
+
+  return `${crew} — ${rows.length} row(s): ${roles} (${notes.join('; ')})`;
 }
 
 function silentEvents() {

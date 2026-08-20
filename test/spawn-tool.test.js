@@ -61,6 +61,8 @@ const spawnBoard = () => {
 
   const workspaceRoot = mkdtempSync(join(tmpdir(), 'clawsky-workspaces-'));
   const logged = [];
+  // The pool the waker would be drawing on. Mutable so a test can fill it.
+  const capacity = { live: 1, max: 4, idleTimeoutMinutes: 0 };
   const spawnOf = (agentId) =>
     buildSpawnTools(agentId, {
       registry,
@@ -68,10 +70,11 @@ const spawnBoard = () => {
       workspaceRoot,
       charter: spawnCharter,
       wakesOnMail: true,
+      capacity: () => capacity,
       log: (line) => logged.push(line),
     })[0];
 
-  return { registry, mail, spawnOf, workspaceRoot, logged };
+  return { registry, mail, spawnOf, workspaceRoot, logged, capacity };
 };
 
 /**
@@ -100,6 +103,7 @@ function spawnInto({ registry, mail }, coordinatorId, workspaceRoot, log = () =>
     workspaceRoot,
     charter: spawnCharter,
     wakesOnMail: true,
+    capacity: () => ({ live: 1, max: 4, idleTimeoutMinutes: 0 }),
     log,
   });
   return spawn;
@@ -255,6 +259,7 @@ test('spawn refuses when nothing would ever wake what it created', async () => {
     // delivery into a turn. A spawned agent has no Discord channel, so this is
     // the one configuration where the row could never run at all.
     wakesOnMail: false,
+    capacity: () => ({ live: 1, max: 4, idleTimeoutMinutes: 0 }),
     log: () => {},
   });
 
@@ -409,5 +414,90 @@ test('a spawned agent survives the process that spawned it', async () => {
   });
   assert.equal(started.length, 2);
   assert.match(started[1].context.mail, /second task/);
+  registry.close();
+});
+
+// ── Capacity: a row that could never take a turn is not written ─────────────
+
+test('spawn refuses when the session pool is full and nothing ever empties it', async () => {
+  const { registry, mail, spawnOf, capacity, logged } = spawnBoard();
+
+  // `agent-config.hamachi.yaml`: maxConcurrent 1, idleTimeoutMinutes 0. `spawn`
+  // runs inside the calling coordinator's turn, so the coordinator is always
+  // holding that one slot — the pool is full by construction at every spawn,
+  // not just at a busy moment.
+  capacity.live = 1;
+  capacity.max = 1;
+  capacity.idleTimeoutMinutes = 0;
+
+  const refused = await spawnOf('hamachi-coordinator').handler(
+    { role: 'engineer', instructions: 'take #121' },
+    {},
+  );
+
+  assert.equal(refused.isError, true);
+  assert.match(said(refused), /sessions\.maxConcurrent/);
+  assert.match(said(refused), /sessions\.idleTimeoutMinutes/);
+
+  // The whole point of refusing rather than queueing. There is no kill verb,
+  // `create` refuses a taken id and ids are never reused, so a row written here
+  // would be permanently unrunnable and removable only with sqlite3 on the VPS.
+  assert.equal(registry.get('hamachi-engineer1'), undefined);
+  assert.equal(mail.unread('hamachi-engineer1').length, 0);
+  assert.equal(logged.length, 0, 'nothing happened, so nothing is claimed in the journal');
+  registry.close();
+});
+
+test('a full pool with eviction on is a wait, not a refusal', async () => {
+  const { registry, spawnOf, capacity } = spawnBoard();
+
+  // Same full pool, but idle sessions are evicted, so a slot genuinely frees
+  // itself and the ten-second sweep picks the agent up. Refusing here would
+  // block a spawn that would have worked.
+  capacity.live = 3;
+  capacity.max = 3;
+  capacity.idleTimeoutMinutes = 30;
+
+  const result = await spawnOf('hamachi-coordinator').handler(
+    { role: 'engineer', instructions: 'take #121' },
+    {},
+  );
+
+  assert.equal(result.isError, undefined);
+  assert.ok(registry.get('hamachi-engineer1'));
+  // And the caller is told which wait it is in. "retries within ~10s" would be
+  // the wrong sentence: the retry is real but what it is waiting on is a slot.
+  assert.match(said(result), /waiting for a session slot/);
+  assert.match(said(result), /frees after 30m idle/);
+  registry.close();
+});
+
+test('a free slot spawns normally and says the turn started', async () => {
+  const { registry, spawnOf, capacity } = spawnBoard();
+  capacity.live = 1;
+  capacity.max = 4;
+
+  const result = await spawnOf('hamachi-coordinator').handler(
+    { role: 'engineer', instructions: 'take #121' },
+    {},
+  );
+
+  // No waker is wired in this board, so the mail is still unread and the tool
+  // reports the ordinary sweep retry rather than a capacity wait.
+  assert.equal(result.isError, undefined);
+  assert.match(said(result), /sweep retries every ~10s/);
+  assert.doesNotMatch(said(result), /waiting for a session slot/);
+  registry.close();
+});
+
+test('the description separates the policy limit from the machine limit', () => {
+  const { registry, spawnOf } = spawnBoard();
+  const spawn = spawnOf('hamachi-coordinator');
+
+  // "There is no limit on how many you may spawn and nothing will stop you"
+  // was true of the policy and false of the machine — the session cap will.
+  assert.match(spawn.description, /No POLICY limits how many you may spawn/);
+  assert.match(spawn.description, /THE MACHINE LIMITS YOU EVEN SO/);
+  assert.doesNotMatch(spawn.description, /nothing will stop you/);
   registry.close();
 });

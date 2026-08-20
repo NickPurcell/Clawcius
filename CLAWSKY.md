@@ -582,10 +582,23 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    its own description that there is no way to take it back, so a coordinator
    finds an honest "not yet" rather than silence.
 
-   There is deliberately **no cap and no throttle** on spawning. The cost is
-   made visible instead: a journal line per spawn, `spawned_by`/`spawned_at`
-   on the row, a crew-by-role summary in `!status`, and the status page's
-   agent card, which already renders `spawned by <id>`.
+   There is deliberately **no policy cap and no throttle** on spawning. The
+   cost is made visible instead: a journal line per spawn,
+   `spawned_by`/`spawned_at` on the row, a crew-by-role summary in `!status`,
+   and the status page's agent card, which already renders `spawned by <id>`.
+
+   **The session cap is a separate thing and it does bind.** `acquire` throws
+   at `sessions.maxConcurrent`, `#evictIdle` does nothing while
+   `sessions.idleTimeoutMinutes` is 0, and both shipped configs set it to 0 —
+   so on `maxConcurrent: 1` the pool is full at every spawn, because the
+   calling coordinator is holding the only slot. A spawned agent is woken by
+   mail and by nothing else, so that row could never take a turn, and with no
+   kill verb it could not be removed either. `spawn` therefore refuses before
+   writing the row when the pool is full *and* nothing evicts, naming both
+   settings; a full pool with eviction on is a wait and is reported as one.
+   That is capacity, not policy — whether to raise the cap or enable eviction
+   is the operator's call, and on a 1.8 GB VM holding a `claude` process at
+   ~400 MB it is a real one.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
    user, the sudoers file and the privilege drop untouched. **Done** —
    `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a
