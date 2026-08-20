@@ -453,12 +453,32 @@ run out first. Hitting it is a failing `fork()` somewhere unrelated, not a
 message about sessions.
 
 `sessions.maxConcurrent` is **10** in both configs since 2026-08-20, above
-anything measured here. It is a policy ceiling, not a budget, and the operator
-set it knowing that: with `idleTimeoutMinutes: 0` the pool never gives a slot
-back, so a lower cap did not protect memory either — it just locked the pool
-sooner. Nothing enforces this section; the container's limits do, by killing
-something. `browse` adds ~410 MB peak (`browser-cli/README.md` § Memory) and
-holds an exclusive lock, so there is only ever one.
+anything measured here. It is a policy ceiling, deliberately set past what the
+measurements support, and the operator chose it knowing that. Nothing enforces
+this section; the container's limits do, by killing something. `browse` adds
+~410 MB peak (`browser-cli/README.md` § Memory) and holds an exclusive lock, so
+there is only ever one.
+
+**The cap and the timeout are orthogonal, and neither substitutes for the
+other.** The cap is the only thing that bounds *peak* residency: `acquire`
+throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:894`), so
+at most that many sessions are ever resident at once. `idleTimeoutMinutes` is
+the only thing that gives a slot *back* — and only a slot nobody is using:
+`#evictIdle` skips every session that is busy or was active within the timeout
+(`src/agent.ts:1018`), and it runs on a 60-second sweep, never on the acquire
+path. **So eviction cannot bound a burst.** With `idleTimeoutMinutes: 5` and
+ten channels mentioned at once, ten sessions go live and all ten stay live,
+because none of them is idle. Eviction bounds accumulation over time; the cap
+bounds the peak. Turning eviction on does not make a cap of 10 safe against the
+limits above — it makes the pool recover afterwards.
+
+At `idleTimeoutMinutes: 0` the cap does both jobs badly: it still bounds the
+peak, but it returns a slot only on a restart, so it protects by locking rather
+than by refusing gracefully. That lockout is not an alternative to the bound —
+it is the same bound seen from the user's side. At `maxConcurrent: 1` hamachi's
+resident session memory really was bounded at one session; raising the cap
+trades that bound for headroom, which is the operator's call to make, but it is
+a trade and not the removal of a limit that was never there.
 
 **What the raise changed is where the failure surfaces.** At the old caps the
 pool ran out first, and `atCapacityNotice` names `sessions.maxConcurrent`, so a
@@ -506,8 +526,10 @@ sessions are **never evicted** — the agent stays warm and skips Claude Code
 startup on every mention, at a standing cost of **at least** 400 MB RSS per live
 session and considerably more for a busy one (§ 5 has the measurements and why
 they do not reduce to one figure). Note that this also makes
-`sessions.maxConcurrent` a lifetime budget rather than a concurrency limit: with
-nothing evicting, the pool fills permanently and only a restart empties it.
+`sessions.maxConcurrent` a lifetime budget *as well as* a concurrency limit: it
+still bounds how many sessions are resident at once, and with nothing evicting
+it also bounds how many distinct channels can run at all, because the pool fills
+permanently and only a restart empties it.
 Any positive value evicts after that many idle minutes and resumes
 from SQLite on the next mention; continuity is preserved either way, the
 difference is latency versus resident memory.

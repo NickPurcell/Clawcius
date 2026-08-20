@@ -487,8 +487,28 @@ sessions:
   #
   # So what happens at the ceiling is NOT a refused acquire — the container
   # hits `--memory` or `--pids-limit` first, and that is an OOM kill or a
-  # failing fork(), neither of which is attributed to this setting. The honest
-  # guard is `idleTimeoutMinutes`, not this number; see below.
+  # failing fork(), neither of which is attributed to this setting.
+  #
+  # That is an argument about where 10 fails. It is NOT an argument that this
+  # number does nothing, and the difference matters because the two settings
+  # here are orthogonal and neither substitutes for the other:
+  #
+  #   - This number is the only thing that bounds PEAK residency. `acquire`
+  #     throws at `#sessions.size >= maxConcurrent` (src/agent.ts:894), so at
+  #     most this many sessions are ever resident at once.
+  #   - `idleTimeoutMinutes` is the only thing that gives a slot BACK, and only
+  #     a slot nobody is using: `#evictIdle` skips every session that is busy or
+  #     was active within the timeout (src/agent.ts:1018), and it runs on a 60s
+  #     sweep, never on the acquire path.
+  #
+  # So eviction cannot bound a burst. Ten channels mentioned at once put ten
+  # sessions live and none of them is idle, whatever the timeout is set to.
+  # Eviction bounds accumulation over time; this number bounds the peak.
+  # Turning eviction on does NOT make 10 safe against the limits above — it
+  # makes the pool recover afterwards. At the old `maxConcurrent: 1` this
+  # crew's resident session memory really was bounded at one session, and the
+  # lockout was that same bound seen from the user's side; raising to 10 trades
+  # the bound for headroom rather than removing a limit that was never there.
   maxConcurrent: 10
   # 0 = never evict. Sessions stay alive for the life of the process, so the
   # agent is always warm and never pays Claude Code startup on a mention.
