@@ -463,7 +463,8 @@ sessions:
   maxConcurrent: 10
   # 0 = never evict. Sessions stay alive for the life of the process, so the
   # agent is always warm and never pays Claude Code startup on a mention.
-  # Costs ~400 MB RSS per live session, standing, whether busy or not.
+  # Costs at least ~400 MB RSS per live session, standing, whether busy or not,
+  # and materially more for a busy one — see the measurements above.
   #
   # This is what makes maxConcurrent a permanent ceiling rather than a busy
   # moment: nothing ever gives a slot back, so once `maxConcurrent` sessions

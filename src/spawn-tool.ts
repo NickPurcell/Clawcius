@@ -190,7 +190,8 @@ export type SpawnToolOptions = {
    * the call happens. Both shipped configs set `maxConcurrent: 10` since
    * 2026-08-19, up from 3 and 1 — which DEFERS this rather than fixing it.
    * With `idleTimeoutMinutes` still 0 the pool never gives a slot back, so it
-   * still fills permanently; it now takes ten sessions instead of one.
+   * still fills permanently; it now takes ten sessions to get there instead of
+   * three on instance 1 and one on hamachi.
    *
    * A full pool is not automatically fatal, and the distinction is why this
    * carries the timeout rather than just two numbers: with eviction ON a slot
@@ -354,10 +355,11 @@ export function buildSpawnTools(
           `Not spawned — there is no session slot for it and nothing will free one. ` +
             `${pool.live} of ${pool.max} sessions are live (\`sessions.maxConcurrent\`), and ` +
             '`sessions.idleTimeoutMinutes` is 0, so a session is never evicted — the pool only ' +
-            'empties on a restart. Your own turn is holding one of those slots, so this is the ' +
-            'state at every spawn, not a busy moment. The row would be written and could never ' +
-            'take a turn, and there is no kill verb to remove it afterwards. The operator has ' +
-            'to raise the cap or turn eviction on.',
+            'empties on a restart. Your own turn is holding one of those slots, and nothing ' +
+            'gives one back, so this is not a busy moment that will pass: the pool is full ' +
+            'until the process restarts. The row would be written and could never take a turn, ' +
+            'and there is no kill verb to remove it afterwards. The operator has to raise the ' +
+            'cap or turn eviction on.',
         );
       }
 

@@ -598,13 +598,19 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    settings; a full pool with eviction on is a wait and is reported as one.
    That is capacity, not policy — whether to raise the cap or enable eviction
    is the operator's call. On 2026-08-19 they took the first: both configs went
-   to `maxConcurrent: 10` (from 3 and 1). That buys ten sessions before the
-   lockout instead of one, and nothing else — `idleTimeoutMinutes` is still 0,
-   so the pool still never recovers. Eviction remains the only thing that would
-   make it recover. Nor is 10 a load either container has been shown to carry:
-   on 2026-08-19 one busy session put `hamachi-agent` at 997 MiB of 3 GiB and
-   242 of its 512 PIDs. See SETUP.md § 5, which also says why that does not
-   divide into a per-session figure.
+   to `maxConcurrent: 10` — from 3 on instance 1 and from 1 on hamachi. That
+   buys ten sessions before the lockout instead of three or one, and nothing
+   else: `idleTimeoutMinutes` is still 0, so the pool still never recovers, and
+   eviction remains the only one of the three that would make it.
+
+   It also moves where the failure shows up, which is the part worth knowing.
+   At `maxConcurrent: 1` hamachi was structurally incapable of a second session
+   and said so — `atCapacityNotice` names the setting, so a user who lost a turn
+   learned which file to look in. At 10, on the measurements in SETUP.md § 5,
+   the container's `--memory` or `--pids-limit` is the likelier thing to give
+   first, and that is an OOM kill or a failing `fork()` in something unrelated,
+   which nothing attributes to this setting. The trade is legibility, not just
+   headroom.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
    user, the sudoers file and the privilege drop untouched. **Done** —
    `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a
