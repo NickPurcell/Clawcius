@@ -522,6 +522,16 @@ test('a stored UUID is resumed and a placeholder is not', async () => {
   // spawn keeps the workspace spawn chose.
   assert.equal(built[0].workspacePath, '/tmp/a');
 
+  // `b` gets a ROW and no session id, which is what `ensure` writes and so is
+  // the state of every channel that has been woken but has not yet persisted a
+  // UUID. Without the row this half tests nothing: `persisted` would be
+  // undefined, `resumeFrom` undefined either way, and the `pending-b` that came
+  // back would be FakeSession's own fallback rather than a decision `acquire`
+  // made. Found by OJ on #133 by mutating `isResumable(persisted?.sessionId)`
+  // away and watching the suite stay green — an eleventh mutant that the
+  // mutation table had missed.
+  registry.ensure('b', { crew: CREW, role: 'coordinator', workspacePath: '/tmp/b', spawnedBy: null });
+  assert.equal(registry.get('b').sessionId, '');
   manager.acquire('b', events);
   assert.equal(built[1].sessionId, 'pending-b');
   await manager.shutdown();

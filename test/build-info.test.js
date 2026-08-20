@@ -507,10 +507,23 @@ test('the banner is printed even when the process is about to die in its config 
   // banner has to come out of that process anyway, which is why it lives in a
   // module imported ahead of everything rather than in the body of index.ts.
   //
+  // ── What is load-bearing here, and what stopped being ────────────────────
+  //
   // Until #130 the throw was at IMPORT time, inside `./config.js`. Moving it
-  // into the body is what made `dist/agent.js` loadable by a test; this
-  // assertion is the check that it did not also make the daemon startable
-  // without a token.
+  // into the body is what made `dist/agent.js` loadable by a test — and the
+  // same fact dissolved this test's grip on the OTHER half of #89. While
+  // `config.js` threw while it was being EVALUATED, moving the banner import
+  // below it meant the banner never printed and this test went red; that was
+  // measured, and ops/src/selftest.ts records having measured it. Now nothing
+  // in the import phase throws, so the banner import can be moved anywhere in
+  // the list and the two assertions below still pass. The position went from
+  // enforced-by-accident to pinned by nothing, which is exactly the state
+  // ops/src/build-banner.ts warns about: "a banner that stopped printing looks
+  // like nothing at all until the next incident".
+  //
+  // So the last two assertions are ported from ops/src/selftest.ts, which has
+  // had them since its own position stopped being load-bearing. Ordering and
+  // the compiled import index, not mere presence.
   const root = resolve(fileURLToPath(import.meta.url), '..', '..');
   const result = spawnSync(process.execPath, [join(root, 'dist', 'index.js')], {
     cwd: root,
@@ -523,8 +536,39 @@ test('the banner is printed even when the process is about to die in its config 
   assert.notEqual(result.status, 0, 'this run is expected to fail; that is the scenario');
   const output = `${result.stdout}${result.stderr}`;
   assert.match(output, /\[clawcius\] build /, `no build banner in:\n${output.slice(0, 2000)}`);
-  // And it really did die where the test claims it did.
+  // And it really did die where the test claims it did, rather than somewhere
+  // else that happens to also exit non-zero.
   assert.match(output, /Missing required environment variable/);
+  // The banner comes FIRST. Ordering is the property, not mere presence: a
+  // banner printed after the throw would be a banner printed by nothing.
+  assert.ok(
+    output.indexOf('[clawcius] build ') < output.indexOf('Missing required environment variable'),
+    'the banner must precede the failure it is meant to identify',
+  );
+
+  // And the mechanism, on the compiled artefact: the banner's import comes
+  // before every other one. tsc preserves import order in its ESM output, so
+  // this is a fact about what will run, not about what the source looks like.
+  // Nothing else pins it now — no linter here reorders imports, and an editor's
+  // organise-imports does it in one keystroke.
+  //
+  // Anchored to the start of a line, which is where the ops copy differs: a
+  // bare `indexOf('import ')` finds the word inside index.ts's own leading doc
+  // comment, which tsc preserves. That is a false RED rather than a false
+  // green, so ops/src/selftest.ts is not wrong today — but this file's header
+  // contains the word and the ops one does not, which is the whole of the
+  // difference.
+  const compiled = readFileSync(join(root, 'dist', 'index.js'), 'utf8');
+  const bannerAt = compiled.search(/^import '\.\/build-banner\.js';$/m);
+  assert.notEqual(bannerAt, -1, 'dist/index.js does not import ./build-banner.js at all');
+  const firstImportAt = compiled.search(/^import /m);
+  assert.equal(
+    bannerAt,
+    firstImportAt,
+    'the build banner must be the FIRST import in src/index.ts — anything evaluated ' +
+      'before it that throws takes the banner with it, and #89 is 22,675 starts that ' +
+      'died before saying which build they were',
+  );
 });
 
 test('every generated build-info.ts is gitignored', () => {

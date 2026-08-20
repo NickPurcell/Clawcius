@@ -5,13 +5,26 @@
  * ── Why this is a module and not two lines in index.ts ──────────────────────
  *
  * ES module bodies run in dependency order, and every import in `index.ts` is
- * evaluated before the first statement of `index.ts` itself. Some of those
- * imports throw at load: the waker's `config.ts` throws on a missing
- * environment variable, and a config loader is exactly what dies in the case
- * this exists for — `clawcius-ops` failed to start 22,675 consecutive times
- * inside its config loader on a `dist/` that predated its own config, and
- * nothing escalated (Clawcius #89). A banner printed from the body of
- * `index.ts` would have appeared zero of those 22,675 times.
+ * evaluated before the first statement of `index.ts` itself. A config loader is
+ * exactly what dies in the case this exists for — `clawcius-ops` failed to
+ * start 22,675 consecutive times inside its config loader on a `dist/` that
+ * predated its own config, and nothing escalated (Clawcius #89). A banner
+ * printed from the body of `index.ts` would have appeared zero of those 22,675
+ * times.
+ *
+ * Every package now loads its config from a function the entry point CALLS —
+ * `loadOpsConfig`, `loadStatusConfig`, and the waker's `loadConfig` since
+ * Clawcius #130 — so nothing in any of these import graphs throws while it
+ * evaluates, and this module's position is defensive rather than currently
+ * load-bearing. This paragraph said the opposite until #133, and it was true
+ * when it was written: the waker's `config.ts` DID throw on a missing
+ * environment variable while it evaluated, which enforced the position here by
+ * accident. That is the kind of fact that stops being true quietly — one
+ * import above this one that throws while it evaluates and the banner is gone,
+ * and a banner that stopped printing looks like nothing at all until the next
+ * incident. `ops/src/selftest.ts` and the waker's `test/build-info.test.js`
+ * pin the position on the compiled artefact for that reason. `status/` does
+ * not: Clawcius #134.
  *
  * So this is imported FIRST, it depends on nothing but the generated constant,
  * and it prints as a side effect. The line comes out of a process that is about

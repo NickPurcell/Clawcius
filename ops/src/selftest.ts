@@ -3482,10 +3482,17 @@ test('the build banner survives the config load that kills this daemon', () => {
   // index.ts does NOT break the banner, and that was checked by doing it and
   // rebuilding rather than by reasoning about it. The reason is that
   // `loadOpsConfig` throws when it is CALLED, from index.ts's own body, which
-  // runs after every import has evaluated — so any import position works. The
-  // waker is the opposite case: `src/config.ts` evaluates `loadAgentConfig()`
-  // at import time, so there the position is the whole mechanism, and the test
-  // in test/build-info.test.js does fail when it is moved.
+  // runs after every import has evaluated — so any import position works.
+  //
+  // The waker USED to be the opposite case, and this comment said so until
+  // Clawcius #133: `src/config.ts` evaluated `loadAgentConfig()` at import
+  // time, so there the position was the whole mechanism and
+  // test/build-info.test.js did fail when it was moved. #130 moved that read
+  // into `loadConfig()` — which is what made the waker's session pool
+  // importable by a test, and in the same stroke left its banner position
+  // pinned by nothing. That test has since been given the two assertions
+  // below. All three packages are the defensive case now, and two of the three
+  // pin it; `status/` is #134.
   //
   // So the position is defensive here, not currently load-bearing — and the
   // second assertion below pins it anyway, on the compiled output. "Not

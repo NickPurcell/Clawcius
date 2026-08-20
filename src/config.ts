@@ -39,14 +39,21 @@ function required(name: string): string {
   return value;
 }
 
+/**
+ * `readonly` on the env-derived members, because `as const` used to give them
+ * that and a hand-written type does not. `config()` hands every caller the same
+ * object, so without these `config().discord.token = …` typechecks — an
+ * assignment the old shape rejected. Nothing does it today; that is the point of
+ * writing it down while nothing does.
+ */
 export type Config = {
-  discord: {
-    token: string;
+  readonly discord: {
+    readonly token: string;
     /**
      * The single guild the bot operates in. Passed to the agent so the
      * `discord` CLI resolves it without the agent ever choosing a server.
      */
-    guildId: string;
+    readonly guildId: string;
   };
 
   /**
@@ -57,12 +64,12 @@ export type Config = {
    * SSH is not HTTP, so `git@github.com` has no path out of the sandbox at
    * all. HTTPS goes over CONNECT like every other allowed request.
    */
-  github: { token: string };
+  readonly github: { readonly token: string };
 
-  storage: { dbPath: string };
+  readonly storage: { readonly dbPath: string };
 
-  /** Agent behaviour, from agent-config.yaml. */
-  agent: AgentConfig;
+  /** Agent behaviour, from agent-config.yaml. `AgentConfig` states its own. */
+  readonly agent: AgentConfig;
 };
 
 let loaded: Config | null = null;
