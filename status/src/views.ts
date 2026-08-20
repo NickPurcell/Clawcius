@@ -38,7 +38,85 @@ import {
 
 export type Liveness = 'running' | 'idle' | 'stale' | 'unknown';
 
-export type AgentOverview = {
+/**
+ * One crew agent, as the front page lists it.
+ *
+ * ── Why this exists, and why subagents are not in it ───────────────────────
+ *
+ * The front page used to list INSTANCES — two cards, "Clawcius" and
+ * "Hamachi" — and the only things on it wearing a type were subagents, whose
+ * type is `general-purpose`, `Explore` or `workflow-subagent`. So an operator
+ * who came to the page asking "which of these is the engineer and which is the
+ * researcher" was shown neither the agents nor the roles, and was shown three
+ * words that look like roles and are not.
+ *
+ * The list is therefore the registry's rows, and `role` here is the registry's
+ * `role` — CLAWSKY.md's four, coordinator / engineer / researcher / poster,
+ * plus `host`. It is the only "type" in this system that means anything to a
+ * person, and it is the one the operator asked for.
+ *
+ * Subagents are not here, and the reason is not that a busy page is
+ * unpleasant. **A subagent has no identity of its own.** CLAWSKY.md: it
+ * inherits its parent's worktree and identity, it has no registry row, no
+ * mailbox and no persistence, and it dies with its parent — "it is an
+ * extension of the named agent". There is no id to DM and no row to list. So a
+ * subagent on a list of agents is not a peer of the engineer above it; it is
+ * part of that engineer, filed as though it were a colleague. That is the
+ * honest reason it is not here, and it does not stop being true when somebody
+ * later decides the page has room.
+ *
+ * What a subagent DOES contribute here is activity: its writes are its
+ * parent's work, so `liveness` below counts subagent transcript mtimes. An
+ * engineer blocked for ten minutes waiting on a subagent is working, and a
+ * page that called it stale would be wrong about the one thing it is for.
+ *
+ * The transcripts remain reachable — every one of them, including the 58 that
+ * Clawcius #80 found in `subagents/workflows/<runId>/` — through the roll-up
+ * at `/api/agents/<id>/subagents`, now scopeable to one agent. Off the front
+ * page is not the same as gone, and this file's job is to keep the difference.
+ */
+export type OverviewAgent = {
+  /** `hamachi-engineer1`. The registry's id, which is also its mailbox. */
+  id: string;
+  crew: string;
+  /**
+   * The CREW role, verbatim from the registry: `coordinator`, `engineer`,
+   * `researcher`, `poster`, or `host`.
+   *
+   * Never synthesised. If a row's role is empty the page says the registry
+   * recorded none — it does not guess one, and it does not borrow a
+   * `subagent_type` from a transcript to fill the gap.
+   */
+  role: string;
+  /**
+   * `status` verbatim from the registry — written, never observed.
+   *
+   * Carried beside `lastActiveAt` and `liveness` for the same reason
+   * `RosterAgent` carries it: a kill writes `dead`, a crash writes nothing, so
+   * the word alone is not evidence. Living and dead have to stay
+   * distinguishable on this page, and one written word is not enough to do it.
+   */
+  declaredStatus: string;
+  /** The board's own record of when this agent last ran a turn. */
+  lastActiveAt: string | null;
+  /**
+   * `slug(workspace_path)` — the transcript directory this agent writes into,
+   * and the front page's link to that agent's own page.
+   *
+   * The workspace path itself is not here. It is on the roster, one click
+   * down, where the join it feeds is explained; carrying it on a payload
+   * nothing renders is how a field goes stale unnoticed.
+   */
+  projectSlug: string;
+  /** Transcripts under that directory. Zero is normal for `host`. */
+  sessionCount: number;
+  /** From the newest write across those sessions and their subagents. */
+  liveness: Liveness;
+  /** ISO of that write, or null when the agent has written none. */
+  lastActivity: string | null;
+};
+
+export type InstanceOverview = {
   id: string;
   label: string;
   projectsRoot: string;
@@ -50,7 +128,16 @@ export type AgentOverview = {
   sessionCount: number;
   /** Sessions whose transcript was written within the running window. */
   activeSessionCount: number;
-  subagentCount: number;
+  /**
+   * This instance's registry rows, each with its crew role. The front page's
+   * actual content.
+   *
+   * In the registry's own order — crew, then role, then id — so two loads
+   * agree and so the roles cluster. Not sorted by activity: an idle poster
+   * moving above a working engineer between refreshes makes a list of five
+   * things impossible to read.
+   */
+  agents: OverviewAgent[];
   /** Rows in this instance's registry. The count of AGENTS, not directories. */
   registeredAgentCount: number;
   /** Of those, how many declare `live`. Declared, never observed — see below. */
@@ -95,8 +182,18 @@ export type SessionSummary = {
 
 export type SubagentNode = {
   agentId: string;
-  /** The ROLE — `subagent_type` from the spawning tool call. */
-  role: string;
+  /**
+   * How this subagent was spawned — the sidecar's `agentType`, or
+   * `subagent_type` from the spawning tool call. `general-purpose`, `Explore`,
+   * `workflow-subagent`.
+   *
+   * Was called `role`, which is the name this repository uses for a crew role,
+   * and it is not one: a subagent has no registry row, so it has no crew role
+   * to have. The empty string means the sidecar recorded no type and no
+   * spawning call was found — a fact that IS missing, unlike a crew role,
+   * which for a subagent is not missing but inapplicable. The UI says which.
+   */
+  subagentType: string;
   description: string;
   model: string | null;
   parentAgentId: string | null;
@@ -174,20 +271,22 @@ export function livenessFromMtime(
 }
 
 /**
- * The overview row for one agent.
+ * One instance's front-page entry: its crew agents, and totals about them.
  *
  * Deliberately does NOT index any transcript. This runs for every configured
- * agent on every load of the front page, and parsing every session's JSONL to
- * answer "when did something last happen" would make the cheapest page the
+ * instance on every load of the front page, and parsing every session's JSONL
+ * to answer "when did something last happen" would make the cheapest page the
  * most expensive one. `stat` on each file is enough, and mtime is the right
- * signal for liveness anyway.
+ * signal for liveness anyway. The per-agent rows below are built from the same
+ * single walk — grouping stats we already have costs nothing, whereas a second
+ * pass per registry row would multiply the walk by the size of the crew.
  */
-export async function buildAgentOverview(
+export async function buildInstanceOverview(
   store: TranscriptStore,
   agent: AgentRoot,
   config: StatusConfig,
   now: number,
-): Promise<AgentOverview> {
+): Promise<InstanceOverview> {
   const { sessions, error } = await store.sessions(agent);
 
   // The registry read is a handful of rows and costs nothing next to the stats
@@ -198,11 +297,28 @@ export async function buildAgentOverview(
 
   let newestMtime: number | null = null;
   let activeSessionCount = 0;
-  let subagentCount = 0;
   let unattributedSessionCount = 0;
+
+  // Per transcript directory, so each registry row can be given its own
+  // liveness without a second walk of the tree. The join is `projectSlug`,
+  // which is `slug(workspace_path)` — see registry.ts for why it needs no
+  // schema change.
+  const perSlug = new Map<string, { sessions: number; newestMtime: number | null }>();
+  const forSlug = (slug: string): { sessions: number; newestMtime: number | null } => {
+    const existing = perSlug.get(slug);
+    if (existing) return existing;
+    const fresh = { sessions: 0, newestMtime: null as number | null };
+    perSlug.set(slug, fresh);
+    return fresh;
+  };
 
   for (const session of sessions) {
     if (!claimedSlugs.has(session.projectSlug)) unattributedSessionCount += 1;
+    const slug = forSlug(session.projectSlug);
+    // Counted before the stat, so this agrees with `sessions.length` below
+    // even for a transcript that vanishes between the listing and the stat.
+    slug.sessions += 1;
+
     let mtimeMs: number | null = null;
     try {
       mtimeMs = (await stat(session.transcriptPath)).mtimeMs;
@@ -213,17 +329,38 @@ export async function buildAgentOverview(
     }
 
     if (newestMtime === null || mtimeMs > newestMtime) newestMtime = mtimeMs;
+    if (slug.newestMtime === null || mtimeMs > slug.newestMtime) slug.newestMtime = mtimeMs;
     if (clampSeconds(mtimeMs, now) <= config.liveness.runningSeconds) activeSessionCount += 1;
 
-    // Subagent files are counted, not indexed. The count is a useful
-    // at-a-glance number and costs one readdir per session; indexing them here
-    // would mean parsing megabytes to render a single digit.
-    const subagents = await store.subagents(session);
-    subagentCount += subagents.length;
-    for (const subagent of subagents) {
+    // Subagent transcripts are STATTED, not counted onto the page and not
+    // indexed. Their mtimes decide liveness — a subagent's write is its
+    // parent's work, and an engineer blocked waiting on one is working — but
+    // the number of them is not a fact about the crew and no longer appears
+    // here. See `OverviewAgent` for why a subagent is not a peer of the agent
+    // that spawned it.
+    for (const subagent of await store.subagents(session)) {
       if (newestMtime === null || subagent.mtimeMs > newestMtime) newestMtime = subagent.mtimeMs;
+      if (slug.newestMtime === null || subagent.mtimeMs > slug.newestMtime) {
+        slug.newestMtime = subagent.mtimeMs;
+      }
     }
   }
+
+  const overviewAgents: OverviewAgent[] = registry.agents.map((row) => {
+    const own = perSlug.get(row.projectSlug);
+    const newest = own?.newestMtime ?? null;
+    return {
+      id: row.id,
+      crew: row.crew,
+      role: row.role,
+      declaredStatus: row.declaredStatus,
+      lastActiveAt: row.lastActiveAt,
+      projectSlug: row.projectSlug,
+      sessionCount: own?.sessions ?? 0,
+      liveness: livenessFromMtime(newest, now, config.liveness),
+      lastActivity: toIso(newest),
+    };
+  });
 
   return {
     id: agent.id,
@@ -234,7 +371,7 @@ export async function buildAgentOverview(
     lastActivityAgoSeconds: newestMtime === null ? null : clampSeconds(newestMtime, now),
     sessionCount: sessions.length,
     activeSessionCount,
-    subagentCount,
+    agents: overviewAgents,
     registeredAgentCount: registry.agents.length,
     declaredLiveCount: registry.agents.filter((row) => row.declaredStatus === 'live').length,
     unattributedSessionCount,
@@ -466,9 +603,10 @@ async function summariseSession(
  * Two independent sources of truth, used in that order of preference:
  *
  *   1. `agent-<id>.meta.json` beside each subagent transcript. It records
- *      `agentType` (the role), `description`, the `toolUseId` of the call that
- *      spawned it, and `parentAgentId` for anything nested. When present this
- *      is recorded fact and needs no inference at all.
+ *      `agentType` (how it was spawned, not a crew role), `description`, the
+ *      `toolUseId` of the call that spawned it, and `parentAgentId` for
+ *      anything nested. When present this is recorded fact and needs no
+ *      inference at all.
  *
  *   2. The spawning tool call itself. Every transcript — the session's and each
  *      subagent's — is scanned during indexing for `Task`/`Agent` tool_use
@@ -570,7 +708,7 @@ export async function buildSessionDetail(
   // Looking it up by agent id as well as by tool_use id is not redundant: a
   // subagent with no `.meta.json` has no tool_use id to look up with, and
   // resolving it only through the sidecar meant those subagents rendered with
-  // `role: unknown` and no description — losing exactly the field this view
+  // no subagent type and no description — losing exactly the fields this view
   // exists to show. Caught 2026-08-09 by a fixture with the sidecar deliberately
   // absent, which is the shape older sessions on this host actually have.
   const spawnFor = (ref: SubagentRef): OwnedSpawn | undefined =>
@@ -675,7 +813,12 @@ function buildNode(
   config: StatusConfig,
   runs: Map<string, WorkflowRun>,
 ): SubagentNode {
-  const role = ref.meta?.agentType ?? fromToolUse?.spawn.subagentType ?? 'unknown';
+  // Empty, not `'unknown'`, when neither source has it. `unknown` is a word
+  // and sat in a column headed "role", so it read as an agent whose crew role
+  // nobody had filled in — a claim about the crew, made by a field that has
+  // nothing to do with the crew. Empty carries no such suggestion and the UI
+  // spells the absence out where there is room to say what is absent.
+  const subagentType = ref.meta?.agentType ?? fromToolUse?.spawn.subagentType ?? '';
   const description = ref.meta?.description ?? fromToolUse?.spawn.description ?? '';
 
   // Start prefers the spawn instant over the subagent's first line: the gap
@@ -686,7 +829,7 @@ function buildNode(
 
   return {
     agentId: ref.agentId,
-    role,
+    subagentType,
     description,
     model: ref.meta?.model ?? fromToolUse?.spawn.model ?? null,
     parentAgentId: null,
@@ -725,13 +868,41 @@ export { describeFsError };
  * and a sidecar JSON read. There are 104 subagent transcripts under Hamachi's
  * root today and parsing all of them to put turn counts on a list view would
  * make the cheapest question the most expensive one — the same reasoning as
- * `buildAgentOverview`. Open one and the session view indexes it properly.
+ * `buildInstanceOverview`. Open one and the session view indexes it properly.
  */
 export type SubagentEntry = {
   agentId: string;
   sessionId: string;
-  /** `agentType` from the sidecar — the ROLE. `unknown` when there is none. */
-  role: string;
+  /**
+   * The transcript directory this subagent was found under.
+   *
+   * Carried so the roll-up can be scoped to one agent: `projectSlug` is
+   * `slug(workspace_path)` for exactly one registry row, so filtering on it
+   * turns "every subagent on this instance" into "this engineer's subagents",
+   * which is the only grouping that matches how they are actually owned — a
+   * subagent inherits its parent's identity and belongs to that agent's work.
+   */
+  projectSlug: string;
+  /**
+   * `agentType` from the sidecar. NOT a crew role, and no longer called one.
+   *
+   * ── Empty means "no sidecar", and only that ────────────────────────────
+   *
+   * ONE source, deliberately. `buildSessionDetail` has a second — the
+   * `subagent_type` on the `Task` call that spawned it — and recovers a type
+   * this field leaves empty. That is not an oversight to be tidied up: the
+   * spawning call is inside the PARENT transcript, so reading it means
+   * indexing, and the header above commits this roll-up to a readdir, a stat
+   * and a sidecar read for all 104 transcripts under Hamachi's root.
+   *
+   * So the honest reading of the empty string here is "this subagent has no
+   * sidecar", NOT "nothing anywhere recorded a type" — the session view may
+   * well know, and the UI says so rather than claiming the type is lost. The
+   * doc used to assert the two-source fallback that `buildNode` has and this
+   * does not, which is a sentence outrunning its code, in a change whose whole
+   * subject is sentences outrunning their code.
+   */
+  subagentType: string;
   description: string;
   model: string | null;
   depth: number | null;
@@ -755,8 +926,15 @@ export type SubagentEntry = {
   active: boolean;
 };
 
-export type RoleGroup = {
-  role: string;
+/**
+ * Subagents sharing a `subagent_type`.
+ *
+ * Was `RoleGroup`, and the page headed it "By role". Two different things in
+ * this system are called a type and only one of them is a role; the group that
+ * is NOT the role is the one that had the word.
+ */
+export type SubagentTypeGroup = {
+  subagentType: string;
   count: number;
   subagents: SubagentEntry[];
 };
@@ -770,29 +948,75 @@ export type WorkflowSummary = WorkflowRun & {
 export type SubagentRollup = {
   agent: string;
   label: string;
+  /**
+   * The transcript directory this roll-up was scoped to, or null for the whole
+   * instance.
+   *
+   * On the wire rather than only in the URL because the two answers differ and
+   * a reader has to be able to tell which they are looking at: "this instance
+   * has run 5 subagents" and "this agent has run 5 subagents" are different
+   * claims, and the second is the one that is wrong if the scope silently
+   * failed to apply.
+   */
+  projectSlug: string | null;
+  /**
+   * Non-null when the scope names a directory the registry does not claim.
+   *
+   * The registry and the transcript directories are allowed to disagree — the
+   * three `/tmp` slugs under Hamachi's root are directories with no agent —
+   * and when a scope lands on one of those, the page says so instead of
+   * captioning somebody's permission probe with an agent's name.
+   */
+  scopeNote: string | null;
   total: number;
   /** Of those, how many came from a workflow run rather than a direct spawn. */
   fromWorkflows: number;
-  roles: RoleGroup[];
+  types: SubagentTypeGroup[];
   workflows: WorkflowSummary[];
   error: string | null;
 };
 
 /**
- * Every subagent this instance has ever run, grouped by role.
+ * Every subagent this instance has run, grouped by `subagent_type` — or just
+ * one agent's, when `projectSlug` scopes it.
  *
- * Roles are ordered by how many there are, because the question the page is
- * answering is "what does this system spend its subagents on". Within a role
+ * Types are ordered by how many there are, because the question the page is
+ * answering is "what does this system spend its subagents on". Within a type
  * the newest is first, because the question after that is always "what was the
  * last one doing".
+ *
+ * ── The scope, and Clawcius #80 ────────────────────────────────────────────
+ *
+ * The scope is a FILTER over the same walk, not a different walk. That is
+ * deliberate and it is the check that keeps #80 fixed: #80 was 58 of 104
+ * subagent transcripts sitting in `subagents/workflows/<runId>/`, a directory
+ * nothing read. If scoping meant "look in this agent's directory instead", a
+ * future edit could narrow where it looks and lose a population again. Here
+ * every transcript is still enumerated on every call and the only question is
+ * which ones are returned — and the unscoped call, which the instance page
+ * still links, returns all of them.
+ *
+ * A `projectSlug` matching nothing yields an empty roll-up rather than an
+ * error. An agent that has spawned no subagents is a perfectly ordinary state,
+ * so "none" is an answer and not a fault.
+ *
+ * This used to add that the coordinator and poster "cannot spawn one at all
+ * (CLAWSKY.md: they lose the tool)". CLAWSKY.md does say the tool is removed
+ * from those two, but it says it under phase 5, which is unmarked while phase
+ * 6 is Done, and there is no `disallowedTools`, `allowedTools` or `canUseTool`
+ * anywhere in `src/` today. So it is the intent, written down, and not yet a
+ * mechanism — and a comment asserting it is this file claiming a guarantee the
+ * code does not make. Removed rather than hedged: "none" needs no explanation.
  */
 export async function buildSubagentRollup(
   store: TranscriptStore,
   agent: AgentRoot,
   config: StatusConfig,
   now: number,
+  scope: { projectSlug?: string | null } = {},
 ): Promise<SubagentRollup> {
   const { sessions, error } = await store.sessions(agent);
+  const projectSlug = scope.projectSlug ?? null;
 
   const entries: SubagentEntry[] = [];
   const workflows: WorkflowSummary[] = [];
@@ -800,21 +1024,31 @@ export async function buildSubagentRollup(
   const runNames = new Map<string, string | null>();
 
   for (const session of sessions) {
+    // Every session is still walked, scope or no scope — the filter is on what
+    // comes back, never on where we look. See the header: narrowing the walk
+    // is how a population goes missing, and one already did.
+    const inScope = projectSlug === null || session.projectSlug === projectSlug;
+
     const refs = await store.subagents(session);
     const runs = await store.workflowRuns(session);
     for (const run of runs.values()) {
       runNames.set(run.runId, run.name);
-      workflows.push({ ...run, sessionId: session.sessionId, observedAgents: 0 });
+      if (inScope) workflows.push({ ...run, sessionId: session.sessionId, observedAgents: 0 });
     }
 
     for (const ref of refs) {
       if (ref.workflowRunId) {
         observed.set(ref.workflowRunId, (observed.get(ref.workflowRunId) ?? 0) + 1);
       }
+      if (!inScope) continue;
       entries.push({
         agentId: ref.agentId,
         sessionId: session.sessionId,
-        role: ref.meta?.agentType ?? 'unknown',
+        projectSlug: session.projectSlug,
+        // The sidecar and nothing else — see the field's doc. Empty here means
+        // "no sidecar", which is weaker than `buildNode`'s empty and is
+        // labelled differently on the page for exactly that reason.
+        subagentType: ref.meta?.agentType ?? '',
         description: ref.meta?.description ?? '',
         model: ref.meta?.model ?? null,
         depth: ref.meta?.spawnDepth ?? null,
@@ -828,33 +1062,93 @@ export async function buildSubagentRollup(
     }
   }
 
+  // Counted across the whole walk on purpose, so a run's "5 agents recorded, 5
+  // on disk" reconciliation stays true under a scope. A scoped page showing 3
+  // of a 5-agent run would otherwise print a discrepancy warning about a run
+  // that is perfectly consistent.
   for (const run of workflows) run.observedAgents = observed.get(run.runId) ?? 0;
 
-  const byRole = new Map<string, SubagentEntry[]>();
+  const byType = new Map<string, SubagentEntry[]>();
   for (const entry of entries) {
-    const group = byRole.get(entry.role);
+    const group = byType.get(entry.subagentType);
     if (group) group.push(entry);
-    else byRole.set(entry.role, [entry]);
+    else byType.set(entry.subagentType, [entry]);
   }
 
-  const roles: RoleGroup[] = [...byRole.entries()]
-    .map(([role, group]) => {
+  const types: SubagentTypeGroup[] = [...byType.entries()]
+    .map(([subagentType, group]) => {
       group.sort((a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity));
-      return { role, count: group.length, subagents: group };
+      return { subagentType, count: group.length, subagents: group };
     })
-    .sort((a, b) => b.count - a.count || a.role.localeCompare(b.role));
+    .sort((a, b) => b.count - a.count || a.subagentType.localeCompare(b.subagentType));
 
   workflows.sort((a, b) => Date.parse(b.startedAt ?? '') - Date.parse(a.startedAt ?? ''));
 
   return {
     agent: agent.id,
     label: agent.label,
+    projectSlug,
+    scopeNote: describeScope(agent, projectSlug),
     total: entries.length,
     fromWorkflows: entries.filter((entry) => entry.workflowRunId !== null).length,
-    roles,
+    types,
     workflows,
     error,
   };
+}
+
+/**
+ * `slug('/tmp/…')`. The leading dash is the slugified leading slash — see
+ * `slugifyWorkspace`, where every non-alphanumeric becomes one — so this is a
+ * statement about the path the directory was named after, not a guess.
+ */
+function isTmpSlug(projectSlug: string): boolean {
+  return projectSlug === '-tmp' || projectSlug.startsWith('-tmp-');
+}
+
+/**
+ * Say which of the two disagreeing sources the scope came from, when they
+ * disagree.
+ *
+ * Directories are not agents and the registry is the list of agents; a slug
+ * can therefore be a real directory full of real transcripts and still belong
+ * to nobody. Three of the five under Hamachi's root are exactly that. Null
+ * when the scope is a registered agent's own directory, or when there is no
+ * scope at all — a note on every page is a note nobody reads.
+ */
+function describeScope(agent: AgentRoot, projectSlug: string | null): string | null {
+  if (projectSlug === null) return null;
+  const registry = readRegistry(agent.boardDb);
+  if (registry.error !== null) {
+    return (
+      `${registry.error} These subagents are shown by transcript directory ` +
+      `(${projectSlug}); which agent owns that directory could not be checked.`
+    );
+  }
+  if (!registry.configured) {
+    return (
+      `This instance has no boardDb in status-config.yaml, so there is no registry to say ` +
+      `which agent owns ${projectSlug}. These subagents are shown by directory.`
+    );
+  }
+  const owner = registry.agents.find((row) => row.projectSlug === projectSlug);
+  if (owner) return null;
+  return (
+    `No agent in the registry has ${projectSlug} as its workspace, so these subagents are ` +
+    'attributed to a directory rather than to an agent. ' +
+    // Read off the slug in hand, not asserted about "this host". The sentence
+    // this replaces named the /tmp permission probes on EVERY unclaimed slug,
+    // which made it wrong in the case that matters most: a directory that did
+    // belong to an agent the registry no longer carries, which is exactly what
+    // an operator scopes to when something has gone wrong. What is left is
+    // checkable from the string, and the alternatives are offered as
+    // alternatives instead of one of them being reported as an observation.
+    (isTmpSlug(projectSlug)
+      ? 'That directory is under /tmp, which on this host is where engineers have run ' +
+        'permission probes — real transcripts, no owner.'
+      : 'It may be a cwd somebody ran Claude Code in, or an agent this registry no longer ' +
+        'carries. Nothing here can tell those apart: the directory is all there is.')
+  );
 }
 
 // ── Clawsky ─────────────────────────────────────────────────────────────────

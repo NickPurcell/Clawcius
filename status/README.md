@@ -153,16 +153,39 @@ as before.
 
 ## What it shows
 
-**Overview** — how many agents there are, how many instances, how many sessions
-and how many of those no agent claims; then a card per instance with a liveness
-state. `running` if something was written in the last few minutes, `idle` if it
-is merely quiet, `stale` beyond an hour. The distinction is the point: an agent
-nobody has spoken to and an agent wedged mid-turn look identical from outside,
-and this is the line between them.
+**Overview** — **the crew, by role.** One row per registry agent, grouped by
+the instance it belongs to, with its crew role — `coordinator`, `engineer`,
+`researcher`, `poster`, or `host` — in a column of its own, beside both an
+observed liveness state and the registry's declared status. `running` if
+something was written in the last few minutes, `idle` if it is merely quiet,
+`stale` beyond an hour. The distinction is the point: an agent nobody has
+spoken to and an agent wedged mid-turn look identical from outside, and this is
+the line between them.
+
+It used to list the two *instances* under a heading reading "Agents on this
+host", which are containers rather than agents, and the only words on it that
+looked like an agent's type belonged to subagents — `general-purpose`,
+`Explore`, `workflow-subagent`. Those are `subagent_type`, the argument a
+parent passes when it spawns one. They are not crew roles and there is no
+sense in which they answer "which of these is the engineer".
+
+**Subagents are not on this page**, and the reason is not tidiness. A subagent
+has no registry row, no mailbox and no persistence; CLAWSKY.md's rule is that
+it inherits its parent's worktree and identity and "is an extension of the
+named agent". Listing one beside the engineer that spawned it files part of
+that engineer as its colleague, under a Role column it can never have a value
+for. What a subagent *does* contribute to this page is activity: its writes
+count towards its parent's liveness, because an engineer blocked waiting on one
+is working.
+
+Nothing is lost by that. Every subagent transcript is one click down — from the
+agent that spawned it, or from the unscoped roll-up linked on this page and on
+each instance's. See *Subagents* below.
 
 **Agents** — per instance, one card per registry row: id, crew, role, the
-workspace path and the slug it maps to, and the declared status beside the time
-the agent last spoke — `live · last spoke 4m ago`.
+workspace path and the slug it maps to, the declared status beside the time the
+agent last spoke — `live · last spoke 4m ago` — and a link to that agent's own
+subagent transcripts.
 
 Both, and not one of them, because they are different claims. `status` in the
 registry is *declared*: a kill writes `dead`, and an agent that dies mid-turn
@@ -187,12 +210,35 @@ The other reason to state the absence rather than infer from it: an agent whose
 record that it *did* run, and it is what every card would look like if the slug
 join ever stopped matching. That contradiction gets its own warning.
 
-**Subagents** — every subagent an instance has ever run, grouped by role,
-across all sessions. The session view already draws one run's tree over a time
-axis; what it cannot do is find the transcript of the thing that died at 4am
-unless you already know which session it belonged to. That is Clawcius #22, and
-this list is the answer to it: roles ordered by how many there are, newest
-first within a role, each row linking to its transcript.
+**Subagents** — every subagent an instance has ever run, grouped by
+**subagent type**, across all sessions; or one agent's, at
+`#/subagents/<instance>/<slug>`. The session view already draws one run's tree
+over a time axis; what it cannot do is find the transcript of the thing that
+died at 4am unless you already know which session it belonged to. That is
+Clawcius #22, and this list is the answer to it: types ordered by how many
+there are, newest first within a type, each row linking to its transcript.
+
+Grouped by type and *called* type. The heading used to read "By role", which
+made a list of things with no identity look like a list of agents. A subagent
+type is how the parent spawned it; the crew roles are on the Overview and are a
+different column of a different table.
+
+**This list reads the `.meta.json` sidecar and nothing else**, so a subagent
+without one is grouped under **"no sidecar"** rather than under a type. That is
+not the same claim as "nothing recorded a type": there is a second source — the
+`subagent_type` on the `Task` call that spawned it, in the *parent* transcript
+— and *Subagent branching* uses it, because that view indexes and this one is
+built not to. So the same subagent can read `no sidecar` here and `Explore`
+there, and neither is wrong. The card says so and points at the session view.
+Only the swimlane, where both sources have been tried, says **"type not
+recorded"**.
+
+The scoped form is a filter over the same walk, never a narrower walk — which
+is the check that keeps the bug below fixed. The unscoped form is linked from
+the Overview and from each instance page, and every directory under a projects
+root gets a link of its own, including the three that belong to no agent. A
+subagent transcript reachable only through the agent that owns its directory is
+unreachable when nobody does.
 
 Two populations, and the second is where most of them are:
 
@@ -249,7 +295,7 @@ row: a subagent of an older session can easily be the most recent write.
 
 **Subagent branching** — the headline view. Every subagent a session spawned,
 as a tree indented by depth and drawn as a swimlane over the session's time
-axis, with its role (`subagent_type`), its task description, start, end and
+axis, with its `subagent_type`, its task description, start, end and
 duration. Hovering a bar gives the detail; clicking a row opens that subagent's
 own transcript. This is what makes a run legible: you can see which children ran
 in parallel, which one took forty minutes, and which is still going.
@@ -516,9 +562,9 @@ All read-only, all JSON except the assets.
 
 | Route | Returns |
 |---|---|
-| `GET /api/overview` | Every instance with liveness, agent counts and session counts |
+| `GET /api/overview` | `instances[]`, each with its registry agents (id, crew role, declared status, observed liveness) and its counts |
 | `GET /api/agents/:agent/sessions` | The instance's roster: registry agents each with their sessions, plus `other` for directories no agent claims |
-| `GET /api/agents/:agent/subagents` | Every subagent, grouped by role, plus the workflow runs |
+| `GET /api/agents/:agent/subagents[?slug=]` | Every subagent, grouped by `subagent_type`, plus the workflow runs. `slug` scopes it to one transcript directory; a malformed one is a 400 rather than a silently unscoped answer |
 | `GET /api/clawsky` | Every instance's board: participants, feed, DMs |
 | `GET /api/agents/:agent/sessions/:id` | One session plus its subagent tree |
 | `GET /api/agents/:agent/sessions/:id/transcript?from&limit&subagent` | A page of lines |

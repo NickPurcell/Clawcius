@@ -79,9 +79,9 @@ import { isLoopback, loadStatusConfig } from './config.js';
 import { readOjSnapshot } from './oj.js';
 import { probeAll, processIdentity, targetsFor } from './reach.js';
 import { bindUnixSockets, releaseSocketPath, type SocketOutcome } from './socket.js';
-import { isValidSubagentId, TranscriptStore } from './transcripts.js';
+import { isValidProjectSlug, isValidSubagentId, TranscriptStore } from './transcripts.js';
 import {
-  buildAgentOverview,
+  buildInstanceOverview,
   buildClawsky,
   buildRoster,
   buildSessionDetail,
@@ -241,15 +241,22 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
   const now = Date.now();
   const path = url.pathname;
 
+  // The front page: every crew agent on this host, with its crew role.
+  //
+  // The top-level key is `instances` and it used to be `agents`, which was the
+  // conflation the page was built on — a configured transcript root called an
+  // agent, so "Agents on this host" rendered two cards named after containers.
+  // The agents are inside, in `instances[].agents`, and they come from the
+  // registry.
   if (path === '/api/overview') {
-    const agents = [];
+    const instances = [];
     for (const agent of store.agents) {
-      agents.push(await buildAgentOverview(store, agent, config, now));
+      instances.push(await buildInstanceOverview(store, agent, config, now));
     }
     sendJson(response, 200, {
       generatedAt: new Date(now).toISOString(),
       liveness: config.liveness,
-      agents,
+      instances,
     });
     return;
   }
@@ -292,12 +299,32 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
       return;
     }
 
-    // Every subagent this instance has run, grouped by role. Flat and
-    // cross-session on purpose — the session view already draws the tree, and
-    // the thing it cannot do is find a transcript when you do not know which
-    // run it belonged to (Clawcius #22).
+    // Every subagent this instance has run, grouped by `subagent_type`. Flat
+    // and cross-session on purpose — the session view already draws the tree,
+    // and the thing it cannot do is find a transcript when you do not know
+    // which run it belonged to (Clawcius #22).
+    //
+    // `?slug=` narrows it to one transcript directory, which is one agent's.
+    // That is where subagents live now that they are off the front page: a
+    // drill-down from the agent that spawned them, which is whose work they
+    // are. UNSCOPED IS STILL A ROUTE AND THE INSTANCE PAGE STILL LINKS IT —
+    // that is the guarantee against re-losing a population the way #80 did,
+    // and the filter is applied to the results of the same full walk rather
+    // than by looking in fewer places.
+    //
+    // A malformed slug is rejected rather than ignored. Ignoring it would
+    // serve the whole instance under a heading naming one agent, which is the
+    // page telling a specific lie instead of refusing.
     if (parts[3] === 'subagents' && parts.length === 4) {
-      sendJson(response, 200, await buildSubagentRollup(store, agent, config, now));
+      const slug = url.searchParams.get('slug');
+      if (slug !== null && !isValidProjectSlug(slug)) {
+        return fail(response, 400, 'malformed slug');
+      }
+      sendJson(
+        response,
+        200,
+        await buildSubagentRollup(store, agent, config, now, { projectSlug: slug }),
+      );
       return;
     }
 
