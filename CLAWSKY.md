@@ -590,15 +590,21 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    **The session cap is a separate thing and it does bind.** `acquire` throws
    at `sessions.maxConcurrent`, `#evictIdle` does nothing while
    `sessions.idleTimeoutMinutes` is 0, and both shipped configs set it to 0 —
-   so on `maxConcurrent: 1` the pool is full at every spawn, because the
-   calling coordinator is holding the only slot. A spawned agent is woken by
+   so the pool fills permanently and stays full until the process restarts,
+   because nothing ever gives a slot back. A spawned agent is woken by
    mail and by nothing else, so that row could never take a turn, and with no
    kill verb it could not be removed either. `spawn` therefore refuses before
    writing the row when the pool is full *and* nothing evicts, naming both
    settings; a full pool with eviction on is a wait and is reported as one.
    That is capacity, not policy — whether to raise the cap or enable eviction
-   is the operator's call, and on a 1.8 GB VM holding a `claude` process at
-   ~400 MB it is a real one.
+   is the operator's call. On 2026-08-19 they took the first: both configs went
+   to `maxConcurrent: 10` (from 3 and 1). That buys ten sessions before the
+   lockout instead of one, and nothing else — `idleTimeoutMinutes` is still 0,
+   so the pool still never recovers. Eviction remains the only thing that would
+   make it recover. Nor is 10 a load either container has been shown to carry:
+   on 2026-08-19 one busy session put `hamachi-agent` at 997 MiB of 3 GiB and
+   242 of its 512 PIDs. See SETUP.md § 5, which also says why that does not
+   divide into a per-session figure.
 6. ~~**Retire the ops queue.**~~ Host agent becomes a participant; keep the
    user, the sudoers file and the privilege drop untouched. **Done** —
    `ops/src/board.ts`, `ops/src/host-mailbox.ts`, `Executor.runMailTask`, and a

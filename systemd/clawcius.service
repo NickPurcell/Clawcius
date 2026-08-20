@@ -68,7 +68,13 @@ StateDirectoryMode=0750
 # MemoryHigh throttles and reclaims first; MemoryMax is the hard stop. The gap
 # between MemoryMax and total RAM is deliberate — a ceiling close to total
 # would squeeze the OS instead of stopping the runaway agent. Raise both
-# together with sessions.maxConcurrent, never one alone.
+# together, never one alone.
+#
+# These do NOT bound the sessions, and it used to say here that they should be
+# raised alongside sessions.maxConcurrent. They should not: this unit is the
+# waker, and the sessions are `claude` processes inside `clawcius-agent`,
+# bounded by that container's --memory (2g). The setting to raise with
+# maxConcurrent is CLAWCIUS_CONTAINER_MEMORY. See SETUP.md § 5.
 MemoryHigh=3G
 MemoryMax=4G
 TasksMax=512

@@ -187,8 +187,10 @@ export type SpawnToolOptions = {
    * immediately when `sessions.idleTimeoutMinutes` is 0, and nothing else frees
    * a slot in the ordinary course. `spawn` runs INSIDE the calling
    * coordinator's turn, so that coordinator is necessarily holding a slot when
-   * the call happens — which on `maxConcurrent: 1` means the pool is full by
-   * construction at every spawn, forever.
+   * the call happens. Both shipped configs set `maxConcurrent: 10` since
+   * 2026-08-19, up from 3 and 1 — which DEFERS this rather than fixing it.
+   * With `idleTimeoutMinutes` still 0 the pool never gives a slot back, so it
+   * still fills permanently; it now takes ten sessions instead of one.
    *
    * A full pool is not automatically fatal, and the distinction is why this
    * carries the timeout rather than just two numbers: with eviction ON a slot

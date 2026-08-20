@@ -381,7 +381,11 @@ the bot can see.
 
 ## 5. Memory budget
 
-Measured on this box: one Claude Code process is ~383 MB RSS.
+Measured on this box: one Claude Code process is ~383 MB RSS. That is the
+low end — a session carrying a large context measured **669 MB RSS** inside
+`hamachi-agent` on 2026-08-19. Budget with 400 MB as the floor, not the figure.
+
+The original sizing, on the 4 GB box this section was written for:
 
 ```
   180 MB   bot process (Node + discord.js)
@@ -397,11 +401,55 @@ Squid adds ~97 MB (measured on this box with
 caching off — see `squid/README.md`). It comes out of the OS slice above, not
 the agents'.
 
-`sessions.maxConcurrent: 3` in `agent-config.yaml` is sized for this. Two
-ceilings back it up: `MemoryMax=2400M` on the waker unit, and `--memory=2g` on
-the agent container (plus 256m for Squid). The container limit is the one that
-matters now — the agents live there. gVisor adds roughly 50–100 MB per container on top.
-Raise both together, never one alone.
+**The container limit is the one that matters — the agents live there, as
+`claude` processes under `docker exec`, and a container that reaches its
+`--memory` is OOM-killed rather than told no.** The bot process is not in it:
+the waker is a host unit (`clawcius.service`, `MemoryHigh=3G`/`MemoryMax=4G`;
+`hamachi.service`, `2G`/`3G`), so the container budget is agents plus whatever
+tools they run. gVisor adds roughly 50–100 MB per container on top.
+
+Measured on the host, 2026-08-19:
+
+| | `clawcius-agent` | `hamachi-agent` |
+|---|---|---|
+| `--memory` | 2 GiB (`run-container.sh` default; no override set) | 3 GiB (`hamachi-container.service`) |
+| `--pids-limit` | 512 | 512 |
+| live sessions at the time | 0 | 1 |
+| memory in use | 151.5 MiB (7.4%) | 997 MiB (32.5%) |
+| PIDs in use | 101 | 242 (47%) |
+
+**Do not turn this into a per-session figure.** One instance was idle and the
+other had a single busy session; cost is dominated by what a session is doing,
+not by how many there are, and a number derived from either container is wrong
+for the other. What the table does support is a bound: one busy session already
+takes a third of a 3 GiB container and nearly half of its 512 PIDs.
+
+**`--pids-limit` is the ceiling to watch, and it is the one you cannot
+configure.** `--memory` is parameterised through `CLAWCIUS_CONTAINER_MEMORY`;
+`--pids-limit=512` is hardcoded at `docker/run-container.sh:600` for every
+instance. hamachi is at 47% of it with one session and 32% of memory, so PIDs
+run out first. Hitting it is a failing `fork()` somewhere unrelated, not a
+message about sessions.
+
+`sessions.maxConcurrent` is **10** in both configs since 2026-08-19, above
+anything measured here. It is a policy ceiling, not a budget, and the operator
+set it knowing that: with `idleTimeoutMinutes: 0` the pool never gives a slot
+back, so a lower cap did not protect memory either — it just locked the pool
+sooner. Nothing enforces this section; the container's limits do, by killing
+something. `browse` adds ~410 MB peak (`browser-cli/README.md` § Memory) and
+holds an exclusive lock, so there is only ever one.
+
+The host is **not** the constraint: 11.7 GiB total, 8.65 GiB available, 4 GiB
+of swap essentially untouched, 6 cores (2026-08-19). If you raise a container's
+`--memory`, the host has room; raising `--pids-limit` means editing
+`run-container.sh`.
+
+> Reading limits from inside a container is normally useless — without lxcfs,
+> `/proc/meminfo` shows the host's figures. **These containers run gVisor
+> (`runtime runsc`), whose sentry synthesises `/proc/meminfo` from the sandbox
+> limit**, so an in-container `MemTotal` of 3145728 kB is exactly the `3g` cap
+> and not the host's 11.7 GiB. That is what makes `browser-cli`'s
+> MemAvailable-trough method valid here. It would not be under `runc`.
 
 After the reboot, drop swappiness — swapping a Node heap costs hundreds of ms
 on the next tool call:

@@ -60,9 +60,14 @@ WatchdogSec=90
 StateDirectory=hamachi
 StateDirectoryMode=0750
 
-# Below the main instance (one session vs three), but no longer starved: the
-# old 600M/900M ceiling was rationing a 3.4 GB VM the instance shared with
-# everything else. On the 12 GB VPS the ceiling is for stopping a runaway.
+# Below the main instance, but no longer starved: the old 600M/900M ceiling was
+# rationing a 3.4 GB VM the instance shared with everything else. On the 12 GB
+# VPS the ceiling is for stopping a runaway.
+#
+# It is NOT sized per session. This unit is the waker; the sessions are `claude`
+# processes inside `hamachi-agent` and are bounded by that container's
+# --memory (3g), not by this. Both instances set sessions.maxConcurrent to 10
+# as of 2026-08-19 and neither unit was resized, which is correct.
 MemoryHigh=2G
 MemoryMax=3G
 TasksMax=256
