@@ -1,0 +1,528 @@
+/**
+ * The session pool: who a turn is written back as, when `acquire` refuses, and
+ * what eviction does when it is switched off.
+ *
+ * None of this could be tested before. `agent.ts` imports `config.ts`, which
+ * read and validated the environment in its module body, so `dist/agent.js`
+ * was unloadable without a live deployment — Clawcius #130. Everything below
+ * covers something that went wrong in #128 and was found by reading or by
+ * review rather than by a test:
+ *
+ *   - `#identityFor` returned `coordinator` unconditionally. An engineer whose
+ *     row went missing came back as the one role that may DM the host agent.
+ *   - Under the shipped caps a spawned agent could never take a turn, because
+ *     `acquire` had no slot for it and `idleTimeoutMinutes: 0` means no slot is
+ *     ever given back.
+ *   - The at-capacity announcement, added to fix the second, was reasoned about
+ *     and shipped unexercised.
+ *
+ * Run against `dist/`, like every other test here: Node's type stripping does
+ * not resolve a `.js` specifier to a `.ts` file, and testing the built output
+ * is also what catches the stale-dist failure this repo keeps hitting.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+import { AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
+import { AgentRegistry } from '../dist/store.js';
+import { setConfig } from '../dist/config.js';
+
+const CREW = 'hamachi';
+const UUID = '0b3f4d1e-1111-4222-8333-444455556666';
+const OTHER_UUID = '7c1a2b3d-2222-4333-8444-555566667777';
+
+function tempDir(prefix) {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/**
+ * Only the keys the pool reads, and deliberately so.
+ *
+ * A fixture obliged to be a complete `AgentConfig` would be a second copy of
+ * `agent-config.yaml` drifting quietly out of step with the real one. What each
+ * test stands up should be readable in the test — so if a future `acquire`
+ * reads a key that is not here, it gets a `TypeError` naming the key rather
+ * than a plausible default.
+ */
+function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot }) {
+  setConfig({
+    discord: { token: 'unused-by-the-pool', guildId: 'unused-by-the-pool' },
+    github: { token: '' },
+    storage: { dbPath: 'unused-by-the-pool' },
+    agent: {
+      clawsky: { crew: CREW, wakeOnMail: true },
+      sessions: { maxConcurrent, idleTimeoutMinutes, workspaceRoot },
+    },
+  });
+}
+
+/**
+ * A session that is a session in every way the pool cares about, and starts no
+ * container.
+ *
+ * `SessionManager.newSession` exists for this. A real `AgentSession` stands up
+ * a containerised `claude` from its constructor — an env file and a
+ * `docker exec` — so a test of the bookkeeping would otherwise pass or fail on
+ * whether the host had docker and a live image.
+ */
+class FakeSession {
+  constructor(channelId, workspacePath, resumeSessionId) {
+    this.channelId = channelId;
+    this.workspacePath = workspacePath;
+    this.sessionId = resumeSessionId ?? `pending-${channelId}`;
+    this.busy = false;
+    this.lastActiveAt = Date.now();
+    this.closed = false;
+    this.onBusyChanged = () => {};
+  }
+
+  async close() {
+    this.closed = true;
+  }
+}
+
+/** A manager wired to a real registry on a real (temporary) database. */
+function pool(options = {}) {
+  const {
+    maxConcurrent = 4,
+    idleTimeoutMinutes = 0,
+    dbPath = join(tempDir('clawsky-sessions-'), 'clawcius.db'),
+    workspaceRoot = tempDir('clawsky-workspaces-'),
+  } = options;
+
+  installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot });
+  const registry = new AgentRegistry(dbPath, { crew: CREW });
+  const built = [];
+  const manager = new SessionManager(registry);
+  manager.newSession = (channelId, workspacePath, resumeSessionId) => {
+    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+    built.push(session);
+    return session;
+  };
+  return { manager, registry, dbPath, workspaceRoot, built };
+}
+
+const events = {
+  onToolUse: () => {},
+  onDone: () => {},
+  onError: () => {},
+  onCliFailure: () => {},
+  onNeedsRespawn: () => {},
+};
+
+/** Delete a row behind the registry's back, as a stray DELETE would. */
+function deleteRow(dbPath, id) {
+  const db = new DatabaseSync(dbPath);
+  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+  db.close();
+}
+
+// ── identity: the row wins ───────────────────────────────────────────────────
+
+/**
+ * A registry that records the identity it was handed.
+ *
+ * `#identityFor` is private and its output goes to exactly two places:
+ * `ensure`, which ignores it whenever a row already exists, and
+ * `recordSession`, whose conflict clause updates the session and nothing else.
+ * So with a row present the identity it computes is invisible from the
+ * database — which is what makes this stub worth the lines. Assert on the
+ * stored row instead and the assertion holds even when `#identityFor` returns
+ * `coordinator` for everybody, which is precisely the bug (#128).
+ *
+ * That is not a criticism of the store: two independent defences is the design,
+ * and the tests below cover the other one against a real database. It is that
+ * an end-to-end assertion cannot tell you which of them is doing the work.
+ */
+function recordingRegistry(rows = {}) {
+  return {
+    calls: [],
+    rows: new Map(Object.entries(rows)),
+    get(id) {
+      return this.rows.get(id);
+    },
+    ensure(id, identity) {
+      this.calls.push({ method: 'ensure', id, identity });
+      const existing = this.rows.get(id);
+      if (existing) return existing;
+      const created = { id, sessionId: '', status: 'live', spawnedAt: 0, lastActiveAt: 0, ...identity };
+      this.rows.set(id, created);
+      return created;
+    },
+    recordSession(id, sessionId, workspacePath, identity) {
+      this.calls.push({ method: 'recordSession', id, sessionId, workspacePath, identity });
+    },
+    touch(id) {
+      this.calls.push({ method: 'touch', id });
+    },
+  };
+}
+
+/** A manager over a stubbed registry — no database, no config beyond the pool's. */
+function stubbedPool(rows, options = {}) {
+  const { maxConcurrent = 4, idleTimeoutMinutes = 0 } = options;
+  installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot: tempDir('clawsky-ws-') });
+  const registry = recordingRegistry(rows);
+  const built = [];
+  const manager = new SessionManager(registry);
+  manager.newSession = (channelId, workspacePath, resumeSessionId) => {
+    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+    built.push(session);
+    return session;
+  };
+  return { manager, registry, built };
+}
+
+test('the identity written back for an engineer is the engineer, not a coordinator', async () => {
+  const { manager, registry, built } = stubbedPool({
+    'hamachi-engineer1': {
+      id: 'hamachi-engineer1',
+      crew: CREW,
+      role: 'engineer',
+      sessionId: '',
+      workspacePath: '/tmp/engineer1',
+      spawnedBy: 'hamachi-coordinator',
+    },
+  });
+
+  manager.acquire('hamachi-engineer1', events);
+  built[0].sessionId = UUID;
+  manager.persist('hamachi-engineer1');
+
+  const written = registry.calls.find((call) => call.method === 'recordSession');
+  // The bug: `#identityFor` returned `coordinator` unconditionally. Coordinator
+  // is the one role that may DM the host agent, so the promotion would have been
+  // a privilege handed out on the way past.
+  assert.equal(written.identity.role, 'engineer');
+  assert.equal(written.identity.crew, CREW);
+  assert.equal(written.identity.spawnedBy, 'hamachi-coordinator');
+  assert.equal(written.sessionId, UUID);
+  await manager.shutdown();
+});
+
+test('an engineer stays an engineer in the database too', async () => {
+  const { manager, registry } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  const session = manager.acquire('hamachi-engineer1', events);
+  session.sessionId = UUID;
+  manager.persist('hamachi-engineer1');
+
+  // The second defence, over a real database: even handed the wrong identity,
+  // `recordSession`'s conflict clause updates the session and nothing else. Both
+  // of these have to hold — see the note on `recordingRegistry`.
+  const row = registry.get('hamachi-engineer1');
+  assert.equal(row.role, 'engineer');
+  assert.equal(row.spawnedBy, 'hamachi-coordinator');
+  assert.equal(row.sessionId, UUID);
+  await manager.shutdown();
+});
+
+test('acquire hands ensure the identity the row says, not a default', async () => {
+  // The role the pool acts on is the row's, not the one `#identityFor` guessed:
+  // `acquire` reads it back out of `ensure`. CLAWSKY.md — "Spawn and kill: held
+  // by the coordinator alone".
+  const { manager, registry } = stubbedPool({
+    'hamachi-engineer1': {
+      id: 'hamachi-engineer1',
+      crew: CREW,
+      role: 'engineer',
+      sessionId: '',
+      workspacePath: '/tmp/engineer1',
+      spawnedBy: 'hamachi-coordinator',
+    },
+  });
+  manager.acquire('hamachi-engineer1', events);
+  const ensured = registry.calls.find((call) => call.method === 'ensure');
+  assert.equal(ensured.identity.role, 'engineer');
+  await manager.shutdown();
+});
+
+test('a turn ending for an agent with no row never calls recordSession', async () => {
+  const { manager, registry, built } = stubbedPool({});
+  manager.acquire('hamachi-engineer1', events);
+  built[0].sessionId = UUID;
+  // The row was created by `ensure` on the way in. Take it away again.
+  registry.rows.delete('hamachi-engineer1');
+  registry.calls.length = 0;
+
+  manager.persist('hamachi-engineer1');
+  assert.deepEqual(registry.calls, [], 'persist must not touch the registry with no row');
+  await manager.shutdown();
+});
+
+test('a channel the registry has never heard of is a coordinator, in the configured crew', async () => {
+  const { manager, registry, workspaceRoot } = pool();
+  manager.acquire('1234567890', events);
+
+  const row = registry.get('1234567890');
+  assert.equal(row.role, 'coordinator');
+  assert.equal(row.crew, CREW);
+  // The id is the channel id and the workspace is under the configured root:
+  // minting a prettier name would detach a live session from its channel.
+  assert.equal(row.workspacePath, join(workspaceRoot, '1234567890'));
+  assert.equal(row.spawnedBy, null);
+  await manager.shutdown();
+});
+
+test('a turn ending for an agent with no row writes nothing at all', async () => {
+  const { manager, registry, dbPath } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  const session = manager.acquire('hamachi-engineer1', events);
+  session.sessionId = UUID;
+
+  // Something deleted the row mid-turn. Nothing in this tree does that today —
+  // `!reset` clears the session id, not the row — which is why the guard needs
+  // a test rather than a reproduction.
+  deleteRow(dbPath, 'hamachi-engineer1');
+  assert.equal(registry.get('hamachi-engineer1'), undefined);
+
+  const written = [];
+  const realWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => {
+    written.push(String(chunk));
+    return realWrite(chunk, ...rest);
+  };
+  try {
+    manager.persist('hamachi-engineer1');
+  } finally {
+    process.stderr.write = realWrite;
+  }
+
+  // An agent is a row; a turn is not a thing that may create one.
+  assert.equal(registry.get('hamachi-engineer1'), undefined);
+  // And it is loud, because a silent no-op would hide the delete that made it
+  // reachable.
+  assert.match(written.join(''), /finished a turn with no registry row — not creating one/);
+  await manager.shutdown();
+});
+
+test('persist writes nothing while the session id is still the placeholder', async () => {
+  const { manager, registry } = pool();
+  manager.acquire('1234567890', events);
+
+  // `pending-<channelId>` must never reach SQLite: it is not a UUID, so every
+  // later wake for this channel would try to resume from it and the CLI exits 1.
+  manager.persist('1234567890');
+  assert.equal(registry.get('1234567890').sessionId, '');
+  await manager.shutdown();
+});
+
+test('persist on a channel with no live session is a no-op', async () => {
+  const { manager, registry } = pool();
+  registry.ensure('1234567890', {
+    crew: CREW,
+    role: 'coordinator',
+    workspacePath: '/tmp/x',
+    spawnedBy: null,
+  });
+  manager.persist('1234567890');
+  assert.equal(registry.get('1234567890').sessionId, '');
+  await manager.shutdown();
+});
+
+// ── capacity ─────────────────────────────────────────────────────────────────
+
+test('capacity reports the live count, the cap and whether anything empties it', async () => {
+  const { manager } = pool({ maxConcurrent: 3, idleTimeoutMinutes: 0 });
+  assert.deepEqual(manager.capacity, { live: 0, max: 3, idleTimeoutMinutes: 0 });
+
+  manager.acquire('a', events);
+  manager.acquire('b', events);
+  // The timeout travels with the two numbers deliberately: a full pool with
+  // eviction on is a wait, and a full pool with eviction off is forever. `spawn`
+  // cannot tell those apart from `live` and `max` alone.
+  assert.deepEqual(manager.capacity, { live: 2, max: 3, idleTimeoutMinutes: 0 });
+  await manager.shutdown();
+});
+
+test('acquire throws AtCapacityError at the cap, carrying the numbers', async () => {
+  const { manager } = pool({ maxConcurrent: 2 });
+  manager.acquire('a', events);
+  manager.acquire('b', events);
+
+  let error;
+  assert.throws(
+    () => manager.acquire('c', events),
+    (thrown) => {
+      error = thrown;
+      return true;
+    },
+  );
+  assert.equal(error.live, 2);
+  assert.equal(error.max, 2);
+  assert.equal(error.name, 'AtCapacityError');
+  // The catch site tells this apart from a spawn failure or a dead transport
+  // by class, not by matching on a message.
+  assert.equal(error instanceof AtCapacityError, true);
+  // And nothing was half-created on the way out.
+  assert.equal(manager.has('c'), false);
+  assert.equal(manager.capacity.live, 2);
+  await manager.shutdown();
+});
+
+test('a channel that already holds a slot is served at capacity', async () => {
+  const { manager } = pool({ maxConcurrent: 1 });
+  const first = manager.acquire('a', events);
+  // The cap is on distinct sessions, not on turns. A conversation that has a
+  // slot keeps it, or the pool would deadlock the moment it filled.
+  assert.equal(manager.acquire('a', events), first);
+  assert.throws(() => manager.acquire('b', events), AtCapacityError);
+  await manager.shutdown();
+});
+
+test('releasing a slot makes it available again', async () => {
+  const { manager, built } = pool({ maxConcurrent: 1 });
+  manager.acquire('a', events);
+  assert.throws(() => manager.acquire('b', events), AtCapacityError);
+
+  await manager.release('a');
+  assert.equal(built[0].closed, true);
+  assert.equal(manager.capacity.live, 0);
+  assert.doesNotThrow(() => manager.acquire('b', events));
+  await manager.shutdown();
+});
+
+test('onCountsChanged fires when the pool moves', async () => {
+  const { manager } = pool({ maxConcurrent: 2 });
+  let moves = 0;
+  manager.onCountsChanged = () => {
+    moves += 1;
+  };
+  manager.acquire('a', events);
+  assert.equal(moves, 1);
+  await manager.release('a');
+  assert.equal(moves, 2);
+  // A refusal is not a move.
+  manager.acquire('b', events);
+  manager.acquire('c', events);
+  assert.throws(() => manager.acquire('d', events), AtCapacityError);
+  assert.equal(moves, 4);
+  await manager.shutdown();
+});
+
+// ── eviction ─────────────────────────────────────────────────────────────────
+
+test('the sweeper is inert at idleTimeoutMinutes: 0, however idle a session is', async (t) => {
+  // Enabled before the manager is constructed: the sweeper interval is armed in
+  // the constructor.
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  t.after(() => t.mock.timers.reset());
+
+  const { manager, built } = pool({ maxConcurrent: 4, idleTimeoutMinutes: 0 });
+  manager.acquire('a', events);
+  manager.acquire('b', events);
+  // Idle since well before this deployment existed.
+  for (const session of built) session.lastActiveAt = 0;
+
+  t.mock.timers.tick(60_000);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // 0 disables eviction: sessions stay alive for the life of the process. This
+  // is the shipped configuration, and it is why `liveCount` is a high-water mark
+  // and why a full pool needs a restart.
+  assert.equal(manager.capacity.live, 2);
+  assert.equal(built.every((session) => session.closed === false), true);
+  await manager.shutdown();
+});
+
+test('with a timeout set, the sweeper evicts the idle and leaves the busy', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  t.after(() => t.mock.timers.reset());
+
+  const { manager, built } = pool({ maxConcurrent: 4, idleTimeoutMinutes: 30 });
+  manager.acquire('idle', events);
+  manager.acquire('busy', events);
+  manager.acquire('recent', events);
+  const [idle, busy, recent] = built;
+
+  idle.lastActiveAt = Date.now() - 31 * 60_000;
+  busy.lastActiveAt = Date.now() - 31 * 60_000;
+  busy.busy = true;
+  recent.lastActiveAt = Date.now() - 29 * 60_000;
+
+  t.mock.timers.tick(60_000);
+  // #evictIdle awaits release() per session; give the microtasks room.
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+
+  assert.equal(manager.has('idle'), false, 'an idle session past the cutoff should be evicted');
+  // Nothing interrupts a running turn — CLAWSKY.md § Lifecycle.
+  assert.equal(manager.has('busy'), true, 'a busy session must never be evicted');
+  assert.equal(manager.has('recent'), true, 'a session inside the window must not be evicted');
+  await manager.shutdown();
+});
+
+test('shutdown closes everything and empties the pool', async () => {
+  const { manager, built } = pool({ maxConcurrent: 4 });
+  manager.acquire('a', events);
+  manager.acquire('b', events);
+  await manager.shutdown();
+  assert.equal(manager.capacity.live, 0);
+  assert.equal(built.every((session) => session.closed), true);
+});
+
+// ── what the user is told ────────────────────────────────────────────────────
+
+test('at capacity with eviction off, the notice names the restart', () => {
+  const notice = atCapacityNotice(new AtCapacityError(4, 4), 0);
+  assert.match(notice, /4 of 4 are in use/);
+  assert.match(notice, /not queued/);
+  // The branch is the point. On the shipped configuration a retry cannot work,
+  // and "try again" is what a person would naturally do.
+  assert.match(notice, /will not clear on its own/);
+  assert.match(notice, /restart on the host, or a higher `sessions\.maxConcurrent`/);
+  assert.doesNotMatch(notice, /say it again/);
+});
+
+test('at capacity with eviction on, the notice says when to come back', () => {
+  const notice = atCapacityNotice(new AtCapacityError(2, 2), 30);
+  assert.match(notice, /2 of 2 are in use/);
+  assert.match(notice, /A slot frees after 30m idle — say it again after that\./);
+  assert.doesNotMatch(notice, /will not clear on its own/);
+  assert.doesNotMatch(notice, /restart on the host/);
+});
+
+test('the notice carries the numbers from the error it was given', () => {
+  // `live` and `max` exist on the error because the catch site has no other way
+  // to get them — the pool has moved on by then.
+  assert.match(atCapacityNotice(new AtCapacityError(1, 7), 0), /1 of 7 are in use/);
+});
+
+// ── the resumable-id rule these all lean on ──────────────────────────────────
+
+test('a stored UUID is resumed and a placeholder is not', async () => {
+  const { manager, registry, built } = pool();
+  registry.ensure('a', { crew: CREW, role: 'coordinator', workspacePath: '/tmp/a', spawnedBy: null });
+  registry.recordSession('a', OTHER_UUID, '/tmp/a', {
+    crew: CREW,
+    role: 'coordinator',
+    workspacePath: '/tmp/a',
+  });
+
+  manager.acquire('a', events);
+  assert.equal(built[0].sessionId, OTHER_UUID);
+  // And the stored workspace wins over the derived one, so a row written by
+  // spawn keeps the workspace spawn chose.
+  assert.equal(built[0].workspacePath, '/tmp/a');
+
+  manager.acquire('b', events);
+  assert.equal(built[1].sessionId, 'pending-b');
+  await manager.shutdown();
+});

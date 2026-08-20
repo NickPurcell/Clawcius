@@ -500,17 +500,22 @@ test('an unwritable output stops the build, with a sentence rather than a stack'
 });
 
 test('the banner is printed even when the process is about to die in its config loader', () => {
-  // The point of the whole mechanism. `src/config.ts` throws at IMPORT time on
-  // a missing environment variable, so this is a waker that cannot start — the
-  // #89 shape, where 22,675 consecutive failed starts said nothing about which
-  // `dist/` was failing. The banner has to come out of that process anyway,
-  // which is why it lives in a module imported before `./config.js` rather than
-  // in the body of index.ts.
+  // The point of the whole mechanism. `loadConfig()` is the first statement in
+  // the body of `index.ts` and throws on a missing environment variable, so
+  // this is a waker that cannot start — the #89 shape, where 22,675
+  // consecutive failed starts said nothing about which `dist/` was failing. The
+  // banner has to come out of that process anyway, which is why it lives in a
+  // module imported ahead of everything rather than in the body of index.ts.
+  //
+  // Until #130 the throw was at IMPORT time, inside `./config.js`. Moving it
+  // into the body is what made `dist/agent.js` loadable by a test; this
+  // assertion is the check that it did not also make the daemon startable
+  // without a token.
   const root = resolve(fileURLToPath(import.meta.url), '..', '..');
   const result = spawnSync(process.execPath, [join(root, 'dist', 'index.js')], {
     cwd: root,
     encoding: 'utf8',
-    // A deliberately empty environment for the variables config.ts requires.
+    // A deliberately empty environment for the variables loadConfig requires.
     env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
     timeout: 30_000,
   });

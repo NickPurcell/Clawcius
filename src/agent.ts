@@ -131,7 +131,7 @@ function linkSkills(workspacePath: string): void {
   const target = join(workspacePath, '.claude');
   if (existsSync(target)) return;
   try {
-    symlinkSync(config.agent.paths.skillsDir, target, 'dir');
+    symlinkSync(config().agent.paths.skillsDir, target, 'dir');
   } catch (error) {
     process.stderr.write(
       `[clawcius] could not link skills into ${workspacePath}: ${String(error)}\n`,
@@ -155,11 +155,11 @@ function linkSkills(workspacePath: string): void {
  */
 function gitEnv(): Record<string, string> {
   const entries: Array<[string, string]> = [
-    ['user.name', config.agent.git.userName],
-    ['user.email', config.agent.git.userEmail],
+    ['user.name', config().agent.git.userName],
+    ['user.email', config().agent.git.userEmail],
   ];
 
-  if (config.github.token) {
+  if (config().github.token) {
     entries.push([
       'credential.https://github.com.helper',
       '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f',
@@ -175,7 +175,7 @@ function gitEnv(): Record<string, string> {
     env[`GIT_CONFIG_KEY_${i}`] = key;
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
-  if (config.github.token) env['GITHUB_TOKEN'] = config.github.token;
+  if (config().github.token) env['GITHUB_TOKEN'] = config().github.token;
   return env;
 }
 
@@ -201,6 +201,33 @@ export class AtCapacityError extends Error {
     this.live = live;
     this.max = max;
   }
+}
+
+/**
+ * The sentence a user reads when their mention was dropped for want of a slot.
+ *
+ * Deliberately says the message was dropped rather than "try again": a retry
+ * is what a person would naturally do, and on the shipped configuration
+ * (`sessions.idleTimeoutMinutes: 0`) it cannot work, because nothing releases a
+ * session short of a restart. Naming the restart is the useful half.
+ *
+ * Here, and taking the timeout as an argument, rather than reading `config()`
+ * inside `announceAtCapacity` in index.ts. The branch is the part worth
+ * getting right — "this will not clear on its own" and "say it again in a
+ * minute" are opposite instructions, chosen by a number — and index.ts is not
+ * importable by a test, so a branch that lived there could only be reasoned
+ * about. It was reasoned about, in #128, and shipped unexercised (Clawcius
+ * #130). What stays in index.ts is the Discord plumbing around it.
+ */
+export function atCapacityNotice(error: AtCapacityError, idleTimeoutMinutes: number): string {
+  return (
+    `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
+    `pick that up and it was not queued. ` +
+    (idleTimeoutMinutes === 0
+      ? 'This deployment never evicts idle sessions, so this will not clear on its own: ' +
+        'it needs a restart on the host, or a higher `sessions.maxConcurrent`.'
+      : `A slot frees after ${idleTimeoutMinutes}m idle — say it again after that.`)
+  );
 }
 
 export type AgentEvents = {
@@ -365,7 +392,7 @@ export class AgentSession {
   #buildOptions(resumeSessionId: string | undefined): Options {
     const options: Options = {
       cwd: this.workspacePath,
-      model: config.agent.model,
+      model: config().agent.model,
       systemPrompt: buildSystemPrompt(),
       // Required for the discord-cli skill to load at all. The SDK defaults to
       // isolation mode, where no filesystem settings — and therefore no skills
@@ -377,8 +404,8 @@ export class AgentSession {
       // This is also where the bot token enters the sandbox — see SETUP.md.
       env: {
         ...process.env,
-        DISCORD_TOKEN: config.discord.token,
-        DISCORD_GUILD_ID: config.discord.guildId,
+        DISCORD_TOKEN: config().discord.token,
+        DISCORD_GUILD_ID: config().discord.guildId,
         DISCORD_CLI_HOME: join(this.workspacePath, '.discord-cli'),
         ...gitEnv(),
       },
@@ -396,8 +423,8 @@ export class AgentSession {
 
     // 0 means unlimited: omit the cap entirely rather than sending a zero,
     // which the SDK would read as "no turns allowed".
-    if (config.agent.maxTurns > 0) {
-      options.maxTurns = config.agent.maxTurns;
+    if (config().agent.maxTurns > 0) {
+      options.maxTurns = config().agent.maxTurns;
     }
 
     if (isResumable(resumeSessionId)) {
@@ -408,12 +435,12 @@ export class AgentSession {
     // container's job. Permission prompts would only block every tool call
     // with nothing there to answer them.
     options.spawnClaudeCodeProcess = containerSpawner({
-      name: config.agent.container.name,
-      claudePath: config.agent.container.claudePath,
+      name: config().agent.container.name,
+      claudePath: config().agent.container.claudePath,
       // The env above holds both tokens, and it reaches the container through
       // a 0600 file in here rather than through the exec's argv, which is
       // world-readable. See the header of src/container.ts.
-      execEnvDir: config.agent.container.execEnvDir,
+      execEnvDir: config().agent.container.execEnvDir,
     });
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
@@ -741,7 +768,7 @@ export class SessionManager {
       };
     }
     return {
-      crew: config.agent.clawsky.crew,
+      crew: config().agent.clawsky.crew,
       role: 'coordinator',
       workspacePath,
       spawnedBy: null,
@@ -771,8 +798,8 @@ export class SessionManager {
   get capacity(): { live: number; max: number; idleTimeoutMinutes: number } {
     return {
       live: this.#sessions.size,
-      max: config.agent.sessions.maxConcurrent,
-      idleTimeoutMinutes: config.agent.sessions.idleTimeoutMinutes,
+      max: config().agent.sessions.maxConcurrent,
+      idleTimeoutMinutes: config().agent.sessions.idleTimeoutMinutes,
     };
   }
 
@@ -806,6 +833,33 @@ export class SessionManager {
    */
   onCountsChanged: () => void = () => {};
 
+  /**
+   * How a live session is built.
+   *
+   * Assignable, and the same shape as `onCountsChanged` above, for one reason:
+   * constructing an `AgentSession` starts a containerised `claude`. The
+   * constructor creates the workspace, links the skills, and hands the SDK a
+   * `spawnClaudeCodeProcess` that writes an env file into
+   * `container.execEnvDir` and runs `docker exec`. What this class is, on the
+   * other hand, is bookkeeping: a map, a cap, an eviction rule and which
+   * identity gets written back. A test of that which had to stand up a
+   * container would pass or fail on whether the host had docker and a live
+   * image, which are not facts about the pool.
+   *
+   * The waker never touches this. It is the seam that made `acquire`,
+   * `persist`, `capacity` and eviction testable at all — see Clawcius #130 and
+   * test/sessions.test.js — and everything it hands over is what `acquire`
+   * decided, which is the part under test.
+   */
+  newSession: (
+    channelId: string,
+    workspacePath: string,
+    resumeSessionId: string | undefined,
+    events: AgentEvents,
+    mcpServers: Record<string, McpServerConfig> | null,
+  ) => AgentSession = (channelId, workspacePath, resumeSessionId, events, mcpServers) =>
+    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers);
+
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
   }
@@ -834,12 +888,12 @@ export class SessionManager {
       return existing;
     }
 
-    if (this.#sessions.size >= config.agent.sessions.maxConcurrent) {
-      throw new AtCapacityError(this.#sessions.size, config.agent.sessions.maxConcurrent);
+    if (this.#sessions.size >= config().agent.sessions.maxConcurrent) {
+      throw new AtCapacityError(this.#sessions.size, config().agent.sessions.maxConcurrent);
     }
 
     const persisted = this.#registry.get(channelId);
-    const workspacePath = persisted?.workspacePath ?? join(config.agent.sessions.workspaceRoot, channelId);
+    const workspacePath = persisted?.workspacePath ?? join(config().agent.sessions.workspaceRoot, channelId);
     const resumeFrom = isResumable(persisted?.sessionId) ? persisted.sessionId : undefined;
 
     // Registered before the turn rather than after it. The row is the identity
@@ -851,7 +905,7 @@ export class SessionManager {
       this.#identityFor(channelId, workspacePath),
     );
 
-    const session = new AgentSession(
+    const session = this.newSession(
       channelId,
       workspacePath,
       resumeFrom,
@@ -864,7 +918,7 @@ export class SessionManager {
         ? buildMailServer(
             this.#mail,
             channelId,
-            hostAgentId(config.agent.clawsky.crew),
+            hostAgentId(config().agent.clawsky.crew),
             [
               ...(this.#armed ? buildArmedTools(channelId, this.#armed) : []),
               // Offered to a coordinator and to nobody else — CLAWSKY.md,
@@ -877,9 +931,9 @@ export class SessionManager {
                 ? buildSpawnTools(channelId, {
                     registry: this.#registry,
                     mail: this.#mail,
-                    workspaceRoot: config.agent.sessions.workspaceRoot,
+                    workspaceRoot: config().agent.sessions.workspaceRoot,
                     charter: buildSpawnCharter,
-                    wakesOnMail: config.agent.clawsky.wakeOnMail,
+                    wakesOnMail: config().agent.clawsky.wakeOnMail,
                     // A getter, not a snapshot: the tool is built once per
                     // session and the pool moves under it.
                     capacity: () => this.capacity,
@@ -954,9 +1008,9 @@ export class SessionManager {
 
   async #evictIdle(): Promise<void> {
     // 0 disables eviction: sessions stay alive for the life of the process.
-    if (config.agent.sessions.idleTimeoutMinutes === 0) return;
+    if (config().agent.sessions.idleTimeoutMinutes === 0) return;
 
-    const cutoff = Date.now() - config.agent.sessions.idleTimeoutMinutes * 60_000;
+    const cutoff = Date.now() - config().agent.sessions.idleTimeoutMinutes * 60_000;
     for (const [channelId, session] of this.#sessions) {
       if (session.busy || session.lastActiveAt > cutoff) continue;
       // The session ID survives in SQLite, so the next mention resumes rather

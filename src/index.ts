@@ -11,17 +11,20 @@
  */
 
 // FIRST, and it must stay first. This prints which commit this artefact was
-// built from, as a side effect of being imported. `./config.js` below throws
-// at IMPORT time on a missing environment variable, so anything printed from
-// this file's body would be lost in precisely the case worth reporting. See
-// build-banner.ts.
+// built from, as a side effect of being imported. The startup that follows can
+// die before it says anything — `loadConfig()` throws on a missing environment
+// variable or an unreadable agent-config.yaml, and `preflight()` throws on a
+// container stack that is not up — so anything printed later would be lost in
+// precisely the cases worth reporting. Being an import rather than two lines
+// in this body is what puts it ahead of every other import too, any of which
+// could in principle throw at load. See build-banner.ts.
 import './build-banner.js';
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
-import { config } from './config.js';
+import { loadConfig } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
-import { AtCapacityError, SessionManager } from './agent.js';
+import { AtCapacityError, SessionManager, atCapacityNotice } from './agent.js';
 import { MailStore } from './mail.js';
 import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
@@ -34,6 +37,16 @@ import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import { sweepEnvFiles } from './container.js';
 import type { TurnSummary, WakeContext } from './types.js';
+
+// The environment is read HERE, not by importing `./config.js` — that is the
+// whole of Clawcius #130. Importing a module should not need a deployment
+// underneath it, or nothing that imports this graph can be tested; loading is
+// something an entry point does. This is the first statement in the body, so a
+// waker with no DISCORD_TOKEN still dies at startup with the same message.
+//
+// Every `config.` below is this constant, and every one of them reads the same
+// way as before.
+const config = loadConfig();
 
 // Fail before touching Discord if the container stack is not actually up —
 // a missing agent or proxy container reads as a bot that never answers.
@@ -714,23 +727,15 @@ function deliver(channelId: string, buffered: BufferedMessage[], afterRespawn = 
 /**
  * Say, in the channel, that there was no session slot.
  *
- * Deliberately says the message was dropped rather than "try again": a retry
- * is what a person would naturally do, and on the shipped configuration it
- * cannot work. Naming the restart is the useful half.
+ * The sentence itself is `atCapacityNotice` in agent.ts, where a test can
+ * reach it. What is left here is the Discord plumbing: find the channel, send,
+ * and never throw out of either.
  */
 async function announceAtCapacity(channelId: string, error: AtCapacityError): Promise<void> {
   try {
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased() || !('send' in channel)) return;
-    const evicts = config.agent.sessions.idleTimeoutMinutes;
-    await channel.send(
-      `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
-        `pick that up and it was not queued. ` +
-        (evicts === 0
-          ? 'This deployment never evicts idle sessions, so this will not clear on its own: ' +
-            'it needs a restart on the host, or a higher `sessions.maxConcurrent`.'
-          : `A slot frees after ${evicts}m idle — say it again after that.`),
-    );
+    await channel.send(atCapacityNotice(error, config.agent.sessions.idleTimeoutMinutes));
   } catch (sendError) {
     // Best effort, as in announceOutage. If Discord is unreachable too, the
     // journal is the record, and throwing here would take the process down.

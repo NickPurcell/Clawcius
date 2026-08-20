@@ -87,7 +87,7 @@ function execTakesEnvFile(): boolean {
 
 export async function preflight(): Promise<void> {
   const problems: string[] = [];
-  const name = config.agent.container.name;
+  const name = config().agent.container.name;
   const proxy = 'clawcius-squid';
 
   if (onPath('docker') && !execTakesEnvFile()) {
