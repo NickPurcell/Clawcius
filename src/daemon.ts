@@ -509,8 +509,8 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
       // A FULL POOL IS DIFFERENT and is the exception this earns. Nothing is
       // wrong with the request, the channel or the credentials; the messages in
       // this bundle are dropped and no later message in this channel will fare
-      // any better, because with `idleTimeoutMinutes: 0` nothing releases a
-      // session short of a restart. Silence there is indistinguishable from the
+      // any better, because with `idleTimeoutMinutes: 0` nothing frees a slot in
+      // the ordinary course. Silence there is indistinguishable from the
       // bot being down — the same reading `announceOutage` exists to prevent —
       // and spawn is what makes it reachable by a coordinator rather than only
       // by the operator: a spawned agent that has taken a turn holds one of

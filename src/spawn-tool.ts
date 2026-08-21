@@ -189,9 +189,12 @@ export type SpawnToolOptions = {
    * coordinator's turn, so that coordinator is necessarily holding a slot when
    * the call happens. Both shipped configs set `maxConcurrent: 10` since
    * 2026-08-20, up from 3 and 1 — which DEFERS this rather than fixing it.
-   * With `idleTimeoutMinutes` still 0 the pool never gives a slot back, so it
-   * still fills permanently; it now takes ten sessions to get there instead of
-   * three on instance 1 and one on hamachi.
+   * With `idleTimeoutMinutes` still 0 nothing frees a slot in the ordinary
+   * course, so it still fills; it now takes ten sessions to get there instead
+   * of three on instance 1 and one on hamachi. `!reset` can spend a channel's
+   * transcript to give that channel's slot back, but it is a person's remedy
+   * and not the caller's — see the refusal below for why that distinction
+   * matters here in particular.
    *
    * A full pool is not automatically fatal, and the distinction is why this
    * carries the timeout rather than just two numbers: with eviction ON a slot
@@ -352,14 +355,18 @@ export function buildSpawnTools(
       const free = pool.max - pool.live;
       if (free <= 0 && pool.idleTimeoutMinutes === 0) {
         return refuse(
-          `Not spawned — there is no session slot for it and nothing will free one. ` +
-            `${pool.live} of ${pool.max} sessions are live (\`sessions.maxConcurrent\`), and ` +
-            '`sessions.idleTimeoutMinutes` is 0, so a session is never evicted — the pool only ' +
-            'empties on a restart. Your own turn is holding one of those slots, and nothing ' +
-            'gives one back, so this is not a busy moment that will pass: the pool is full ' +
-            'until the process restarts. The row would be written and could never take a turn, ' +
-            'and there is no kill verb to remove it afterwards. The operator has to raise the ' +
-            'cap or turn eviction on.',
+          `Not spawned — there is no session slot for it and nothing frees one in the ` +
+            `ordinary course. ${pool.live} of ${pool.max} sessions are live ` +
+            '(`sessions.maxConcurrent`), and `sessions.idleTimeoutMinutes` is 0, so a session ' +
+            'is never evicted — eviction is the only thing that reclaims a live, healthy ' +
+            'session on its own. Your own turn is holding one of those slots, so this is not a ' +
+            'busy moment that will pass. The row would be written and could never take a turn, ' +
+            'and there is no kill verb to remove it afterwards. A slot CAN still be freed, but ' +
+            'not by you: `!reset` in a channel holding a session gives that slot back at the ' +
+            "cost of the channel's transcript, and the waker ignores this bot's own messages, " +
+            'so a command you post is not a command. It reaches channels only — never a spawned ' +
+            'agent\'s slot. So the ways out are someone running `!reset` in a live channel, or ' +
+            'the operator raising the cap or turning eviction on.',
         );
       }
 

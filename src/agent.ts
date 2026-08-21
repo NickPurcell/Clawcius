@@ -208,8 +208,12 @@ export class AtCapacityError extends Error {
  *
  * Deliberately says the message was dropped rather than "try again": a retry
  * is what a person would naturally do, and on the shipped configuration
- * (`sessions.idleTimeoutMinutes: 0`) it cannot work, because nothing releases a
- * session short of a restart. Naming the restart is the useful half.
+ * (`sessions.idleTimeoutMinutes: 0`) it cannot work, because nothing frees a
+ * slot in the ordinary course. Naming the remedies is the useful half — and
+ * `!reset` comes first because it is the only one the reader can act on
+ * themselves. A restart is the operator's and raising the cap is an edit and a
+ * redeploy, so a message that named only those two told the reader to wait for
+ * somebody else.
  *
  * Here, and taking the timeout as an argument, rather than reading `config()`
  * inside `announceAtCapacity` in daemon.ts. The branch is the part worth
@@ -227,8 +231,10 @@ export function atCapacityNotice(error: AtCapacityError, idleTimeoutMinutes: num
     `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
     `pick that up and it was not queued. ` +
     (idleTimeoutMinutes === 0
-      ? 'This deployment never evicts idle sessions, so this will not clear on its own: ' +
-        'it needs a restart on the host, or a higher `sessions.maxConcurrent`.'
+      ? 'This deployment never evicts idle sessions, so this will not clear on its own. ' +
+        '`!reset` in a channel that is holding a session gives its slot back, at the cost ' +
+        'of that channel\'s transcript. Failing that it needs a restart on the host, or a ' +
+        'higher `sessions.maxConcurrent`.'
       : `A slot frees after ${idleTimeoutMinutes}m idle — say it again after that.`)
   );
 }
@@ -789,8 +795,10 @@ export class SessionManager {
    * is woken by mail and by nothing else, so if `acquire` can never find it a
    * slot then the row can never take a turn. The two numbers are not enough on
    * their own — a full pool with eviction ON is a wait, and a full pool with
-   * eviction OFF is forever — so the timeout comes with them rather than the
-   * caller guessing.
+   * eviction OFF does not clear on its own — so the timeout comes with them
+   * rather than the caller guessing. `spawn` is right to refuse on the second:
+   * the remedies that exist there are a person's, not something the caller can
+   * wait for.
    *
    * `live` is `liveCount` by another name and carries its caveat: with
    * eviction off it is a high-water mark rather than a measure of activity.

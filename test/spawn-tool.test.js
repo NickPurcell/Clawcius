@@ -419,15 +419,18 @@ test('a spawned agent survives the process that spawned it', async () => {
 
 // ── Capacity: a row that could never take a turn is not written ─────────────
 
-test('spawn refuses when the session pool is full and nothing ever empties it', async () => {
+test('spawn refuses when the session pool is full and nothing empties it on its own', async () => {
   const { registry, mail, spawnOf, capacity, logged } = spawnBoard();
 
-  // The shipped shape: idleTimeoutMinutes 0, so nothing ever gives a slot
-  // back. `spawn` runs inside the calling coordinator's turn, so a slot is
-  // always held when the call happens, and once the pool has filled it stays
-  // full until the process restarts — not just a busy moment. 1/1 is the
-  // smallest case that says it; both configs now set maxConcurrent 10, which
-  // moves when this happens and not whether.
+  // The shipped shape: idleTimeoutMinutes 0, so nothing gives a slot back in
+  // the ordinary course. `spawn` runs inside the calling coordinator's turn, so
+  // a slot is always held when the call happens, and once the pool has filled it
+  // stays full — not just a busy moment. A person can still spend a channel's
+  // transcript with `!reset`, which is why the refusal says so; what it must not
+  // do is tell the caller to run it, since the waker drops this bot's own
+  // messages before they reach a command. 1/1 is the smallest case that says it;
+  // both configs now set maxConcurrent 10, which moves when this happens and not
+  // whether.
   capacity.live = 1;
   capacity.max = 1;
   capacity.idleTimeoutMinutes = 0;
@@ -440,6 +443,21 @@ test('spawn refuses when the session pool is full and nothing ever empties it', 
   assert.equal(refused.isError, true);
   assert.match(said(refused), /sessions\.maxConcurrent/);
   assert.match(said(refused), /sessions\.idleTimeoutMinutes/);
+
+  // Clawcius #146. This refusal is read by a coordinator, and it used to end
+  // "The operator has to raise the cap or turn eviction on" — routing the reader
+  // to a human as the only way out, which is false. It must name `!reset`...
+  assert.match(said(refused), /`!reset`/);
+  // ...and must say it is not the caller's to run, because it genuinely is not:
+  // `handleCommand` has one call site and both the self-check and the bot check
+  // above it return first, so a `!reset` this bot posts is never a command.
+  assert.match(said(refused), /not by you/);
+  // The other limit, or a coordinator reads `!reset` as a general escape hatch:
+  // sessions are keyed by channel id for channels and by agent id for spawned
+  // agents, and `!reset` only ever carries a channel id.
+  assert.match(said(refused), /never a spawned agent's slot/);
+  // The claim that survives, and the only one that was ever true.
+  assert.match(said(refused), /eviction is the only thing that reclaims a live, healthy session/);
 
   // The whole point of refusing rather than queueing. There is no kill verb,
   // `create` refuses a taken id and ids are never reused, so a row written here

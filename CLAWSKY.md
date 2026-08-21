@@ -590,8 +590,11 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    **The session cap is a separate thing and it does bind.** `acquire` throws
    at `sessions.maxConcurrent`, `#evictIdle` does nothing while
    `sessions.idleTimeoutMinutes` is 0, and both shipped configs set it to 0 —
-   so the pool fills permanently and stays full until the process restarts,
-   because nothing ever gives a slot back. A spawned agent is woken by
+   so the pool fills and nothing frees a slot in the ordinary course. It is not
+   only a restart away — `!reset` in a channel holding a session gives that slot
+   back, at the cost of that channel's transcript (SETUP.md § 5) — but that is a
+   person's remedy, it reaches channels only, and nothing happens on its own. A
+   spawned agent is woken by
    mail and by nothing else, so that row could never take a turn, and with no
    kill verb it could not be removed either. `spawn` therefore refuses before
    writing the row when the pool is full *and* nothing evicts, naming both
@@ -600,8 +603,8 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    is the operator's call. On 2026-08-20 they took the first: both configs went
    to `maxConcurrent: 10` — from 3 on instance 1 and from 1 on hamachi. That
    buys ten sessions before the lockout instead of three or one, and nothing
-   else: `idleTimeoutMinutes` is still 0, so the pool still never recovers, and
-   eviction remains the only one of the three that would make it.
+   else: `idleTimeoutMinutes` is still 0, so the pool still does not recover on
+   its own, and eviction remains the only one of the three that would make it.
 
    It also moves where the failure shows up, which is the part worth knowing.
    At `maxConcurrent: 1` hamachi was structurally incapable of a second session
