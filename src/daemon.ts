@@ -513,11 +513,11 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
       // frees a slot in the ordinary course — someone spending another
       // channel's transcript with `!reset` is what changes that, and it is a
       // deliberate act rather than something to wait for. Silence here is
-      // indistinguishable from the
-      // bot being down — the same reading `announceOutage` exists to prevent —
-      // and spawn is what makes it reachable by a coordinator rather than only
-      // by the operator: a spawned agent that has taken a turn holds one of
-      // these slots and `!reset` cannot reach it to give it back.
+      // indistinguishable from the bot being down — the same reading
+      // `announceOutage` exists to prevent — and spawn is what makes it
+      // reachable by a coordinator rather than only by the operator: a spawned
+      // agent that has taken a turn holds one of these slots, and `!reset`
+      // cannot reach it to give it back.
       if (error instanceof AtCapacityError) {
         void announceAtCapacity(channelId, error);
       }
