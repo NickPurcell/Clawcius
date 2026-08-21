@@ -362,10 +362,13 @@ export function buildSpawnTools(
             'session on its own. Your own turn is holding one of those slots, so this is not a ' +
             'busy moment that will pass. The row would be written and could never take a turn, ' +
             'and there is no kill verb to remove it afterwards. A slot CAN still be freed, but ' +
-            'not by you: `!reset` in a channel holding a session gives that slot back at the ' +
-            "cost of the channel's transcript, and the waker ignores this bot's own messages, " +
-            'so a command you post is not a command. It reaches channels only — never a spawned ' +
-            'agent\'s slot. So the ways out are someone running `!reset` in a live channel, or ' +
+            "not by you: `!reset` gives back the slot of the channel it is run in, at the cost " +
+            "of that channel's transcript, and the waker ignores this bot's own messages, so a " +
+            'command you post is not a command. It reaches channels only — never a spawned ' +
+            "agent's slot. If you relay it to a person, tell them to @-mention this bot with " +
+            'it: a bare `!reset` is only a command in an always-on channel, and to run it in a ' +
+            'channel that holds no session costs that channel its transcript and frees nothing. ' +
+            'So the ways out are someone doing that in a channel that is holding a session, or ' +
             'the operator raising the cap or turning eviction on.',
         );
       }

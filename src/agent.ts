@@ -215,6 +215,21 @@ export class AtCapacityError extends Error {
  * redeploy, so a message that named only those two told the reader to wait for
  * somebody else.
  *
+ * Two things the sentence has to carry, both found in review of #146 and both
+ * about the reader acting on it in the obvious way:
+ *
+ *   - ANOTHER channel, and it says so. `acquire` returns an existing session
+ *     before it reaches the cap check, so `AtCapacityError` can only fire for a
+ *     channel with no live session — the one the reader is standing in is
+ *     guaranteed to be the one where `!reset` frees nothing. It is not inert
+ *     there either: `release` no-ops, but `clearSession` runs regardless and
+ *     spends the row's resumable id, and the reply is the same sentence a
+ *     successful reset gets. Clawcius #157 is the code half of that.
+ *   - WITH A MENTION. `handleCommand` is gated on `addressed && startsWith('!')`
+ *     (`src/daemon.ts:332`), so outside an always-on channel a bare `!reset` is
+ *     dropped or handed to the agent as chat. The mention form works in every
+ *     channel, which matters when the reader has to go to a different one.
+ *
  * Here, and taking the timeout as an argument, rather than reading `config()`
  * inside `announceAtCapacity` in daemon.ts. The branch is the part worth
  * getting right — "this will not clear on its own" and "say it again in a
@@ -232,9 +247,11 @@ export function atCapacityNotice(error: AtCapacityError, idleTimeoutMinutes: num
     `pick that up and it was not queued. ` +
     (idleTimeoutMinutes === 0
       ? 'This deployment never evicts idle sessions, so this will not clear on its own. ' +
-        '`!reset` in a channel that is holding a session gives its slot back, at the cost ' +
-        'of that channel\'s transcript. Failing that it needs a restart on the host, or a ' +
-        'higher `sessions.maxConcurrent`.'
+        'Mentioning me with `!reset` in another channel that is holding a session gives ' +
+        "its slot back, at the cost of that channel's transcript — but not here: this " +
+        'channel has no session to free, so resetting it would spend its transcript for ' +
+        'nothing. Failing that it needs a restart on the host, or a higher ' +
+        '`sessions.maxConcurrent`.'
       : `A slot frees after ${idleTimeoutMinutes}m idle — say it again after that.`)
   );
 }

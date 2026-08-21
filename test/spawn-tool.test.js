@@ -458,6 +458,12 @@ test('spawn refuses when the session pool is full and nothing empties it on its 
   assert.match(said(refused), /never a spawned agent's slot/);
   // The claim that survives, and the only one that was ever true.
   assert.match(said(refused), /eviction is the only thing that reclaims a live, healthy session/);
+  // Round 1 of #156: this reader relays the instruction to a human who types it
+  // literally, so the form has to be the one that works. A bare `!reset` is only
+  // a command where `addressed` is true, and running it in a channel that holds
+  // no session spends that channel's transcript and frees nothing.
+  assert.match(said(refused), /@-mention this bot/);
+  assert.match(said(refused), /a channel that is holding a session/);
 
   // The whole point of refusing rather than queueing. There is no kill verb,
   // `create` refuses a taken id and ids are never reused, so a row written here

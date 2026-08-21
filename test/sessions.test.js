@@ -502,8 +502,21 @@ test('at capacity with eviction off, the notice names the remedies', () => {
   // all. A restart is the operator's and raising the cap is an edit and a
   // redeploy, so naming only those two left a user waiting for somebody else
   // when `!reset` would have freed a slot immediately.
-  assert.match(notice, /`!reset` in a channel that is holding a session/);
+  assert.match(notice, /`!reset`/);
   assert.match(notice, /transcript/);
+  // Round 1 of #156. `acquire` returns an existing session before the cap check
+  // (src/agent.ts:895-904), so AtCapacityError can only fire for a channel with
+  // NO live session — the channel this notice is posted in is guaranteed to be
+  // the one where `!reset` frees nothing, and it is not harmless there:
+  // `release` no-ops but `clearSession` still spends the row's resumable id.
+  // Sending the reader elsewhere is the whole value of the sentence.
+  assert.match(notice, /another channel/);
+  assert.match(notice, /this channel has no session to free/);
+  // `handleCommand` is gated on `addressed && startsWith('!')`, so outside an
+  // always-on channel a bare `!reset` is dropped or handed to the agent as
+  // chat. The reader is being sent to a DIFFERENT channel, so the form shown
+  // has to be the one that works in any of them.
+  assert.match(notice, /Mentioning me with `!reset`/);
   assert.match(notice, /restart on the host, or a higher `sessions\.maxConcurrent`/);
   assert.doesNotMatch(notice, /say it again/);
   // No duration promise: `close()` has no busy branch, so a mid-turn session

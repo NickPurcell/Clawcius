@@ -594,9 +594,8 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    only a restart away — `!reset` in a channel holding a session gives that slot
    back, at the cost of that channel's transcript (SETUP.md § 5) — but that is a
    person's remedy, it reaches channels only, and nothing happens on its own. A
-   spawned agent is woken by
-   mail and by nothing else, so that row could never take a turn, and with no
-   kill verb it could not be removed either. `spawn` therefore refuses before
+   spawned agent is woken by mail and by nothing else, so that row could never
+   take a turn, and with no kill verb it could not be removed either. `spawn` therefore refuses before
    writing the row when the pool is full *and* nothing evicts, naming both
    settings; a full pool with eviction on is a wait and is reported as one.
    That is capacity, not policy — whether to raise the cap or enable eviction
