@@ -461,12 +461,12 @@ so there is only ever one.
 
 **The cap and the timeout are orthogonal, and neither substitutes for the
 other.** The cap is the only thing that bounds *peak* residency: `acquire`
-throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:894`), and
-nothing awaits between that check and the `#sessions.set` at `:952`, so no more
+throws at `#sessions.size >= sessions.maxConcurrent` (`src/agent.ts:919`), and
+nothing awaits between that check and the `#sessions.set` at `:977`, so no more
 than that many sessions are ever admitted at once. `idleTimeoutMinutes` is the
 only thing that reclaims a live session *on its own* — and only one nobody is
 using: `#evictIdle` skips every session that is busy or was active within the
-timeout (`src/agent.ts:1018`), and it runs on a 60-second sweep, never on the
+timeout (`src/agent.ts:1043`), and it runs on a 60-second sweep, never on the
 acquire path. **So eviction cannot bound a burst.** With
 `idleTimeoutMinutes: 5` and ten channels mentioned at once, ten sessions go
 live and all ten stay live, because none of them is idle. Eviction bounds
@@ -484,19 +484,19 @@ operator's call to make, but it is a trade and not the removal of a limit that
 was never there.
 
 **A full pool is not only a restart away, and a user told otherwise waits for
-the wrong thing.** `SessionManager.release` (`src/agent.ts:1004`) is also
+the wrong thing.** `SessionManager.release` (`src/agent.ts:1029`) is also
 reached by the `!reset` command (`src/daemon.ts:155`), so `!reset` in any one
 channel holding a live session frees that slot at once — though a session
 that is mid-turn keeps its process until the turn drains, since `close()`
-(`src/agent.ts:691`) closes the prompt queue rather than interrupting the way
+(`src/agent.ts:714`) closes the prompt queue rather than interrupting the way
 `!stop` does. So it frees a slot faster than it frees memory when the session
 is mid-turn; on an idle one — which is what a pool at `idleTimeoutMinutes: 0`
 mostly holds — both come back together. It costs that channel's transcript
 and only that: `clearSession` clears the session ID rather than the row, so
 the mailbox survives, and a turn finishing after the reset does not write its
 ID back either, because `persist` returns early once the map entry is gone
-(`src/agent.ts:983`). Two limits on it. It reaches only channels, so a
-spawned agent holding a slot cannot be freed this way (`src/daemon.ts:517`).
+(`src/agent.ts:1008`). Two limits on it. It reaches only channels, so a
+spawned agent holding a slot cannot be freed this way (`src/daemon.ts:520`).
 And it is a remedy rather than a guard — someone has to notice and choose
 which conversation to spend, so it bounds nothing in advance.
 

@@ -505,7 +505,7 @@ test('at capacity with eviction off, the notice names the remedies', () => {
   assert.match(notice, /`!reset`/);
   assert.match(notice, /transcript/);
   // Round 1 of #156. `acquire` returns an existing session before the cap check
-  // (src/agent.ts:895-904), so AtCapacityError can only fire for a channel with
+  // (src/agent.ts:912-920), so AtCapacityError can only fire for a channel with
   // NO live session — the channel this notice is posted in is guaranteed to be
   // the one where `!reset` frees nothing, and it is not harmless there:
   // `release` no-ops but `clearSession` still spends the row's resumable id.
