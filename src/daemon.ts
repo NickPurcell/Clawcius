@@ -172,7 +172,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
             // are the same until an operator gives this row's role an override,
             // and `persisted` is already in hand — so reporting the default here
             // would be a number that is right by coincidence and wrong silently.
-            `Model: ${(persisted && config.agent.modelByRole[persisted.role]) || config.agent.model}`,
+            `Model: ${config.agent.modelByRole[persisted?.role ?? 'coordinator'] ?? config.agent.model}`,
             `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
             `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
             `Buffered: ${bundler.pendingCount(channelId)} message(s)`,

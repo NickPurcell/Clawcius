@@ -65,8 +65,8 @@
  * is not belt-and-braces: the row is the truth, roles can be edited, and the
  * check that matters is the one made against the row at the moment of the call.
  *
- * `engineer`, `researcher` and `poster` can be spawned. `coordinator` and
- * `host` cannot, and the line is privilege rather than taste — those are the
+ * `engineer`, `researcher`, `poster` and `updater` can be spawned. `coordinator`
+ * and `host` cannot, and the line is privilege rather than taste — those are the
  * two roles mail policy treats specially. A coordinator is the only role that
  * may DM the host agent, which is the only access control on running commands
  * on the VPS, and `host` is a row the ops executor claims from outside every

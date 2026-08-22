@@ -52,7 +52,8 @@ export type Liveness = 'running' | 'idle' | 'stale' | 'unknown';
  *
  * The list is therefore the registry's rows, and `role` here is the registry's
  * `role` — CLAWSKY.md's five, coordinator / engineer / researcher / poster /
- * updater, plus `host`. It is the only "type" in this system that means anything to a
+ * updater, plus `host`. It is the only "type" in this system that means
+ * anything to a
  * person, and it is the one the operator asked for.
  *
  * Subagents are not here, and the reason is not that a busy page is
@@ -80,8 +81,14 @@ export type OverviewAgent = {
   id: string;
   crew: string;
   /**
-   * The CREW role, verbatim from the registry: `coordinator`, `engineer`,
-   * `researcher`, `poster`, or `host`.
+   * The CREW role, verbatim from the registry — whatever string is in that
+   * column, which is `AgentRole` in the waker's `src/store.ts`.
+   *
+   * Deliberately not enumerated here. This doc is the one a reader of the wire
+   * payload consults, and a list in it is a second copy of a union that lives
+   * in another package: it cannot be type-checked from here and it goes stale
+   * the next time a role is added, which is how it came to say four when there
+   * were five.
    *
    * Never synthesised. If a row's role is empty the page says the registry
    * recorded none — it does not guess one, and it does not borrow a

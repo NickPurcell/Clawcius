@@ -212,14 +212,19 @@ modelByRole:
   # Rewriting a four-item task list in place, on a timer. Speed matters here
   # more than depth.
   #
-  # THE UNDATED FORM IS CORRECT and is not a guess. `Model` in the installed SDK
+  # THE UNDATED FORM IS CORRECT, and the reason is the deployment rather than the
+  # types. `claude-opus-5` is also undated, it is what `model` above resolves to
+  # on both crews, and it is what `DEFAULTS.model` falls back to — so if undated
+  # ids did not work, both crews would be down now rather than the updater later.
+  # That is an observation about the present, not a prediction.
+  #
+  # Corroborating but weaker: the `Model` union in the installed SDK
   # (node_modules/@anthropic-ai/sdk 0.115.0,
-  # resources/messages/messages.d.ts:853) lists BOTH `claude-haiku-4-5` and
-  # `claude-haiku-4-5-20251001` as members of the union — the alias is a
-  # first-class id, not something that merely happens to resolve. The same union
-  # carries `claude-opus-5` with NO dated variant at all, which is the id both
-  # shipped configs already run on, so this deployment depends on undated ids
-  # working whether or not this line does.
+  # resources/messages/messages.d.ts) enumerates both `claude-haiku-4-5` and
+  # `claude-haiku-4-5-20251001`, so the undated spelling is one Anthropic's own
+  # SDK names. It is only evidence of intent: the union ends `| (string & {})`,
+  # so it enumerates rather than constrains and every string type-checks.
+  # Nothing here validates that an id names a real model — see `roleModels`.
   updater: claude-haiku-4-5
 
 # Cap on agent turns per wake. 0 = unlimited.
@@ -361,10 +366,25 @@ systemPrompt:
     the fifth is the honest failure — the list stays true about what it shows,
     and you can say what is waiting if anyone asks.
 
-    POST ONCE, THEN EDIT FOREVER. Send the message the first time, keep its id,
-    and every update after that edits that same message. Never post a second.
-    That is the whole point of the role: one line in the channel that is always
-    current, instead of a stream of updates nobody asked for.
+    POST ONCE, THEN EDIT FOREVER. Send the message the first time, and every
+    update after that edits that same message. Never post a second. That is the
+    whole point of the role: one line in the channel that is always current,
+    instead of a stream of updates nobody asked for.
+
+    WRITE THE MESSAGE ID TO A FILE in your working directory, in the same turn
+    you first post it. Your directory persists between wakes and your transcript
+    does not survive forever — an agent editing every ten minutes will be
+    compacted eventually, and an updater that has lost the id while being told
+    never to post twice has no instruction for the state it is in. The likeliest
+    thing it would do is post a second one, which is the single failure this
+    role exists to avoid.
+
+    If you ever do find yourself without it, do not start a new message: read
+    the channel back, find your own last one, and resume editing that.
+
+    ONE UPDATER PER CREW. Nothing in the code stops a second being spawned, and
+    a second updater means a second message — which is the same failure arriving
+    by a different route. If one already exists, you are not needed.
 
     This is the one exception to `<coordinator>`'s "no other role has a route to
     the human", and it is deliberately narrow: you own one message and nothing
@@ -383,13 +403,13 @@ systemPrompt:
     stays resident. Your own turns are the cheap half.
 
     Ten minutes is also what keeps you clear of the follow-up window. Editing
-    your message is bot activity, and bot activity extends that window
-    (src/daemon.ts:355) — so a message living in a follow-up channel, edited
-    faster than the window is long, holds it open permanently, and while it is
-    open every message in the room wakes the coordinator, including people
-    talking to each other. If your message must live in such a channel and you
-    need to edit faster than the window, say so and let the operator decide;
-    do not simply do it.
+    your message is bot activity, and the waker's `handleMessageUpdate` extends
+    that window on any edit the bot makes — so a message living in a follow-up
+    channel, edited faster than the window is long, holds it open permanently,
+    and while it is open every message in the room wakes the coordinator,
+    including people talking to each other. If your message must live in such a
+    channel and you need to edit faster than the window, say so and let the
+    operator decide; do not simply do it.
 
     ARM YOUR OWN NEXT WAKE. This is the part that decides whether the role works
     at all: an agent runs only when it has mail, so a check-in you have not

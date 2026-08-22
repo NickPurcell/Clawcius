@@ -154,8 +154,8 @@ as before.
 ## What it shows
 
 **Overview** — **the crew, by role.** One row per registry agent, grouped by
-the instance it belongs to, with its crew role — `coordinator`, `engineer`,
-`researcher`, `poster`, or `host` — in a column of its own, beside both an
+the instance it belongs to, with its crew role — whatever the registry
+recorded, `coordinator` through `updater`, or `host` — in a column of its own, beside both an
 observed liveness state and the registry's declared status. `running` if
 something was written in the last few minutes, `idle` if it is merely quiet,
 `stale` beyond an hour. The distinction is the point: an agent nobody has
