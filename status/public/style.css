@@ -10,8 +10,8 @@
  *
  * Types, not roles: the categorical hues belong to `general-purpose`,
  * `Explore` and `workflow-subagent`, which are how a subagent was spawned. A
- * CREW role is never a colour here, because there is no palette that can say "engineer" and because
- * the two were confusable enough already.
+ * CREW role is never a colour here, because there is no palette that can say
+ * "engineer" and because the two were confusable enough already.
  *
  * Status colour never carries meaning alone: every liveness dot is accompanied
  * by its word ("running", "idle", "stale"), and every swimlane bar sits on a

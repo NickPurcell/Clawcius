@@ -292,12 +292,11 @@ function tile(label, value, sub) {
 /**
  * The crew role of one registry row, as a chip.
  *
- * `role` is the registry's column — coordinator, engineer, researcher, poster,
- * updater, host — and this is the only place on the page that renders a word
- * under the
- * heading "Role". Nothing derives it, nothing falls back to a `subagent_type`,
- * and a row that has none says so in words rather than showing a blank cell or
- * borrowing "unknown" from somewhere it would look like a value.
+ * `role` is the registry's column, and this is the only place on the page that
+ * renders a word under the heading "Role". Nothing derives it, nothing falls
+ * back to a `subagent_type`, and a row that has none says so in words rather
+ * than showing a blank cell or borrowing "unknown" from somewhere it would
+ * look like a value.
  */
 function roleChip(role) {
   if (!role) {

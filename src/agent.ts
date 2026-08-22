@@ -714,6 +714,18 @@ export class AgentSession {
   }
 }
 
+/**
+ * What a channel with no registry row resolves to.
+ *
+ * Exported because `!status` has to answer the same question `#identityFor`
+ * answers, and answer it the same way: it reports the model a channel would run
+ * on, which is resolved from the role, which for a channel that has not taken a
+ * turn yet is this. Two copies of the constant would put `!status` back to
+ * reporting one model while the next turn ran on another — the defect it was
+ * just fixed for, arriving by the route the fix opened.
+ */
+export const DEFAULT_CHANNEL_ROLE = 'coordinator' as const;
+
 export class SessionManager {
   #sessions = new Map<string, AgentSession>();
   #registry: AgentRegistry;
@@ -785,7 +797,7 @@ export class SessionManager {
     }
     return {
       crew: config().agent.clawsky.crew,
-      role: 'coordinator',
+      role: DEFAULT_CHANNEL_ROLE,
       workspacePath,
       spawnedBy: null,
     };
