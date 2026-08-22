@@ -245,6 +245,15 @@ test('the description tells a coordinator what spawn costs and what it cannot un
   assert.match(spawn.description, /LONG-LIVED/);
   assert.match(spawn.description, /THERE IS NO KILL VERB YET/);
   assert.match(spawn.description, /ONLY A COORDINATOR MAY SPAWN/);
+  // The newest load-bearing claim in this string, and the one a coordinator has
+  // to act on twice — spawn, then DM. Round 4 of #163: it was the only part of
+  // the description with no assertion.
+  assert.match(spawn.description, /AN UPDATER IS WORTH SPAWNING/);
+  assert.match(spawn.description, /Spawn one, then DM it\s+the list/);
+  // Deliberately NOT asserting a number. The four-item cap lives in `<updater>`
+  // in agent-config.yaml; naming it here too would be the same enumeration drift
+  // this branch spent three review rounds closing, reintroduced in a test.
+  assert.doesNotMatch(spawn.description, /at most four/);
   registry.close();
 });
 
