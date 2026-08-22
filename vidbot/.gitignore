@@ -1,0 +1,14 @@
+# Runtime state, never the repo's business: the poll cursor, the pid file, the
+# log and the health file are all per-deployment and all rewritten constantly.
+# A tracked state.json in particular would be actively harmful -- checking one
+# out onto a second machine would hand it another machine's cursor and re-post
+# a channel's recent history, which is the exact failure the cold-start
+# anchoring exists to prevent.
+run/
+__pycache__/
+
+# Holds the channel list and, when a second bot application is used, a token.
+# vidbot.env.example is tracked in its place. Listed explicitly because the
+# repo's root ignore covers `.env` and `.env.*`, and `vidbot.env` matches
+# neither -- the name is one character away from being caught by accident.
+vidbot.env
