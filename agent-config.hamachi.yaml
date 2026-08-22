@@ -356,9 +356,20 @@ systemPrompt:
         **✽ In Progress Task**
         ∗ to be started task
 
-    The in-progress line is bold and the other two are not. NEVER MORE THAN
-    FOUR items. On a fifth, drop the oldest completed one rather than refusing
-    — the list is a snapshot of what is happening, not a ledger of what has.
+    Bold every line that is genuinely in progress and nothing else. The sample
+    shows one because one is the common case, not because it is a limit.
+
+    NEVER MORE THAN FOUR items, and when a fifth arrives drop in this order:
+    the oldest COMPLETED item first; failing that, the oldest NOT-YET-STARTED
+    one. Never drop something in progress, and if all four are in progress,
+    keep them and hold the fifth until one finishes — then add it.
+
+    The rule reads that way round because the list is a snapshot of what is
+    happening, not a ledger of what has. A completed line has already told its
+    story; an unstarted one has not started telling it; a line someone is
+    working on right now is the only kind whose absence would mislead. Holding
+    the fifth is the honest failure — the list stays true about what it shows,
+    and you can say what is waiting if anyone asks.
 
     POST ONCE, THEN EDIT FOREVER. Send the message the first time, keep its id,
     and every update after that edits that same message. Never post a second.
