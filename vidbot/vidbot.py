@@ -127,6 +127,21 @@ class State:
         tmp.write_text(json.dumps(payload, indent=2))
         os.replace(tmp, self.path)
 
+    def fingerprint(self):
+        """A cheap value that changes whenever something worth persisting does.
+
+        Lives here rather than at the call site so that a field added to State
+        has one obvious place to be registered. It deliberately does NOT
+        include the cursors: losing cursor progress costs a re-read that `done`
+        dedupes, and batching those writes is the entire point of asking.
+
+        Lengths alone are not enough. `attempts` is incremented in place, so
+        bumping an existing entry from 1 to 3 moves no length at all -- which
+        silently un-persisted the retry cap and let every restart hand a dead
+        link a fresh budget. The sum is what catches an increment.
+        """
+        return (len(self.done), len(self.attempts), sum(self.attempts.values()))
+
     def should_skip(self, status_id):
         return status_id in self.done or self.attempts.get(status_id, 0) >= MAX_ATTEMPTS
 
@@ -467,7 +482,7 @@ def process(dc, state, channel, msg, args, me_id, advance=True):
     # one page. Draining lifted that cap and turned a 5000-message catch-up
     # into 5000 whole-state rewrites -- hundreds of megabytes of writes to say
     # nothing changed, since a backlog is mostly messages with no link in them.
-    before = (len(state.done), len(state.attempts))
+    before = state.fingerprint()
     try:
         handle_message(dc, state, channel, msg, args)
     except Stopped:
@@ -479,7 +494,7 @@ def process(dc, state, channel, msg, args, me_id, advance=True):
         # After the work, not before: a crash mid-download leaves the cursor
         # behind the message so the next poll retries it.
         advance_cursor(state, channel, msg["id"])
-    if (len(state.done), len(state.attempts)) != before or not advance:
+    if state.fingerprint() != before or not advance:
         # Something happened that must not be repeated, or we are on the
         # gateway path where this message is the whole batch.
         state.save()

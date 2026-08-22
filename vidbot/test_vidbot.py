@@ -521,6 +521,48 @@ class CursorOwnershipTest(DaemonHarness):
         self.assertLessEqual(len(saves), 5,
                              f"{len(saves)} writes for 250 no-op messages")
 
+    def test_a_retry_count_survives_a_restart(self):
+        """attempts is incremented in place, so a length-based dirty check
+        never saw 1 -> 2 and the retry cap did not survive a restart: every
+        restart handed a dead link a fresh budget and the three-attempt
+        abandonment never fired."""
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        vidbot.handle_message = lambda dc, st, c, m, a: st.attempts.__setitem__(
+            "777", st.attempts.get("777", 0) + 1)
+        msg = {"id": "5", "channel_id": "chan", "author_id": "42",
+               "content": "https://x.com/a/status/777"}
+        for _ in range(3):
+            vidbot.process(None, state, "chan", dict(msg), args, "me")
+
+        self.assertTrue(state.should_skip("777"))
+        reloaded = vidbot.State(args.state)
+        self.assertEqual(reloaded.attempts.get("777"), 3,
+                         "the increment never reached disk")
+        self.assertTrue(reloaded.should_skip("777"),
+                        "a restart refreshed the retry budget of a dead link")
+
+    def test_health_is_refreshed_during_a_long_drain(self):
+        """The tick landed with no test at all -- deleting it left the whole
+        suite green, which is the README's own rule pointed back at me. A long
+        catch-up is precisely the incident the health file exists to describe,
+        so it must not go stale for the length of one."""
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli)
+        self.cli.post(1, "chan", "anchor")
+        vidbot.anchor_channels(dc, state, args)
+        for i in range(2, 352):                    # four pages
+            self.cli.post(i, "chan", f"noise {i}")
+
+        ticks = []
+        health = vidbot.Health(None)
+        health.tick = lambda: ticks.append(1)
+        vidbot.poll_once(dc, state, args, "me", health)
+        self.assertGreaterEqual(len(ticks), 3,
+                                "health went unrefreshed across a multi-page "
+                                f"drain ({len(ticks)} ticks)")
+
     def test_a_gateway_handled_message_is_not_posted_twice(self):
         """The poll re-reads what the gateway already did. state.done is what
         makes that safe, and it is the whole reason the cursor can lag."""
