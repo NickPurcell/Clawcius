@@ -147,6 +147,17 @@ export type AgentConfig = {
   };
   prompts: PromptTemplates;
   model: string;
+  /**
+   * Per-role model overrides. A role absent here runs on `model`.
+   *
+   * Config rather than prose, deliberately. The retired `<updater-agent>` block
+   * carried a `<recommended-model>haiku</recommended-model>` hint in the system
+   * prompt for the team leader to pass through, and #44 removed that mechanism
+   * on the grounds that a model hint in the role text is not a mechanism — it
+   * is a suggestion to a model about a parameter it does not control. This is
+   * the same intent expressed where the value is actually read.
+   */
+  modelByRole: Readonly<Partial<Record<AgentRole, string>>>;
   /** 0 means unlimited — no turn cap is sent to the SDK at all. */
   maxTurns: number;
   systemPrompt: SystemPromptConfig;
@@ -456,6 +467,10 @@ const DEFAULTS: Defaults = {
   },
   prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
+  // Empty on purpose: the default deployment runs every role on `model`. An
+  // override is a deliberate act in agent-config.yaml, not something a role
+  // acquires by existing.
+  modelByRole: {},
   maxTurns: 0,
   systemPrompt: {
     useClaudeCodeDefault: true,
@@ -577,6 +592,39 @@ function strList(raw: unknown, path: string, fallback: string[]): string[] {
     if (typeof entry !== 'string') throw new ConfigError(`${path}[${index}]`, 'must be a string');
     return entry;
   });
+}
+
+/**
+ * `modelByRole` — a mapping of crew role to the model that role runs on.
+ *
+ * Both halves are validated at load rather than at first use, because both
+ * failures are silent otherwise. An unknown role key is the likelier mistake
+ * (a typo, or a role that was renamed) and would simply never match, leaving
+ * the agent on `model` with nothing said. And an empty or non-string value
+ * would reach the SDK as a model id, where it fails per-session at spawn time
+ * rather than at boot — the loader refusing to start naming the key is the
+ * cheaper failure by a wide margin.
+ *
+ * What is NOT validated is whether the string names a real model: this file
+ * has no list to check against and inventing one would go stale the week a
+ * model ships. A wrong-but-well-formed id fails at the SDK, which is the only
+ * place that actually knows.
+ */
+function roleModels(raw: unknown, path: string): Partial<Record<AgentRole, string>> {
+  if (raw === undefined || raw === null) return {};
+  if (!isRecord(raw)) throw new ConfigError(path, 'must be a mapping of role to model id');
+
+  const out: Partial<Record<AgentRole, string>> = {};
+  for (const [role, value] of Object.entries(raw)) {
+    if (!isAgentRole(role)) {
+      throw new ConfigError(`${path}.${role}`, `is not a role — one of: ${AGENT_ROLES.join(', ')}`);
+    }
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new ConfigError(`${path}.${role}`, 'must be a non-empty model id');
+    }
+    out[role] = value;
+  }
+  return out;
 }
 
 /** `hamachi-engineer1` — lowercase, and prefixed with the crew that owns it. */
@@ -780,6 +828,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       ),
     },
     model: str(root['model'], 'model', DEFAULTS.model),
+    modelByRole: roleModels(root['modelByRole'], 'modelByRole'),
     maxTurns: num(root['maxTurns'], 'maxTurns', DEFAULTS.maxTurns, 0),
     systemPrompt: {
       useClaudeCodeDefault: bool(
