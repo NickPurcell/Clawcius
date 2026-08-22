@@ -21,9 +21,14 @@ RUN="${VIDBOT_RUN:-$HERE/run}"
 PIDFILE="$RUN/vidbot.pid"
 LOG="$RUN/vidbot.log"
 STATE="$RUN/state.json"
+HEALTH="$RUN/health.json"
 CHANNELS="${VIDBOT_CHANNELS:-1105739162230984735}"
 INTERVAL="${VIDBOT_INTERVAL:-6}"
 MAX_BYTES="${VIDBOT_MAX_BYTES:-10485760}"
+# How often the poll runs as a safety net while the gateway is healthy. When
+# the gateway is not carrying events the daemon falls back to INTERVAL on its
+# own, so this only governs the belt-and-braces case.
+RECONCILE="${VIDBOT_RECONCILE:-300}"
 
 mkdir -p "$RUN"
 
@@ -45,6 +50,8 @@ case "${1:-}" in
     setsid nohup python3 "$HERE/vidbot.py" $args \
       --interval "$INTERVAL" --state "$STATE" \
       --max-bytes "$MAX_BYTES" --log "$LOG" \
+      --reconcile-interval "$RECONCILE" --health "$HEALTH" \
+      ${VIDBOT_NO_GATEWAY:+--no-gateway} \
       >/dev/null 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
@@ -81,8 +88,20 @@ case "${1:-}" in
     if alive; then
       echo "running as pid $(cat "$PIDFILE")"
       ps -o pid,etime,cmd -p "$(cat "$PIDFILE")" 2>/dev/null | tail -n +2 || true
+      [ -f "$HEALTH" ] && "$0" health
     else
       echo "not running"
+      exit 1
+    fi
+    ;;
+  health)
+    # Which path messages are arriving on. `degraded` means the gateway is
+    # gone and the poll is carrying it -- still working, but one failure from
+    # not working, and nothing else will say so out loud.
+    if [ -f "$HEALTH" ]; then
+      cat "$HEALTH"
+    else
+      echo "no health file at $HEALTH (daemon started without --health?)" >&2
       exit 1
     fi
     ;;
@@ -90,7 +109,7 @@ case "${1:-}" in
     tail -n "${2:-40}" "$LOG"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|log [n]}" >&2
+    echo "usage: $0 {start|stop|restart|status|health|log [n]}" >&2
     exit 2
     ;;
 esac
