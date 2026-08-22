@@ -216,6 +216,36 @@ test('modelByRole refuses an empty or non-string model id', () => {
   }
 });
 
+test('modelByRole refuses host, which is a role but never a session', () => {
+  // Round 1 of #163. `host` passes the is-it-a-role check and would then never
+  // apply: `MailWaker.#consider` returns before `acquire` for it, and the ops
+  // executor owns that mailbox from outside the container. Loading clean and
+  // doing nothing is the exact silent no-op this validator exists to prevent
+  // for a mistyped key, so it is refused rather than ignored.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfig(['  execEnvDir: /var/lib/x-env', 'modelByRole:', '  host: some-model']),
+      ),
+    /modelByRole\.host cannot take a model/,
+  );
+
+  // Every other role still loads — the refusal is about `host` specifically,
+  // not about narrowing the key set to whatever is spawnable.
+  const config = loadAgentConfig(
+    writeConfig([
+      '  execEnvDir: /var/lib/x-env',
+      'modelByRole:',
+      '  coordinator: a',
+      '  engineer: b',
+      '  researcher: c',
+      '  poster: d',
+      '  updater: e',
+    ]),
+  );
+  assert.equal(Object.keys(config.modelByRole).length, 5);
+});
+
 test('both shipped configs put the updater on Haiku, and agree with each other', () => {
   const clawcius = loadAgentConfig('agent-config.yaml');
   const hamachi = loadAgentConfig('agent-config.hamachi.yaml');

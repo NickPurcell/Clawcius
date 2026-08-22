@@ -619,6 +619,18 @@ function roleModels(raw: unknown, path: string): Partial<Record<AgentRole, strin
     if (!isAgentRole(role)) {
       throw new ConfigError(`${path}.${role}`, `is not a role — one of: ${AGENT_ROLES.join(', ')}`);
     }
+    // `host` is a role but never a session. `MailWaker.#consider` returns before
+    // `acquire` for it (src/mail-wake.ts:149) and the ops executor owns that
+    // mailbox from outside the container, so an override here would load clean
+    // and never apply — the exact silent no-op this function exists to prevent
+    // for a mistyped key. Refused rather than ignored, for the same reason.
+    if (role === 'host') {
+      throw new ConfigError(
+        `${path}.host`,
+        'cannot take a model — the host agent runs outside this container and ' +
+          'never opens a session here, so an override would never apply',
+      );
+    }
     if (typeof value !== 'string' || value.trim() === '') {
       throw new ConfigError(`${path}.${role}`, 'must be a non-empty model id');
     }

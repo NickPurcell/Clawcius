@@ -168,7 +168,11 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
           [
             `Live sessions: ${sessions.liveCount}/${config.agent.sessions.maxConcurrent}` +
               ` (${sessions.busyCount} mid-turn)`,
-            `Model: ${config.agent.model}`,
+            // The model THIS channel's agent resolves to, not the default. They
+            // are the same until an operator gives this row's role an override,
+            // and `persisted` is already in hand — so reporting the default here
+            // would be a number that is right by coincidence and wrong silently.
+            `Model: ${(persisted && config.agent.modelByRole[persisted.role]) || config.agent.model}`,
             `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
             `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
             `Buffered: ${bundler.pendingCount(channelId)} message(s)`,

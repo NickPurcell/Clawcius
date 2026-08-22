@@ -754,9 +754,10 @@ a.chip:hover {
   font-style: italic;
 }
 
-/* The crew role, on the front page and on an agent's card. One weight for all
-   five values: colouring engineer differently from researcher would invent a
-   hierarchy the system does not have. */
+/* The crew role, on the front page and on an agent's card. One weight for every
+   value, however many there are: colouring engineer differently from researcher
+   would invent a hierarchy the system does not have, and pinning the count here
+   only guarantees this comment goes stale the next time a role is added. */
 .chip[data-role] {
   color: var(--ink);
   border-color: var(--baseline);
