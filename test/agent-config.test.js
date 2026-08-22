@@ -177,3 +177,86 @@ test('a near-miss prefix is not containment', () => {
   );
   assert.equal(config.container.execEnvDir, '/var/lib/x-ops/exec-env');
 });
+
+// ── modelByRole ─────────────────────────────────────────────────────────────
+
+test('modelByRole defaults to empty, so every role runs on `model`', () => {
+  const config = loadAgentConfig(writeConfig(['  execEnvDir: /var/lib/x-env']));
+  assert.deepEqual(config.modelByRole, {});
+});
+
+test('modelByRole accepts a role and refuses one that is not', () => {
+  const config = loadAgentConfig(
+    writeConfig(['  execEnvDir: /var/lib/x-env', 'modelByRole:', '  updater: some-model']),
+  );
+  assert.equal(config.modelByRole.updater, 'some-model');
+
+  // The likelier mistake by far, and silent without this: a key that matches no
+  // role never applies, and the agent stays on `model` with nothing said.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfig(['  execEnvDir: /var/lib/x-env', 'modelByRole:', '  updaters: some-model']),
+      ),
+    /modelByRole\.updaters is not a role — one of: .*updater/,
+  );
+});
+
+test('modelByRole refuses an empty or non-string model id', () => {
+  // An empty string would reach the SDK as a model id and fail per session at
+  // spawn time. Failing at boot, naming the key, is the cheaper failure.
+  for (const value of ['""', '[]', '{}']) {
+    assert.throws(
+      () =>
+        loadAgentConfig(
+          writeConfig(['  execEnvDir: /var/lib/x-env', 'modelByRole:', `  updater: ${value}`]),
+        ),
+      /modelByRole\.updater must be a non-empty model id/,
+    );
+  }
+});
+
+test('modelByRole refuses host, which is a role but never a session', () => {
+  // Round 1 of #163. `host` passes the is-it-a-role check and would then never
+  // apply: `MailWaker.#consider` returns before `acquire` for it, and the ops
+  // executor owns that mailbox from outside the container. Loading clean and
+  // doing nothing is the exact silent no-op this validator exists to prevent
+  // for a mistyped key, so it is refused rather than ignored.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfig(['  execEnvDir: /var/lib/x-env', 'modelByRole:', '  host: some-model']),
+      ),
+    /modelByRole\.host cannot take a model/,
+  );
+
+  // Every other role still loads — the refusal is about `host` specifically,
+  // not about narrowing the key set to whatever is spawnable.
+  const config = loadAgentConfig(
+    writeConfig([
+      '  execEnvDir: /var/lib/x-env',
+      'modelByRole:',
+      '  coordinator: a',
+      '  engineer: b',
+      '  researcher: c',
+      '  poster: d',
+      '  updater: e',
+    ]),
+  );
+  assert.equal(Object.keys(config.modelByRole).length, 5);
+});
+
+test('both shipped configs put the updater on Haiku, and agree with each other', () => {
+  const clawcius = loadAgentConfig('agent-config.yaml');
+  const hamachi = loadAgentConfig('agent-config.hamachi.yaml');
+
+  assert.deepEqual(clawcius.modelByRole, hamachi.modelByRole);
+  assert.equal(clawcius.modelByRole.updater, 'claude-haiku-4-5');
+
+  // The `[1m]` suffix is parsed by the SDK and is ungated — any id containing it
+  // is assumed to have a 1M window. Haiku 4.5's is 200K, so carrying the suffix
+  // across from `model` would have the harness autocompact against a limit five
+  // times the real one. This is the assertion that stops a copy-paste doing it.
+  assert.doesNotMatch(clawcius.modelByRole.updater, /\[1m\]/);
+  assert.match(clawcius.model, /\[1m\]/, 'the default model still carries the suffix');
+});
