@@ -51,7 +51,12 @@ import { Client, Events, GatewayIntentBits, Partials, type Message } from 'disco
 import { join } from 'node:path';
 import { loadConfig, type Config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
-import { AtCapacityError, SessionManager, atCapacityNotice } from './agent.js';
+import {
+  AtCapacityError,
+  DEFAULT_CHANNEL_ROLE,
+  SessionManager,
+  atCapacityNotice,
+} from './agent.js';
 import { MailStore } from './mail.js';
 import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
@@ -172,7 +177,10 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
             // are the same until an operator gives this row's role an override,
             // and `persisted` is already in hand — so reporting the default here
             // would be a number that is right by coincidence and wrong silently.
-            `Model: ${config.agent.modelByRole[persisted?.role ?? 'coordinator'] ?? config.agent.model}`,
+            `Model: ${
+              config.agent.modelByRole[persisted?.role ?? DEFAULT_CHANNEL_ROLE] ??
+              config.agent.model
+            }`,
             `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
             `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
             `Buffered: ${bundler.pendingCount(channelId)} message(s)`,

@@ -51,10 +51,9 @@ export type Liveness = 'running' | 'idle' | 'stale' | 'unknown';
  * words that look like roles and are not.
  *
  * The list is therefore the registry's rows, and `role` here is the registry's
- * `role` — CLAWSKY.md's five, coordinator / engineer / researcher / poster /
- * updater, plus `host`. It is the only "type" in this system that means
- * anything to a
- * person, and it is the one the operator asked for.
+ * `role` — a crew role from CLAWSKY.md, or `host`. It is the only "type" in
+ * this system that means anything to a person, and it is the one the operator
+ * asked for.
  *
  * Subagents are not here, and the reason is not that a busy page is
  * unpleasant. **A subagent has no identity of its own.** CLAWSKY.md: it

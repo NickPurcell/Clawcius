@@ -250,12 +250,12 @@ export type SpawnRecord = {
    *
    * NOT a crew role. This comment used to say "the ROLE", in a repository
    * where `role` means one of CLAWSKY.md's crew roles, plus `host`. Those live
-   * in the registry
-   * (`registry.ts`, column `role`) and belong to agents with an identity and a
-   * mailbox. This one is the harness's word for how a *subagent* was spawned,
-   * it comes from a tool argument the parent chose, and it is meaningless to
-   * anyone reading this page for the crew. Calling both of them "role" is what
-   * put `general-purpose` on a page the operator went to for `engineer`.
+   * in the registry (`registry.ts`, column `role`) and belong to agents with
+   * an identity and a mailbox. This one is the harness's word for how a
+   * *subagent* was spawned, it comes from a tool argument the parent chose,
+   * and it is meaningless to anyone reading this page for the crew. Calling
+   * both of them "role" is what put `general-purpose` on a page the operator
+   * went to for `engineer`.
    */
   subagentType: string;
   description: string;
