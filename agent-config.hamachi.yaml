@@ -211,6 +211,15 @@ model: claude-opus-5[1m]
 modelByRole:
   # Rewriting a four-item task list in place, on a timer. Speed matters here
   # more than depth.
+  #
+  # THE UNDATED FORM IS CORRECT and is not a guess. `Model` in the installed SDK
+  # (node_modules/@anthropic-ai/sdk 0.115.0,
+  # resources/messages/messages.d.ts:853) lists BOTH `claude-haiku-4-5` and
+  # `claude-haiku-4-5-20251001` as members of the union — the alias is a
+  # first-class id, not something that merely happens to resolve. The same union
+  # carries `claude-opus-5` with NO dated variant at all, which is the id both
+  # shipped configs already run on, so this deployment depends on undated ids
+  # working whether or not this line does.
   updater: claude-haiku-4-5
 
 # Cap on agent turns per wake. 0 = unlimited.
