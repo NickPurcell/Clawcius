@@ -75,7 +75,18 @@ if cmd == "read":
     after = opts.get("--after")
     if after:
         msgs = [m for m in msgs if int(m["id"]) > int(after)]
-    msgs = msgs[-int(opts.get("-n", "100")):]
+    # Discord paginates differently depending on whether a cursor is given,
+    # and the double has to model both or it lies about one of them. Verified
+    # against the live API:
+    #   with --after : the OLDEST page after the cursor, so a backlog DRAINS
+    #                  (cursor 12 back, limit 3 -> the 3 immediately after it)
+    #   without      : the NEWEST page, which is what cold-start anchoring
+    #                  depends on to avoid backfilling a channel's history
+    # The double previously took the newest page in both cases, which modelled
+    # a backlog as permanently lossy when in fact it drains -- a regime this
+    # design now deliberately enters, since the poll owns the cursor.
+    limit = int(opts.get("-n", "100"))
+    msgs = msgs[:limit] if after else msgs[-limit:]
     print(json.dumps(list(reversed(msgs))))   # the CLI returns newest-first
     sys.exit(0)
 if cmd == "reply":
@@ -428,6 +439,33 @@ class CursorOwnershipTest(DaemonHarness):
                          "only the poll may advance the cursor; the gateway "
                          "handled 500 to completion and must have left it")
 
+    def test_a_backlog_larger_than_one_page_drains_completely(self):
+        """Nothing covered a backlog over the page limit, and the poll now owns
+        the cursor, so this regime is entered by design rather than by
+        accident.
+
+        The CLI caps --limit at 100, so one read is at most 100 messages. With
+        a 300s reconcile interval that is a cursor throughput of one message
+        per three seconds unless a pass keeps reading until it has caught up.
+        Every message must be handled exactly once and the cursor must reach
+        the end.
+        """
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli)
+        self.cli.post(1, "chan", "anchor")
+        vidbot.anchor_channels(dc, state, args)
+
+        for i in range(2, 252):                      # 250, well over one page
+            self.cli.post(i, "chan", f"msg {i}")
+
+        vidbot.poll_once(dc, state, args, "me")
+
+        self.assertEqual(len(self.handled), 250,
+                         f"only {len(self.handled)} of 250 drained in one pass")
+        self.assertEqual(len(set(self.handled)), 250, "each exactly once")
+        self.assertEqual(state.cursors["chan"], "251")
+
     def test_a_gateway_handled_message_is_not_posted_twice(self):
         """The poll re-reads what the gateway already did. state.done is what
         makes that safe, and it is the whole reason the cursor can lag."""
@@ -490,6 +528,47 @@ class ShutdownAndOnceTest(DaemonHarness):
             self.assertTrue(state.should_skip("111"))
         finally:
             vidbot.fetch_video = real_fetch
+
+    def test_an_ambiguous_upload_failure_retries_rather_than_losing(self):
+        """Pins a trade, not an accident.
+
+        `done` is recorded after the upload, so an upload that reached Discord
+        but reported failure is retried and posted twice. Moving the id into
+        `done` before the call makes it at-most-once and turns every genuinely
+        failed upload into a silent loss -- the failure mode this design spent
+        its whole effort removing. This test exists so that "fix" fails loudly
+        rather than looking like a tidy-up.
+        """
+        vidbot.handle_message = self.real_handle
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli)
+
+        real_fetch, real_reply = vidbot.fetch_video, dc.reply_with_file
+        blob = Path(self.tmp.name) / "v.mp4"
+        blob.write_bytes(b"x" * 32)
+        vidbot.fetch_video = lambda *a, **k: blob
+
+        landed = []
+
+        def reply_then_fail(channel, message_id, path, **kw):
+            landed.append(message_id)          # it really did reach Discord
+            raise RuntimeError("Request to Discord timed out after 300.0s.")
+
+        dc.reply_with_file = reply_then_fail
+        try:
+            msg = {"id": "2", "channel_id": "chan", "author_id": "42",
+                   "content": "https://x.com/a/status/777"}
+            vidbot.handle_message(dc, state, "chan", msg, args)
+            self.assertEqual(state.attempts.get("777"), 1)
+            self.assertNotIn("777", state.done,
+                             "an upload reported as failed must stay retryable")
+            # The poll re-reads it, which is the whole point of the cursor fix.
+            vidbot.handle_message(dc, state, "chan", msg, args)
+            self.assertEqual(landed, ["2", "2"], "retried, not silently dropped")
+        finally:
+            vidbot.fetch_video = real_fetch
+            dc.reply_with_file = real_reply
 
     def test_once_exits_when_the_poll_fails(self):
         """--once against a broken CLI used to spin forever: the except branch

@@ -349,6 +349,21 @@ def handle_message(dc, state, channel, msg, args):
                          status_id, size / 1048576, msg["id"])
                 state.done.add(status_id)
                 continue
+            # `done` is recorded AFTER the upload, so an upload that lands on
+            # Discord but reports failure -- the 300s timeout firing on a large
+            # file that in fact completed -- is retried and posted twice.
+            #
+            # That is deliberate, and it is a trade rather than an oversight.
+            # Recording the id before the call would make it at-most-once, at
+            # the price of turning every genuinely failed upload into a silent
+            # loss, which is the failure mode this whole design spent its
+            # effort removing. A duplicate is visible and someone can delete
+            # it; a video that never arrives is neither.
+            #
+            # It became reachable when the poll took ownership of the cursor:
+            # before that the gateway advanced past the message and nothing
+            # ever re-read it, so the same ambiguous failure lost the video
+            # instead of duplicating it.
             dc.reply_with_file(channel, msg["id"], video,
                                max_bytes=args.max_bytes + 65536)
             state.done.add(status_id)
@@ -458,19 +473,50 @@ def process(dc, state, channel, msg, args, me_id, advance=True):
     state.save()
 
 
+# One read returns at most this many messages -- it is the CLI's ceiling on
+# --limit as well as its default, so a single read cannot catch up on more.
+PAGE = 100
+
+# How many pages one pass will walk before giving up and leaving the rest for
+# the next one. 50 pages is 5000 messages; past that something is wrong enough
+# that grinding through it while holding the poll loop is not the right answer.
+MAX_PAGES = 50
+
+
 def poll_once(dc, state, args, me_id):
-    """One pass over every channel. Returns how many messages it handled."""
+    """One pass over every channel, draining any backlog. Returns the count.
+
+    Reads until it has caught up rather than taking a single page. Since the
+    poll took ownership of the cursor, the cursor advances only here -- so one
+    page per pass would cap it at 100 messages per --reconcile-interval, which
+    at the 300s default is one message every three seconds. Above that rate the
+    lag grows without bound and the poll's real job, revisiting messages the
+    socket delivered badly, decays with it: a cursor 400 behind does not
+    revisit a recent message for twenty minutes.
+
+    Draining is safe because Discord paginates `after` forwards -- it returns
+    the OLDEST page after the cursor, so successive reads walk toward the
+    present instead of returning the same newest page forever.
+    """
     seen = 0
     for channel in args.channels:
         if state.cursors.get(channel) is None:
             anchor_channels(dc, state, args)
             continue
-        msgs = dc.read_after(channel, after=state.cursors[channel])
-        for msg in msgs:
-            process(dc, state, channel, msg, args, me_id)
-            seen += 1
-        if msgs:
+        for _ in range(MAX_PAGES):
+            msgs = dc.read_after(channel, after=state.cursors[channel], limit=PAGE)
+            if not msgs:
+                break
+            for msg in msgs:
+                process(dc, state, channel, msg, args, me_id)
+                seen += 1
             state.save()
+            if len(msgs) < PAGE:
+                # Short page: caught up. A full one means there may be more.
+                break
+        else:
+            log.warning("channel %s still behind after %d pages; the rest "
+                        "waits for the next pass", channel, MAX_PAGES)
     return seen
 
 
@@ -556,10 +602,9 @@ def poll_loop(dc, state, args, me_id, health, until=None):
             # rather than exiting and losing the poll cursor's freshness.
             log.exception("poll failed; backing off")
             time.sleep(min(args.interval * 5, 60))
-            # Not `continue`: that skipped the --once check below, so a single
-            # pass against a broken CLI span forever instead of exiting.
-            if args.once:
-                return
+            # Deliberately no `continue` here: it skipped the --once check
+            # below, so a single pass against a broken CLI span forever
+            # instead of exiting. Falling through is the whole fix.
         health.tick()
         if args.once:
             return
