@@ -80,6 +80,10 @@ function configFixture(overrides = {}) {
     storage: { dbPath: 'unused-by-the-handlers' },
     agent: {
       model: 'a-model',
+      // `!status` resolves the channel's role through this, so an absent key is
+      // a TypeError naming it rather than a plausible default — which is what
+      // this fixture is for, and which is how it caught the unguarded index.
+      modelByRole: overrides.modelByRole ?? {},
       maxTurns: 0,
       container: { name: 'clawcius-agent' },
       clawsky: { crew: 'hamachi' },
@@ -487,6 +491,31 @@ test('!stop with nothing running says so and does not create a session to stop',
   assert.deepEqual(sessions.acquired, [], 'acquiring here would spawn a container to interrupt it');
   assert.deepEqual(sessions.interrupted, []);
   assert.deepEqual(msg.replies, ['Nothing running here.']);
+});
+
+test('!status reports the model this channel resolves to, not the default', async () => {
+  // Round 3 of #163. A Discord channel has no row until it has taken a turn, and
+  // `acquire` would resolve that case through `#identityFor`'s coordinator
+  // fallback — so `!status` has to use the same fallback or it reports one model
+  // while the next turn runs on another.
+  const { handlers } = harness({ config: { modelByRole: { coordinator: 'a-cheaper-model' } } });
+  const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  // No registry row for this channel — the fixture's registry is empty — so this
+  // is the fallback path, and it must agree with what `acquire` would do.
+  assert.match(msg.replies[0], /Model: a-cheaper-model/);
+  assert.doesNotMatch(msg.replies[0], /Model: a-model/);
+});
+
+test('!status reports the default when the resolved role has no override', async () => {
+  const { handlers } = harness({ config: { modelByRole: { updater: 'a-cheaper-model' } } });
+  const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  // An override exists, but not for the role this channel resolves to. The
+  // assertion that would have passed vacuously before the one above.
+  assert.match(msg.replies[0], /Model: a-model/);
 });
 
 test('answering a command extends the window rather than ending the conversation', async () => {
