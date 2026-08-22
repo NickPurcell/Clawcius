@@ -466,6 +466,61 @@ class CursorOwnershipTest(DaemonHarness):
         self.assertEqual(len(set(self.handled)), 250, "each exactly once")
         self.assertEqual(state.cursors["chan"], "251")
 
+    def test_a_posted_video_is_persisted_immediately(self):
+        """The property traded away to stop the write amplification.
+
+        Cursor progress may be batched -- losing it costs a re-read, which
+        `done` dedupes. `done` itself may NOT be: losing it re-posts a video
+        someone has already seen. So a message that actually changed `done` or
+        `attempts` must hit the disk before the next one is touched.
+        """
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        saves = []
+        real_save = vidbot.State.save
+        vidbot.State.save = lambda self: (saves.append(len(self.done)),
+                                          real_save(self))[1]
+        try:
+            # A message that changes nothing must not write.
+            vidbot.handle_message = lambda dc, st, c, m, a: None
+            vidbot.process(None, state, "chan",
+                           {"id": "10", "channel_id": "chan", "content": "hi",
+                            "author_id": "42"}, args, "me")
+            self.assertEqual(saves, [], "a no-op message must not write state")
+
+            # One that posts a video must write at once.
+            vidbot.handle_message = lambda dc, st, c, m, a: st.done.add("777")
+            vidbot.process(None, state, "chan",
+                           {"id": "11", "channel_id": "chan", "content": "x",
+                            "author_id": "42"}, args, "me")
+            self.assertEqual(len(saves), 1, "a posted video must be persisted")
+            self.assertIn("777", vidbot.State(args.state).done,
+                          "and must survive a reload")
+        finally:
+            vidbot.State.save = real_save
+
+    def test_a_backlog_of_noise_writes_once_per_page_not_once_per_message(self):
+        """Draining lifted the one-page cap and multiplied a per-message save
+        by fifty. A backlog is mostly messages with no link in them."""
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli)
+        self.cli.post(1, "chan", "anchor")
+        vidbot.anchor_channels(dc, state, args)
+        for i in range(2, 252):
+            self.cli.post(i, "chan", f"noise {i}")
+
+        saves = []
+        real_save = vidbot.State.save
+        vidbot.State.save = lambda self: (saves.append(1), real_save(self))[1]
+        try:
+            vidbot.poll_once(dc, state, args, "me")
+        finally:
+            vidbot.State.save = real_save
+        self.assertEqual(len(self.handled), 250)
+        self.assertLessEqual(len(saves), 5,
+                             f"{len(saves)} writes for 250 no-op messages")
+
     def test_a_gateway_handled_message_is_not_posted_twice(self):
         """The poll re-reads what the gateway already did. state.done is what
         makes that safe, and it is the whole reason the cursor can lag."""

@@ -457,8 +457,17 @@ def process(dc, state, channel, msg, args, me_id, advance=True):
     if msg.get("author_id") == me_id:
         if advance:
             advance_cursor(state, channel, msg["id"])
-            state.save()
         return
+    # What must survive a crash is `done` and `attempts`: losing those re-posts
+    # a video someone has already seen. Losing cursor progress only costs a
+    # re-read, which `done` then dedupes -- so the cursor is saved per page by
+    # the caller rather than per message.
+    #
+    # This used to save unconditionally, which was affordable when a pass was
+    # one page. Draining lifted that cap and turned a 5000-message catch-up
+    # into 5000 whole-state rewrites -- hundreds of megabytes of writes to say
+    # nothing changed, since a backlog is mostly messages with no link in them.
+    before = (len(state.done), len(state.attempts))
     try:
         handle_message(dc, state, channel, msg, args)
     except Stopped:
@@ -470,7 +479,10 @@ def process(dc, state, channel, msg, args, me_id, advance=True):
         # After the work, not before: a crash mid-download leaves the cursor
         # behind the message so the next poll retries it.
         advance_cursor(state, channel, msg["id"])
-    state.save()
+    if (len(state.done), len(state.attempts)) != before or not advance:
+        # Something happened that must not be repeated, or we are on the
+        # gateway path where this message is the whole batch.
+        state.save()
 
 
 # One read returns at most this many messages -- it is the CLI's ceiling on
@@ -483,7 +495,7 @@ PAGE = 100
 MAX_PAGES = 50
 
 
-def poll_once(dc, state, args, me_id):
+def poll_once(dc, state, args, me_id, health=None):
     """One pass over every channel, draining any backlog. Returns the count.
 
     Reads until it has caught up rather than taking a single page. Since the
@@ -511,6 +523,11 @@ def poll_once(dc, state, args, me_id):
                 process(dc, state, channel, msg, args, me_id)
                 seen += 1
             state.save()
+            # Inside the page loop, not after the pass: a long drain is exactly
+            # the kind of incident someone reads the health file during, and a
+            # 50-page catch-up outruns HEALTH_FLUSH_INTERVAL before it returns.
+            if health is not None:
+                health.tick()
             if len(msgs) < PAGE:
                 # Short page: caught up. A full one means there may be more.
                 break
@@ -594,7 +611,8 @@ def poll_loop(dc, state, args, me_id, health, until=None):
     """The original REST loop. Runs until `until` (monotonic) or forever."""
     while until is None or time.monotonic() < until:
         try:
-            health.counts["poll_messages"] += poll_once(dc, state, args, me_id)
+            health.counts["poll_messages"] += poll_once(
+                dc, state, args, me_id, health)
         except Stopped:
             raise
         except Exception:
@@ -695,7 +713,7 @@ def gateway_session(dc, state, args, me_id, health):
                 last_reconcile = time.monotonic()
                 try:
                     health.counts["poll_messages"] += poll_once(
-                        dc, state, args, me_id)
+                        dc, state, args, me_id, health)
                 except Stopped:
                     raise
                 except Exception:
