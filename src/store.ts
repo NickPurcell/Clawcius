@@ -41,7 +41,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /**
- * The four crew roles, and `host`.
+ * The five crew roles, and `host`.
  *
  * `coordinator` is the default for anything that predates the registry, because
  * the only agents that existed before it were the ones Discord wakes, and
@@ -53,14 +53,34 @@ import { dirname } from 'node:path';
  * it and neither should be a string comparison against an id: only a
  * coordinator may DM it (mail.ts), and nothing inside a container may run it —
  * the ops executor owns that mailbox, from the host (src/mail-wake.ts).
+ *
+ * `updater` keeps one Discord message current — a task list it edits in place
+ * rather than reposting. It is an ordinary crew row like the rest: an id, a
+ * mailbox, and turns it arms for itself. It exists as a role rather than as an
+ * engineer with unusual instructions because `modelByRole` keys off it, which
+ * is what lets it run on Haiku while the crew runs on Opus — polling colleagues
+ * and rewriting a short list is mechanical, and a status line that arrives late
+ * has already failed.
+ *
+ * An `<updater-agent>` existed here before, from the initial commit until #44
+ * removed it. That one was a Task-tool subagent with a `<recommended-model>`
+ * hint in its prose, and #44 retired the whole mechanism rather than the
+ * function. This is the function rebuilt on the mechanism that replaced it.
  */
-export type AgentRole = 'coordinator' | 'engineer' | 'researcher' | 'poster' | 'host';
+export type AgentRole =
+  | 'coordinator'
+  | 'engineer'
+  | 'researcher'
+  | 'poster'
+  | 'updater'
+  | 'host';
 
 export const AGENT_ROLES: readonly AgentRole[] = [
   'coordinator',
   'engineer',
   'researcher',
   'poster',
+  'updater',
   'host',
 ];
 

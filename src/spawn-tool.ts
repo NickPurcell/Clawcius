@@ -136,7 +136,12 @@ import type { AgentRegistry, AgentRole } from './store.js';
  * `coordinator` and `host` are absent on purpose — see the header. This is the
  * one list to change if the operator decides otherwise.
  */
-export const SPAWNABLE_ROLES: readonly AgentRole[] = ['engineer', 'researcher', 'poster'];
+export const SPAWNABLE_ROLES: readonly AgentRole[] = [
+  'engineer',
+  'researcher',
+  'poster',
+  'updater',
+];
 
 /** Refused above this. Instructions are a brief, not a payload. */
 const MAX_INSTRUCTIONS_CHARS = 16_000;

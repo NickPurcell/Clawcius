@@ -59,13 +59,15 @@ function tempDir(prefix) {
  * reads a key that is not here, it gets a `TypeError` naming the key rather
  * than a plausible default.
  */
-function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot }) {
+function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, modelByRole = {} }) {
   setConfig({
     discord: { token: 'unused-by-the-pool', guildId: 'unused-by-the-pool' },
     github: { token: '' },
     storage: { dbPath: 'unused-by-the-pool' },
     agent: {
       clawsky: { crew: CREW, wakeOnMail: true },
+      model: 'model-for-everyone-else',
+      modelByRole,
       sessions: { maxConcurrent, idleTimeoutMinutes, workspaceRoot },
     },
   });
@@ -81,9 +83,11 @@ function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot }) {
  * whether the host had docker and a live image.
  */
 class FakeSession {
-  constructor(channelId, workspacePath, resumeSessionId) {
+  constructor(channelId, workspacePath, resumeSessionId, events, mcpServers, model) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
+    /** What `acquire` resolved from the row's role — undefined means "use `model`". */
+    this.model = model;
     this.sessionId = resumeSessionId ?? `pending-${channelId}`;
     this.busy = false;
     this.lastActiveAt = Date.now();
@@ -109,8 +113,8 @@ function pool(options = {}) {
   const registry = new AgentRegistry(dbPath, { crew: CREW });
   const built = [];
   const manager = new SessionManager(registry);
-  manager.newSession = (channelId, workspacePath, resumeSessionId) => {
-    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+  manager.newSession = (...args) => {
+    const session = new FakeSession(...args);
     built.push(session);
     return session;
   };
@@ -175,13 +179,18 @@ function recordingRegistry(rows = {}) {
 
 /** A manager over a stubbed registry — no database, no config beyond the pool's. */
 function stubbedPool(rows, options = {}) {
-  const { maxConcurrent = 4, idleTimeoutMinutes = 0 } = options;
-  installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot: tempDir('clawsky-ws-') });
+  const { maxConcurrent = 4, idleTimeoutMinutes = 0, modelByRole = {} } = options;
+  installConfig({
+    maxConcurrent,
+    idleTimeoutMinutes,
+    workspaceRoot: tempDir('clawsky-ws-'),
+    modelByRole,
+  });
   const registry = recordingRegistry(rows);
   const built = [];
   const manager = new SessionManager(registry);
-  manager.newSession = (channelId, workspacePath, resumeSessionId) => {
-    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+  manager.newSession = (...args) => {
+    const session = new FakeSession(...args);
     built.push(session);
     return session;
   };
@@ -486,6 +495,52 @@ test('shutdown closes everything and empties the pool', async () => {
   await manager.shutdown();
   assert.equal(manager.capacity.live, 0);
   assert.equal(built.every((session) => session.closed), true);
+});
+
+// ── per-role models ─────────────────────────────────────────────────────────
+
+test('a role with an override gets that model; every other role gets undefined', () => {
+  const { manager, built } = stubbedPool(
+    {
+      'hamachi-updater1': { id: 'hamachi-updater1', role: 'updater', sessionId: '' },
+      'hamachi-engineer1': { id: 'hamachi-engineer1', role: 'engineer', sessionId: '' },
+    },
+    { modelByRole: { updater: 'claude-haiku-4-5' } },
+  );
+
+  manager.acquire('hamachi-updater1', events);
+  manager.acquire('hamachi-engineer1', events);
+
+  // Resolved from the ROW's role. The updater runs cheap; nothing else moves.
+  assert.equal(built[0].model, 'claude-haiku-4-5');
+  // undefined rather than the top-level model: the fallback lives in
+  // `#buildOptions`, so a role with no override is byte-identical to how it
+  // behaved before `modelByRole` existed.
+  assert.equal(built[1].model, undefined);
+});
+
+test('no overrides configured leaves every role on the default model', () => {
+  const { manager, built } = stubbedPool({
+    'hamachi-updater1': { id: 'hamachi-updater1', role: 'updater', sessionId: '' },
+  });
+
+  manager.acquire('hamachi-updater1', events);
+
+  // The shipped default before an operator writes `modelByRole` at all.
+  assert.equal(built[0].model, undefined);
+});
+
+test('the override follows the row, not the id', () => {
+  // An id that looks like an engineer on a row that says updater. The row wins,
+  // for the same reason `#identityFor` prefers it: ids are a naming convention
+  // and the row is the identity.
+  const { manager, built } = stubbedPool(
+    { 'hamachi-engineer7': { id: 'hamachi-engineer7', role: 'updater', sessionId: '' } },
+    { modelByRole: { updater: 'claude-haiku-4-5' } },
+  );
+
+  manager.acquire('hamachi-engineer7', events);
+  assert.equal(built[0].model, 'claude-haiku-4-5');
 });
 
 // ── what the user is told ────────────────────────────────────────────────────

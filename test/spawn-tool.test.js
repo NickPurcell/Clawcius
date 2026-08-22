@@ -417,6 +417,30 @@ test('a spawned agent survives the process that spawned it', async () => {
   registry.close();
 });
 
+test('updater is spawnable, and the refusal still names the roles that are not', async () => {
+  const { registry, spawnOf, logged } = spawnBoard();
+
+  const spawned = await spawnOf('hamachi-coordinator').handler(
+    { role: 'updater', instructions: 'Track the four tasks I just DMed you.' },
+    {},
+  );
+
+  assert.notEqual(spawned.isError, true, said(spawned));
+  const row = registry.get('hamachi-updater1');
+  assert.equal(row?.role, 'updater');
+  assert.match(logged.join('\n'), /hamachi-coordinator spawned hamachi-updater1 \(updater/);
+
+  // The two that stay refused, and the reason is privilege rather than taste:
+  // a coordinator is the only role that may DM the host agent, and `host` is a
+  // row the ops executor claims from outside the container. Adding a spawnable
+  // role must not quietly widen either.
+  for (const role of ['coordinator', 'host']) {
+    const refused = await spawnOf('hamachi-coordinator').handler({ role, instructions: 'x' }, {});
+    assert.equal(refused.isError, true, role);
+  }
+  registry.close();
+});
+
 // ── Capacity: a row that could never take a turn is not written ─────────────
 
 test('spawn refuses when the session pool is full and nothing ever empties it', async () => {
