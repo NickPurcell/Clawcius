@@ -507,9 +507,11 @@ class GatewayClient:
                                   f"{self._failures} consecutive failures")
                     return
                 # Jittered, so a gateway that drops every client at once does
-                # not get all of them back in a synchronised herd.
-                delay = min(self.backoff_ceiling, 2 ** (self._failures - 1))
-                delay *= 0.5 + random.random()
+                # not get all of them back in a synchronised herd. Clamped
+                # AFTER the jitter, or the 1.5x upper jitter would push the
+                # real ceiling to 96s while the constant claimed 64s.
+                delay = (2 ** (self._failures - 1)) * (0.5 + random.random())
+                delay = min(self.backoff_ceiling, delay)
                 log.info("reconnecting in %.1fs (attempt %d/%d)",
                          delay, self._failures + 1, self.max_failures)
 

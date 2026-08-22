@@ -89,12 +89,13 @@ sys.exit(2)
 '''
 
 
-class DaemonTestCase(unittest.TestCase):
+class DaemonHarness(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cli = FakeCLI(self.tmp.name)
         self.handled = []
+        self.seen = []          # (id, content) -- content is what matters here
         self.stop_after = None
         self.servers = []
         self.threads = []
@@ -120,6 +121,7 @@ class DaemonTestCase(unittest.TestCase):
 
         def fake_handle(dc, state, channel, msg, args):
             self.handled.append(msg["id"])
+            self.seen.append((msg["id"], msg.get("content") or ""))
             if self.stop_after and len(self.handled) >= self.stop_after:
                 raise vidbot.Stopped("test finished")
 
@@ -184,6 +186,9 @@ class DaemonTestCase(unittest.TestCase):
         if error:
             raise error["exc"]
         return thread, state, health
+
+
+class DaemonTestCase(DaemonHarness):
 
     # -- the promise -----------------------------------------------------
 
@@ -355,6 +360,204 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(len(self.cli.sent()), 1)
 
 
+class CursorOwnershipTest(DaemonHarness):
+    """The poll owns the cursor, so no gateway event can strand a message.
+
+    Regression for the one case where "worst case equals the old behaviour"
+    was false. The cursor is a high-water mark and read_after only looks
+    forward, so anything it is dragged over is unreachable forever -- which
+    made the poll a safety net for a TRAILING gap only, never an interior one.
+    """
+
+    def test_empty_content_event_does_not_strand_the_link(self):
+        """MESSAGE_CONTENT disabled: the gateway sees "", REST sees the link.
+
+        Driven directly rather than through wall-clock timing. An integration
+        version of this is a race the poll usually wins, which makes it pass
+        against the bug and prove nothing -- the failure only appears when the
+        gateway gets there first, which is what it does in production, where
+        the safety net is 300s behind it.
+
+        The intent gates the gateway, not the API, so the poll finds this link
+        over REST. The question is only whether the cursor still lets it look.
+        """
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli)
+        self.cli.post(1, "chan", "anchor")
+        vidbot.anchor_channels(dc, state, args)
+        self.assertEqual(state.cursors["chan"], "1")
+
+        self.cli.post(2, "chan", "https://x.com/a/status/777")
+
+        # The gateway delivers it first, blind, exactly as it does with the
+        # intent switched off in the developer portal.
+        vidbot.process(dc, state, "chan",
+                       {"id": "2", "channel_id": "chan", "content": "",
+                        "author_id": "42"},
+                       args, "me", advance=False)
+        self.assertEqual([c for _, c in self.seen if "x.com" in c], [],
+                         "precondition: the gateway saw no link, as expected")
+
+        # Now the safety net runs. It must still be able to reach message 2.
+        vidbot.poll_once(dc, state, args, "me")
+
+        self.assertTrue([c for _, c in self.seen if "x.com" in c],
+                        "the poll could not reach a message the gateway had "
+                        f"already stepped over; the video is lost. saw {self.seen}")
+
+    def test_gateway_alone_does_not_move_the_cursor(self):
+        """Pins the CALL SITE, not just process().
+
+        Two messages, and the run stops on the SECOND. The first must be
+        handled all the way through -- if it stops on the first, Stopped
+        propagates out of process() before advance_cursor is reached and the
+        test cannot tell the two behaviours apart. It passed against the bug
+        for exactly that reason.
+        """
+        server = self.server(scripts=[[("send", ready()),
+                                       ("send", message("500", "chan", "one")),
+                                       ("send", message("501", "chan", "two"))]])
+        self.cli.post(1, "chan", "anchor")
+        args = self.make_args(gateway_url=server.url, reconcile_interval=3600,
+                              interval=3600)
+        self.stop_after = 2
+        thread, state, health = self.run_daemon(args, timeout=25)
+        self.assertEqual(self.handled, ["500", "501"])
+        self.assertEqual(state.cursors["chan"], "1",
+                         "only the poll may advance the cursor; the gateway "
+                         "handled 500 to completion and must have left it")
+
+    def test_a_gateway_handled_message_is_not_posted_twice(self):
+        """The poll re-reads what the gateway already did. state.done is what
+        makes that safe, and it is the whole reason the cursor can lag."""
+        state = vidbot.State(str(Path(self.tmp.name) / "dedupe.json"))
+        state.done.add("777")
+        self.assertTrue(state.should_skip("777"))
+
+
+class ShutdownAndOnceTest(DaemonHarness):
+
+    def test_stopped_is_not_swallowed_by_handle_message(self):
+        """SIGTERM arrives during a download far more often than anywhere else
+        -- that is where the daemon spends minutes inside yt-dlp. Stopped
+        subclasses Exception, so the broad handler caught it: the daemon did
+        not shut down (the signal handler only raises once) and it burned a
+        retry on every link in the message for a download that never failed."""
+        vidbot.handle_message = self.real_handle          # the real one
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli, dry_run=True)
+
+        real_fetch = vidbot.fetch_video
+        vidbot.fetch_video = lambda *a, **k: (_ for _ in ()).throw(
+            vidbot.Stopped("signal 15"))
+        try:
+            msg = {"id": "9", "channel_id": "chan", "author_id": "42",
+                   "content": "https://x.com/a/status/111 "
+                              "https://x.com/b/status/222"}
+            with self.assertRaises(vidbot.Stopped):
+                vidbot.handle_message(dc, state, "chan", msg, args)
+            self.assertEqual(state.attempts, {},
+                             "a shutdown must not count as a failed attempt")
+        finally:
+            vidbot.fetch_video = real_fetch
+
+    def test_a_failed_download_counts_an_attempt(self):
+        """The broad handler in handle_message had no test at all.
+
+        I discovered that by deleting it -- while verifying a different test --
+        and watching all 26 pass. Without it, a failed download propagates out
+        of handle_message instead of being counted, so attempts never reaches
+        MAX_ATTEMPTS and the abandonment that exists to stop retrying a dead
+        link forever never fires.
+        """
+        vidbot.handle_message = self.real_handle
+        args = self.make_args()
+        state = vidbot.State(args.state)
+        dc = vidbot.Discord(args.cli, dry_run=True)
+        real_fetch = vidbot.fetch_video
+        vidbot.fetch_video = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("yt-dlp exited 1"))
+        try:
+            msg = {"id": "9", "channel_id": "chan", "author_id": "42",
+                   "content": "https://x.com/a/status/111"}
+            for expected in (1, 2, 3):
+                vidbot.handle_message(dc, state, "chan", msg, args)
+                self.assertEqual(state.attempts.get("111"), expected)
+            # Abandoned, so a dead link is not retried until the heat death of
+            # the universe.
+            self.assertTrue(state.should_skip("111"))
+        finally:
+            vidbot.fetch_video = real_fetch
+
+    def test_once_exits_when_the_poll_fails(self):
+        """--once against a broken CLI used to spin forever: the except branch
+        ended in `continue`, which skipped the --once check below it."""
+        args = self.make_args(once=True, interval=0.05, no_gateway=True)
+        state = vidbot.State(args.state)
+        health = vidbot.Health(None)
+
+        calls = []
+        real_poll = vidbot.poll_once
+
+        def broken(*a, **k):
+            calls.append(1)
+            raise RuntimeError("discord CLI exited 1")
+
+        vidbot.poll_once = broken
+        try:
+            done = threading.Event()
+            threading.Thread(
+                target=lambda: (vidbot.poll_loop(None, state, args, "me", health),
+                                done.set()), daemon=True).start()
+            self.assertTrue(done.wait(timeout=10),
+                            "--once did not exit after a failed poll")
+            self.assertEqual(len(calls), 1, "it should try exactly once")
+        finally:
+            vidbot.poll_once = real_poll
+
+
+class HealthFileTest(unittest.TestCase):
+
+    def test_concurrent_writes_always_publish_parseable_json(self):
+        """set_mode runs on the gateway thread and tick on the main loop. They
+        shared one .tmp path, so a shorter payload could land inside a longer
+        one and os.replace would publish the wreckage -- during a reconnect
+        storm, which is exactly when someone is catting it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        health = vidbot.Health(str(Path(tmp.name) / "health.json"))
+        stop = threading.Event()
+        bad = []
+
+        def churn(mode, detail):
+            while not stop.is_set():
+                health.set_mode(mode, detail)
+
+        def read():
+            while not stop.is_set():
+                try:
+                    json.loads(Path(health.path).read_text())
+                except FileNotFoundError:
+                    pass
+                except ValueError:
+                    bad.append(1)
+
+        threads = [threading.Thread(target=churn, args=("gateway_reconnecting",
+                                                        "in 12.4s"), daemon=True),
+                   threading.Thread(target=churn, args=("gateway", ""), daemon=True),
+                   threading.Thread(target=read, daemon=True)]
+        for t in threads:
+            t.start()
+        time.sleep(3)
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual(bad, [], f"{len(bad)} unparseable reads of the "
+                                  "published health file")
+
+
 class PostingWiringTest(unittest.TestCase):
     """That the flag ARRIVES correctly, which is a different claim from the
     guard working.
@@ -399,8 +602,9 @@ class PostingWiringTest(unittest.TestCase):
         self.assertEqual(vidbot.posting_banner(dc), vidbot.POSTING_DISABLED)
 
     def test_the_two_banners_are_distinguishable_by_grep(self):
-        """install.sh asserts on these strings, so they must not be
-        substrings of one another."""
+        """Deployment checks grep the log for these, so neither may be a
+        substring of the other -- otherwise a check for "will post" would
+        match the line that says it will not."""
         self.assertNotIn(vidbot.POSTING_DISABLED, vidbot.POSTING_ENABLED)
         self.assertNotIn(vidbot.POSTING_ENABLED, vidbot.POSTING_DISABLED)
 
@@ -414,6 +618,15 @@ class CursorTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_own_message_from_the_gateway_does_not_move_the_cursor(self):
+        """Even the bot's own post must not advance it from the socket, or the
+        upload it just made would strand every message before it."""
+        args = Namespace(channels=["chan"], workdir="/tmp", max_bytes=1,
+                         cli="/bin/true", report_failures=False, dry_run=False)
+        msg = {"id": "900", "channel_id": "chan", "content": "", "author_id": "me"}
+        vidbot.process(None, self.state, "chan", msg, args, "me", advance=False)
+        self.assertNotIn("chan", self.state.cursors)
 
     def test_cursor_only_moves_forward(self):
         vidbot.advance_cursor(self.state, "c", "100")

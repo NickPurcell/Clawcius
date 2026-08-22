@@ -63,6 +63,14 @@ HEALTH_FLUSH_INTERVAL = 30.0
 log = logging.getLogger("vidbot")
 
 
+def _snowflake(value):
+    """Sort key for Discord ids: numeric when it can be, stable when it cannot."""
+    try:
+        return (0, int(value), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(value))
+
+
 class Stopped(Exception):
     """Raised when a signal asks us to shut down mid-work."""
 
@@ -108,7 +116,11 @@ class State:
             "cursors": self.cursors,
             "attempts": self.attempts,
             # Bounded so the file cannot grow without limit on a busy channel.
-            "done": sorted(self.done)[-5000:],
+            # Sorted numerically: these are snowflakes, and lexically a
+            # 19-digit id sorts after a 20-digit one, so a lexical cap would
+            # evict the newest entries the day ids grow a digit. Same hazard
+            # as the cursor, one field over.
+            "done": sorted(self.done, key=_snowflake)[-5000:],
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
@@ -342,6 +354,13 @@ def handle_message(dc, state, channel, msg, args):
             state.done.add(status_id)
             state.attempts.pop(status_id, None)
             log.info("posted %s (%.1f MB)", status_id, size / 1048576)
+        except Stopped:
+            # Stopped subclasses Exception, and this is the site that matters:
+            # it is where the daemon spends minutes inside yt-dlp, so a SIGTERM
+            # almost always arrives here. Swallowed, it neither shut the daemon
+            # down -- the handler only raises once -- nor left the tweet alone,
+            # instead burning a retry on a download that never actually failed.
+            raise
         except Exception as exc:
             n = state.attempts.get(status_id, 0) + 1
             state.attempts[status_id] = n
@@ -392,16 +411,38 @@ def anchor_channels(dc, state, args):
         state.save()
 
 
-def process(dc, state, channel, msg, args, me_id):
-    """Handle one message from either path, then advance the cursor past it.
+def process(dc, state, channel, msg, args, me_id, advance=True):
+    """Handle one message. Only the poll is allowed to move the cursor.
 
-    The cursor moves after the work, not before: a crash mid-download leaves it
-    behind the message so the next poll retries, rather than in front of it
-    where the video is lost silently.
+    THE POLL OWNS THE CURSOR. A gateway event handles its message and then
+    leaves the cursor alone, so the poll re-reads it later and `state.done`
+    throws the duplicate away.
+
+    That looks like redundant work and is in fact the only thing keeping the
+    fallback honest. The cursor is a high-water mark and `read_after` only ever
+    looks forward, so anything the cursor is dragged over is unreachable
+    forever. When the gateway advanced it, the poll became a safety net for a
+    TRAILING gap only -- it could catch up after a disconnect, but it could
+    never revisit a message the socket had already delivered badly.
+
+    The case that makes this concrete is the one _watch_content exists to
+    detect: with MESSAGE_CONTENT disabled, every MESSAGE_CREATE arrives with
+    content as an empty string. REST returns the real content -- the intent
+    gates the gateway, not the API -- so the poll would have found the link and
+    posted the video. Instead the gateway saw no link in an empty string,
+    dragged the cursor past the message, and the video was gone: not delayed,
+    gone, and still gone after a human fixes the developer portal.
+
+    Detection needed five such messages before it fired. The cursor had already
+    passed all five.
+
+    The cost of the fix is re-reading up to one reconcile interval of messages
+    after a restart, every one of which is deduped on the tweet status id.
     """
     if msg.get("author_id") == me_id:
-        advance_cursor(state, channel, msg["id"])
-        state.save()
+        if advance:
+            advance_cursor(state, channel, msg["id"])
+            state.save()
         return
     try:
         handle_message(dc, state, channel, msg, args)
@@ -410,7 +451,10 @@ def process(dc, state, channel, msg, args, me_id):
     except Exception:
         # One malformed message must never take the daemon down.
         log.exception("unhandled error on message %s", msg.get("id"))
-    advance_cursor(state, channel, msg["id"])
+    if advance:
+        # After the work, not before: a crash mid-download leaves the cursor
+        # behind the message so the next poll retries it.
+        advance_cursor(state, channel, msg["id"])
     state.save()
 
 
@@ -450,6 +494,12 @@ class Health:
                        "reconnects": 0, "degradations": 0}
         self.since = time.time()
         self._last_write = 0.0
+        # set_mode is called from the gateway thread and tick from the main
+        # loop. Both wrote the same .tmp path, so a shorter payload could land
+        # inside a longer one and os.replace would publish the wreckage --
+        # exactly during a reconnect storm, which is when someone is most
+        # likely to be reading it.
+        self._lock = threading.Lock()
 
     def set_mode(self, mode, detail=""):
         if mode != self.mode:
@@ -474,6 +524,10 @@ class Health:
         self._last_write = time.monotonic()
         if not self.path:
             return
+        with self._lock:
+            self._write_locked()
+
+    def _write_locked(self):
         payload = {
             "mode": self.mode,
             "detail": self.detail,
@@ -502,7 +556,10 @@ def poll_loop(dc, state, args, me_id, health, until=None):
             # rather than exiting and losing the poll cursor's freshness.
             log.exception("poll failed; backing off")
             time.sleep(min(args.interval * 5, 60))
-            continue
+            # Not `continue`: that skipped the --once check below, so a single
+            # pass against a broken CLI span forever instead of exiting.
+            if args.once:
+                return
         health.tick()
         if args.once:
             return
@@ -576,7 +633,9 @@ def gateway_session(dc, state, args, me_id, health):
                 msg = None
             if msg is not None:
                 health.counts["gateway_messages"] += 1
-                process(dc, state, msg["channel_id"], msg, args, me_id)
+                # advance=False: the poll owns the cursor. See process().
+                process(dc, state, msg["channel_id"], msg, args, me_id,
+                        advance=False)
 
             # While the socket is down -- backing off, reconnecting, or still
             # on its first attempt -- the poll is not a safety net, it is the
