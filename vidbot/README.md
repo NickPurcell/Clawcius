@@ -100,6 +100,64 @@ Waiting for the real gateway to produce one of those is not a test strategy.
 `--dry-run` does everything except post, which is how a second copy is tested
 against a channel the real daemon still owns.
 
+## A test is not evidence until it has been seen to fail
+
+Write the test, then **reintroduce the bug and watch the test fail.** A test
+that has only ever passed tells you nothing: it is equally consistent with
+"the code is correct" and "the test does not touch the code".
+
+This is not a general principle someone thought sounded good. Every line of it
+was paid for during the gateway work, in two days:
+
+- Six regression tests were written for six real bugs. **Four of them passed
+  against the bug they were written for.** One raced the safety-net poll and
+  the poll usually won. One asserted on message ids, which cannot distinguish
+  "seen with its link" from "seen empty" — the entire distinction the bug was
+  about. One stopped the daemon on the *first* message, so the shutdown
+  exception propagated before the line under test was ever reached.
+- The `--dry-run` guard was silent by luck rather than by design: two failure
+  replies were gated on a different flag that happened to default off. Tests
+  covered the safe direction and not the live one.
+- `reply_with_file` had never once executed with posting enabled — not against
+  Discord, not even against the fake CLI. The guard's falling-through direction
+  was uncovered in every mode.
+- While verifying one of the above, the broad `except` in `handle_message` was
+  deleted by accident and **the entire suite still passed.** That is not a weak
+  test; it is a whole path — failure counting and the 3-attempt abandonment —
+  with no coverage at all, found only because something else broke it first.
+
+### The procedure
+
+**Mutate a copy, never the working tree.**
+
+```sh
+rm -rf /tmp/mut && mkdir /tmp/mut && cp *.py /tmp/mut/
+cd /tmp/mut
+# delete or invert exactly the line the fix added, then:
+python3 -m unittest test_vidbot.TheTest.the_case   # must FAIL
+```
+
+The copy is not tidiness. Mutating the real file and restoring it afterwards
+is how a half-applied edit survives: a deletion that took out one line more
+than intended left `except Exception as exc:` missing from `handle_message`,
+the restore copied the damage back over the good file, and the suite went on
+reporting green over a daemon that could no longer count a failed download.
+
+Two failure modes to watch for, both of which happened here:
+
+- **The mutation silently did not apply.** A string that no longer matches
+  makes the test "pass" against unmutated code. Assert the file actually
+  changed before running anything.
+- **The mutation applied and the test still passed.** That is the finding.
+  The test is measuring something other than what its name claims, and the
+  bug it was written for can come back freely.
+
+Prefer driving the code directly over timing-dependent integration tests. The
+cursor regression above is deterministic and runs in 0.3s precisely because it
+calls `process()` and `poll_once()` in sequence instead of standing up a
+daemon and hoping the gateway wins a race against the poll — which it does in
+production, and did not on a loaded test machine.
+
 ## State
 
 `run/state.json`, written atomically, holds three things:
