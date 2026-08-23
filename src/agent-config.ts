@@ -615,12 +615,11 @@ let keyProvenance = new Map<string, string>();
  *
  * Walks UP the dotted path, and strips a trailing `[index]` at each step — which
  * is the whole of OJ round 2's residual on finding 4. Stripping only at the last
- * `.` made `discord.allowedChannelIds[0]` walk to `discord.allowedChannelIds`…
- * no, to `discord.allowedChannelIds[0]` minus nothing, then jump straight past
- * the array's own entry to `discord`. So an element error named whichever file
- * wrote the *parent mapping*, and for `discord.allowedChannelIds` that is always
- * wrong: `BASE_FORBIDDEN` refuses that key in the base, so it can only ever have
- * come from an instance file.
+ * `.` made `discord.allowedChannelIds[0]` jump straight past the array's own
+ * entry to `discord`, so an element error named whichever file wrote the *parent
+ * mapping* — and for `discord.allowedChannelIds` that is always wrong:
+ * `BASE_FORBIDDEN` refuses that key in the base, so it can only ever have come
+ * from an instance file.
  */
 function fileFor(path: string): string {
   for (let at = path; ; ) {
