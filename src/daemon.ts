@@ -770,6 +770,8 @@ export async function main(): Promise<void> {
           // So when the installation token is given up on, the netrc is
           // rewritten with the PAT if there is one — and only removed when
           // there is no credential at all to serve.
+          // Shutdown clears rather than falls back: see `stop()`.
+          onStop: () => removeCurlConfig(config.agent.container.githubTokenDir),
           onNoToken: () => {
             if (config.github.token) {
               writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);

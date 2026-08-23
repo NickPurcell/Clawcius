@@ -18,13 +18,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFile = promisify(execFileCb);
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { setConfig } from '../dist/config.js';
 import { gitEnv } from '../dist/agent.js';
-import { tokenFilePath } from '../dist/token-file.js';
+import { tokenFilePath, writeCurlConfig, netrcPath } from '../dist/token-file.js';
 
 function configure({ token = '', appId = '', githubTokenDir, armed = true }) {
   setConfig({
@@ -166,4 +171,89 @@ test('no helper when the App is configured but nothing will write the file', () 
     .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
     .map((k) => gitEnv()[k]);
   assert.ok(on.includes('credential.https://github.com.helper'));
+});
+
+// ── the CURL_HOME wiring, end to end and offline ────────────────────────────
+
+/** Start a server that reports the Authorization header it was sent. */
+async function echoAuthServer() {
+  const server = createServer((req, res) => {
+    res.end(JSON.stringify({ auth: req.headers['authorization'] ?? null }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { server, port: server.address().port };
+}
+
+/**
+ * ASYNC, and it has to be. `execFileSync` blocks the event loop, so a server
+ * listening in THIS process can never accept the connection curl is waiting on
+ * — curl waits for a reply that cannot be sent and the sync call waits for curl.
+ * A deadlock rather than a slow test, and it presents as the whole file hanging
+ * before a single assertion runs.
+ *
+ * The other tests here use `execFileSync` safely because the credential helper
+ * they run talks to nothing.
+ */
+const curlAuth = async (port, curlHome) => {
+  const { stdout } = await execFile(
+    'curl',
+    ['-s', '--noproxy', '*', `http://127.0.0.1:${port}/`],
+    { encoding: 'utf8', env: { ...process.env, CURL_HOME: curlHome } },
+  );
+  return JSON.parse(stdout).auth;
+};
+
+test('CURL_HOME reaches the agent, and a bare curl carries the credential', async () => {
+  // THE ONE LINK WITH NO TEST. `agent.ts` sets CURL_HOME; every other assertion
+  // is about file contents and cannot see whether the environment actually
+  // points at the directory. This file's header is the argument: it is a string
+  // nothing type-checks, and nothing would notice it being wrong until an agent
+  // got a 401 with no explanation.
+  //
+  // Offline, against a local server, so what is proved is that curl FOUND the
+  // .curlrc, found the netrc through it, and applied it — not that GitHub
+  // accepts anything.
+  const root = mkdtempSync(join(tmpdir(), 'clawsky-curl-'));
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
+  writeCurlConfig(root, 'ghs_installation_token');
+
+  const env = gitEnv();
+  assert.equal(env['CURL_HOME'], root, 'the agent must be pointed at the directory');
+
+  const { server, port } = await echoAuthServer();
+  try {
+    writeFileSync(
+      netrcPath(root),
+      'machine 127.0.0.1\n  login x-access-token\n  password ghs_installation_token\n',
+    );
+    const auth = await curlAuth(port, env['CURL_HOME']);
+    assert.ok(auth, 'curl sent no Authorization header — the chain is broken');
+    assert.match(
+      Buffer.from(auth.replace(/^Basic /, ''), 'base64').toString(),
+      /^x-access-token:ghs_installation_token$/,
+      'and it must be the credential the daemon wrote',
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('a host not in the netrc gets nothing', async () => {
+  // The scope assertion in token-file.test.js checks the file's CONTENTS; this
+  // checks curl honours it. Both halves are needed — a correct file that curl
+  // ignored would look identical from the file's side.
+  const root = mkdtempSync(join(tmpdir(), 'clawsky-curl-'));
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
+  writeCurlConfig(root, 'ghs_installation_token');   // scoped to api.github.com
+
+  const { server, port } = await echoAuthServer();
+  try {
+    assert.equal(
+      await curlAuth(port, gitEnv()['CURL_HOME']),
+      null,
+      'the App credential must not reach a host outside the netrc',
+    );
+  } finally {
+    server.close();
+  }
 });

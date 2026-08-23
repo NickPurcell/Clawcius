@@ -223,13 +223,29 @@ export function writeCurlConfig(githubTokenDir: string, token: string): void {
   );
   // `netrc-optional` rather than `netrc`: a missing file must not make every
   // unrelated curl in the container fail.
+  //
+  // AND THE PATH IS QUOTED. curl terminates an unquoted config parameter at the
+  // first space, so a `githubTokenDir` containing one would silently disable the
+  // credential — `netrc-optional` then does its job, curl exits 0, and the agent
+  // gets a 401 from GitHub with nothing saying why. It would also print an
+  // unquoted-whitespace warning on EVERY curl in the container, since CURL_HOME
+  // makes this file global. `agent.ts` carries the same lesson about a path
+  // spliced into a shell command: silent is the part that matters.
   writeSecretFile(
     curlrcPath(githubTokenDir),
-    `netrc-optional\nnetrc-file = ${netrcPath(githubTokenDir)}\n`,
+    `netrc-optional\nnetrc-file = "${netrcPath(githubTokenDir)}"\n`,
   );
 }
 
-/** Remove the curl credential without disturbing the token file. */
+/**
+ * Remove the curl credential without disturbing the token file.
+ *
+ * The netrc only, deliberately — `.curlrc` is left pointing at a path that no
+ * longer exists, which is exactly what `netrc-optional` is for: curl finds no
+ * netrc, sends no credential, and does not error. Removing both would be tidier
+ * and would buy nothing, and re-creating `.curlrc` on every refresh is a write
+ * of a file whose contents never change.
+ */
 export function removeCurlConfig(githubTokenDir: string): void {
   rmSync(netrcPath(githubTokenDir), { force: true });
 }
@@ -245,6 +261,8 @@ export type TokenFileOptions = {
   readonly onToken?: (token: string) => void;
   /** Called when the written token is given up on, for the same reason. */
   readonly onNoToken?: () => void;
+  /** Called on `stop()`, to clear rather than replace. See `stop()`. */
+  readonly onStop?: () => void;
   /**
    * Whether a PAT exists to fall back TO. Decides what the failure line may
    * promise — `github-app.ts` spends a paragraph on why: a warning the reader
@@ -324,7 +342,20 @@ export class TokenFileRefresher {
     this.#timer = null;
     this.#written = false;
     this.#lastToken = null;
-    this.#opts.onNoToken?.();
+    // NOT `onNoToken` — that writes whichever credential is IN FORCE, which for
+    // an App-plus-PAT deployment means shutdown would install the PAT: an
+    // hour-lived credential replaced by one that never expires and that nothing
+    // ever removes, in the directory this method exists to clear. The bounding
+    // argument in this module's header — a bind-mounted file outlives the
+    // container, but the token dies in an hour — does not transfer to a PAT.
+    //
+    // Which credential is in force is the RUNNING daemon's business. A stopped
+    // one leaves nothing.
+    try {
+      this.#opts.onStop?.();
+    } catch {
+      // Shutdown is not a place to throw.
+    }
     try {
       rmSync(this.#opts.path, { force: true });
     } catch {
@@ -340,10 +371,6 @@ export class TokenFileRefresher {
   async #write(): Promise<void> {
     const token = await this.#opts.provider();
     writeTokenFile(this.#opts.path, token);
-    // In step, always. A netrc holding last hour's token while the token file
-    // holds this hour's is the drift this whole module exists to prevent,
-    // reintroduced one directory over.
-    this.#opts.onToken?.(token);
     // THE CLOCK TRACKS THE TOKEN, NOT THE WRITE, and the difference is 45
     // minutes of serving a corpse.
     //
@@ -363,6 +390,26 @@ export class TokenFileRefresher {
       this.#mintedAtMs = this.#now();
     }
     this.#written = true;
+
+    // THE SECONDARY CONSUMER CANNOT INVALIDATE THE PRIMARY ONE. Called last,
+    // after every piece of bookkeeping, and inside its own catch.
+    //
+    // Inside `#write`'s try it was worse than it looks: a throw from here was
+    // attributed to the PROVIDER, so a token that had been obtained and written
+    // was deleted and the operator was told "could not obtain an installation
+    // token" naming the wrong subsystem. And because `#mintedAtMs` was stamped
+    // after it returned, a persistently failing netrc write froze the staleness
+    // clock — sixty minutes of a healthy credential, then every agent's git
+    // demoted to the PAT because a file one directory over could not be written.
+    try {
+      this.#opts.onToken?.(token);
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
+      this.#opts.log(
+        `[token-file] the git credential is current, but the curl credential could not ` +
+          `be written (${code}); REST calls fall back until the next refresh.`,
+      );
+    }
   }
 
   async #tick(): Promise<void> {
@@ -393,7 +440,15 @@ export class TokenFileRefresher {
         // uncaught exception. There is nothing useful to do about a failed
         // unlink and nothing at all to gain by dying of it.
       }
-      this.#opts.onNoToken?.();
+      try {
+        this.#opts.onNoToken?.();
+      } catch {
+        // Same reason as the `rmSync` below: `#tick` runs as `void this.#tick()`
+        // from a timer, so a throw out of this catch is an unhandled rejection
+        // and Node turns that into an uncaught exception. From `start()` it
+        // would be a throw out of `main()`'s await — the daemon-wide restart
+        // loop this module deliberately stopped doing.
+      }
       this.#opts.log(
         `[token-file] could not obtain an installation token (${code}); there is no ` +
           `usable credential at ${this.#opts.path}. ` +

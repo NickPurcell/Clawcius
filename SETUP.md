@@ -392,7 +392,11 @@ which is how Clawcius keeps working.
 
 With an App configured, the daemon also keeps **one** file holding a current
 installation token, at `<container.githubTokenDir>/installation-token`, mode
-`0600`. The **file** is rewritten every five minutes; the **token** in it is
+`0600` — plus a `netrc` and a `.curlrc` beside it, so that agents' **REST** calls
+authenticate too. `CURL_HOME` points at that directory, which means a bare
+`curl https://api.github.com/...` carries the App with no header. An explicit
+`-H "Authorization: …"` replaces it with whatever that header holds, so passing
+one opts out. The **file** is rewritten every five minutes; the **token** in it is
 minted roughly hourly, because the provider caches until shortly before expiry.
 The agents' git credential helper reads that file instead of
 an environment variable.
@@ -426,8 +430,9 @@ makes the daemon fail at boot.
 Reading it is not a new exposure: every process in the container already runs as
 uid 1000 `agent` and can read `/proc/1/environ`. It is wider in one way — a file
 outlives the container where an env var does not — and that is bounded by
-`docker/snapshot.sh` using `docker commit`, which excludes mounts. The file is
-removed on a clean shutdown.
+`docker/snapshot.sh` using `docker commit`, which excludes mounts. The files are
+removed on a clean shutdown — including the netrc, which is deliberately not
+replaced by the PAT there: a stopped daemon leaves nothing.
 
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the

@@ -512,8 +512,14 @@ systemPrompt:
     the first happens because somebody put the label back. A push nobody has
     asked OJ about is a push nobody will review. `gh` is not installed in the
     agent image, so the label goes on through the REST API — `POST
-    /repos/{owner}/{repo}/issues/{n}/labels`, with the `GITHUB_TOKEN` already in
-    your environment.
+    /repos/{owner}/{repo}/issues/{n}/labels`.
+
+    USE A BARE `curl`. Do NOT pass `-H "Authorization: Bearer $GITHUB_TOKEN"`.
+    The daemon keeps a credential where curl finds it by itself, so a plain
+    `curl https://api.github.com/...` authenticates as the App — which is what
+    makes a pull request you open reviewable by the account, rather than authored
+    by it. An explicit header REPLACES that credential with the older identity, so
+    adding one is not belt-and-braces; it is opting out.
 
     That is also the diagnostic, because from outside these states are identical.
     OJ polls once a minute and posts an acknowledgement the moment a round

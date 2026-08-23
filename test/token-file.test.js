@@ -20,6 +20,7 @@ import {
   TokenFileRefresher,
   writeTokenFile,
   writeCurlConfig,
+  removeCurlConfig,
   netrcPath,
   curlrcPath,
 } from '../dist/token-file.js';
@@ -352,7 +353,10 @@ test('the curl credential is 0600 and holds the token it was given', () => {
   // curl in the container fail.
   const curlrc = readFileSync(curlrcPath(d), 'utf8');
   assert.match(curlrc, /^netrc-optional$/m);
-  assert.match(curlrc, new RegExp(`netrc-file = ${netrcPath(d)}`));
+  // QUOTED. curl terminates an unquoted parameter at the first space, so a
+  // directory containing one would silently disable the credential and warn on
+  // every curl in the container.
+  assert.match(curlrc, new RegExp(`netrc-file = "${netrcPath(d)}"`));
 });
 
 test('a refresh keeps the netrc in step with the token file', async () => {
@@ -411,4 +415,95 @@ test('giving up on the installation token falls back to the PAT rather than leav
     'and the netrc must hold the credential that still works, not nothing',
   );
   r.stop();
+});
+
+test('a path with a space still yields a usable curlrc', () => {
+  // The failure this quoting prevents is silent twice over: curl stops reading
+  // the parameter at the space, `netrc-optional` then means no error, and the
+  // agent gets a 401 from GitHub with nothing saying why — while every unrelated
+  // curl in the container prints an unquoted-whitespace warning, because
+  // CURL_HOME makes this file global.
+  const d = mkdtempSync(join(tmpdir(), 'clawsky tok-'));
+  writeCurlConfig(d, 'ghs_tok');
+  const curlrc = readFileSync(curlrcPath(d), 'utf8');
+  const line = curlrc.split('\n').find((l) => l.startsWith('netrc-file'));
+  assert.match(line, /^netrc-file = ".*"$/, `unquoted path would break: ${line}`);
+  assert.ok(line.includes(d), 'and it must still be the right path');
+});
+
+test('stop() clears the curl credential rather than replacing it with the PAT', async () => {
+  // stop() called onNoToken, which writes whichever credential is IN FORCE — so
+  // for an App-plus-PAT deployment a clean shutdown INSTALLED the PAT into the
+  // directory it exists to clear: an hour-lived credential swapped for one that
+  // never expires and that nothing removes. Which credential is in force is the
+  // running daemon's business; a stopped one leaves nothing.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  const r = new TokenFileRefresher({
+    path,
+    provider: async () => 'ghs_app',
+    log: silent,
+    onToken: (t) => writeCurlConfig(d, t),
+    onNoToken: () => writeCurlConfig(d, 'ghp_the_pat'),
+    onStop: () => removeCurlConfig(d),
+  });
+  await r.start();
+  assert.ok(existsSync(netrcPath(d)));
+
+  r.stop();
+  assert.equal(existsSync(path), false, 'the token file goes, as before');
+  assert.equal(existsSync(netrcPath(d)), false, 'and so must the curl credential');
+});
+
+test('a failing curl write does not delete a healthy token or blame the provider', async () => {
+  // onToken sat inside #write's try, before the bookkeeping. So a throw from the
+  // SECOND consumer was attributed to the FIRST: a token that had been obtained
+  // and written was deleted, and the operator was told "could not obtain an
+  // installation token" — naming the wrong subsystem, in a module whose logging
+  // section is careful about exactly that.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  const logs = [];
+  let clock = 1_000_000;
+  const r = new TokenFileRefresher({
+    path,
+    now: () => clock,
+    log: (m) => logs.push(m),
+    provider: async () => 'ghs_healthy',
+    onToken: () => {
+      throw Object.assign(new Error('no space'), { code: 'ENOSPC' });
+    },
+  });
+
+  await r.start();
+  assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'the token was obtained and written');
+  assert.match(logs.join('\n'), /curl credential could not be written \(ENOSPC\)/);
+  assert.doesNotMatch(logs.join('\n'), /could not obtain an installation token/);
+
+  // …and the staleness clock must still have advanced, or a persistently failing
+  // netrc write would freeze it and demote every agent an hour later.
+  clock += 56 * 60_000;
+  await r.refreshNow();
+  assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'still healthy an hour on');
+  r.stop();
+});
+
+test('a throwing onNoToken cannot escape the tick', async () => {
+  // #tick runs as `void this.#tick()` from a timer, so a throw out of its catch
+  // is an unhandled rejection and Node turns that into an uncaught exception.
+  // From start() it would be a throw out of main()'s await — the daemon-wide
+  // restart loop this module deliberately stopped doing.
+  const d = dir();
+  const r = new TokenFileRefresher({
+    path: join(d, 'installation-token'),
+    log: silent,
+    provider: async () => {
+      throw Object.assign(new Error('nope'), { code: 'ECONNRESET' });
+    },
+    onNoToken: () => {
+      throw Object.assign(new Error('read-only'), { code: 'EROFS' });
+    },
+  });
+  await r.start();   // must not throw
+  r.stop();          // nor must this
 });
