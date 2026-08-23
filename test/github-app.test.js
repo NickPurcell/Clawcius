@@ -140,7 +140,10 @@ test('more than one installation is refused rather than guessed', async () => {
     appId: '1', privateKeyPath: pemOnDisk(), apiBase: 'https://api.github.com', fetchImpl,
   });
   // Picking one would silently choose a repository set nobody chose.
-  await assert.rejects(provider(), /set githubApp\.installationId to choose one/);
+  // The name must be the one an operator can grep for. It is read in the mail
+  // announcing that every watch has been disarmed, which is the worst possible
+  // moment to point at a key that does not exist.
+  await assert.rejects(provider(), /set GITHUB_APP_INSTALLATION_ID to choose one/);
 });
 
 test('a failed mint says the status and nothing else', async () => {
@@ -160,6 +163,51 @@ test('a failed mint says the status and nothing else', async () => {
     assert.doesNotMatch(e.message, /eyJ|BEGIN|PRIVATE KEY|ghs_/);
     return true;
   });
+});
+
+test('a malformed expires_at falls back to an hour instead of minting every call', async () => {
+  // Round 2 of #178. Date.parse answers NaN on anything it cannot read, and NaN
+  // is never greater than anything — so the cache check was false forever and
+  // every call re-minted. Not a slow cache: a POST per poll per watch, and the
+  // rate limit it reaches throws, and a mint that throws is the permanent
+  // disarm this module exists to prevent. A field GitHub controls must not be
+  // able to reach that.
+  let mints = 0;
+  const fetchImpl = async (url) => {
+    if (String(url).endsWith('/app/installations')) {
+      return { ok: true, status: 200, json: async () => [{ id: 42 }] };
+    }
+    mints += 1;
+    return { ok: true, status: 200, json: async () => ({ token: 't', expires_at: 'not-a-date' }) };
+  };
+  let clock = 1_700_000_000_000;
+  const provider = appTokenProvider({
+    appId: '1', privateKeyPath: pemOnDisk(), apiBase: 'https://api.github.com',
+    now: () => clock, fetchImpl,
+  });
+
+  for (let i = 0; i < 5; i += 1) await provider();
+  assert.equal(mints, 1, 'an unreadable expires_at must not defeat the cache');
+
+  // And the fallback is measured on the INJECTED clock, so a test can reach it
+  // faithfully rather than by luck.
+  clock += 56 * 60_000;
+  await provider();
+  assert.equal(mints, 2, 'the one-hour fallback must still expire');
+});
+
+test('an installation id that is not digits is refused before it reaches a URL', async () => {
+  // Operator-controlled and interpolated into a path. A trailing newline in a
+  // systemd EnvironmentFile is an ordinary typo, and `github.ts` validates
+  // every value it interpolates so a bad one fails with a name.
+  for (const bad of ['42\n', ' 42', '42/../../meta', 'abc']) {
+    const provider = appTokenProvider({
+      appId: '1', privateKeyPath: pemOnDisk(), installationId: bad,
+      apiBase: 'https://api.github.com',
+      fetchImpl: async () => { throw new Error('must not reach the network'); },
+    });
+    await assert.rejects(provider(), /GITHUB_APP_INSTALLATION_ID must be digits only/, bad);
+  }
 });
 
 // ── the regression that matters ─────────────────────────────────────────────

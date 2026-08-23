@@ -2,12 +2,22 @@
  * GitHub App installation tokens, and why the daemon needs a *provider* rather
  * than a token.
  *
- * Every pull request in this repository is authored by `NickPurcell`, which is
- * also the personal access token the crew holds. GitHub refuses self-approval,
- * so the operator cannot review the crew's work — and a ruleset requiring one
- * approval collapses onto OJ, whose reviews are `verdictMode: comment` and
- * cannot approve anything. A GitHub App has its own identity without being a
- * second user account, which is what makes review possible at all.
+ * The WAKER polls GitHub as the App instead of as the account whose personal
+ * access token the crew holds.
+ *
+ * BE PRECISE ABOUT WHAT THAT DOES AND DOES NOT BUY, because the first version
+ * of this comment claimed the second and was wrong. The credential minted here
+ * is consumed by exactly one object — `GitHubClient` — and that client is
+ * read-only: `getPullRequest`, `listReviews`, `listComments`, one `#get` and no
+ * other request path. It never opens a pull request, never pushes, never
+ * approves.
+ *
+ * So this does NOT change who authors pull requests, and does NOT make a
+ * required-approval ruleset satisfiable. Authorship comes from the agent's
+ * `GITHUB_TOKEN` inside the container, which this file deliberately does not
+ * touch — see below. What it buys is that the waker's own reads carry an
+ * identity separable from the crew's, and that the credential it carries can be
+ * rotated without touching the agent.
  *
  * ── The part that is not a drop-in ──────────────────────────────────────────
  *
@@ -111,6 +121,7 @@ async function mint(
   opts: GitHubAppOptions,
   jwt: string,
   fetchImpl: typeof fetch,
+  now: () => number,
 ): Promise<Minted> {
   const headers = {
     Authorization: `Bearer ${jwt}`,
@@ -121,6 +132,14 @@ async function mint(
   const base = opts.apiBase.replace(/\/+$/, '');
 
   let id = opts.installationId;
+  // Operator-controlled, and it is interpolated into a path. `github.ts`
+  // validates every value it interpolates (`requireRepo`, `requirePr`,
+  // `encodePath`) so a bad one fails with a name instead of a puzzling status,
+  // and a trailing newline in a systemd EnvironmentFile is an ordinary typo.
+  // Here it matters more than style: the failure lands as a permanent disarm.
+  if (id !== undefined && !/^\d+$/.test(id)) {
+    throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
+  }
   if (!id) {
     const res = await fetchImpl(`${base}/app/installations`, { headers });
     if (!res.ok) throw new Error(`listing installations: GitHub answered ${res.status}`);
@@ -131,7 +150,8 @@ async function mint(
     if (list.length > 1) {
       // Guessing would pick a repository set nobody chose. Name the fix.
       throw new Error(
-        `the App has ${list.length} installations; set githubApp.installationId to choose one`,
+        `the App has ${list.length} installations; set GITHUB_APP_INSTALLATION_ID ` +
+        'to choose one',
       );
     }
     id = String(list[0]!.id);
@@ -147,7 +167,14 @@ async function mint(
   }
   const body = (await res.json()) as { token?: string; expires_at?: string };
   if (!body.token) throw new Error('GitHub returned no token');
-  const expiresAtMs = body.expires_at ? Date.parse(body.expires_at) : Date.now() + 3_600_000;
+  // `Date.parse` answers NaN on anything it cannot read, and NaN is never
+  // greater than anything — so a malformed field would make the cache check
+  // false forever and mint a token per request. That is not a slow cache: it is
+  // a POST per poll per watch, and the rate limit it reaches throws, and a mint
+  // that throws is the permanent disarm this whole file exists to prevent. A
+  // field this code does not control must not be able to do that.
+  const parsed = body.expires_at ? Date.parse(body.expires_at) : NaN;
+  const expiresAtMs = Number.isFinite(parsed) ? parsed : now() + 3_600_000;
   return { token: body.token, expiresAtMs };
 }
 
@@ -183,7 +210,7 @@ export function appTokenProvider(opts: GitHubAppOptions): TokenProvider {
     if (!inFlight) {
       inFlight = (async () => {
         const pem = readFileSync(opts.privateKeyPath, 'utf8');
-        const minted = await mint(opts, appJwt(opts.appId, pem, now()), fetchImpl);
+        const minted = await mint(opts, appJwt(opts.appId, pem, now()), fetchImpl, now);
         cached = minted;
         return minted;
       })().finally(() => {

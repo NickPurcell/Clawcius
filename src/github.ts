@@ -1,3 +1,4 @@
+import { staticTokenProvider, type TokenProvider } from './github-app.js';
 /**
  * A read-only view of one pull request, and the frame everything it says
  * arrives in.
@@ -48,7 +49,6 @@
 export const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /** Refuse a response larger than this rather than parsing it. */
-import { staticTokenProvider, type TokenProvider } from './github-app.js';
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 /** A slow poll must not hold a tick open forever. */

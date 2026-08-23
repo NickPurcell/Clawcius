@@ -49,6 +49,7 @@
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
+import { accessSync, constants as fsConstants } from 'node:fs';
 import { loadConfig, type Config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
 import {
@@ -672,7 +673,37 @@ export async function main(): Promise<void> {
     // — a half-configured deployment falls back rather than failing, because a
     // crew that cannot poll is worse than one polling as the older identity.
     const app = config.github.appId && config.github.appPrivateKeyPath;
+    // PROVE IT BEFORE ARMING ANYTHING. Every way an App can be misconfigured —
+    // a typo'd PEM path, a PEM the service user cannot read, a wrong app id, an
+    // uninstalled App, more than one installation — throws when the provider is
+    // FIRST AWAITED, and the first await is inside `#get`, inside the try in
+    // `ArmedWaker`, whose catch calls `store.disarm()`. So a misconfiguration
+    // does not degrade a poll: it permanently deletes every armed row in the
+    // crew, one mail each, which is the exact sweep this file exists to
+    // prevent, reached through a different door.
+    //
+    // An absent GITHUB_TOKEN is already handled by refusing to build the client
+    // and letting `watchPr` decline to arm. A half-configured App deserves the
+    // same answer and deserves it more, because it fails AFTER arming rather
+    // than before.
+    let appTokenOk = false;
     if (app) {
+      try {
+        // `fs.access` rather than a mint: it catches the two failures an
+        // operator actually makes — wrong path, wrong owner — without spending
+        // a token or a round trip at every boot, and without making startup
+        // depend on GitHub being reachable.
+        accessSync(config.github.appPrivateKeyPath, fsConstants.R_OK);
+        appTokenOk = true;
+      } catch (error) {
+        process.stderr.write(
+          `[armed] GITHUB_APP_PRIVATE_KEY_PATH is set but unreadable — ${String(error)}. ` +
+            'watchPr will refuse to arm rather than arm watches that would be disarmed on ' +
+            'their first poll.\n',
+        );
+      }
+    }
+    if (app && appTokenOk) {
       // A PROVIDER, not a token. An installation token lasts an hour and this
       // client lives for the life of the daemon; a poll that throws is disarmed
       // rather than retried (`ArmedWaker`), so a stale credential would kill
@@ -686,8 +717,10 @@ export async function main(): Promise<void> {
         }),
         config.agent.armed.github.apiBase,
       );
-      // The id is not a secret; the key and the token are, and neither the PEM's
-      // path nor anything minted from it is logged here or anywhere else.
+      // Said only once the key has been shown readable. Printing it before
+      // anything was proven reported success at the exact moment the failure
+      // became undetectable. The id is not a secret; the key and the token are,
+      // and neither the PEM's path nor anything minted from it is logged.
       process.stderr.write(`[armed] authenticating as GitHub App ${config.github.appId}\n`);
     } else if (config.github.token) {
       github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);
