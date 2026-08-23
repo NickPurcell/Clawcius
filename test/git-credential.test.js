@@ -17,15 +17,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile as execFileCb } from 'node:child_process';
 import { createServer } from 'node:http';
-import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-
-const execFile = promisify(execFileCb);
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const execFile = promisify(execFileCb);
 
 import { setConfig } from '../dist/config.js';
 import { gitEnv } from '../dist/agent.js';
