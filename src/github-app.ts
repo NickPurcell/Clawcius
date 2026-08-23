@@ -58,7 +58,9 @@
  */
 
 import { createSign } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, readFileSync } from 'node:fs';
+
+const { R_OK } = fsConstants;
 
 /** Answers with a token that is valid *now*. */
 export type TokenProvider = () => Promise<string>;
@@ -107,6 +109,73 @@ export function appJwt(appId: string, privateKeyPem: string, nowMs: number): str
   return `${header}.${payload}.${base64url(signer.sign(privateKeyPem))}`;
 }
 
+/**
+ * One predicate, two callers, deliberately.
+ *
+ * The boot check (`checkAppConfig`) and the runtime throw (`mint`) answer the
+ * same question about the same value at two different moments. Written twice
+ * they can drift, and the direction of drift is the bad one: the operator is
+ * told the boot line is where they learn what happened, so a boot check that
+ * had quietly grown laxer than the runtime one would clear a value that later
+ * disarms every watch in the crew.
+ *
+ * The MESSAGES stay separate — one is a warning with a remedy, the other is a
+ * throw — because it is the condition that must not diverge, not the prose.
+ */
+export function isInstallationIdValid(id: string | undefined): boolean {
+  return id === undefined || id === '' || /^\d+$/.test(id);
+}
+
+/**
+ * A character the operator cannot see, in a value the operator typed.
+ *
+ * THE FAILURE THESE THREE VARIABLES SHARE is not a wrong value, it is an
+ * invisible one: a `\r` from a Windows paste, a trailing newline in a systemd
+ * `EnvironmentFile`, a space picked up by a shell heredoc. The value looks
+ * right in the file and in every journal line that echoes it, and it is wrong.
+ *
+ * Checked against the FAILURE MODE rather than against a format, deliberately.
+ * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
+ * ones contain a dot), so a positive pattern would be this module guessing at
+ * GitHub's identifier alphabet and would reject a valid deployment the first
+ * time that alphabet changed. Nothing legitimate in any of the three carries any
+ * character named below, and that is knowable without guessing.
+ *
+ * EXACTLY THREE GROUPS, and this list is the whole of the claim:
+ *
+ *   C0 controls and DEL   \u0000-\u001F, \u007F   -- \r, \n, \t
+ *   Unicode format chars  \p{Cf}                  -- ZWSP, soft hyphen, word
+ *                                                    joiner, BOM, ZWJ/ZWNJ
+ *   whitespace            \s                      -- ALL of it for the App ID;
+ *                                                    for the path, all of it
+ *                                                    EXCEPT U+0020
+ *
+ * `\p{Cf}` is here because it is the WORST case, not an exotic one. A trailing
+ * space can be found by moving a cursor; a zero-width space cannot be found at
+ * all, and web UIs insert them into long identifiers to allow line breaking --
+ * so "I copied the App ID off the page" is exactly how one arrives. The
+ * consequence is the one this check exists to prevent, a 401 at first mint
+ * inside the catch that disarms every armed row, reached through the single
+ * input an operator has no way to inspect. The more invisible the character,
+ * the more a boot check is the ONLY thing that can catch it.
+ *
+ * It is also free to be right about: `\p{Cf}` is a NEGATIVE pattern, so the
+ * objection to positive ones above -- that they guess at someone else's
+ * alphabet and expire when it changes -- does not apply to it.
+ *
+ * U+0020 IS THE ONLY CHARACTER THE TWO DIFFER ON, and that is the whole of the
+ * difference: a filesystem path may legitimately contain a space, and an App ID
+ * may not. Nobody types NBSP, a figure space or an ideographic space into a path
+ * on purpose either, and letting them through delivered the ENOENT message this
+ * function suppresses for `\r` -- true, unhelpful, and pointing at the visible
+ * half of a value whose problem is the invisible half.
+ *
+ * Written `[^\S ]` -- whitespace that is not a space -- so the exception stays
+ * one character wide and cannot quietly grow into "whitespace is allowed here".
+ */
+const INVISIBLE = /[^\S ]|[\u0000-\u001F\u007F\p{Cf}]/u;
+const INVISIBLE_OR_SPACE = /[\s\u0000-\u001F\u007F\p{Cf}]/u;
+
 type Minted = { token: string; expiresAtMs: number };
 
 /**
@@ -137,7 +206,7 @@ async function mint(
   // `encodePath`) so a bad one fails with a name instead of a puzzling status,
   // and a trailing newline in a systemd EnvironmentFile is an ordinary typo.
   // Here it matters more than style: the failure lands as a permanent disarm.
-  if (id !== undefined && !/^\d+$/.test(id)) {
+  if (!isInstallationIdValid(id)) {
     throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
   }
   if (!id) {
@@ -224,4 +293,161 @@ export function appTokenProvider(opts: GitHubAppOptions): TokenProvider {
 /** The PAT path, unchanged in behaviour: the same string, forever. */
 export function staticTokenProvider(token: string): TokenProvider {
   return async () => token;
+}
+
+/**
+ * Whether the App is usable, and what to tell the operator if it is not.
+ *
+ * TWO QUESTIONS, TWO FIELDS, because they are not the same question and an
+ * earlier version answered both with one `null`. "Nothing to warn about" and
+ * "safe to authenticate as the App" diverge on the ordinary deployment that
+ * configures no App at all — `{ usable: false, warning: null }` — and a caller
+ * that inferred the second from the first would have been right only because a
+ * guard outside this function happened to exclude that case.
+ *
+ * TOTAL over its input. Every combination of set and unset is defined here,
+ * including the ones the daemon's guard currently makes unreachable, so that
+ * widening the guard cannot produce a false sentence.
+ *
+ * ── Why this is a function and not four lines inside `main()` ───────────────
+ *
+ * Because those four lines have been wrong in three consecutive reviews, and
+ * each time the fix was invisible to the test suite. `main()` builds a Discord
+ * client and a session pool; nothing was going to grow a test around it for the
+ * sake of a warning string, so the warning string was the one thing in this
+ * repository changed repeatedly and never asserted on. It is pure and it takes
+ * its filesystem as an argument for exactly that reason.
+ *
+ * ── Two checks, both reported ──────────────────────────────────────────────
+ *
+ * They used to share a branch, so a bad installation id skipped the key check
+ * entirely: an operator with both wrong fixed one, restarted, and only then
+ * learned about the other. Two facts that were both knowable at the first boot
+ * should cost one boot.
+ *
+ * ── The consequence clause is conditional, and stops short when it must ─────
+ *
+ * Saying "FALLING BACK TO GITHUB_TOKEN … watches will arm and poll" is true
+ * only when there IS a token. Without one the daemon prints, on the very next
+ * line, that nothing will arm at all — so the unconditional version was
+ * refuted by the sentence beneath it, which is worse than saying nothing: a
+ * warning the reader watches get disproved is a warning they learn to skip.
+ *
+ * The fix is subtraction. With no PAT this says only what it knows — the App
+ * is not in use — and leaves the consequence to the branch that actually
+ * decides it, which already states it correctly and with the remedy attached.
+ */
+export function checkAppConfig(
+  input: {
+    appId: string;
+    privateKeyPath: string;
+    installationId: string | undefined;
+    /** Whether a PAT exists to fall back TO. Decides what may be promised. */
+    hasFallbackToken: boolean;
+  },
+  // Injected so the tests can drive real failures without needing a real
+  // unreadable file, and so this module keeps its only `node:fs` dependency in
+  // one place.
+  access: (path: string) => void = (path) => accessSync(path, R_OK),
+): { usable: boolean; warning: string | null } {
+  // NEITHER SET IS NOT A FAULT. It is the ordinary deployment — Clawcius has no
+  // App — so there is nothing to warn about, and nothing usable either. These
+  // are two different questions and the return type answers both, rather than
+  // making the caller infer one from a `null` that also means "all well".
+  if (!input.appId && !input.privateKeyPath) return { usable: false, warning: null };
+
+  const faults: string[] = [];
+
+  // ONE OF THE TWO SET IS THE SHORTEST ROUTE TO A BROKEN APP: an operator who
+  // typos the VARIABLE NAME rather than its value. It used to produce complete
+  // silence — not even the "authenticating as GitHub App" line, which lives
+  // behind the same guard — while every neighbouring misconfiguration was loud.
+  // Falling back is the right behaviour and is not what changed; falling back
+  // QUIETLY is, because SETUP.md tells the operator to read a startup line that
+  // was never printed for this case.
+  if (!input.privateKeyPath) {
+    faults.push(
+      'GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_PATH is not — the App needs both',
+    );
+  } else if (!input.appId) {
+    faults.push(
+      'GITHUB_APP_PRIVATE_KEY_PATH is set but GITHUB_APP_ID is not — the App needs both',
+    );
+  }
+
+  // THE THIRD VARIABLE, and the one this function was checking for presence and
+  // never for shape. `appId` goes straight into the JWT as `iss`
+  // (`appJwt`), so a stray character does not fail here — it fails at the FIRST
+  // MINT, with a 401, inside the poll's try, whose catch disarms the row. That
+  // is the permanent sweep this whole boot check exists to prevent, reached
+  // through the one variable of the three that was not being checked.
+  //
+  // Not digits-only: GitHub accepts the numeric App ID *or* a client ID as
+  // `iss`, and narrowing to digits would refuse a valid deployment.
+  if (input.appId && INVISIBLE_OR_SPACE.test(input.appId)) {
+    faults.push(
+      'GITHUB_APP_ID contains an invisible character — whitespace, a control character, ' +
+        'or a zero-width one such as U+200B, which a web UI inserts into long ' +
+        'identifiers and no editor shows you. It is sent as the JWT `iss`, so GitHub ' +
+        'answers 401 at the first mint rather than here',
+    );
+  }
+
+  // Spaces are legal in a path, so this is the narrower test of the two. A
+  // trailing \r would otherwise surface as ENOENT below, which is true but
+  // sends the operator to stare at a path that looks correct.
+  if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
+    faults.push(
+      'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — a control character ' +
+        'or a zero-width one. A trailing newline in an EnvironmentFile is the usual ' +
+        'cause, and nothing in the value itself shows it',
+    );
+  }
+
+  if (!isInstallationIdValid(input.installationId)) {
+    faults.push(
+      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
+        'and a trailing newline in an EnvironmentFile is the usual cause',
+    );
+  }
+
+  // Skipped in the two cases where `access` would answer ENOENT and attach a
+  // false sentence to it. UNSET: "GITHUB_APP_PRIVATE_KEY_PATH is set but the
+  // key is not readable" has its first four words wrong. MALFORMED: "ENOENT
+  // means the path is wrong" points at the visible half of a value whose
+  // problem is the invisible half. Both are the defect this function exists to
+  // stop making, arrived at through its own readability check.
+  if (input.privateKeyPath && !INVISIBLE.test(input.privateKeyPath)) {
+    try {
+      // `access` rather than a mint: it catches the two failures an operator
+      // actually makes — wrong path, wrong owner — without spending a token or
+      // a round trip at every boot, and without making startup depend on
+      // GitHub being reachable.
+      access(input.privateKeyPath);
+    } catch (error) {
+      // `error.code` rather than the message. `fs` errors carry the PATH in
+      // `.message`, and this module's header states that the PEM's path is not
+      // logged. ENOENT and EACCES also happen to be the more useful half — they
+      // distinguish "wrong path" from "wrong owner", which is the operator's
+      // actual question.
+      const code =
+        error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
+      faults.push(
+        `GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable (${code}) — ` +
+          'ENOENT means the path is wrong, EACCES means the owner or mode is',
+      );
+    }
+  }
+
+  if (faults.length === 0) return { usable: true, warning: null };
+
+  return {
+    usable: false,
+    warning:
+      faults.join('. ALSO: ') +
+      (input.hasFallbackToken
+        ? '. FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm ' +
+          'and poll as the personal access token.'
+        : '. The App is NOT in use.'),
+  };
 }

@@ -360,17 +360,27 @@ container. Making the *session* use App credentials is a separate problem with a
 different shape, because an installation token expires in an hour and a
 session's environment is fixed when its process spawns.
 
-If the PEM is missing or unreadable, or `GITHUB_APP_INSTALLATION_ID` is not
-digits, the waker says so at startup and **falls back to `GITHUB_TOKEN`** — the
-App is not in use, and watches arm and poll as the PAT. That is deliberate, for
-the reason above, but it means a mistyped path leaves you running as the older
-identity with everything apparently working. The startup line is the only place
-that says so, so read it after changing either variable.
+The waker checks five things at startup and **falls back to `GITHUB_TOKEN`** if
+any of them fails:
 
-Both variables are required together — either alone falls back to the PAT rather
-than failing, because a crew that cannot reach GitHub is worse than one reaching
-it as the older identity. A deployment with neither is unchanged, which is how
-Clawcius keeps working.
+1. both variables are set, not one — either alone falls back rather than failing;
+2. the PEM is present and readable by the service user;
+3. `GITHUB_APP_INSTALLATION_ID` is digits, if it is set at all;
+4. `GITHUB_APP_ID` carries no invisible character;
+5. neither does the key path.
+
+An "invisible character" is a trailing newline from an `EnvironmentFile`, a
+stray `\r` from a paste, or a zero-width space picked up by copying an
+identifier out of a web page — the last of which no editor will show you. Each
+check reports itself, so the line names the variable that actually failed rather
+than the one that failed last time.
+
+The fallback is deliberate, for the reason above: a crew that cannot reach GitHub
+is worse than one reaching it as the older identity. But it means a mistyped path
+leaves you running as the older identity with everything apparently working, and
+**the startup line is the only place that says so** — so read it after changing
+any of them. A deployment with neither variable set is unchanged and silent,
+which is how Clawcius keeps working.
 
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the

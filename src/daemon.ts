@@ -49,7 +49,6 @@
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
-import { accessSync, constants as fsConstants } from 'node:fs';
 import { loadConfig, type Config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
 import {
@@ -63,7 +62,7 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
-import { appTokenProvider } from './github-app.js';
+import { appTokenProvider, checkAppConfig } from './github-app.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -672,7 +671,14 @@ export async function main(): Promise<void> {
     // Prefer the App when this deployment has one. Both variables are required
     // — a half-configured deployment falls back rather than failing, because a
     // crew that cannot poll is worse than one polling as the older identity.
-    const app = config.github.appId && config.github.appPrivateKeyPath;
+    //
+    // EITHER variable, not both, because this guard decides whether the
+    // operator hears anything at all. With `&&` a deployment that set one and
+    // typo'd the name of the other said NOTHING — not the fault, and not the
+    // "authenticating as GitHub App" line either, since that sits behind the
+    // same guard — while every neighbouring misconfiguration was loud. The
+    // fallback is unchanged; only its silence is.
+    const app = config.github.appId || config.github.appPrivateKeyPath;
     // PROVE IT BEFORE ARMING ANYTHING. Every way an App can be misconfigured —
     // a typo'd PEM path, a PEM the service user cannot read, a wrong app id, an
     // uninstalled App, more than one installation — throws when the provider is
@@ -688,34 +694,25 @@ export async function main(): Promise<void> {
     // than before.
     let appTokenOk = false;
     if (app) {
-      try {
-        // Costs no network, no token and no PEM, so there is no reason for it
-        // to wait until first use — and first use is inside `ArmedWaker`'s try,
-        // where the catch deletes the row. A trailing newline in an
-        // EnvironmentFile is an ordinary typo; discovering it at boot is a log
-        // line, discovering it at first poll is a permanent sweep.
-        if (config.github.appInstallationId && !/^\d+$/.test(config.github.appInstallationId)) {
-          throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
-        }
-        // `fs.access` rather than a mint: it catches the two failures an
-        // operator actually makes — wrong path, wrong owner — without spending
-        // a token or a round trip at every boot, and without making startup
-        // depend on GitHub being reachable.
-        accessSync(config.github.appPrivateKeyPath, fsConstants.R_OK);
-        appTokenOk = true;
-      } catch (error) {
-        // Say what actually happens next, which is NOT a refusal: the branch
-        // below falls through to the PAT, `github` is built, and watches arm
-        // and poll normally. Claiming a refusal here was worse than saying
-        // nothing — an operator who mistypes the path would see a warning, then
-        // see watches working, conclude the warning was spurious, and run
-        // indefinitely as the PAT believing they were the App.
-        process.stderr.write(
-          `[armed] GITHUB_APP_PRIVATE_KEY_PATH is set but unreadable — ${String(error)}. ` +
-            'FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm and ' +
-            'poll as the personal access token. Fix the path or the ownership to use the App.\n',
-        );
-      }
+      // Checked at BOOT because it costs no network, no token and no PEM, so
+      // there is no reason for it to wait until first use — and first use is
+      // inside `ArmedWaker`'s try, where the catch deletes the row. A trailing
+      // newline in an EnvironmentFile is an ordinary typo; discovering it at
+      // boot is a log line, discovering it at first poll is a permanent sweep.
+      //
+      // The checks themselves live in `github-app.ts` as a pure function. They
+      // were four lines here, and those four lines were wrong in three
+      // consecutive reviews without a single test noticing, because nothing was
+      // ever going to grow a test around `main()`. `checkAppConfig` is asserted
+      // directly; this call site is now too small to be wrong.
+      const { usable, warning } = checkAppConfig({
+        appId: config.github.appId,
+        privateKeyPath: config.github.appPrivateKeyPath,
+        installationId: config.github.appInstallationId || undefined,
+        hasFallbackToken: Boolean(config.github.token),
+      });
+      appTokenOk = usable;
+      if (warning) process.stderr.write(`[armed] ${warning}\n`);
     }
     if (app && appTokenOk) {
       // A PROVIDER, not a token. An installation token lasts an hour and this

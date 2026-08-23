@@ -22,7 +22,12 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { appJwt, appTokenProvider, staticTokenProvider } from '../dist/github-app.js';
+import {
+  appJwt,
+  appTokenProvider,
+  staticTokenProvider,
+  checkAppConfig,
+} from '../dist/github-app.js';
 import { GitHubClient } from '../dist/github.js';
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -248,4 +253,255 @@ test('a plain string still works, so the PAT path is unchanged', async () => {
   }
   assert.deepEqual(seen, ['Bearer ghp_static']);
   assert.equal(await staticTokenProvider('ghp_static')(), 'ghp_static');
+});
+
+
+// ── checkAppConfig ──────────────────────────────────────────────────────────
+//
+// These exist because the lines this function replaced were wrong in three
+// consecutive reviews and no test ever noticed: they lived in `main()`, beside
+// a Discord client and a session pool, where nothing was going to assert on
+// them. The warning string is operator-facing output and SETUP.md tells the
+// operator it is the only place they learn what happened, so it is worth the
+// same scrutiny as a return value.
+
+/** An `access` that fails the way the real one does, with a `code`. */
+const accessFailing = (code) => () => {
+  const error = new Error(`${code}: opening '/etc/clawcius/secret-app-key.pem'`);
+  error.code = code;
+  throw error;
+};
+const accessOk = () => {};
+const cfg = (over) => ({
+  appId: '1',
+  privateKeyPath: '/k.pem',
+  installationId: undefined,
+  hasFallbackToken: true,
+  ...over,
+});
+
+test('checkAppConfig says nothing when the App is configured correctly', () => {
+  const { usable, warning } = checkAppConfig(cfg(), accessOk);
+  assert.equal(warning, null, 'a good configuration must produce no warning at all');
+  assert.equal(usable, true);
+});
+
+test('checkAppConfig reports BOTH faults in one boot', () => {
+  // The two used to share a branch, so a bad id suppressed the key check and
+  // the operator needed two restarts to learn two things knowable at the first.
+  const { warning } = checkAppConfig(cfg({ installationId: '42\n' }), accessFailing('ENOENT'));
+  assert.match(warning, /GITHUB_APP_INSTALLATION_ID must be digits only/);
+  assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable \(ENOENT\)/);
+});
+
+test('checkAppConfig distinguishes a wrong path from a wrong owner', () => {
+  // ENOENT and EACCES are the operator's actual question, and they are the
+  // reason this reports `error.code` rather than `String(error)`.
+  assert.match(checkAppConfig(cfg(), accessFailing('ENOENT')).warning, /\(ENOENT\)/);
+  assert.match(checkAppConfig(cfg(), accessFailing('EACCES')).warning, /\(EACCES\)/);
+});
+
+test('checkAppConfig never puts the PEM path in the warning', () => {
+  // The `fs` error carries the path in `.message`; the whole point of reading
+  // `.code` is that this line goes to a journal and, via `armed-wake`, near a
+  // mailbox. The path names the file and the file is the key.
+  for (const code of ['ENOENT', 'EACCES']) {
+    const { warning } = checkAppConfig(
+      cfg({ privateKeyPath: '/etc/clawcius/secret-app-key.pem' }),
+      accessFailing(code),
+    );
+    assert.doesNotMatch(warning, /secret-app-key/, code);
+    assert.doesNotMatch(warning, /etc\/clawcius/, code);
+  }
+});
+
+test('checkAppConfig promises a fallback only when there is one to fall back to', () => {
+  // THE ROUND-3 DEFECT, in its third costume. With no PAT the daemon prints, on
+  // the very next line, that watchPr will refuse to arm anything — so an
+  // unconditional "watches will arm and poll" was refuted by the sentence
+  // directly beneath it. A warning the reader watches get disproved is a
+  // warning they learn to skip.
+  const withPat = checkAppConfig(cfg(), accessFailing('ENOENT')).warning;
+  const withoutPat = checkAppConfig(cfg({ hasFallbackToken: false }), accessFailing('ENOENT'))
+    .warning;
+  assert.match(withPat, /watches will arm and poll as the personal access token/);
+  assert.doesNotMatch(withoutPat, /will arm/);
+  assert.doesNotMatch(withoutPat, /FALLING BACK/);
+  assert.match(withoutPat, /The App is NOT in use\./);
+});
+
+test('an empty installation id means unset, in both callers', () => {
+  // `config.github.appInstallationId || undefined` normalises it before `mint`
+  // ever sees it, and the boot check skipped it too. The shared predicate makes
+  // that agreement explicit rather than coincidental.
+  assert.equal(checkAppConfig(cfg({ installationId: '' }), accessOk).warning, null);
+});
+
+// ── the half-configured App, which used to say nothing at all ───────────────
+
+test('a half-configured App names the variable that is missing', () => {
+  // The shortest route to a broken App is typing the VARIABLE NAME wrong rather
+  // than its value, and it was the one route that produced complete silence —
+  // not even "authenticating as GitHub App", which sits behind the same guard.
+  const noPath = checkAppConfig(cfg({ privateKeyPath: '' }), accessOk);
+  assert.equal(noPath.usable, false);
+  assert.match(noPath.warning, /GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_PATH is not/);
+
+  const noId = checkAppConfig(cfg({ appId: '' }), accessOk);
+  assert.equal(noId.usable, false);
+  assert.match(noId.warning, /GITHUB_APP_PRIVATE_KEY_PATH is set but GITHUB_APP_ID is not/);
+});
+
+test('an unset key path is never described as unreadable', () => {
+  // `access('')` answers ENOENT, which would have produced "GITHUB_APP_PRIVATE_
+  // KEY_PATH is set but the key is not readable" about a variable that is not
+  // set — the first four words false, which is the whole defect class this
+  // function was extracted to end.
+  const { warning } = checkAppConfig({
+    appId: '1', privateKeyPath: '', installationId: undefined, hasFallbackToken: true,
+  });
+  assert.doesNotMatch(warning, /not readable/);
+  assert.doesNotMatch(warning, /is set but the key/);
+});
+
+test('no App configured at all is not a fault, and is not usable either', () => {
+  // The ordinary deployment — Clawcius has no App. Two questions, two fields:
+  // inferring "usable" from a null warning would be right only because a guard
+  // outside this function happens to exclude this case.
+  const { usable, warning } = checkAppConfig({
+    appId: '', privateKeyPath: '', installationId: undefined, hasFallbackToken: true,
+  });
+  assert.equal(warning, null);
+  assert.equal(usable, false);
+});
+
+// ── the real `access`, which nothing else exercises ─────────────────────────
+
+test('the default access check reads the real filesystem', () => {
+  // Every case above injects `access`, so `accessSync(path, R_OK)` — the only
+  // version that runs in production — would otherwise be asserted nowhere. A
+  // later change from R_OK to F_OK would pass the whole suite while making the
+  // boot check laxer than the read that follows it, which is exactly the drift
+  // `isInstallationIdValid` was extracted to prevent.
+  const real = pemOnDisk();
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).warning, null);
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).usable, true);
+
+  const missing = join(mkdtempSync(join(tmpdir(), 'clawsky-app-')), 'absent.pem');
+  const { usable, warning } = checkAppConfig(cfg({ privateKeyPath: missing }));
+  assert.equal(usable, false);
+  assert.match(warning, /not readable \(ENOENT\)/);
+  assert.doesNotMatch(warning, /absent\.pem/);
+});
+
+// ── invisible characters, the class the three variables share ───────────────
+
+test('an App id with a stray character is caught at boot, not at the first mint', () => {
+  // `appId` was checked for PRESENCE and never for SHAPE, then went straight
+  // into the JWT as `iss`. A trailing \r does not fail here — it fails at the
+  // first mint with a 401, inside the poll's try, whose catch disarms the row.
+  // That is the permanent sweep the whole boot check exists to prevent, through
+  // the one variable of the three nothing was checking.
+  for (const bad of ['99\r', '99\n', ' 99', '99 ', '99\t']) {
+    const { usable, warning } = checkAppConfig(cfg({ appId: bad }), accessOk);
+    assert.equal(usable, false, JSON.stringify(bad));
+    assert.match(warning, /GITHUB_APP_ID contains an invisible character/);
+  }
+});
+
+test('a client id is still a valid App id', () => {
+  // GitHub accepts the numeric App ID *or* a client ID as `iss`. Narrowing to
+  // digits would refuse a valid deployment, so this checks the failure mode
+  // rather than guessing GitHub's identifier alphabet — including the older
+  // form, which contains a dot.
+  for (const good of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
+    const { usable, warning } = checkAppConfig(cfg({ appId: good }), accessOk);
+    assert.equal(usable, true, good);
+    assert.equal(warning, null, good);
+  }
+});
+
+test('a key path may contain a space but not a control character', () => {
+  // Spaces are legal in a path and must not be refused; a \r is not, and would
+  // otherwise surface as ENOENT — true, and it sends the operator to stare at a
+  // path that looks correct.
+  const spaced = checkAppConfig(cfg({ privateKeyPath: '/home/my dir/key.pem' }), accessOk);
+  assert.equal(spaced.usable, true, 'a space in a path is legitimate');
+
+  const cr = checkAppConfig(cfg({ privateKeyPath: '/k.pem\r' }), accessFailing('ENOENT'));
+  assert.equal(cr.usable, false);
+  assert.match(cr.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/);
+  assert.doesNotMatch(cr.warning, /not readable/, 'the misleading ENOENT must be suppressed');
+});
+
+test('a zero-width character is caught too, and it is the worst case', () => {
+  // A trailing space can be found by moving a cursor; U+200B cannot be found at
+  // all. Web UIs insert zero-width characters into long identifiers so they can
+  // line-break, so "I copied the App ID off the page" is how one arrives — and
+  // the consequence is the same 401 at first mint, inside the catch that
+  // disarms every armed row. The prose above the regex claims "a character the
+  // operator cannot see"; these are the characters that claim is most about.
+  const zeroWidth = {
+    'U+200B ZERO WIDTH SPACE': '​',
+    'U+00AD SOFT HYPHEN': '­',
+    'U+2060 WORD JOINER': '⁠',
+    'U+FEFF BYTE ORDER MARK': '﻿',
+    'U+200D ZERO WIDTH JOINER': '‍',
+  };
+  for (const [name, ch] of Object.entries(zeroWidth)) {
+    const id = checkAppConfig(cfg({ appId: `99${ch}` }), accessOk);
+    assert.equal(id.usable, false, name);
+    assert.match(id.warning, /GITHUB_APP_ID contains an invisible character/, name);
+
+    const path = checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessFailing('ENOENT'));
+    assert.equal(path.usable, false, name);
+    assert.match(path.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
+    assert.doesNotMatch(path.warning, /not readable/, `${name}: misleading ENOENT must be suppressed`);
+  }
+});
+
+test('the invisible-character check does not refuse ordinary values', () => {
+  // The regex is negative, so the risk it carries is over-rejection. These are
+  // the shapes a real deployment uses: both App ID forms, the older dotted
+  // client ID, and a path with a space in it.
+  for (const appId of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
+    assert.equal(checkAppConfig(cfg({ appId }), accessOk).usable, true, appId);
+  }
+  assert.equal(
+    checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
+    true,
+    'spaces are legal in a path and must not be refused',
+  );
+});
+
+test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
+  // The docstring calls its list "the whole of the claim", so the path check has
+  // to implement the whole of it. It excluded ALL whitespace via a comment about
+  // spaces being legal — true of U+0020 and of nothing else in the group. NBSP
+  // and the ideographic space fell through to "the key is not readable (ENOENT)",
+  // which is the message this function suppresses for `\r` for the same reason:
+  // it points at the visible half of a value whose problem is the invisible half.
+  const nonSpaceWhitespace = {
+    'U+00A0 NO-BREAK SPACE': ' ',
+    'U+2007 FIGURE SPACE': ' ',
+    'U+3000 IDEOGRAPHIC SPACE': '　',
+    'U+2028 LINE SEPARATOR': ' ',
+    'U+0009 TAB': '\t',
+  };
+  for (const [name, ch] of Object.entries(nonSpaceWhitespace)) {
+    const { usable, warning } = checkAppConfig(
+      cfg({ privateKeyPath: `/k.pem${ch}` }),
+      accessFailing('ENOENT'),
+    );
+    assert.equal(usable, false, name);
+    assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
+    assert.doesNotMatch(warning, /not readable/, `${name}: the misleading ENOENT must be suppressed`);
+  }
+
+  // …and the one exception stays exactly one character wide.
+  assert.equal(
+    checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
+    true,
+    'U+0020 is the only whitespace a path may contain',
+  );
 });
