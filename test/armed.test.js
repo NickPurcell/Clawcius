@@ -37,10 +37,16 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
-import { ArmedWaker, composeWatchMail, composeReminderMail } from '../dist/armed-wake.js';
+import {
+  ArmedWaker,
+  composeWatchMail,
+  composeReminderMail,
+  isPollFailurePermanent,
+  MAX_CONSECUTIVE_POLL_FAILURES,
+} from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
-import { quoteExternal, MAX_EXTERNAL_CHARS } from '../dist/github.js';
+import { quoteExternal, MAX_EXTERNAL_CHARS, GitHubError } from '../dist/github.js';
 
 /** A board on disk, so a second process can be simulated by a second store. */
 function board() {
@@ -473,7 +479,16 @@ test('a watch armed only for reviews still announces its own end', async () => {
   registry.close();
 });
 
-test('a poll that cannot reach GitHub disarms and says so, rather than going quiet', async () => {
+test('a transient poll failure is retried and the watch survives — THE 2026-08-23 INCIDENT', async () => {
+  // 06:24:08Z watch armed. 07:11:11Z a GitHub token rotation produced ONE 401
+  // and the watch was permanently disarmed. ~07:16Z the service restarted with
+  // a valid credential. The pull request was open, healthy and being actively
+  // reviewed throughout; a single retry would have survived the whole event.
+  //
+  // Worse, the mail tools were down in the same window, so the failure arrived
+  // when the owner could neither be told, nor re-arm, nor report it. The mail
+  // is the recovery mechanism and it runs on the same infrastructure — which is
+  // why a self-healing poll matters more than a well-worded failure mail.
   const { registry, mail, store } = board();
   store.arm(
     'hamachi-engineer1',
@@ -483,9 +498,9 @@ test('a poll that cannot reach GitHub disarms and says so, rather than going qui
     { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
   );
 
-  const broken = {
+  const rotating = {
     async getPullRequest() {
-      throw new Error('GitHub answered 401 for /repos/NickPurcell/Clawcius/pulls/44');
+      throw new GitHubError(401, 'Bad credentials');
     },
     async listReviews() {
       return [];
@@ -494,13 +509,106 @@ test('a poll that cannot reach GitHub disarms and says so, rather than going qui
       return [];
     },
   };
-  await new ArmedWaker({ store, registry, mail, github: broken, tickMs: 1000, log: () => {} }).tick();
+  const waker = new ArmedWaker({
+    store, registry, mail, github: rotating, tickMs: 1000, log: () => {},
+  });
 
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /DISARMED, the poll failed/);
-  assert.match(told.body, /401/);
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  await waker.tick();
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, 'one 401 must not disarm');
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'and must not mail — it may recover');
   registry.close();
+});
+
+test('a transient failure disarms only after the bound, and says how many', async () => {
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const down = {
+    async getPullRequest() {
+      throw new GitHubError(503, 'Service Unavailable');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+
+  for (let i = 1; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) {
+    await waker.tick();
+    assert.equal(store.listFor('hamachi-engineer1').length, 1, `failure ${i} must not disarm`);
+  }
+  await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'the bound must eventually apply');
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /DISARMED, the poll kept failing/);
+  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES} times in a row`));
+  assert.match(told.body, /503/);
+  registry.close();
+});
+
+test('a 404 disarms on the FIRST failure and says the target is gone', async () => {
+  // The distinction the old code could not draw, because `String(error)` ran
+  // one line before the decision that needed the status. A deleted pull request
+  // will not come back; retrying it four more times is four more minutes of
+  // pretending. The mail says the target is gone rather than that GitHub could
+  // not be reached, because those send the reader to different places.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 120 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const gone = {
+    async getPullRequest() {
+      throw new GitHubError(404, 'Not Found');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  await new ArmedWaker({
+    store, registry, mail, github: gone, tickMs: 1000, log: () => {},
+  }).tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /DISARMED, the target is gone/);
+  assert.match(told.body, /not there/);
+  // It must not claim to know WHICH of deletion or a permissions change it saw.
+  assert.match(told.body, /no longer visible/);
+  registry.close();
+});
+
+test('the classifier decides on status, and is driven by status rather than read', () => {
+  // Every case enumerated, because the whole defect was that this decision was
+  // being made on a string in which every status looked the same.
+  const permanent = [404, 410];
+  const transient = [401, 403, 408, 429, 500, 502, 503, 504];
+  for (const status of permanent) {
+    assert.equal(
+      isPollFailurePermanent(new GitHubError(status, 'x')), true, `${status} is about the TARGET`,
+    );
+  }
+  for (const status of transient) {
+    assert.equal(
+      isPollFailurePermanent(new GitHubError(status, 'x')), false,
+      `${status} is about the CREDENTIAL or the SERVICE, not the pull request`,
+    );
+  }
+  // No status at all: a timeout, a socket reset, a DNS failure, or the
+  // readFileSync that token-file.ts throws when a PEM is briefly unreadable
+  // during a key rotation (#182). None of them says anything about the PR.
+  assert.equal(isPollFailurePermanent(new Error('ETIMEDOUT')), false);
+  assert.equal(isPollFailurePermanent(Object.assign(new Error('x'), { code: 'ENOENT' })), false);
+  assert.equal(isPollFailurePermanent(undefined), false);
 });
 
 // ── 4. Seeing and withdrawing your own, and nobody else's (Clawcius #50) ────
