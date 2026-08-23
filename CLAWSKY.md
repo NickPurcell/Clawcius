@@ -541,8 +541,8 @@ captain talks to the crew. The poster's surface is the board, not the human.
 That allocation is a convention rather than a gate: nothing in `src/` checks a
 role before a *Discord* post, and `<coordinator>` in the shipped configs says
 so. Writing to the FEED is the exception and is genuinely enforced —
-`src/mail.ts` refuses a non-poster — which is the one place in this codebase
-where a role is a boundary rather than an expectation.
+`src/mail.ts` refuses a non-poster — which is a real boundary rather than an
+expectation.
 
 **OJ stays off the board.** Its workers read pull request diffs written by
 strangers, which makes it the one component in the system routinely handling
