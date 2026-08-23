@@ -42,6 +42,9 @@
  * correct and useless. **To check work you have already committed, pass the
  * merge base explicitly**, e.g. `node scripts/check-orphaned-docs.mjs origin/main`.
  *
+ * Runs correctly from any directory in the repository: paths are anchored to
+ * the toplevel rather than to cwd.
+ *
  * Exits 1 if any exported symbol lost its docs, 2 if the base ref does not
  * resolve. It never exits 0 on a question it could not ask.
  */
@@ -73,6 +76,24 @@ try {
   console.error(`  base ref does not resolve to a commit: ${base}`);
   process.exit(2);
 }
+
+// ANCHOR BOTH SIDES TO THE REPOSITORY ROOT, or they can disagree about which
+// file they mean. `readdirSync('src')` is cwd-relative; `git show <ref>:src/x.ts`
+// resolves against the root. Those agree only when cwd IS the root, and this
+// repository has a second TypeScript package -- `ops/`, with three filenames in
+// common with this one. Run from there, the old version read `ops/src/config.ts`
+// off disk, fetched the ROOT `src/config.ts` out of git, compared the exported
+// symbols of one file against those of an unrelated one, and reported:
+//
+//     ok -- 3 changed file(s), no exported symbol lost its documentation
+//
+// A clean pass on a comparison it never made -- the same failure as the bad-ref
+// case above, which is why the fix belongs beside it rather than in the loop.
+// This file's own promise is that it never exits 0 on a question it could not
+// ask, and asking the question of the wrong files is a way of not asking it.
+const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+  encoding: 'utf8',
+}).trim();
 
 /** Every exported declaration in `source`, mapped to how many JSDoc blocks it has. */
 function documentedSymbols(source, fileName) {
@@ -106,9 +127,9 @@ function documentedSymbols(source, fileName) {
   return found;
 }
 
-const files = readdirSync('src')
+const files = readdirSync(join(root, 'src'))
   .filter((f) => f.endsWith('.ts'))
-  .map((f) => join('src', f));
+  .map((f) => join('src', f)); // repo-relative, as `git show` wants
 
 let regressions = 0;
 let checked = 0;
@@ -116,11 +137,14 @@ let checked = 0;
 for (const file of files) {
   let before;
   try {
-    before = execFileSync('git', ['show', `${base}:${file}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    before = execFileSync('git', ['-C', root, 'show', `${base}:${file}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
   } catch {
     continue; // new file in this diff — nothing to have lost
   }
-  const after = readFileSync(file, 'utf8');
+  const after = readFileSync(join(root, file), 'utf8');
   if (before === after) continue;
 
   const was = documentedSymbols(before, file);
