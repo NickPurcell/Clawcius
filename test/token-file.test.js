@@ -16,7 +16,14 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { TokenFileRefresher, writeTokenFile } from '../dist/token-file.js';
+import {
+  TokenFileRefresher,
+  writeTokenFile,
+  writeCurlConfig,
+  removeCurlConfig,
+  netrcPath,
+  curlrcPath,
+} from '../dist/token-file.js';
 
 const dir = () => mkdtempSync(join(tmpdir(), 'clawsky-token-'));
 const silent = () => {};
@@ -314,4 +321,197 @@ test('the failure line promises a fallback only when there is one', async () => 
   assert.match(withPat.join('\n'), /fall back to GITHUB_TOKEN/);
   assert.doesNotMatch(withoutPat.join('\n'), /fall back to/);
   assert.match(withoutPat.join('\n'), /GITHUB_TOKEN is not set either/);
+});
+
+// ── the curl credential, and the one assertion whose absence would cost ─────
+
+test('the netrc is scoped to exactly one machine, and that machine is api.github.com', () => {
+  // THE ONLY SAFETY PROPERTY A NETRC HAS IS ITS SCOPE. `machine api.github.com`
+  // attaches the credential to that host and nothing else — confirmed by hand
+  // including across `curl -L`, which does not carry it to a redirect target.
+  //
+  // A `default` entry, or a second `machine` line, silently hands the App token
+  // to any host an agent curls, and nothing downstream would notice: the file
+  // is still well-formed, curl still works, every test still passes. This is
+  // the assertion whose absence would cost something.
+  const d = dir();
+  writeCurlConfig(d, 'ghs_installation_token');
+  const netrc = readFileSync(netrcPath(d), 'utf8');
+
+  const machines = netrc.split('\n').filter((l) => /^\s*machine\s/.test(l));
+  assert.equal(machines.length, 1, `expected exactly one machine line, got: ${machines.join(' | ')}`);
+  assert.match(machines[0], /^machine api\.github\.com$/);
+  assert.doesNotMatch(netrc, /^\s*default\b/m, 'a default entry would match every host');
+});
+
+test('the curl credential is 0600 and holds the token it was given', () => {
+  const d = dir();
+  writeCurlConfig(d, 'ghs_installation_token');
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password ghs_installation_token/);
+  assert.equal(statSync(netrcPath(d)).mode & 0o777, 0o600);
+  // `netrc-optional`, not `netrc`: a missing file must not make every unrelated
+  // curl in the container fail.
+  const curlrc = readFileSync(curlrcPath(d), 'utf8');
+  assert.match(curlrc, /^netrc-optional$/m);
+  // QUOTED. curl terminates an unquoted parameter at the first space, so a
+  // directory containing one would silently disable the credential and warn on
+  // every curl in the container.
+  assert.match(curlrc, new RegExp(`netrc-file = "${netrcPath(d)}"`));
+});
+
+test('a refresh keeps the netrc in step with the token file', async () => {
+  // Drift between the two is the defect this module exists to prevent, one
+  // directory over: git pushing with this hour's token while curl posts with
+  // last hour's would be two credentials to reason about instead of one.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  let n = 0;
+  const r = new TokenFileRefresher({
+    path,
+    provider: async () => `tok-${++n}`,
+    log: silent,
+    onToken: (t) => writeCurlConfig(d, t),
+  });
+  await r.start();
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password tok-1/);
+
+  await r.refreshNow();
+  assert.equal(readFileSync(path, 'utf8'), 'tok-2');
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password tok-2/, 'netrc must follow the token');
+  r.stop();
+});
+
+test('giving up on the installation token falls back to the PAT rather than leaving nothing', async () => {
+  // FALLBACK AT THE WRITER. Curl cannot do the git helper's
+  // file-first/environment-second ordering — with no netrc it sends nothing and
+  // takes a 401 rather than falling back. So when the installation token is
+  // given up on, the netrc is rewritten with the PAT if there is one.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  let clock = 1_000_000;
+  let calls = 0;
+  const r = new TokenFileRefresher({
+    path,
+    now: () => clock,
+    log: silent,
+    provider: async () => {
+      calls += 1;
+      if (calls === 1) return 'ghs_app';
+      throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+    },
+    onToken: (t) => writeCurlConfig(d, t),
+    onNoToken: () => writeCurlConfig(d, 'ghp_the_pat'),
+  });
+
+  await r.start();
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password ghs_app/);
+
+  clock += 56 * 60_000;
+  await r.refreshNow();
+  assert.equal(existsSync(path), false, 'the dead installation token must go');
+  assert.match(
+    readFileSync(netrcPath(d), 'utf8'),
+    /password ghp_the_pat/,
+    'and the netrc must hold the credential that still works, not nothing',
+  );
+  r.stop();
+});
+
+test('a path with a space still yields a usable curlrc', () => {
+  // The failure this quoting prevents is silent twice over: curl stops reading
+  // the parameter at the space, `netrc-optional` then means no error, and the
+  // agent gets a 401 from GitHub with nothing saying why — while every unrelated
+  // curl in the container prints an unquoted-whitespace warning, because
+  // CURL_HOME makes this file global.
+  const d = mkdtempSync(join(tmpdir(), 'clawsky tok-'));
+  writeCurlConfig(d, 'ghs_tok');
+  const curlrc = readFileSync(curlrcPath(d), 'utf8');
+  const line = curlrc.split('\n').find((l) => l.startsWith('netrc-file'));
+  assert.match(line, /^netrc-file = ".*"$/, `unquoted path would break: ${line}`);
+  assert.ok(line.includes(d), 'and it must still be the right path');
+});
+
+test('stop() clears the curl credential rather than replacing it with the PAT', async () => {
+  // stop() called onNoToken, which writes whichever credential is IN FORCE — so
+  // for an App-plus-PAT deployment a clean shutdown INSTALLED the PAT into the
+  // directory it exists to clear: an hour-lived credential swapped for one that
+  // never expires and that nothing removes. Which credential is in force is the
+  // running daemon's business; a stopped one leaves nothing.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  const r = new TokenFileRefresher({
+    path,
+    provider: async () => 'ghs_app',
+    log: silent,
+    onToken: (t) => writeCurlConfig(d, t),
+    onNoToken: () => writeCurlConfig(d, 'ghp_the_pat'),
+    onStop: () => removeCurlConfig(d),
+  });
+  await r.start();
+  assert.ok(existsSync(netrcPath(d)));
+
+  r.stop();
+  assert.equal(existsSync(path), false, 'the token file goes, as before');
+  assert.equal(existsSync(netrcPath(d)), false, 'and so must the curl credential');
+});
+
+test('a failing curl write does not delete a healthy token or blame the provider', async () => {
+  // onToken sat inside #write's try, before the bookkeeping. So a throw from the
+  // SECOND consumer was attributed to the FIRST: a token that had been obtained
+  // and written was deleted, and the operator was told "could not obtain an
+  // installation token" — naming the wrong subsystem, in a module whose logging
+  // section is careful about exactly that.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  const logs = [];
+  let clock = 1_000_000;
+  const r = new TokenFileRefresher({
+    path,
+    now: () => clock,
+    log: (m) => logs.push(m),
+    provider: async () => 'ghs_healthy',
+    onToken: () => {
+      throw Object.assign(new Error('no space'), { code: 'ENOSPC' });
+    },
+  });
+
+  await r.start();
+  assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'the token was obtained and written');
+  assert.match(logs.join('\n'), /curl credential could not be written \(ENOSPC\)/);
+  // …and it must not promise a fallback that does not exist. With no netrc curl
+  // sends nothing and takes a 401; the credential is unchanged, not replaced.
+  assert.match(logs.join('\n'), /it is UNCHANGED/);
+  assert.doesNotMatch(logs.join('\n'), /fall back/);
+  assert.doesNotMatch(logs.join('\n'), /could not obtain an installation token/);
+
+  // …and an hour on, the token file is still healthy. What this proves is that
+  // `#write` no longer THROWS, so the staleness branch is never reached at all —
+  // not that the clock advanced. It cannot have: the provider returns a constant,
+  // so `token !== #lastToken` is false and `#mintedAtMs` is deliberately not
+  // re-stamped, per the caching-provider comment. Right assertion, and the
+  // reason first attached to it was wrong.
+  clock += 56 * 60_000;
+  await r.refreshNow();
+  assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'still healthy an hour on');
+  r.stop();
+});
+
+test('a throwing onNoToken cannot escape the tick', async () => {
+  // #tick runs as `void this.#tick()` from a timer, so a throw out of its catch
+  // is an unhandled rejection and Node turns that into an uncaught exception.
+  // From start() it would be a throw out of main()'s await — the daemon-wide
+  // restart loop this module deliberately stopped doing.
+  const d = dir();
+  const r = new TokenFileRefresher({
+    path: join(d, 'installation-token'),
+    log: silent,
+    provider: async () => {
+      throw Object.assign(new Error('nope'), { code: 'ECONNRESET' });
+    },
+    onNoToken: () => {
+      throw Object.assign(new Error('read-only'), { code: 'EROFS' });
+    },
+  });
+  await r.start();   // must not throw
+  r.stop();          // nor must this
 });

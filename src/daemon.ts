@@ -64,7 +64,12 @@ import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
 import type { TokenProvider } from './github-app.js';
 import { appTokenProvider, checkAppConfig } from './github-app.js';
-import { TokenFileRefresher, tokenFilePath } from './token-file.js';
+import {
+  TokenFileRefresher,
+  tokenFilePath,
+  writeCurlConfig,
+  removeCurlConfig,
+} from './token-file.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -755,6 +760,25 @@ export async function main(): Promise<void> {
           provider: appProvider,
           log: (message) => process.stderr.write(`${message}\n`),
           hasFallbackToken: Boolean(config.github.token),
+          // Keep the REST credential in step with the git one. Written here
+          // rather than by a second timer so there is one provider, one cache
+          // and one moment at which the crew's credential changes.
+          onToken: (token) => writeCurlConfig(config.agent.container.githubTokenDir, token),
+          // FALLBACK AT THE WRITER, which is where it has to live. Curl cannot
+          // do the git helper's file-first/environment-second ordering: with no
+          // netrc it sends nothing and takes a 401 rather than falling back.
+          // So when the installation token is given up on, the netrc is
+          // rewritten with the PAT if there is one — and only removed when
+          // there is no credential at all to serve.
+          // Shutdown clears rather than falls back: see `stop()`.
+          onStop: () => removeCurlConfig(config.agent.container.githubTokenDir),
+          onNoToken: () => {
+            if (config.github.token) {
+              writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
+            } else {
+              removeCurlConfig(config.agent.container.githubTokenDir);
+            }
+          },
         });
         // Awaited so the file exists before any session spawns, but a failure
         // does NOT stop startup — `start()` logs and retries. Throwing here put
@@ -782,6 +806,31 @@ export async function main(): Promise<void> {
           'the container.\n',
       );
     }
+  }
+
+  // THE PAT-ONLY DEPLOYMENT, which is Clawcius and which must not change. The
+  // refresher only runs when an App is usable, so without this a crew with no
+  // App has no netrc — and bare curl then sends nothing and takes a 401, where
+  // before it used $GITHUB_TOKEN and worked. Curl cannot do the git helper's
+  // file-first/environment-second ordering, so the choice of credential is made
+  // here, once, rather than at each call.
+  //
+  // Also covers `clawsky.enabled: false` and `armed.enabled: false`, where the
+  // whole block above is skipped and agents still make REST calls.
+  if (!tokenFileRefresher && config.github.token) {
+    writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
+    // "(no App credential in use)", not "(no App configured)". Three deployments
+    // reach this line and the old wording was false in two of them: an App that
+    // is configured but unusable, where `checkAppConfig` has just named the
+    // failing variable and this contradicted it one line later; and an App that
+    // is fully configured with `clawsky` or `armed` disabled, where `armedStore`
+    // is null so the check never runs and NOTHING contradicts it — an operator
+    // debugging why their App is not in use reads that it is not configured, and
+    // goes to check a configuration that is already correct.
+    //
+    // This line knows exactly one fact: nothing is refreshing an installation
+    // token. That is what it says now, and it is true in all three.
+    process.stderr.write('[armed] agent REST calls use GITHUB_TOKEN (no App credential in use)\n');
   }
 
   const armedTools = armedStore
@@ -1101,6 +1150,42 @@ export async function main(): Promise<void> {
       clearInterval(windowSweeper);
       bundler.flushAll();
       tokenFileRefresher?.stop();
+      // AND THE BRANCH WITH NO REFRESHER TO HANG IT ON. The PAT-only path writes
+      // a netrc at startup and has no `stop()` to clear it, so a non-expiring
+      // credential sat in the bind-mounted directory across every shutdown and
+      // redeploy — indefinitely. That is the exposure `stop()`'s own principle
+      // rejects for the installation token, which at least has an hour's fuse.
+      // Rewritten at the next startup either way; this only shrinks the window,
+      // which is the same thing `stop()` is for.
+      // GUARDED, and this is the one place on this branch where a guard beats
+      // letting it fail. `shutdown()`'s `finally` is `process.exit(0)`, so a
+      // throw here skips `sessions.shutdown()`, `registry.close()` and
+      // `client.destroy()` — and the daemon still exits 0, reporting a clean
+      // shutdown while having released no live session. The failure is not
+      // visible, it is SILENCED, and a guard is the only way the real problem
+      // gets to be seen at all.
+      //
+      // `force` swallows ENOENT and nothing else: a directory at that path
+      // throws EISDIR, an unwritable parent throws EACCES. `writeSecretFile`'s
+      // header names the first case exactly, because that throw took the daemon
+      // down at boot once already.
+      //
+      // AND IT LOGS RATHER THAN SWALLOWING. `removeOnShutdown` two lines up is
+      // silent because a stale status file expires on its own; a netrc that
+      // could not be removed is a live credential still on disk after shutdown,
+      // which is the thing this branch exists to prevent. Silence would be the
+      // wrong half of the neighbour's pattern.
+      if (!tokenFileRefresher) {
+        try {
+          removeCurlConfig(config.agent.container.githubTokenDir);
+        } catch (error) {
+          const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
+          process.stderr.write(
+            `[clawcius] could not remove the curl credential on shutdown (${code}); ` +
+              'a usable token may remain on disk. Shutdown continues.\n',
+          );
+        }
+      }
       await sessions.shutdown();
       registry.close();
       await client.destroy();

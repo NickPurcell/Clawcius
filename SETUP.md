@@ -385,14 +385,37 @@ The fallback is deliberate, for the reason above: a crew that cannot reach GitHu
 is worse than one reaching it as the older identity. But it means a mistyped path
 leaves you running as the older identity with everything apparently working, and
 **the startup line is the only place that says so** — so read it after changing
-any of them. A deployment with neither variable set is unchanged and silent,
-which is how Clawcius keeps working.
+any of them. A deployment with neither variable set still falls back to
+`GITHUB_TOKEN`, which is how Clawcius keeps working — but it is no longer
+*silent* and no longer *unchanged*. It writes the two curl files described below,
+sets `CURL_HOME`, prints one startup line saying no App credential is in use, and
+removes the netrc at shutdown. The credential and the identity are exactly as
+before; the plumbing around them is not.
 
-### Agent sessions and the App
+### Agent sessions and the API
 
-With an App configured, the daemon also keeps **one** file holding a current
-installation token, at `<container.githubTokenDir>/installation-token`, mode
-`0600`. The **file** is rewritten every five minutes; the **token** in it is
+**Read this even if you have no App.** Most of what follows applies to every
+deployment — the `netrc`, the `.curlrc`, `CURL_HOME` and the removal at shutdown
+all exist whether or not an App is configured. What an App changes is *which
+credential* those files hold, an installation token instead of the PAT, and
+nothing else about the mechanism.
+
+This heading used to end "…and the App", which meant an operator running a
+PAT-only deployment reasonably read past the only description of four things
+their daemon had started doing.
+
+The daemon keeps a `netrc` and a `.curlrc` in `<container.githubTokenDir>`, mode
+`0600`, holding **whichever credential this deployment uses** — an installation
+token where an App is configured and usable, the `GITHUB_TOKEN` otherwise.
+`CURL_HOME` points at that directory, so a bare
+`curl https://api.github.com/...` from an agent is already authenticated. An
+explicit `-H "Authorization: …"` replaces that credential with whatever the
+header holds, so passing one opts out.
+
+**With an App**, a third file sits beside them —
+`<container.githubTokenDir>/installation-token`, also mode `0600` — which is what
+the git credential helper reads, and which the daemon refreshes because an
+installation token expires in an hour. The **file** is rewritten every five minutes; the **token** in it is
 minted roughly hourly, because the provider caches until shortly before expiry.
 The agents' git credential helper reads that file instead of
 an environment variable.
@@ -426,15 +449,18 @@ makes the daemon fail at boot.
 Reading it is not a new exposure: every process in the container already runs as
 uid 1000 `agent` and can read `/proc/1/environ`. It is wider in one way — a file
 outlives the container where an env var does not — and that is bounded by
-`docker/snapshot.sh` using `docker commit`, which excludes mounts. The file is
-removed on a clean shutdown.
+`docker/snapshot.sh` using `docker commit`, which excludes mounts. The netrc and the
+installation-token file are removed on a clean shutdown, and the netrc is
+deliberately not replaced by the PAT there: a stopped daemon leaves nothing. The
+`.curlrc` stays — it holds no credential, only a path, and `netrc-optional` means
+it does no harm pointing at a file that is gone.
 
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the
 next restart. The PEM should be `0600` and owned by the service user.
 
 **This is not only the waker's identity any more.** It was, until agents began
-reading the same credential from a file — see *Agent sessions and the App* above.
+reading the same credential from a file — see *Agent sessions and the API* above.
 `GITHUB_TOKEN` still reaches the container through `--env-file` and is still what
 the helper falls back to when no credential file exists, which is what keeps a
 half-configured App from breaking every push.
