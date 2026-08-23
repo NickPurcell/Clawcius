@@ -569,12 +569,26 @@ test('the boundary of the invisible-character class is pinned, so widening it is
   // U+180E is category Cf and IS caught, which is the boundary itself: the class
   // is defined by what the characters ARE, not by a hand-listed set.
   //
-  // `accessOk` IS LOAD-BEARING HERE — do not "harmonise" it with the
-  // `accessFailing('ENOENT')` used by the path tests below. If `INVISIBLE` ever
-  // stopped matching U+180E, control would fall through to the `access` branch;
-  // with `accessOk` that yields `usable: true` and this assertion fails, which
-  // is the point. With a failing `access` it would yield `usable: false` and the
-  // assertion would pass for the wrong reason, silently.
+  // `accessOk` IS LOAD-BEARING ON BOTH LINES — do not "harmonise" either with
+  // the `accessFailing('ENOENT')` that the other path tests in this file use.
+  // Under a failing `access` both assertions go green for the wrong reason,
+  // silently, by two different routes:
+  //
+  //   path:  if `INVISIBLE` stopped matching U+180E, control would fall through
+  //          to the `access` branch, and a failing one yields `usable: false`
+  //          — the answer this asserts, arrived at without the regex.
+  //   appId: the App ID check never reaches `access` at all. What protects that
+  //          line is `cfg()`'s default `privateKeyPath`, which a failing
+  //          `access` would fault into `usable: false` regardless of the App ID.
+  //
+  // Same conclusion, different mechanism. Stated separately because a reader who
+  // checks the appId line against the path's mechanism finds it does not apply,
+  // and could reasonably conclude the warning is over-broad there — which is
+  // exactly the edit that breaks it.
+  //
+  // NO DIRECTIONS. This is the third locator in this test to be written as
+  // "above" or "below" and the second to point the wrong way; the file moves and
+  // the direction does not move with it. Name things instead.
   assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
   assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
 });
