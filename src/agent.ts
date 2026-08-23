@@ -341,6 +341,8 @@ export class AgentSession {
    * session read any mailbox.
    */
   #mcpServers: Record<string, McpServerConfig> | null;
+  /** Per-role model override; undefined means use `model` from config. */
+  #model: string | undefined;
   #consuming: Promise<void> | null = null;
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
@@ -400,11 +402,22 @@ export class AgentSession {
     resumeSessionId: string | undefined,
     events: AgentEvents,
     mcpServers: Record<string, McpServerConfig> | null = null,
+    /**
+     * This session's model, already resolved from the agent's role by
+     * `acquire`. Undefined falls back to `model` — so a caller that predates
+     * `modelByRole`, and every role with no override, behaves exactly as before.
+     *
+     * Resolved by the caller rather than read here, because the role lives on
+     * the registry row and this class deliberately knows nothing about the
+     * registry.
+     */
+    model?: string,
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
     this.#events = events;
     this.#mcpServers = mcpServers;
+    this.#model = model;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
@@ -418,7 +431,7 @@ export class AgentSession {
   #buildOptions(resumeSessionId: string | undefined): Options {
     const options: Options = {
       cwd: this.workspacePath,
-      model: config().agent.model,
+      model: this.#model ?? config().agent.model,
       systemPrompt: buildSystemPrompt(),
       // Required for the discord-cli skill to load at all. The SDK defaults to
       // isolation mode, where no filesystem settings — and therefore no skills
@@ -724,6 +737,18 @@ export class AgentSession {
   }
 }
 
+/**
+ * What a channel with no registry row resolves to.
+ *
+ * Exported because `!status` has to answer the same question `#identityFor`
+ * answers, and answer it the same way: it reports the model a channel would run
+ * on, which is resolved from the role, which for a channel that has not taken a
+ * turn yet is this. Two copies of the constant would put `!status` back to
+ * reporting one model while the next turn ran on another — the defect it was
+ * just fixed for, arriving by the route the fix opened.
+ */
+export const DEFAULT_CHANNEL_ROLE = 'coordinator' as const;
+
 export class SessionManager {
   #sessions = new Map<string, AgentSession>();
   #registry: AgentRegistry;
@@ -795,7 +820,7 @@ export class SessionManager {
     }
     return {
       crew: config().agent.clawsky.crew,
-      role: 'coordinator',
+      role: DEFAULT_CHANNEL_ROLE,
       workspacePath,
       spawnedBy: null,
     };
@@ -885,8 +910,9 @@ export class SessionManager {
     resumeSessionId: string | undefined,
     events: AgentEvents,
     mcpServers: Record<string, McpServerConfig> | null,
-  ) => AgentSession = (channelId, workspacePath, resumeSessionId, events, mcpServers) =>
-    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers);
+    model: string | undefined,
+  ) => AgentSession = (channelId, workspacePath, resumeSessionId, events, mcpServers, model) =>
+    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model);
 
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
@@ -971,6 +997,10 @@ export class SessionManager {
             ],
           )
         : null,
+      // Resolved from the ROW's role, not from the id or the caller. A role
+      // with no entry gets undefined and falls back to `model`, so the default
+      // deployment is unchanged by this existing at all.
+      config().agent.modelByRole[identity.role],
     );
 
     session.onBusyChanged = () => this.onCountsChanged();

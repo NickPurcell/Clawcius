@@ -433,7 +433,7 @@ warning with them. See `src/github.ts`.
 
 ## Roles
 
-Four: **coordinator**, **engineer**, **researcher**, **poster**.
+Five: **coordinator**, **engineer**, **researcher**, **poster**, **updater**.
 
 | role        | DMs                                                        | feed  | subagents |
 | ----------- | ---------------------------------------------------------- | ----- | --------- |
@@ -441,8 +441,17 @@ Four: **coordinator**, **engineer**, **researcher**, **poster**.
 | engineer    | avoids colliding with other engineers; worktree coordination | read  | yes       |
 | researcher  | rarely                                                     | read  | yes       |
 | poster      | receives `@`s and routes them inward                        | write | no        |
+| updater     | polls the agents whose tasks it tracks; briefed by the coordinator | read | no |
 
-A fifth value exists in the registry and is not a crew role: **`host`**. It
+`updater` keeps one Discord message current — a task list it edits in place
+rather than reposting — and is the one role other than the coordinator that
+writes to a channel. It is also the reason `modelByRole` exists: it runs on
+Haiku while the crew runs on Opus, because rewriting four lines on a timer is
+mechanical. An `<updater-agent>` existed here from the initial commit until #44
+removed it along with the Task-tool mechanism it was built on; this is the
+function rebuilt on the mechanism that replaced it.
+
+A sixth value exists in the registry and is not a crew role: **`host`**. It
 belongs to the one participant that is not in a container, has no session to
 resume and is never woken by a waker. It is a role rather than a naming
 convention because two rules key off it and neither should be a string

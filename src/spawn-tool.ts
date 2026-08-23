@@ -65,8 +65,8 @@
  * is not belt-and-braces: the row is the truth, roles can be edited, and the
  * check that matters is the one made against the row at the moment of the call.
  *
- * `engineer`, `researcher` and `poster` can be spawned. `coordinator` and
- * `host` cannot, and the line is privilege rather than taste — those are the
+ * `engineer`, `researcher`, `poster` and `updater` can be spawned. `coordinator`
+ * and `host` cannot, and the line is privilege rather than taste — those are the
  * two roles mail policy treats specially. A coordinator is the only role that
  * may DM the host agent, which is the only access control on running commands
  * on the VPS, and `host` is a row the ops executor claims from outside every
@@ -136,7 +136,12 @@ import type { AgentRegistry, AgentRole } from './store.js';
  * `coordinator` and `host` are absent on purpose — see the header. This is the
  * one list to change if the operator decides otherwise.
  */
-export const SPAWNABLE_ROLES: readonly AgentRole[] = ['engineer', 'researcher', 'poster'];
+export const SPAWNABLE_ROLES: readonly AgentRole[] = [
+  'engineer',
+  'researcher',
+  'poster',
+  'updater',
+];
 
 /** Refused above this. Instructions are a brief, not a payload. */
 const MAX_INSTRUCTIONS_CHARS = 16_000;
@@ -267,6 +272,16 @@ function describeSpawn(agentId: string): string {
     'you already have is a DM, not another spawn — keep the engineer who already has',
     'the context for that domain. Researchers are the ones it is reasonable to spawn',
     'freely; engineers are not.',
+    '',
+    'AN UPDATER IS WORTH SPAWNING WHEN A TASK IS LONG ENOUGH THAT THE USER WOULD',
+    'OTHERWISE WONDER. It keeps one message current — a short task list, edited in',
+    'place — so the work is visible without you narrating it. Spawn one, then DM it',
+    'the list; it learns what to track from that DM and from nothing else, so a spawn',
+    'without one leaves it idle and correct and useless. One per crew is enough: a',
+    'second updater owns a second message, which is the thing the role exists to',
+    'avoid. It is also the role `modelByRole` exists for — on a deployment that',
+    'configures one it is the cheapest agent you have. For work that finishes in a',
+    'turn or two, do not bother; the list would be stale before anyone read it.',
     '',
     'No POLICY limits how many you may spawn — there is no quota, no throttle and no',
     'cooldown, and the cost is made visible instead: a line in the journal per spawn,',

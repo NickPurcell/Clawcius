@@ -10,9 +10,8 @@
  *
  * Types, not roles: the categorical hues belong to `general-purpose`,
  * `Explore` and `workflow-subagent`, which are how a subagent was spawned. A
- * CREW role — engineer, researcher, coordinator, poster, host — is never a
- * colour here, because there is no palette that can say "engineer" and because
- * the two were confusable enough already.
+ * CREW role is never a colour here, because there is no palette that can say
+ * "engineer" and because the two were confusable enough already.
  *
  * Status colour never carries meaning alone: every liveness dot is accompanied
  * by its word ("running", "idle", "stale"), and every swimlane bar sits on a
@@ -754,9 +753,10 @@ a.chip:hover {
   font-style: italic;
 }
 
-/* The crew role, on the front page and on an agent's card. One weight for all
-   five values: colouring engineer differently from researcher would invent a
-   hierarchy the system does not have. */
+/* The crew role, on the front page and on an agent's card. One weight for every
+   value, however many there are: colouring engineer differently from researcher
+   would invent a hierarchy the system does not have, and pinning the count here
+   only guarantees this comment goes stale the next time a role is added. */
 .chip[data-role] {
   color: var(--ink);
   border-color: var(--baseline);
