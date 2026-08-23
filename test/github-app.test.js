@@ -898,3 +898,26 @@ test('a Windows line ending is not explained by a rule it does not satisfy', () 
   assert.doesNotMatch(out, /above U\+00FF/);
   assert.match(out, /cannot contain a newline, a carriage return or a NUL/);
 });
+
+test('the paste-from-a-document characters are named, not just numbered', () => {
+  // U+200B is named as the paste-from-a-web-page artifact. These are the other
+  // half of the same story -- what a word processor substitutes as you type --
+  // and they are the exact characters the detector was silent about before the
+  // filter widened. A bare codepoint is a correct claim the operator then has
+  // to go and look up; the table exists to remove that step.
+  const family = [
+    ['\u2018', /curly left quote/],
+    ['\u2019', /curly right quote/],
+    ['\u201c', /curly left quote/],
+    ['\u201d', /curly right quote/],
+    ['\u2013', /en dash/],
+    ['\u2014', /em dash/],
+    ['\u2026', /ellipsis/],
+  ];
+  for (const [ch, name] of family) {
+    const out = describeTokenShape('ghp_abcd' + ch + 'efgh');
+    assert.match(out, name, `U+${ch.codePointAt(0).toString(16)} lost its name`);
+    // Still diagnosed correctly, not merely named.
+    assert.match(out, /throws before anything is sent/);
+  }
+});

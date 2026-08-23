@@ -328,6 +328,17 @@ const CHARACTER_NAMES: Record<number, string> = {
   0x200d: '(a zero-width joiner)',
   0x2060: '(a word joiner)',
   0xfeff: '(a byte-order mark, as a UTF-8 BOM leaves at the front of a file)',
+  // What a word processor or a web page substitutes as you type. These are
+  // the paste-from-a-document artifacts, and they are the half this table
+  // used to be silent about -- not invisible, but nobody reads an opaque
+  // forty-character credential closely enough to see one.
+  0x2018: "(a curly left quote, as a document substitutes for ')",
+  0x2019: "(a curly right quote, as a document substitutes for ')",
+  0x201c: '(a curly left quote, as a document substitutes for ")',
+  0x201d: '(a curly right quote, as a document substitutes for ")',
+  0x2013: '(an en dash, as a document substitutes for -)',
+  0x2014: '(an em dash, as a document substitutes for --)',
+  0x2026: '(an ellipsis, as a document substitutes for ...)',
 };
 
 /**
@@ -512,8 +523,8 @@ export function describeTokenShape(token: string): string | null {
   const cannotBeSent =
     worst.code > 0xff
       ? 'A character above U+00FF cannot go into an HTTP header at all.'
-      : 'An HTTP header value cannot contain a newline, a carriage return or a NUL, ' +
-        'wherever in the value it sits.';
+      : 'An HTTP header value cannot contain a newline, a carriage return or a ' +
+        'NUL at any position.';
 
   const symptom: Record<Outcome, string> = {
     tolerated:
