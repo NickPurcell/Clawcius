@@ -41,7 +41,7 @@ import {
   ArmedWaker,
   composeWatchMail,
   composeReminderMail,
-  isPollFailurePermanent,
+  classifyPollFailure,
   MAX_CONSECUTIVE_POLL_FAILURES,
 } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
@@ -479,6 +479,21 @@ test('a watch armed only for reviews still announces its own end', async () => {
   registry.close();
 });
 
+/**
+ * A `GitHubError` shaped like the one `GitHubClient.#get` actually throws.
+ *
+ * The first version of these tests built `new GitHubError(503, 'Service
+ * Unavailable')` by hand and then asserted the mail contained "503" — which it
+ * only did because the code under test was prefixing the status back on. The
+ * real client already puts it in the message (`github.ts:190`), so the prefix
+ * was a stutter and the tests were validating a string production never emits.
+ */
+const githubError = (status, body) =>
+  new GitHubError(
+    status,
+    `GitHub answered ${status} for /repos/NickPurcell/Clawcius/pulls/44: ${body}`,
+  );
+
 test('a transient poll failure is retried and the watch survives — THE 2026-08-23 INCIDENT', async () => {
   // 06:24:08Z watch armed. 07:11:11Z a GitHub token rotation produced ONE 401
   // and the watch was permanently disarmed. ~07:16Z the service restarted with
@@ -500,7 +515,7 @@ test('a transient poll failure is retried and the watch survives — THE 2026-08
 
   const rotating = {
     async getPullRequest() {
-      throw new GitHubError(401, 'Bad credentials');
+      throw githubError(401, 'Bad credentials');
     },
     async listReviews() {
       return [];
@@ -530,7 +545,7 @@ test('a transient failure disarms only after the bound, and says how many', asyn
   );
   const down = {
     async getPullRequest() {
-      throw new GitHubError(503, 'Service Unavailable');
+      throw githubError(503, 'Server Error');
     },
     async listReviews() { return []; },
     async listComments() { return []; },
@@ -553,7 +568,7 @@ test('a transient failure disarms only after the bound, and says how many', asyn
   registry.close();
 });
 
-test('a 404 disarms on the FIRST failure and says the target is gone', async () => {
+test('a 404 disarms on the SECOND consecutive failure, not the first', async () => {
   // The distinction the old code could not draw, because `String(error)` ran
   // one line before the decision that needed the status. A deleted pull request
   // will not come back; retrying it four more times is four more minutes of
@@ -564,19 +579,25 @@ test('a 404 disarms on the FIRST failure and says the target is gone', async () 
     'hamachi-engineer1',
     'pr-watch',
     Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 120 },
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
     { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
   );
   const gone = {
     async getPullRequest() {
-      throw new GitHubError(404, 'Not Found');
+      throw githubError(404, 'Not Found');
     },
     async listReviews() { return []; },
     async listComments() { return []; },
   };
-  await new ArmedWaker({
+  const waker = new ArmedWaker({
     store, registry, mail, github: gone, tickMs: 1000, log: () => {},
-  }).tick();
+  });
+  await waker.tick();
+  assert.equal(
+    store.listFor('hamachi-engineer1').length, 1,
+    'one 404 may be an installation token that cannot see the repo yet',
+  );
+  await waker.tick();
 
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
   const [told] = mail.unread('hamachi-engineer1');
@@ -590,25 +611,33 @@ test('a 404 disarms on the FIRST failure and says the target is gone', async () 
 test('the classifier decides on status, and is driven by status rather than read', () => {
   // Every case enumerated, because the whole defect was that this decision was
   // being made on a string in which every status looked the same.
-  const permanent = [404, 410];
-  const transient = [401, 403, 408, 429, 500, 502, 503, 504];
-  for (const status of permanent) {
-    assert.equal(
-      isPollFailurePermanent(new GitHubError(status, 'x')), true, `${status} is about the TARGET`,
-    );
-  }
-  for (const status of transient) {
-    assert.equal(
-      isPollFailurePermanent(new GitHubError(status, 'x')), false,
+  //
+  // 410 is unambiguous — the resource was here and is deliberately gone — so
+  // one failure is enough. 404 is NOT unambiguous on this repository: the waker
+  // authenticates with a GitHub App installation token, and GitHub answers 404
+  // rather than 403 for a repository an installation cannot see. A token minted
+  // mid-reconfiguration therefore produces a 404 about a pull request that
+  // exists, which is the same class of event as the 401 this change was written
+  // for, wearing the status that means permanent. Two consecutive costs one
+  // poll interval and covers the rotation window.
+  assert.deepEqual(classifyPollFailure(new GitHubError(410, 'x')), { bound: 1, cause: 'gone' });
+  assert.deepEqual(classifyPollFailure(new GitHubError(404, 'x')), { bound: 2, cause: 'gone' });
+
+  for (const status of [401, 403, 408, 429, 500, 502, 503, 504]) {
+    assert.deepEqual(
+      classifyPollFailure(new GitHubError(status, 'x')),
+      { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' },
       `${status} is about the CREDENTIAL or the SERVICE, not the pull request`,
     );
   }
+
   // No status at all: a timeout, a socket reset, a DNS failure, or the
   // readFileSync that token-file.ts throws when a PEM is briefly unreadable
   // during a key rotation (#182). None of them says anything about the PR.
-  assert.equal(isPollFailurePermanent(new Error('ETIMEDOUT')), false);
-  assert.equal(isPollFailurePermanent(Object.assign(new Error('x'), { code: 'ENOENT' })), false);
-  assert.equal(isPollFailurePermanent(undefined), false);
+  for (const e of [new Error('ETIMEDOUT'), Object.assign(new Error('x'), { code: 'ENOENT' }), undefined]) {
+    assert.equal(classifyPollFailure(e).cause, 'unreachable');
+    assert.equal(classifyPollFailure(e).bound, MAX_CONSECUTIVE_POLL_FAILURES);
+  }
 });
 
 // ── 4. Seeing and withdrawing your own, and nobody else's (Clawcius #50) ────
@@ -1164,5 +1193,52 @@ test('a dead agent gets its reminder in the inbox and is not resurrected by it',
   // deliberate rather than accidental, and it is logged every time.
   assert.equal(mail.unread('hamachi-engineer1').length, 1, 'the mail keeps');
   assert.ok(lines.some((line) => /is dead/.test(line) && /does not resurrect/.test(line)));
+  registry.close();
+});
+
+test('a retry waits a POLL interval, not a tick — it does not become due again immediately', async () => {
+  // THE DEFECT THE OTHER TESTS COULD NOT SEE, because they use pollSeconds: 0
+  // and drive tick() by hand, which makes tick-cadence and poll-cadence
+  // indistinguishable.
+  //
+  // The retry path returned without rescheduling, so `due_at` stayed in the
+  // past and `ArmedStore.due()` handed the row back on the very next tick. With
+  // the shipped defaults — tickSeconds 15, pollSeconds 120 — five strikes were
+  // 60 seconds of grace where the comment promised ten minutes, and the waker
+  // hit GitHub eight times faster exactly while GitHub was unhappy, including
+  // on 429 and rate-limit 403.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 120 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let calls = 0;
+  const down = {
+    async getPullRequest() {
+      calls += 1;
+      throw githubError(503, 'Server Error');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+
+  await waker.tick();
+  assert.equal(calls, 1);
+  assert.equal(store.due(Date.now()).length, 0, 'a failed poll must not be due again at once');
+
+  // Still not due most of a poll interval later…
+  assert.equal(store.due(Date.now() + 60_000).length, 0);
+  // …and due again once the interval has passed.
+  assert.equal(store.due(Date.now() + 121_000).length, 1);
+
+  // Ticking in between must not poll GitHub again.
+  await waker.tick();
+  assert.equal(calls, 1, 'a tick inside the poll interval must not re-poll');
   registry.close();
 });
