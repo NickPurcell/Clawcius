@@ -51,6 +51,32 @@
  *       counting an approval after the branch moves. An approval can therefore
  *       be satisfied and be for code nobody approved.
  *
+ * ── Two things that will look like mistakes in this file, and are not ────
+ *
+ * 1. IT READS `/rulesets`, NOT `/branches/{branch}/protection`. The obvious
+ *    endpoint for "what is blocking this pull request" is **403 for an App** —
+ *    `Resource not accessible by integration`. `/rulesets` and `/rulesets/{id}`
+ *    are not. So the natural call is the one we cannot make, and anyone who
+ *    "simplifies" this back to it gets a permission error and concludes
+ *    something about permissions rather than about endpoints.
+ *
+ *    That is #216 reappearing inside the API surface itself, which is why the
+ *    warning is here rather than in a commit message nobody will read.
+ *
+ * 2. THERE ARE TWO IDENTITIES ON ONE PULL REQUEST, and they are not a bug.
+ *    Commits are authored by the user `hamachi`; the pull request is opened by
+ *    `hamachi-bot[bot]`, the App. The self-approval rule keys on the PULL
+ *    REQUEST author, which is why the App cannot approve its own PR (422) and
+ *    why an approval has to come from outside the crew entirely.
+ *
+ *    Related and NOT the same thing: ruleset OJ1 sets
+ *    `require_extra_approval_for_unattributed_changes: true`. It should not
+ *    fire — a `users.noreply.github.com` address resolves to a real login, so
+ *    GitHub returns an `author` object rather than `null`, and unattributed
+ *    means no linked account. That is verified for the commits and NOT verified
+ *    against GitHub's exact predicate for the rule. **If an approval lands and
+ *    the PR stays blocked, this is the first thing to check.**
+ *
  * Usage:  node scripts/pr-state.mjs <pr> [--repo owner/name] [--json]
  *
  * Reads through bare `curl`, which the daemon has already authenticated via
