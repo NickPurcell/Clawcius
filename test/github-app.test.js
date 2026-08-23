@@ -505,3 +505,21 @@ test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
     'U+0020 is the only whitespace a path may contain',
   );
 });
+
+test('both invisible-character messages name every group they catch', () => {
+  // The path message listed "a control character or a zero-width one" after the
+  // check had grown to catch non-space whitespace too, so an operator with an
+  // NBSP in their path was named by neither example and could reasonably read
+  // the warning as being about someone else's problem. The claim was true and
+  // the examples were narrower than the behaviour — the same defect as the
+  // docstring's, inverted.
+  const nbsp = checkAppConfig(cfg({ privateKeyPath: '/k.pem ' }), accessOk).warning;
+  assert.match(nbsp, /whitespace other than a plain space/);
+  assert.match(nbsp, /control character/);
+  assert.match(nbsp, /zero-width/);
+
+  const id = checkAppConfig(cfg({ appId: '99 ' }), accessOk).warning;
+  assert.match(id, /whitespace/);
+  assert.match(id, /control character/);
+  assert.match(id, /zero-width/);
+});
