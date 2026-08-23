@@ -62,7 +62,7 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
-import { appTokenProvider, describeAppFault } from './github-app.js';
+import { appTokenProvider, checkAppConfig } from './github-app.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -671,7 +671,14 @@ export async function main(): Promise<void> {
     // Prefer the App when this deployment has one. Both variables are required
     // — a half-configured deployment falls back rather than failing, because a
     // crew that cannot poll is worse than one polling as the older identity.
-    const app = config.github.appId && config.github.appPrivateKeyPath;
+    //
+    // EITHER variable, not both, because this guard decides whether the
+    // operator hears anything at all. With `&&` a deployment that set one and
+    // typo'd the name of the other said NOTHING — not the fault, and not the
+    // "authenticating as GitHub App" line either, since that sits behind the
+    // same guard — while every neighbouring misconfiguration was loud. The
+    // fallback is unchanged; only its silence is.
+    const app = config.github.appId || config.github.appPrivateKeyPath;
     // PROVE IT BEFORE ARMING ANYTHING. Every way an App can be misconfigured —
     // a typo'd PEM path, a PEM the service user cannot read, a wrong app id, an
     // uninstalled App, more than one installation — throws when the provider is
@@ -696,15 +703,16 @@ export async function main(): Promise<void> {
       // The checks themselves live in `github-app.ts` as a pure function. They
       // were four lines here, and those four lines were wrong in three
       // consecutive reviews without a single test noticing, because nothing was
-      // ever going to grow a test around `main()`. `describeAppFault` is
-      // asserted directly; this call site is now too small to be wrong.
-      const fault = describeAppFault({
+      // ever going to grow a test around `main()`. `checkAppConfig` is asserted
+      // directly; this call site is now too small to be wrong.
+      const { usable, warning } = checkAppConfig({
+        appId: config.github.appId,
         privateKeyPath: config.github.appPrivateKeyPath,
         installationId: config.github.appInstallationId || undefined,
         hasFallbackToken: Boolean(config.github.token),
       });
-      appTokenOk = fault === null;
-      if (fault) process.stderr.write(`[armed] ${fault}\n`);
+      appTokenOk = usable;
+      if (warning) process.stderr.write(`[armed] ${warning}\n`);
     }
     if (app && appTokenOk) {
       // A PROVIDER, not a token. An installation token lasts an hour and this

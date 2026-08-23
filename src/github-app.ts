@@ -112,7 +112,7 @@ export function appJwt(appId: string, privateKeyPem: string, nowMs: number): str
 /**
  * One predicate, two callers, deliberately.
  *
- * The boot check (`describeAppFault`) and the runtime throw (`mint`) answer the
+ * The boot check (`checkAppConfig`) and the runtime throw (`mint`) answer the
  * same question about the same value at two different moments. Written twice
  * they can drift, and the direction of drift is the bad one: the operator is
  * told the boot line is where they learn what happened, so a boot check that
@@ -246,8 +246,18 @@ export function staticTokenProvider(token: string): TokenProvider {
 }
 
 /**
- * What is wrong with the App configuration, as one operator-facing sentence,
- * or `null` if nothing is.
+ * Whether the App is usable, and what to tell the operator if it is not.
+ *
+ * TWO QUESTIONS, TWO FIELDS, because they are not the same question and an
+ * earlier version answered both with one `null`. "Nothing to warn about" and
+ * "safe to authenticate as the App" diverge on the ordinary deployment that
+ * configures no App at all — `{ usable: false, warning: null }` — and a caller
+ * that inferred the second from the first would have been right only because a
+ * guard outside this function happened to exclude that case.
+ *
+ * TOTAL over its input. Every combination of set and unset is defined here,
+ * including the ones the daemon's guard currently makes unreachable, so that
+ * widening the guard cannot produce a false sentence.
  *
  * ── Why this is a function and not four lines inside `main()` ───────────────
  *
@@ -277,8 +287,9 @@ export function staticTokenProvider(token: string): TokenProvider {
  * is not in use — and leaves the consequence to the branch that actually
  * decides it, which already states it correctly and with the remedy attached.
  */
-export function describeAppFault(
+export function checkAppConfig(
   input: {
+    appId: string;
     privateKeyPath: string;
     installationId: string | undefined;
     /** Whether a PAT exists to fall back TO. Decides what may be promised. */
@@ -288,8 +299,31 @@ export function describeAppFault(
   // unreadable file, and so this module keeps its only `node:fs` dependency in
   // one place.
   access: (path: string) => void = (path) => accessSync(path, R_OK),
-): string | null {
+): { usable: boolean; warning: string | null } {
+  // NEITHER SET IS NOT A FAULT. It is the ordinary deployment — Clawcius has no
+  // App — so there is nothing to warn about, and nothing usable either. These
+  // are two different questions and the return type answers both, rather than
+  // making the caller infer one from a `null` that also means "all well".
+  if (!input.appId && !input.privateKeyPath) return { usable: false, warning: null };
+
   const faults: string[] = [];
+
+  // ONE OF THE TWO SET IS THE SHORTEST ROUTE TO A BROKEN APP: an operator who
+  // typos the VARIABLE NAME rather than its value. It used to produce complete
+  // silence — not even the "authenticating as GitHub App" line, which lives
+  // behind the same guard — while every neighbouring misconfiguration was loud.
+  // Falling back is the right behaviour and is not what changed; falling back
+  // QUIETLY is, because SETUP.md tells the operator to read a startup line that
+  // was never printed for this case.
+  if (!input.privateKeyPath) {
+    faults.push(
+      'GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_PATH is not — the App needs both',
+    );
+  } else if (!input.appId) {
+    faults.push(
+      'GITHUB_APP_PRIVATE_KEY_PATH is set but GITHUB_APP_ID is not — the App needs both',
+    );
+  }
 
   if (!isInstallationIdValid(input.installationId)) {
     faults.push(
@@ -298,32 +332,41 @@ export function describeAppFault(
     );
   }
 
-  try {
-    // `access` rather than a mint: it catches the two failures an operator
-    // actually makes — wrong path, wrong owner — without spending a token or a
-    // round trip at every boot, and without making startup depend on GitHub
-    // being reachable.
-    access(input.privateKeyPath);
-  } catch (error) {
+  // Only when there is a path to check. Asking `access('')` would answer ENOENT
+  // and produce "GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not
+  // readable" about a variable that is not set — the first four words false,
+  // which is the exact defect this function was extracted to stop making.
+  if (input.privateKeyPath) {
+    try {
+      // `access` rather than a mint: it catches the two failures an operator
+      // actually makes — wrong path, wrong owner — without spending a token or
+      // a round trip at every boot, and without making startup depend on
+      // GitHub being reachable.
+      access(input.privateKeyPath);
+    } catch (error) {
     // `error.code` rather than the message. `fs` errors carry the PATH in
     // `.message`, and this module's header states that the PEM's path is not
     // logged. ENOENT and EACCES also happen to be the more useful half — they
     // distinguish "wrong path" from "wrong owner", which is the operator's
     // actual question.
-    const code = error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
-    faults.push(
-      `GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable (${code}) — ` +
-        'ENOENT means the path is wrong, EACCES means the owner or mode is',
-    );
+      const code =
+        error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
+      faults.push(
+        `GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable (${code}) — ` +
+          'ENOENT means the path is wrong, EACCES means the owner or mode is',
+      );
+    }
   }
 
-  if (faults.length === 0) return null;
+  if (faults.length === 0) return { usable: true, warning: null };
 
-  return (
-    faults.join('. ALSO: ') +
-    (input.hasFallbackToken
-      ? '. FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm ' +
-        'and poll as the personal access token.'
-      : '. The App is NOT in use.')
-  );
+  return {
+    usable: false,
+    warning:
+      faults.join('. ALSO: ') +
+      (input.hasFallbackToken
+        ? '. FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm ' +
+          'and poll as the personal access token.'
+        : '. The App is NOT in use.'),
+  };
 }

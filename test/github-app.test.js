@@ -26,7 +26,7 @@ import {
   appJwt,
   appTokenProvider,
   staticTokenProvider,
-  describeAppFault,
+  checkAppConfig,
 } from '../dist/github-app.js';
 import { GitHubClient } from '../dist/github.js';
 
@@ -256,9 +256,9 @@ test('a plain string still works, so the PAT path is unchanged', async () => {
 });
 
 
-// ── describeAppFault ────────────────────────────────────────────────────────
+// ── checkAppConfig ──────────────────────────────────────────────────────────
 //
-// These exist because the four lines this function replaced were wrong in three
+// These exist because the lines this function replaced were wrong in three
 // consecutive reviews and no test ever noticed: they lived in `main()`, beside
 // a Discord client and a session pool, where nothing was going to assert on
 // them. The warning string is operator-facing output and SETUP.md tells the
@@ -272,74 +272,61 @@ const accessFailing = (code) => () => {
   throw error;
 };
 const accessOk = () => {};
-
-test('describeAppFault says nothing when the App is configured correctly', () => {
-  const fault = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: '42', hasFallbackToken: true },
-    accessOk,
-  );
-  assert.equal(fault, null, 'a good configuration must produce no warning at all');
+const cfg = (over) => ({
+  appId: '1',
+  privateKeyPath: '/k.pem',
+  installationId: undefined,
+  hasFallbackToken: true,
+  ...over,
 });
 
-test('describeAppFault reports BOTH faults in one boot', () => {
+test('checkAppConfig says nothing when the App is configured correctly', () => {
+  const { usable, warning } = checkAppConfig(cfg(), accessOk);
+  assert.equal(warning, null, 'a good configuration must produce no warning at all');
+  assert.equal(usable, true);
+});
+
+test('checkAppConfig reports BOTH faults in one boot', () => {
   // The two used to share a branch, so a bad id suppressed the key check and
   // the operator needed two restarts to learn two things knowable at the first.
-  const fault = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: '42\n', hasFallbackToken: true },
-    accessFailing('ENOENT'),
-  );
-  assert.match(fault, /GITHUB_APP_INSTALLATION_ID must be digits only/);
-  assert.match(fault, /GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable \(ENOENT\)/);
+  const { warning } = checkAppConfig(cfg({ installationId: '42\n' }), accessFailing('ENOENT'));
+  assert.match(warning, /GITHUB_APP_INSTALLATION_ID must be digits only/);
+  assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable \(ENOENT\)/);
 });
 
-test('describeAppFault distinguishes a wrong path from a wrong owner', () => {
+test('checkAppConfig distinguishes a wrong path from a wrong owner', () => {
   // ENOENT and EACCES are the operator's actual question, and they are the
   // reason this reports `error.code` rather than `String(error)`.
-  const missing = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
-    accessFailing('ENOENT'),
-  );
-  const denied = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
-    accessFailing('EACCES'),
-  );
-  assert.match(missing, /\(ENOENT\)/);
-  assert.match(denied, /\(EACCES\)/);
+  assert.match(checkAppConfig(cfg(), accessFailing('ENOENT')).warning, /\(ENOENT\)/);
+  assert.match(checkAppConfig(cfg(), accessFailing('EACCES')).warning, /\(EACCES\)/);
 });
 
-test('describeAppFault never puts the PEM path in the warning', () => {
+test('checkAppConfig never puts the PEM path in the warning', () => {
   // The `fs` error carries the path in `.message`; the whole point of reading
-  // `.code` is that this line goes to a journal and, via `armed-wake`, to a
+  // `.code` is that this line goes to a journal and, via `armed-wake`, near a
   // mailbox. The path names the file and the file is the key.
   for (const code of ['ENOENT', 'EACCES']) {
-    const fault = describeAppFault(
-      { privateKeyPath: '/etc/clawcius/secret-app-key.pem', installationId: undefined,
-        hasFallbackToken: true },
+    const { warning } = checkAppConfig(
+      cfg({ privateKeyPath: '/etc/clawcius/secret-app-key.pem' }),
       accessFailing(code),
     );
-    assert.doesNotMatch(fault, /secret-app-key/, code);
-    assert.doesNotMatch(fault, /etc\/clawcius/, code);
+    assert.doesNotMatch(warning, /secret-app-key/, code);
+    assert.doesNotMatch(warning, /etc\/clawcius/, code);
   }
 });
 
-test('describeAppFault promises a fallback only when there is one to fall back to', () => {
+test('checkAppConfig promises a fallback only when there is one to fall back to', () => {
   // THE ROUND-3 DEFECT, in its third costume. With no PAT the daemon prints, on
   // the very next line, that watchPr will refuse to arm anything — so an
   // unconditional "watches will arm and poll" was refuted by the sentence
   // directly beneath it. A warning the reader watches get disproved is a
   // warning they learn to skip.
-  const withPat = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
-    accessFailing('ENOENT'),
-  );
-  const withoutPat = describeAppFault(
-    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: false },
-    accessFailing('ENOENT'),
-  );
+  const withPat = checkAppConfig(cfg(), accessFailing('ENOENT')).warning;
+  const withoutPat = checkAppConfig(cfg({ hasFallbackToken: false }), accessFailing('ENOENT'))
+    .warning;
   assert.match(withPat, /watches will arm and poll as the personal access token/);
   assert.doesNotMatch(withoutPat, /will arm/);
   assert.doesNotMatch(withoutPat, /FALLING BACK/);
-  // It still says the one thing it does know.
   assert.match(withoutPat, /The App is NOT in use\./);
 });
 
@@ -347,11 +334,62 @@ test('an empty installation id means unset, in both callers', () => {
   // `config.github.appInstallationId || undefined` normalises it before `mint`
   // ever sees it, and the boot check skipped it too. The shared predicate makes
   // that agreement explicit rather than coincidental.
-  assert.equal(
-    describeAppFault(
-      { privateKeyPath: '/k.pem', installationId: '', hasFallbackToken: true },
-      accessOk,
-    ),
-    null,
-  );
+  assert.equal(checkAppConfig(cfg({ installationId: '' }), accessOk).warning, null);
+});
+
+// ── the half-configured App, which used to say nothing at all ───────────────
+
+test('a half-configured App names the variable that is missing', () => {
+  // The shortest route to a broken App is typing the VARIABLE NAME wrong rather
+  // than its value, and it was the one route that produced complete silence —
+  // not even "authenticating as GitHub App", which sits behind the same guard.
+  const noPath = checkAppConfig(cfg({ privateKeyPath: '' }), accessOk);
+  assert.equal(noPath.usable, false);
+  assert.match(noPath.warning, /GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_PATH is not/);
+
+  const noId = checkAppConfig(cfg({ appId: '' }), accessOk);
+  assert.equal(noId.usable, false);
+  assert.match(noId.warning, /GITHUB_APP_PRIVATE_KEY_PATH is set but GITHUB_APP_ID is not/);
+});
+
+test('an unset key path is never described as unreadable', () => {
+  // `access('')` answers ENOENT, which would have produced "GITHUB_APP_PRIVATE_
+  // KEY_PATH is set but the key is not readable" about a variable that is not
+  // set — the first four words false, which is the whole defect class this
+  // function was extracted to end.
+  const { warning } = checkAppConfig({
+    appId: '1', privateKeyPath: '', installationId: undefined, hasFallbackToken: true,
+  });
+  assert.doesNotMatch(warning, /not readable/);
+  assert.doesNotMatch(warning, /is set but the key/);
+});
+
+test('no App configured at all is not a fault, and is not usable either', () => {
+  // The ordinary deployment — Clawcius has no App. Two questions, two fields:
+  // inferring "usable" from a null warning would be right only because a guard
+  // outside this function happens to exclude this case.
+  const { usable, warning } = checkAppConfig({
+    appId: '', privateKeyPath: '', installationId: undefined, hasFallbackToken: true,
+  });
+  assert.equal(warning, null);
+  assert.equal(usable, false);
+});
+
+// ── the real `access`, which nothing else exercises ─────────────────────────
+
+test('the default access check reads the real filesystem', () => {
+  // Every case above injects `access`, so `accessSync(path, R_OK)` — the only
+  // version that runs in production — would otherwise be asserted nowhere. A
+  // later change from R_OK to F_OK would pass the whole suite while making the
+  // boot check laxer than the read that follows it, which is exactly the drift
+  // `isInstallationIdValid` was extracted to prevent.
+  const real = pemOnDisk();
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).warning, null);
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).usable, true);
+
+  const missing = join(mkdtempSync(join(tmpdir(), 'clawsky-app-')), 'absent.pem');
+  const { usable, warning } = checkAppConfig(cfg({ privateKeyPath: missing }));
+  assert.equal(usable, false);
+  assert.match(warning, /not readable \(ENOENT\)/);
+  assert.doesNotMatch(warning, /absent\.pem/);
 });
