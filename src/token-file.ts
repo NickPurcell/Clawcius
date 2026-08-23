@@ -66,7 +66,7 @@
  * cannot fix a file they cannot name.
  */
 
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { TokenProvider } from './github-app.js';
 
@@ -89,27 +89,54 @@ export const REFRESH_INTERVAL_MS = 5 * 60_000;
  */
 export function writeTokenFile(path: string, token: string): void {
   mkdirSync(dirname(path), { recursive: true });
+  // Defence in depth. `container.githubTokenDir` is refused inside any bind
+  // mount and is mounted read-only, so nothing in a container should be able to
+  // put a directory here — but `renameSync` throws EISDIR onto a path that has
+  // one, and that throw took down the daemon at boot in the first version of
+  // this module. Clear a non-file rather than propagating an error whose text
+  // explains nothing.
+  const existing = statSync(path, { throwIfNoEntry: false });
+  if (existing && !existing.isFile()) rmSync(path, { recursive: true, force: true });
   // Named per process so two daemons on one host cannot rename each other's
   // half-written file into place.
   const tmp = join(dirname(path), `.github-token.${process.pid}.tmp`);
-  writeFileSync(tmp, token, { mode: 0o600 });
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, token, { mode: 0o600 });
+    renameSync(tmp, path);
+  } finally {
+    // A rename that fails, or a process that dies between the two, would
+    // otherwise leave a 0600 file holding a live token that nothing ever
+    // cleans up — the next write reuses this name only while the pid is the
+    // same. `force` so the ordinary success case, where the rename already
+    // consumed it, is not an error.
+    rmSync(tmp, { force: true });
+  }
 }
 
 /**
  * Where the credential lives, derived rather than configured.
  *
  * ONE function, two callers — the daemon that writes it and `agent.ts`'s
- * credential helper that reads it. A config knob would let those two drift, and
- * a path that is wrong in one of them fails as an authentication error rather
- * than as a missing file, which is the least legible form this can take.
+ * credential helper that reads it. A config knob for the FILE would let those
+ * two drift, and a path wrong on one side fails as an authentication error
+ * rather than as a missing file, which is the least legible form this can take.
  *
- * The workspaces root is bind-mounted into the container at the SAME path
- * (`run-container.sh`, `-v "$WORKSPACES:$WORKSPACES:rw"`), so there is no
- * translation to get wrong between the daemon writing and an agent reading.
+ * THE DIRECTORY IS NOT THE WORKSPACE, and that is the whole of what round 1
+ * corrected. The first version put this in `sessions.workspaceRoot`, which is
+ * bind-mounted READ-WRITE and is the container's working directory — so the
+ * least trusted process on the machine could replace the credential the daemon
+ * serves it, or create a directory at the path and turn `renameSync`'s EISDIR
+ * into a permanent restart loop. `container.githubTokenDir` is mounted
+ * READ-ONLY instead (`run-container.sh`), and `agent-config.ts` refuses to let
+ * it sit inside any bind mount, by the same rule and for the same reason as
+ * `container.execEnvDir`.
+ *
+ * The directory is mounted at the SAME path inside the container as outside, as
+ * every other mount in that script is, so there is no translation to get wrong
+ * between the daemon writing and an agent reading.
  */
-export function tokenFilePath(workspaceRoot: string): string {
-  return join(workspaceRoot, '.github-token');
+export function tokenFilePath(githubTokenDir: string): string {
+  return join(githubTokenDir, 'installation-token');
 }
 
 export type TokenFileOptions = {
@@ -131,7 +158,8 @@ export class TokenFileRefresher {
   readonly #opts: TokenFileOptions;
   readonly #now: () => number;
   #timer: ReturnType<typeof setInterval> | null = null;
-  #writtenAtMs = 0;
+  #mintedAtMs = 0;
+  #lastToken: string | null = null;
   #written = false;
 
   constructor(opts: TokenFileOptions) {
@@ -142,22 +170,51 @@ export class TokenFileRefresher {
   /**
    * Fetch once and write, then keep it current.
    *
-   * The first write is AWAITED and its failure is thrown, because a daemon that
-   * comes up with no credential file has agents whose every push fails, and
-   * that should stop startup rather than be discovered by an agent an hour
-   * later. Failures after the first are survivable and are handled by `#tick`.
+   * A FIRST FETCH THAT FAILS IS LOGGED, NOT THROWN, and that is a reversal of
+   * the first version of this module.
+   *
+   * Throwing here took down the entire daemon — Discord, mail, reminders — into
+   * a five-second restart loop, because `main()` awaits this and nothing above
+   * catches. And the trigger is a network call: a rate limit, a 5xx, or thirty
+   * seconds of packet loss at the wrong moment. That made a MISCONFIGURED App
+   * degrade gracefully while a CORRECTLY configured one that was briefly
+   * unreachable was fatal, which is backwards, and it contradicts this module's
+   * own argument that a transient credential failure must not become a
+   * permanent one.
+   *
+   * Nothing is lost by continuing. No file means the credential helper falls
+   * through to `GITHUB_TOKEN`, which is the same degradation `checkAppConfig`
+   * chooses one screen up for the same reason — a crew reaching GitHub as the
+   * older identity beats a crew not running.
    */
   async start(): Promise<void> {
-    await this.#write();
+    await this.#tick();
     this.#timer = setInterval(() => {
       void this.#tick();
     }, this.#opts.intervalMs ?? REFRESH_INTERVAL_MS);
     this.#timer.unref?.();
   }
 
+  /**
+   * Stop refreshing, and take the credential with you.
+   *
+   * Clearing the timer alone would leave a working installation token in a
+   * mounted directory for up to an hour with nothing refreshing or removing it
+   * — across a clean shutdown or a redeploy. This module's own argument is that
+   * an absent file beats a stale one, and the file outliving the container is
+   * the single genuinely new exposure the design accepts, so unlinking here is
+   * implied by the reasoning already written above.
+   */
   stop(): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = null;
+    this.#written = false;
+    this.#lastToken = null;
+    try {
+      rmSync(this.#opts.path, { force: true });
+    } catch {
+      // Shutdown is not a place to throw. The next start overwrites it anyway.
+    }
   }
 
   /** Visible for tests: run one refresh without waiting for the interval. */
@@ -168,7 +225,24 @@ export class TokenFileRefresher {
   async #write(): Promise<void> {
     const token = await this.#opts.provider();
     writeTokenFile(this.#opts.path, token);
-    this.#writtenAtMs = this.#now();
+    // THE CLOCK TRACKS THE TOKEN, NOT THE WRITE, and the difference is 45
+    // minutes of serving a corpse.
+    //
+    // `appTokenProvider` is a CACHE. It answers with the same token, without
+    // touching the network or the PEM, until five minutes before expiry — so
+    // for the first ~55 minutes of a token's life every tick rewrites identical
+    // bytes and succeeds whether or not the credential source is healthy.
+    // Stamping the clock on every successful write therefore measured the age
+    // of the last provider CALL, which is never more than one interval, so "the
+    // token is past its useful life" was never true while the token was
+    // actually dying.
+    //
+    // A changed value is the only evidence available here that a mint actually
+    // happened, since a `TokenProvider` returns a string and not an expiry.
+    if (token !== this.#lastToken) {
+      this.#lastToken = token;
+      this.#mintedAtMs = this.#now();
+    }
     this.#written = true;
   }
 
@@ -177,7 +251,7 @@ export class TokenFileRefresher {
       await this.#write();
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
-      const ageMs = this.#now() - this.#writtenAtMs;
+      const ageMs = this.#now() - this.#mintedAtMs;
 
       if (this.#written && ageMs < STALE_AFTER_MS) {
         // Keep serving. See the header: turning a transient failure into a
@@ -192,11 +266,18 @@ export class TokenFileRefresher {
       // Past its life and unrefreshable. An absent file fails immediately and
       // legibly; a stale one fails later, as a 401 that names nothing.
       this.#written = false;
-      rmSync(this.#opts.path, { force: true });
+      try {
+        rmSync(this.#opts.path, { force: true });
+      } catch {
+        // `#tick` is called as `void this.#tick()` from a timer, so a throw out
+        // of this catch is an unhandled rejection and Node turns that into an
+        // uncaught exception. There is nothing useful to do about a failed
+        // unlink and nothing at all to gain by dying of it.
+      }
       this.#opts.log(
-        `[token-file] refresh failed (${code}) and the token on disk is no longer ` +
-          `usable, so ${this.#opts.path} has been REMOVED. Agent git operations will ` +
-          'fail naming that file until a refresh succeeds.',
+        `[token-file] could not obtain an installation token (${code}); there is no ` +
+          `usable credential at ${this.#opts.path}. Agents fall back to GITHUB_TOKEN ` +
+          'until a refresh succeeds; retrying.',
       );
     }
   }

@@ -144,6 +144,8 @@ export type AgentConfig = {
      * same reason `status.file` is: `run/` is the mount, its parent is not.
      */
     execEnvDir: string;
+    /** Holds the App installation token for agents; mounted READ-ONLY. */
+    githubTokenDir: string;
   };
   prompts: PromptTemplates;
   model: string;
@@ -468,6 +470,7 @@ const DEFAULTS: Defaults = {
     claudePath: '/usr/local/bin/claude',
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
     execEnvDir: '/var/lib/clawcius/exec-env',
+    githubTokenDir: '/var/lib/clawcius/github-token',
   },
   prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
@@ -830,6 +833,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'container.execEnvDir',
         DEFAULTS.container.execEnvDir,
       ),
+      githubTokenDir: str(
+        container['githubTokenDir'],
+        'container.githubTokenDir',
+        DEFAULTS.container.githubTokenDir,
+      ),
     },
     prompts: {
       protocol: template(prompts['protocol'], 'protocol', DEFAULT_PROMPTS.protocol),
@@ -1015,6 +1023,40 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
           'container. That file holds this instance\'s Discord and GitHub tokens; it must ' +
           'not be reachable from inside any sandbox. Put it beside the state directory, ' +
           'not in it — the default is /var/lib/<instance>/exec-env.',
+      );
+    }
+  }
+
+  // SAME RULE AS execEnvDir ABOVE, and it is here because the first version of
+  // this feature broke it. The file holds a GitHub App installation token that
+  // every agent's `git push` consumes, and the original design put it in
+  // `sessions.workspaceRoot` — a read-write mount, and the container's working
+  // directory — reasoning only about who could READ it.
+  //
+  // The question these guards exist to ask is the other one: is this thing,
+  // which the daemon trusts, somewhere the least trusted process on the machine
+  // can REWRITE? An agent could create a directory at that path and make
+  // `renameSync` throw EISDIR at boot, which with Restart=always is a permanent
+  // restart loop that outlives the container; or write a file there and hand a
+  // credential of its choosing to every other agent in the crew.
+  //
+  // The directory is bind-mounted READ-ONLY (`run-container.sh`), which is what
+  // makes the file re-readable per call without being writable by the thing it
+  // is a credential against. A file the agent cannot write is not a file it can
+  // lie with.
+  if (!isAbsolute(config.container.githubTokenDir)) {
+    throw new ConfigError('container.githubTokenDir', 'must be an absolute path');
+  }
+  const githubTokenDir = resolve(config.container.githubTokenDir);
+  for (const [label, mount] of bindMountedPaths(config)) {
+    if (isInside(githubTokenDir, resolve(mount))) {
+      throw new Error(
+        `agent-config.yaml: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +
+          `(${resolve(mount)}). It holds a GitHub App installation token that every agent ` +
+          'consumes; it is mounted read-only on purpose, and a path inside a read-write ' +
+          'mount would let the sandbox rewrite or replace the credential the daemon serves ' +
+          'it. Put it beside the state directory, not in it — the default is ' +
+          '/var/lib/<instance>/github-token.',
       );
     }
   }

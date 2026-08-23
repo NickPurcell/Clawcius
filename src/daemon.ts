@@ -742,24 +742,28 @@ export async function main(): Promise<void> {
       // and neither the PEM's path nor anything minted from it is logged.
       process.stderr.write(`[armed] authenticating as GitHub App ${config.github.appId}\n`);
 
-      // The agent sessions' half of the same credential. Started only when a
-      // path is configured, so a deployment that has an App for the WAKER and
-      // still wants agents on the PAT is expressible — and Clawcius, which has
-      // no App at all, reaches none of this.
+      // The agent sessions' half of the same credential. Unconditional inside
+      // this branch: if the App is usable for the waker it is usable for the
+      // agents, and there is no state in which writing the file is wrong here.
+      // An earlier comment claimed a guard that let a deployment keep agents on
+      // the PAT while the waker used the App — there was no such condition, and
+      // that deployment is not expressible, because the file always wins over
+      // the PAT. Saying so beats implying a knob that does not exist.
       {
         tokenFileRefresher = new TokenFileRefresher({
-          path: tokenFilePath(config.agent.sessions.workspaceRoot),
+          path: tokenFilePath(config.agent.container.githubTokenDir),
           provider: appProvider,
           log: (message) => process.stderr.write(`${message}\n`),
         });
-        // AWAITED, and a failure here stops startup. A daemon that comes up
-        // without this file has agents whose every push fails with an error
-        // about a missing file, discovered one agent at a time. Failing at boot
-        // is the same argument `checkAppConfig` makes one screen up.
+        // Awaited so the file exists before any session spawns, but a failure
+        // does NOT stop startup — `start()` logs and retries. Throwing here put
+        // the whole daemon into a restart loop over a network call, which is
+        // the opposite of what `checkAppConfig` does one screen up for the same
+        // kind of problem.
         await tokenFileRefresher.start();
         process.stderr.write(
           '[armed] agent git credentials come from ' +
-            `${tokenFilePath(config.agent.sessions.workspaceRoot)}\n`,
+            `${tokenFilePath(config.agent.container.githubTokenDir)}\n`,
         );
       }
     } else if (config.github.token) {

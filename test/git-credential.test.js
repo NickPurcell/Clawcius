@@ -26,7 +26,7 @@ import { setConfig } from '../dist/config.js';
 import { gitEnv } from '../dist/agent.js';
 import { tokenFilePath } from '../dist/token-file.js';
 
-function configure({ token = '', appId = '', workspaceRoot }) {
+function configure({ token = '', appId = '', githubTokenDir }) {
   setConfig({
     discord: { token: 'unused', guildId: 'unused' },
     github: { token, appId },
@@ -36,13 +36,16 @@ function configure({ token = '', appId = '', workspaceRoot }) {
       model: 'm',
       modelByRole: {},
       git: { userName: 'a', userEmail: 'a@b.c' },
-      sessions: { maxConcurrent: 10, idleTimeoutMinutes: 0, workspaceRoot },
+      container: { githubTokenDir },
+      sessions: { maxConcurrent: 10, idleTimeoutMinutes: 0, workspaceRoot: githubTokenDir },
     },
   });
 }
 
 /** The helper as git runs it: strip the leading `!` and execute under `sh`. */
 function runHelper(env, extraEnv) {
+  // The container receives CLAWSKY_GITHUB_TOKEN_FILE alongside the git config,
+  // so a test that omitted it would be exercising a helper no agent ever runs.
   const key = Object.keys(env)
     .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
     .find((k) => env[k] === 'credential.https://github.com.helper');
@@ -50,13 +53,17 @@ function runHelper(env, extraEnv) {
   const body = env[`GIT_CONFIG_VALUE_${key.split('_').pop()}`].replace(/^!/, '');
   return execFileSync('sh', ['-c', body], {
     encoding: 'utf8',
-    env: { ...process.env, ...extraEnv },
+    env: {
+      ...process.env,
+      CLAWSKY_GITHUB_TOKEN_FILE: env['CLAWSKY_GITHUB_TOKEN_FILE'] ?? '',
+      ...extraEnv,
+    },
   });
 }
 
 test('the credential comes from the file when the daemon has written one', () => {
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: 'ghp_the_pat', appId: '123', workspaceRoot: root });
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
   writeFileSync(tokenFilePath(root), 'ghs_installation_token');
 
   const out = runHelper(gitEnv(), { GITHUB_TOKEN: 'ghp_the_pat' });
@@ -70,7 +77,7 @@ test('an absent file falls back to the PAT rather than failing', () => {
   // deployment in that state still has a working PAT. Committing to the file at
   // spawn would break every push for a crew whose credential was fine.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: 'ghp_the_pat', appId: '123', workspaceRoot: root });
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
   rmSync(tokenFilePath(root), { force: true });
 
   const out = runHelper(gitEnv(), { GITHUB_TOKEN: 'ghp_the_pat' });
@@ -85,7 +92,7 @@ test('the fallback is resolved per call, not frozen at session spawn', () => {
   // that appears or disappears after the session started. One `gitEnv()`, two
   // different answers.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: 'ghp_the_pat', appId: '123', workspaceRoot: root });
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
   const env = gitEnv();
 
   writeFileSync(tokenFilePath(root), 'ghs_first');
@@ -102,7 +109,7 @@ test('a PAT-only deployment is byte-identical to before', () => {
   // Clawcius has no App and must keep working exactly as it did. The helper is
   // still configured, still reads at call time, and still answers with the PAT.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: 'ghp_clawcius', appId: '', workspaceRoot: root });
+  configure({ token: 'ghp_clawcius', appId: '', githubTokenDir: root });
 
   const out = runHelper(gitEnv(), { GITHUB_TOKEN: 'ghp_clawcius' });
   assert.match(out, /^password=ghp_clawcius$/m);
@@ -110,7 +117,7 @@ test('a PAT-only deployment is byte-identical to before', () => {
 
 test('no credential helper at all when there is no credential to serve', () => {
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: '', appId: '', workspaceRoot: root });
+  configure({ token: '', appId: '', githubTokenDir: root });
   const env = gitEnv();
   const keys = Object.keys(env)
     .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
@@ -124,7 +131,7 @@ test('the token never appears in the environment handed to the container', () =>
   // The point of the helper has always been that the credential is not in a URL,
   // a remote or a reflog. With a file it is also not in `GIT_CONFIG_VALUE_n`.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
-  configure({ token: 'ghp_the_pat', appId: '123', workspaceRoot: root });
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
   writeFileSync(tokenFilePath(root), 'ghs_installation_token');
 
   const serialised = JSON.stringify(gitEnv());

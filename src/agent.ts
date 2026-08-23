@@ -144,9 +144,9 @@ function linkSkills(workspacePath: string): void {
  * Git configuration for the agent, injected purely through the environment.
  *
  * `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` is git's own mechanism for config with
- * no file behind it. That matters twice over: the token never lands on disk,
- * and the service user's own ~/.gitconfig is left completely alone — the agent
- * gets its own identity without inheriting or clobbering yours.
+ * no file behind it. That matters because the service user's own ~/.gitconfig is
+ * left completely alone — the agent gets its own identity without inheriting or
+ * clobbering yours — and because no credential is ever in the config itself.
  *
  * The credential helper is scoped to github.com and reads its credential at CALL
  * TIME, so the token appears in no URL, no remote, and no reflog.
@@ -185,12 +185,18 @@ export function gitEnv(): Record<string, string> {
       // every push failing because the session was told at spawn to expect a
       // file that never appeared.
       //
-      // `2>/dev/null` because `cat`'s "No such file" would otherwise be read by
-      // git as part of the credential exchange. The absent-file case is not an
-      // error here; it is the fallback.
-      `!f() { echo username=x-access-token; ` +
-        `echo "password=$(cat ${tokenFilePath(config().agent.sessions.workspaceRoot)} ` +
-        `2>/dev/null || printf %s "$GITHUB_TOKEN")"; }; f`,
+      // THE PATH IS PASSED IN AN ENV VAR AND QUOTED, not interpolated. Spliced
+      // in raw, a workspace path containing a space split into two `cat`
+      // arguments, `2>/dev/null` swallowed the error, and the helper silently
+      // served the PAT — or an empty password when there was none. Silent is
+      // the part that mattered: nothing anywhere would have said why.
+      //
+      // `2>/dev/null` stays, because a missing file is the FALLBACK rather than
+      // an error, and `cat`'s complaint would otherwise be read by git as part
+      // of the credential exchange.
+      '!f() { echo username=x-access-token; ' +
+        'echo "password=$(cat "$CLAWSKY_GITHUB_TOKEN_FILE" 2>/dev/null ' +
+        '|| printf %s "$GITHUB_TOKEN")"; }; f',
     ]);
     // Rewrite SSH remotes to HTTPS, so a repo cloned with a git@ URL — or an
     // agent reaching for the SSH form out of habit — still works instead of
@@ -204,6 +210,8 @@ export function gitEnv(): Record<string, string> {
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   if (config().github.token) env['GITHUB_TOKEN'] = config().github.token;
+  // The path, not the token. Named so the helper can quote it; see above.
+  env['CLAWSKY_GITHUB_TOKEN_FILE'] = tokenFilePath(config().agent.container.githubTokenDir);
   return env;
 }
 
