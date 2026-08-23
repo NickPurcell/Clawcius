@@ -7,9 +7,11 @@
 # was a 937-line full copy and its Hamachi sibling was a 972-line full copy of
 # the same thing; 111 lines differed, of which exactly 3 were config VALUES.
 #
-# WHAT MAY GO IN AN INSTANCE FILE: facts. `crew`, `displayName`, the Discord
-# channel lists, and per-instance credentials. Nothing else, and the loader
-# enforces it rather than trusting it.
+# WHAT GOES IN AN INSTANCE FILE: facts. `crew`, `displayName` and the Discord
+# channel lists — that is the whole intended surface. Any other key that is not
+# on one of the refusal lists below WILL be merged and honoured; the loader
+# enforces two denylists, not an allowlist, so read this as the convention plus
+# two hard rules rather than as a closed set.
 #
 # WHAT MAY NOT: prompt content. `systemPrompt.append` and every `prompts.*`
 # template are refused here, as a hard boot error. The rule is that crews share
@@ -22,10 +24,14 @@
 # table in agent-config.base.yaml. `container.name`, `container.stateDir`,
 # `container.execEnvDir`, `container.githubTokenDir`, `sessions.workspaceRoot`,
 # `status.file`, `status.instance`, `git.userName` and `git.userEmail` all come
-# off `crew` and `displayName`. Setting one here is a boot error too — not
-# because overriding is unthinkable, but because every value it could be set to
-# was already correct by derivation for both shipped instances, and a key
-# restated is a key that eventually disagrees.
+# off `crew` and `displayName`. Setting one here IS a boot error — refused in
+# this file and in the base, by the same list.
+#
+# It is refused in both because it is two different bugs. In the base, a value
+# is INHERITED by every instance that did not override it. Here, it is a
+# RESTATEMENT that silently disagrees with the crew name above it — and
+# `container.name` is the `docker exec` target, so a restatement naming another
+# crew's container does not fail, it succeeds against the wrong sandbox.
 #
 # TO ADD A THIRD CREW: copy this file, change `crew`, `displayName` and the
 # three channel lists, add its .env and its systemd units. That is the whole

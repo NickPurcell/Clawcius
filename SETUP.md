@@ -346,11 +346,18 @@ Do not add prompt content either — `systemPrompt.append` and `prompts.*` are
 refused in an instance file. The new crew's agents get the shared prompt with
 its own `displayName` at the three `{{Crew}}` sites.
 
-`status.instance` must also match a key under `instances:` in
-`ops/ops-config.yaml`, which compares exact strings; and `container.stateDir`
-must match `CLAWCIUS_STATE_DIR` in the new instance's container unit. Both are
-derived from the same `crew`, so getting the crew name right is the only way to
-get them right — which is the point.
+**Two things outside this file must agree with it, and nothing checks either.**
+`status.instance` must match a key under `instances:` in `ops/ops-config.yaml`,
+which compares exact strings. `container.stateDir` must match
+`CLAWCIUS_STATE_DIR` in the new instance's container unit — which is hand-written
+there (`systemd/hamachi-container.service:42`) and defaults to
+`/var/lib/clawcius` in `docker/run-container.sh`, so nothing derives it from
+`crew` and nothing compares the two.
+
+Deriving from `crew` means this file cannot disagree with *itself*. It does not
+reach the unit or the ops manifest, and a correct crew name here does not make
+either of those right. Check them by hand; that is the same hand-work the
+section below is about.
 
 ### Adding an instance: the rest
 

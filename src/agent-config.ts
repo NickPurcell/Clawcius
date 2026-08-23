@@ -494,9 +494,14 @@ If you need something you are not permitted to do yourself, say so to
  * Clawcius #55 was, one level up. Omitting it from this type is what makes
  * "somebody must write this down" a compile-time fact instead of a convention.
  */
-type Defaults = Omit<AgentConfig, 'container' | 'crew' | 'displayName' | 'git' | 'sessions'> & {
+type Defaults = Omit<
+  AgentConfig,
+  'container' | 'crew' | 'displayName' | 'git' | 'sessions' | 'status' | 'clawsky'
+> & {
   container: Pick<AgentConfig['container'], 'claudePath'>;
   sessions: Omit<AgentConfig['sessions'], 'workspaceRoot'>;
+  status: Pick<AgentConfig['status'], 'intervalSeconds'>;
+  clawsky: Omit<AgentConfig['clawsky'], 'crew'>;
 };
 
 /**
@@ -511,9 +516,18 @@ type Defaults = Omit<AgentConfig, 'container' | 'crew' | 'displayName' | 'git' |
  * its turns inside the first crew's container (`src/container.ts:323`).
  *
  * `stateDir` was omitted from this type for exactly that reason and the comment
- * called it "a compile-time fact instead of a convention". The others are now
+ * called it "a compile-time fact instead of a convention". All NINE are now
  * omitted on the same grounds; they come from `deriveInstancePaths` instead, so
  * the compiler refuses to let anyone put a crew's name back in here.
+ *
+ * All nine, and the count is the point. Three of them — `status.file`,
+ * `status.instance` and `clawsky.crew` — were briefly left in the type as `''`
+ * placeholders whose only job was to satisfy it, which meant
+ * `file: '/var/lib/clawcius/waker-status.json'` would still have typechecked
+ * while this comment claimed it could not. Harmless, since the loader reads
+ * `derived.*` and never those three — but a compile-time guarantee covering six
+ * of nine is not the guarantee the sentence describes. OJ round 1 on #207,
+ * finding 7.
  */
 const DEFAULTS: Defaults = {
   container: {
@@ -548,9 +562,6 @@ const DEFAULTS: Defaults = {
   },
   clawsky: {
     enabled: true,
-    // Not a default. `crew` is required at the top level and every consumer
-    // reads it from there; this is only here to satisfy the shared type.
-    crew: '',
     wakeOnMail: true,
     agents: [],
   },
@@ -564,11 +575,7 @@ const DEFAULTS: Defaults = {
     },
   },
   status: {
-    // Not defaults: both are derived per instance. `file` is deliberately a
-    // sibling of `run/`, not a child, because `run/` is the bind mount.
-    file: '',
     intervalSeconds: 20,
-    instance: '',
   },
 };
 
@@ -589,9 +596,35 @@ const DEFAULTS: Defaults = {
  */
 let loadingConfigPath = 'agent-config.yaml';
 
+/**
+ * Which file each merged key actually came from, built during `deepMerge`.
+ *
+ * Without it every error named the INSTANCE file, and after the split almost
+ * every value lives in the base — so the two sharpest cases pointed an operator
+ * at the one file that may not contain the key they were told to fix. A bad
+ * `{{crew}}` in the shared prompt said "fix `systemPrompt.append` in
+ * agent-config.yaml"; putting it there is a hard boot error whose message says
+ * to move it back. That is the defect this change lists among its own fixes,
+ * reintroduced one layer up and covering the majority of keys rather than one
+ * instance's worth. OJ round 1 on #207, finding 4.
+ */
+let keyProvenance = new Map<string, string>();
+
+/** The file to name when complaining about `path`; the root file if unknown. */
+function fileFor(path: string): string {
+  for (let at = path; ; ) {
+    const file = keyProvenance.get(at);
+    if (file !== undefined) return file;
+    const cut = at.lastIndexOf('.');
+    if (cut < 0) break;
+    at = at.slice(0, cut);
+  }
+  return loadingConfigPath;
+}
+
 class ConfigError extends Error {
   constructor(path: string, message: string) {
-    super(`${loadingConfigPath}: ${path} ${message}`);
+    super(`${fileFor(path)}: ${path} ${message}`);
   }
 }
 
@@ -811,9 +844,41 @@ function section(raw: unknown, path: string): Record<string, unknown> {
  * would notice — an override would be the last place a stale sentence could
  * hide, inside the mechanism built to end stale sentences.
  */
-const INSTANCE_FORBIDDEN: ReadonlyArray<[string, string]> = [
+const PROMPT_CONTENT: ReadonlyArray<[string, string]> = [
   ['systemPrompt.append', 'the system prompt is shared by every crew'],
   ['prompts', 'the prompt templates are shared by every crew'],
+];
+
+/**
+ * The nine keys computed by `deriveInstancePaths`. Refused in BOTH layered
+ * files, which is two different bugs closed by one list.
+ *
+ * In the BASE the danger is INHERITANCE: a shared file's value reaching every
+ * instance that did not override it. That was the live defect — `DEFAULTS` held
+ * six Clawcius literals, and `container.name` is the `docker exec` target
+ * (`src/container.ts:323`).
+ *
+ * In an INSTANCE file the danger is RESTATEMENT, and it went unnoticed until OJ
+ * round 1 on #207 found that `agent-config.yaml`'s own header claimed a refusal
+ * the loader did not have. An instance could write
+ * `container: { name: clawcius-agent }` and load — crew three `docker exec`-ing
+ * into Clawcius's container, from the file whose header said that was refused.
+ *
+ * Refused rather than the sentence softened, because the sentence described the
+ * behaviour anyone would want. A STANDALONE file — no `extends` — is unaffected:
+ * there is no shared file to inherit through, and the containment guards need
+ * explicit paths to be exercised against.
+ */
+const DERIVED_KEYS: ReadonlyArray<[string, string]> = [
+  ['container.name', 'is the docker exec target and derives from crew'],
+  ['container.stateDir', 'derives from crew'],
+  ['container.execEnvDir', "holds one instance's tokens and derives from crew"],
+  ['container.githubTokenDir', "holds one instance's credential and derives from crew"],
+  ['sessions.workspaceRoot', 'derives from crew'],
+  ['status.file', 'is read per instance by the ops executor and derives from crew'],
+  ['status.instance', 'is matched against the ops allowlist and derives from crew'],
+  ['git.userName', 'derives from displayName'],
+  ['git.userEmail', 'derives from crew'],
 ];
 
 /**
@@ -836,18 +901,10 @@ const INSTANCE_FORBIDDEN: ReadonlyArray<[string, string]> = [
 const BASE_FORBIDDEN: ReadonlyArray<[string, string]> = [
   ['crew', 'names one instance'],
   ['displayName', 'names one instance'],
-  ['container.name', 'is the docker exec target and is derived from crew'],
-  ['container.stateDir', 'is derived from crew'],
-  ['container.execEnvDir', 'holds one instance\'s tokens and is derived from crew'],
-  ['container.githubTokenDir', 'holds one instance\'s credential and is derived from crew'],
-  ['sessions.workspaceRoot', 'is derived from crew'],
-  ['status.file', 'is read per instance by the ops executor and is derived from crew'],
-  ['status.instance', 'is matched against the ops allowlist and is derived from crew'],
-  ['git.userName', 'is derived from displayName'],
-  ['git.userEmail', 'is derived from crew'],
   ['discord.allowedChannelIds', 'each crew lives in its own guild'],
   ['discord.followUpChannelIds', 'each crew lives in its own guild'],
   ['discord.alwaysOnChannelIds', 'each crew lives in its own guild'],
+  ...DERIVED_KEYS,
 ];
 
 /** Is `dotted` present in `root`? Presence, not truthiness — `[]` counts. */
@@ -889,11 +946,45 @@ function refuseKeys(
 function deepMerge(
   base: Record<string, unknown>,
   over: Record<string, unknown>,
+  provenance: Map<string, string>,
+  baseFile: string,
+  overFile: string,
+  prefix = '',
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...base };
+  for (const key of Object.keys(base)) provenance.set(prefix + key, baseFile);
+
+  const claim = (at: string, value: unknown): void => {
+    provenance.set(at, overFile);
+    if (!isRecord(value)) return;
+    for (const [k, v] of Object.entries(value)) claim(`${at}.${k}`, v);
+  };
+
   for (const [key, value] of Object.entries(over)) {
+    const dotted = prefix + key;
     const existing = out[key];
-    out[key] = isRecord(existing) && isRecord(value) ? deepMerge(existing, value) : value;
+
+    // AN EXPLICIT NULL MEANS INHERIT, NOT OVERRIDE. This is a third semantic
+    // nobody chose being removed rather than a preference being expressed.
+    //
+    // `key:` with nothing after it parses to null. Treating that as a value made
+    // it replace the base's — and every reader below (`str`, `num`, `bool`,
+    // `section`, `strList`) then treats null as absent and falls back to
+    // `DEFAULTS`. So commenting out a value in an instance file neither
+    // inherited nor errored: it reset to whatever THIS FILE says, silently.
+    // `model:` moved every agent in the crew off the 1M-context model that way.
+    // OJ round 1 on #207, finding 3.
+    //
+    // An explicit EMPTY value is untouched by this — `[]` is a value and still
+    // overrides, which is what `alwaysOnChannelIds: []` needs.
+    if (value === null || value === undefined) continue;
+
+    if (isRecord(existing) && isRecord(value)) {
+      out[key] = deepMerge(existing, value, provenance, baseFile, overFile, `${dotted}.`);
+    } else {
+      out[key] = value;
+      claim(dotted, value);
+    }
   }
   return out;
 }
@@ -942,8 +1033,19 @@ function substituteCrew(text: string, displayName: string, key: string): string 
  * being imposed, it is the convention that was already being hand-maintained,
  * moved somewhere it cannot be forgotten.
  */
-function deriveInstancePaths(crew: string, displayName: string) {
-  const stateDir = `/var/lib/${crew}`;
+function deriveInstancePaths(crew: string, displayName: string, stateDirOverride?: string) {
+  // EVERY path below hangs off the same resolved `stateDir`, including when it is
+  // stated explicitly. It used not to: `githubTokenDir` re-derived from the
+  // explicit value while `execEnvDir`, `workspaceRoot` and `status.file` kept
+  // computing from `/var/lib/{crew}`, so `stateDir: /srv/third` produced a
+  // `workspaceRoot` outside the directory `run-container.sh` actually mounts —
+  // half-honoured, which reads as coherent and is worse than not honoured at all.
+  // OJ round 1 on #207, finding 5.
+  //
+  // Only reachable from a STANDALONE config now, since `DERIVED_KEYS` refuses an
+  // explicit `stateDir` in either layered file. That is the case the containment
+  // guards are tested through, so it has to be right rather than merely absent.
+  const stateDir = stateDirOverride ?? `/var/lib/${crew}`;
   return {
     containerName: `${crew}-agent`,
     stateDir,
@@ -1077,6 +1179,7 @@ function readYaml(path: string, what: string): Record<string, unknown> {
 export function loadAgentConfig(configPath?: string): AgentConfig {
   const path = resolve(configPath ?? process.env['AGENT_CONFIG_PATH'] ?? 'agent-config.yaml');
   loadingConfigPath = path;
+  keyProvenance = new Map();
   const instance = readYaml(path, 'Agent config');
 
   // `extends` is resolved against the INSTANCE FILE's directory, not the
@@ -1087,7 +1190,14 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const extendsRaw = instance['extends'];
   let root: Record<string, unknown>;
 
-  if (extendsRaw === undefined || extendsRaw === null) {
+  // PRESENCE, not value. `extends:` with nothing after it parses to null, and
+  // treating null like absent made a bare `extends:` mean "this file is
+  // standalone" — so the crew booted with NO system prompt at all, on the code
+  // default model instead of the base's, with nothing printed. `extends: ""` was
+  // already refused with a good message, but in YAML those are the same edit
+  // made two ways and the silent one was the safe-looking one.
+  // OJ round 1 on #207, finding 2.
+  if (!('extends' in instance)) {
     // Standalone: one file, no layering, and therefore nothing the two lists
     // protect against — they exist to stop one instance inheriting another's
     // identity through a SHARED file, and there is no shared file here. Both
@@ -1095,7 +1205,12 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     root = instance;
   } else {
     if (typeof extendsRaw !== 'string' || extendsRaw.trim() === '') {
-      throw new ConfigError('extends', 'must be a path to the shared base config');
+      throw new ConfigError(
+        'extends',
+        'must be a path to the shared base config. A bare `extends:` with no value is ' +
+          'this error rather than a silent standalone file — it would drop the entire ' +
+          'base, and a crew with no system prompt starts and says nothing.',
+      );
     }
     const basePath = resolve(dirname(path), extendsRaw);
     if (basePath === path) {
@@ -1109,13 +1224,24 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       throw new ConfigError('extends', `${basePath} itself has an \`extends\`; chains are not supported`);
     }
 
+    // Two calls, not one, because the list has two kinds of entry and one rule
+    // sentence cannot be true of both — the first version told an operator that
+    // `container.name` was prompt content.
     refuseKeys(
       instance,
       path,
-      INSTANCE_FORBIDDEN,
+      PROMPT_CONTENT,
       'Prompt content is shared: every crew reads the same words, and differs only in ' +
         `facts interpolated into them. Put it in ${basePath}, and if it is true of one crew ` +
         'and not another, rewrite it to be true of the mechanism.',
+    );
+    refuseKeys(
+      instance,
+      path,
+      DERIVED_KEYS,
+      'Every path and identity here derives from `crew`. Restating one is how an instance ' +
+        "ends up pointing at another crew's container, state directory or credential — " +
+        'delete the key and let it derive.',
     );
     refuseKeys(
       base,
@@ -1126,7 +1252,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'the instance file, or let it derive from `crew`.',
     );
 
-    root = deepMerge(base, instance);
+    root = deepMerge(base, instance, keyProvenance, basePath, path);
   }
   delete root['extends'];
 
@@ -1156,7 +1282,17 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     );
   }
   const displayName = str(root['displayName'], 'displayName', crew[0]!.toUpperCase() + crew.slice(1));
-  const derived = deriveInstancePaths(crew, displayName);
+  // Read before deriving, so an explicit stateDir feeds every path rather than
+  // one of them. Refused outright in either layered file; reachable only from a
+  // standalone config.
+  const containerRaw = section(root['container'], 'container');
+  const derived = deriveInstancePaths(
+    crew,
+    displayName,
+    containerRaw['stateDir'] === undefined || containerRaw['stateDir'] === null
+      ? undefined
+      : requiredAbsPath(containerRaw['stateDir'], 'container.stateDir'),
+  );
 
   const prompt = section(root['systemPrompt'], 'systemPrompt');
   const sessions = section(root['sessions'], 'sessions');
@@ -1181,9 +1317,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       // An explicit value is still honoured and still has to be absolute: the
       // containment checks below compare against it, and a relative one would
       // make every one of them compare against a directory that does not exist.
-      stateDir: container['stateDir'] === undefined
-        ? derived.stateDir
-        : requiredAbsPath(container['stateDir'], 'container.stateDir'),
+      stateDir: derived.stateDir,
       execEnvDir: str(container['execEnvDir'], 'container.execEnvDir', derived.execEnvDir),
       // DERIVED FROM stateDir, NOT DEFAULTED TO A LITERAL, and the difference
       // is one instance serving another instance's crew its credential.
@@ -1203,9 +1337,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       githubTokenDir: str(
         container['githubTokenDir'],
         'container.githubTokenDir',
-        container['stateDir'] === undefined
-          ? derived.githubTokenDir
-          : join(requiredAbsPath(container['stateDir'], 'container.stateDir'), 'github-token'),
+        derived.githubTokenDir,
       ),
     },
     prompts: {
