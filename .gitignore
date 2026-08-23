@@ -27,6 +27,18 @@ ops/src/build-info.ts
 .env
 .env.*
 !.env.example
+
+# Private keys — the GitHub App PEM lives untracked at the repo root, and this
+# repository is public. `.env.*` above catches the env files; nothing caught a
+# `.pem` until 2026-08-23, when the App key was placed there and the only thing
+# standing between it and a public commit was nobody typing `git add -A`.
+#
+# Deliberately broad. A key that is ignored by a rule too wide costs nothing;
+# a key that is committed to a public repo cannot be un-published, only revoked.
+*.pem
+*.key
+*.p12
+
 *.log
 
 # SQLite + WAL sidecars
