@@ -781,6 +781,19 @@ function isInside(child: string, parent: string): boolean {
  * literal, so a second instance gets its own without anyone remembering to say
  * so. Deriving beats enumerating for the same reason this paragraph exists.
  */
+/**
+ * The label of `githubTokenDir`'s own entry, named once so its guard can skip
+ * that ENTRY rather than skipping a PATH VALUE.
+ *
+ * The difference is a hole. Comparing resolved paths, `githubTokenDir` set
+ * exactly equal to any OTHER mount also matched the skip — so
+ * `githubTokenDir: <stateDir>/workspaces` was accepted, which is the read-write
+ * mount that is the container's working directory and the exact placement the
+ * whole guard exists to refuse. Equality with a mount is the WORST case, not
+ * the exempt one; only the entry describing this key itself is exempt.
+ */
+const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only';
+
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
   const state = config.container.stateDir;
   return [
@@ -803,7 +816,7 @@ function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
     // `container.execEnvDir: <githubTokenDir>/env` passed validation and put the
     // file holding DISCORD_TOKEN and GITHUB_TOKEN in plain text inside a
     // directory mounted into the container — exactly what that guard refuses.
-    ['container.githubTokenDir, bind-mounted read-only', config.container.githubTokenDir],
+    [GITHUB_TOKEN_DIR_MOUNT, config.container.githubTokenDir],
   ];
 }
 
@@ -1081,11 +1094,13 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     throw new ConfigError('container.githubTokenDir', 'must be an absolute path');
   }
   const githubTokenDir = resolve(config.container.githubTokenDir);
-  for (const [label, mount] of bindMountedPaths(config)) {
-    // Skip its own entry. This directory is itself a bind mount and is in that
-    // list so OTHER paths can be refused inside it — `isInside(x, x)` is true,
-    // so without this the guard rejects every valid configuration.
-    if (resolve(mount) === githubTokenDir) continue;
+  // Its own ENTRY is dropped, not its own PATH. This directory is itself a bind
+  // mount and is in that list so other paths can be refused inside it, and
+  // `isInside(x, x)` is true — so without dropping it the guard would reject
+  // every valid configuration. Dropping by label rather than by resolved path
+  // keeps equality with any OTHER mount a refusal, which is what it must be.
+  const others = bindMountedPaths(config).filter(([label]) => label !== GITHUB_TOKEN_DIR_MOUNT);
+  for (const [label, mount] of others) {
     if (isInside(githubTokenDir, resolve(mount))) {
       throw new Error(
         `agent-config.yaml: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +

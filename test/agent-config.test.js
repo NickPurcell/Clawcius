@@ -26,9 +26,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+
+import { parse, stringify } from 'yaml';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
 
@@ -283,4 +285,36 @@ test('githubTokenDir is derived per instance, not defaulted to one of them', () 
     hamachi.container.githubTokenDir,
     'two instances must never share a credential directory',
   );
+});
+
+test('githubTokenDir is refused inside OR equal to any other bind mount', () => {
+  // FINDING 17 ON #188, and the reason it survived: the derivation had a test
+  // and the containment guard had none, while `execEnvDir` — the guard this one
+  // was copied from — has containment tests against run, workspaces and
+  // agent-home. The copy did not bring them.
+  //
+  // The hole was that the self-skip compared resolved PATHS, so githubTokenDir
+  // set exactly EQUAL to another mount matched it and was accepted. Equality
+  // with a mount is the worst case, not the exempt one: `<stateDir>/workspaces`
+  // is the read-write mount that is also the container's working directory,
+  // which is where round 1 found the credential and why any of this exists.
+  const base = parse(readFileSync('agent-config.yaml', 'utf8'));
+  const refused = [
+    '/var/lib/clawcius/workspaces', // equal to a read-write mount
+    '/var/lib/clawcius/run',
+    '/var/lib/clawcius/agent-home',
+    '/home/npurcell/clawcius/.claude', // equal to a read-only mount BOTH crews share
+    '/var/lib/clawcius/workspaces/tok', // inside one
+  ];
+  for (const dir of refused) {
+    const y = structuredClone(base);
+    y.container.githubTokenDir = dir;
+    const path = join(mkdtempSync(join(tmpdir(), 'clawsky-cfg-')), 'agent-config.yaml');
+    writeFileSync(path, stringify(y));
+    assert.throws(
+      () => loadAgentConfig(path),
+      /githubTokenDir/,
+      `${dir} must be refused — the sandbox can reach it`,
+    );
+  }
 });

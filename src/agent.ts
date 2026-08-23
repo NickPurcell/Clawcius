@@ -175,7 +175,21 @@ export function gitEnv(): Record<string, string> {
     ['user.email', config().agent.git.userEmail],
   ];
 
-  if (config().github.token || config().github.appId) {
+  // THE CONDITION MUST DESCRIBE THE SAME DEPLOYMENT AS THE WRITER'S.
+  //
+  // `github.appId` alone was wider: the file is only written under
+  // `armedStore && app && appTokenOk`, and `armedStore` also needs
+  // `clawsky.enabled && armed.enabled`. So an App-configured deployment with
+  // armed watching off wrote no file and started no refresher — meaning not
+  // even the refresher's "no usable credential" line — and with no PAT either
+  // the helper handed git an EMPTY password. Git then fails on an empty
+  // credential rather than on an absent one, which is the less nameable of the
+  // two: no helper at all makes git say it could not read a username.
+  const appWritesTheFile =
+    Boolean(config().github.appId) &&
+    config().agent.clawsky.enabled &&
+    config().agent.armed.enabled;
+  if (config().github.token || appWritesTheFile) {
     entries.push([
       'credential.https://github.com.helper',
       // FILE FIRST, ENVIRONMENT SECOND, resolved on every call rather than at

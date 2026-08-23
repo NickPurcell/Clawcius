@@ -21,7 +21,8 @@
  * `git push` carries the INSTALLATION token where it used to carry the PAT.
  * That means the App needs `Contents: write`. The mechanism lives in
  * `token-file.ts` and not here, because the two consumers have different
- * lifetimes and mixing them would make neither reviewable. What it buys is that the waker's own reads carry an
+ * lifetimes and mixing them would make neither reviewable. What it buys is
+ * that the waker's own reads carry an
  * identity separable from the crew's, and that the credential it carries can be
  * rotated without touching the agent.
  *

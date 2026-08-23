@@ -26,13 +26,14 @@ import { setConfig } from '../dist/config.js';
 import { gitEnv } from '../dist/agent.js';
 import { tokenFilePath } from '../dist/token-file.js';
 
-function configure({ token = '', appId = '', githubTokenDir }) {
+function configure({ token = '', appId = '', githubTokenDir, armed = true }) {
   setConfig({
     discord: { token: 'unused', guildId: 'unused' },
     github: { token, appId },
     storage: { dbPath: 'unused' },
     agent: {
-      clawsky: { crew: 'hamachi', wakeOnMail: true },
+      clawsky: { crew: 'hamachi', wakeOnMail: true, enabled: true },
+      armed: { enabled: armed },
       model: 'm',
       modelByRole: {},
       git: { userName: 'a', userEmail: 'a@b.c' },
@@ -136,4 +137,33 @@ test('the token never appears in the environment handed to the container', () =>
 
   const serialised = JSON.stringify(gitEnv());
   assert.doesNotMatch(serialised, /ghs_installation_token/, 'the minted token must stay on disk');
+});
+
+test('no helper when the App is configured but nothing will write the file', () => {
+  // FINDING 18, raised three rounds running. `gitEnv` emitted the file-first
+  // helper whenever `github.appId` was set, but the file is only written under
+  // `armedStore && app && appTokenOk` — and `armedStore` also needs
+  // `clawsky.enabled && armed.enabled`. So this deployment wrote no file, started
+  // no refresher (hence not even its "no usable credential" line), and with no PAT
+  // the helper handed git an EMPTY password.
+  //
+  // Empty is the less nameable failure of the two: git reports an auth failure
+  // against a credential it was given, where no helper at all makes it say it
+  // could not read a username.
+  const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
+  configure({ token: '', appId: '123', githubTokenDir: root, armed: false });
+  const keys = Object.keys(gitEnv())
+    .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
+    .map((k) => gitEnv()[k]);
+  assert.ok(
+    !keys.includes('credential.https://github.com.helper'),
+    'no writer means no helper — the two conditions must describe one deployment',
+  );
+
+  // …and with armed watching ON, the file will be written, so the helper belongs.
+  configure({ token: '', appId: '123', githubTokenDir: root, armed: true });
+  const on = Object.keys(gitEnv())
+    .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
+    .map((k) => gitEnv()[k]);
+  assert.ok(on.includes('credential.https://github.com.helper'));
 });

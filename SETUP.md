@@ -393,7 +393,8 @@ which is how Clawcius keeps working.
 With an App configured, the daemon also keeps **one** file holding a current
 installation token, at `<container.githubTokenDir>/installation-token`, mode
 `0600`. The **file** is rewritten every five minutes; the **token** in it is
-minted roughly hourly, because the provider caches until shortly before expiry. The agents' git credential helper reads that file instead of
+minted roughly hourly, because the provider caches until shortly before expiry.
+The agents' git credential helper reads that file instead of
 an environment variable.
 
 It has to be a file rather than an env var because **a session's environment is
