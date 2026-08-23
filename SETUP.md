@@ -382,6 +382,37 @@ leaves you running as the older identity with everything apparently working, and
 any of them. A deployment with neither variable set is unchanged and silent,
 which is how Clawcius keeps working.
 
+### Agent sessions and the App
+
+With an App configured, the daemon also keeps **one** file holding a current
+installation token, at `<workspaceRoot>/.github-token`, mode `0600`, refreshed
+every five minutes. The agents' git credential helper reads that file instead of
+an environment variable.
+
+It has to be a file rather than an env var because **a session's environment is
+fixed when its process spawns**. A PAT never expires, so handing it over at spawn
+was correct forever; an installation token expires in an hour and sessions
+outlive that, and nothing can update an env var inside a running process from
+outside it.
+
+The helper reads **the file first and `GITHUB_TOKEN` second**, resolved on every
+call. So a deployment whose App is configured but unusable — typo'd key path,
+rotated key, wrong installation id — writes no file and its agents keep pushing
+with the PAT, rather than every push failing for a crew whose credential was fine
+the whole time.
+
+If a refresh fails while the written token is still young, the file is **kept**
+and the failure is logged: turning a brief credential blip into an outage for
+every agent is the mistake issue #176 describes. If a refresh fails once the
+written token is past its life, the file is **removed** — an absent file fails
+immediately and names itself, where a stale one keeps working until it does not
+and then fails as a `401` that explains nothing.
+
+The file is not a new exposure: every process in the container already runs as
+uid 1000 `agent` and can read `/proc/1/environ`. It is wider in one way — a
+workspace is a bind mount, so the file outlives the container — and that is
+bounded by `docker/snapshot.sh` using `docker commit`, which excludes mounts.
+
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the
 next restart. The PEM should be `0600` and owned by the service user.

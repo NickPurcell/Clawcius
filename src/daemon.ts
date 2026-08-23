@@ -62,7 +62,9 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
+import type { TokenProvider } from './github-app.js';
 import { appTokenProvider, checkAppConfig } from './github-app.js';
+import { TokenFileRefresher, tokenFilePath } from './token-file.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -667,6 +669,9 @@ export async function main(): Promise<void> {
     : null;
 
   let github: PullRequestSource | null = null;
+  // Declared here rather than beside its construction because `shutdown` is
+  // out here and has to be able to stop it.
+  let tokenFileRefresher: TokenFileRefresher | null = null;
   if (armedStore) {
     // Prefer the App when this deployment has one. Both variables are required
     // — a half-configured deployment falls back rather than failing, because a
@@ -693,6 +698,7 @@ export async function main(): Promise<void> {
     // same answer and deserves it more, because it fails AFTER arming rather
     // than before.
     let appTokenOk = false;
+    let appProvider: TokenProvider | null = null;
     if (app) {
       // Checked at BOOT because it costs no network, no token and no PEM, so
       // there is no reason for it to wait until first use — and first use is
@@ -719,20 +725,43 @@ export async function main(): Promise<void> {
       // client lives for the life of the daemon; a poll that throws is disarmed
       // rather than retried (`ArmedWaker`), so a stale credential would kill
       // every armed watch in the crew an hour after startup rather than degrade.
-      github = new GitHubClient(
-        appTokenProvider({
-          appId: config.github.appId,
-          privateKeyPath: config.github.appPrivateKeyPath,
-          installationId: config.github.appInstallationId || undefined,
-          apiBase: config.agent.armed.github.apiBase,
-        }),
-        config.agent.armed.github.apiBase,
-      );
+      // ONE provider, shared by the waker's client and the agents' token file.
+      // Two providers would mint twice as often against the same rate limit and,
+      // worse, could disagree — an agent pushing with one token while the waker
+      // polls with another is two credentials to reason about instead of one.
+      appProvider = appTokenProvider({
+        appId: config.github.appId,
+        privateKeyPath: config.github.appPrivateKeyPath,
+        installationId: config.github.appInstallationId || undefined,
+        apiBase: config.agent.armed.github.apiBase,
+      });
+      github = new GitHubClient(appProvider, config.agent.armed.github.apiBase);
       // Said only once the key has been shown readable. Printing it before
       // anything was proven reported success at the exact moment the failure
       // became undetectable. The id is not a secret; the key and the token are,
       // and neither the PEM's path nor anything minted from it is logged.
       process.stderr.write(`[armed] authenticating as GitHub App ${config.github.appId}\n`);
+
+      // The agent sessions' half of the same credential. Started only when a
+      // path is configured, so a deployment that has an App for the WAKER and
+      // still wants agents on the PAT is expressible — and Clawcius, which has
+      // no App at all, reaches none of this.
+      {
+        tokenFileRefresher = new TokenFileRefresher({
+          path: tokenFilePath(config.agent.sessions.workspaceRoot),
+          provider: appProvider,
+          log: (message) => process.stderr.write(`${message}\n`),
+        });
+        // AWAITED, and a failure here stops startup. A daemon that comes up
+        // without this file has agents whose every push fails with an error
+        // about a missing file, discovered one agent at a time. Failing at boot
+        // is the same argument `checkAppConfig` makes one screen up.
+        await tokenFileRefresher.start();
+        process.stderr.write(
+          '[armed] agent git credentials come from ' +
+            `${tokenFilePath(config.agent.sessions.workspaceRoot)}\n`,
+        );
+      }
     } else if (config.github.token) {
       github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);
     } else {
@@ -1060,6 +1089,7 @@ export async function main(): Promise<void> {
       wakerStatus.removeOnShutdown();
       clearInterval(windowSweeper);
       bundler.flushAll();
+      tokenFileRefresher?.stop();
       await sessions.shutdown();
       registry.close();
       await client.destroy();
