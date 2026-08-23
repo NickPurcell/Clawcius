@@ -538,6 +538,8 @@ either side of it is used.
 
 Discord stays with the coordinator. The operator talks to the captain; the
 captain talks to the crew. The poster's surface is the board, not the human.
+That allocation is a convention rather than a gate: nothing in `src/` checks a
+role before a post, and `<coordinator>` in the shipped configs says so.
 
 **OJ stays off the board.** Its workers read pull request diffs written by
 strangers, which makes it the one component in the system routinely handling
