@@ -58,7 +58,9 @@
  */
 
 import { createSign } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, readFileSync } from 'node:fs';
+
+const { R_OK } = fsConstants;
 
 /** Answers with a token that is valid *now*. */
 export type TokenProvider = () => Promise<string>;
@@ -107,6 +109,23 @@ export function appJwt(appId: string, privateKeyPem: string, nowMs: number): str
   return `${header}.${payload}.${base64url(signer.sign(privateKeyPem))}`;
 }
 
+/**
+ * One predicate, two callers, deliberately.
+ *
+ * The boot check (`describeAppFault`) and the runtime throw (`mint`) answer the
+ * same question about the same value at two different moments. Written twice
+ * they can drift, and the direction of drift is the bad one: the operator is
+ * told the boot line is where they learn what happened, so a boot check that
+ * had quietly grown laxer than the runtime one would clear a value that later
+ * disarms every watch in the crew.
+ *
+ * The MESSAGES stay separate — one is a warning with a remedy, the other is a
+ * throw — because it is the condition that must not diverge, not the prose.
+ */
+export function isInstallationIdValid(id: string | undefined): boolean {
+  return id === undefined || id === '' || /^\d+$/.test(id);
+}
+
 type Minted = { token: string; expiresAtMs: number };
 
 /**
@@ -137,7 +156,7 @@ async function mint(
   // `encodePath`) so a bad one fails with a name instead of a puzzling status,
   // and a trailing newline in a systemd EnvironmentFile is an ordinary typo.
   // Here it matters more than style: the failure lands as a permanent disarm.
-  if (id !== undefined && !/^\d+$/.test(id)) {
+  if (!isInstallationIdValid(id)) {
     throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
   }
   if (!id) {
@@ -224,4 +243,87 @@ export function appTokenProvider(opts: GitHubAppOptions): TokenProvider {
 /** The PAT path, unchanged in behaviour: the same string, forever. */
 export function staticTokenProvider(token: string): TokenProvider {
   return async () => token;
+}
+
+/**
+ * What is wrong with the App configuration, as one operator-facing sentence,
+ * or `null` if nothing is.
+ *
+ * ── Why this is a function and not four lines inside `main()` ───────────────
+ *
+ * Because those four lines have been wrong in three consecutive reviews, and
+ * each time the fix was invisible to the test suite. `main()` builds a Discord
+ * client and a session pool; nothing was going to grow a test around it for the
+ * sake of a warning string, so the warning string was the one thing in this
+ * repository changed repeatedly and never asserted on. It is pure and it takes
+ * its filesystem as an argument for exactly that reason.
+ *
+ * ── Two checks, both reported ──────────────────────────────────────────────
+ *
+ * They used to share a branch, so a bad installation id skipped the key check
+ * entirely: an operator with both wrong fixed one, restarted, and only then
+ * learned about the other. Two facts that were both knowable at the first boot
+ * should cost one boot.
+ *
+ * ── The consequence clause is conditional, and stops short when it must ─────
+ *
+ * Saying "FALLING BACK TO GITHUB_TOKEN … watches will arm and poll" is true
+ * only when there IS a token. Without one the daemon prints, on the very next
+ * line, that nothing will arm at all — so the unconditional version was
+ * refuted by the sentence beneath it, which is worse than saying nothing: a
+ * warning the reader watches get disproved is a warning they learn to skip.
+ *
+ * The fix is subtraction. With no PAT this says only what it knows — the App
+ * is not in use — and leaves the consequence to the branch that actually
+ * decides it, which already states it correctly and with the remedy attached.
+ */
+export function describeAppFault(
+  input: {
+    privateKeyPath: string;
+    installationId: string | undefined;
+    /** Whether a PAT exists to fall back TO. Decides what may be promised. */
+    hasFallbackToken: boolean;
+  },
+  // Injected so the tests can drive real failures without needing a real
+  // unreadable file, and so this module keeps its only `node:fs` dependency in
+  // one place.
+  access: (path: string) => void = (path) => accessSync(path, R_OK),
+): string | null {
+  const faults: string[] = [];
+
+  if (!isInstallationIdValid(input.installationId)) {
+    faults.push(
+      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
+        'and a trailing newline in an EnvironmentFile is the usual cause',
+    );
+  }
+
+  try {
+    // `access` rather than a mint: it catches the two failures an operator
+    // actually makes — wrong path, wrong owner — without spending a token or a
+    // round trip at every boot, and without making startup depend on GitHub
+    // being reachable.
+    access(input.privateKeyPath);
+  } catch (error) {
+    // `error.code` rather than the message. `fs` errors carry the PATH in
+    // `.message`, and this module's header states that the PEM's path is not
+    // logged. ENOENT and EACCES also happen to be the more useful half — they
+    // distinguish "wrong path" from "wrong owner", which is the operator's
+    // actual question.
+    const code = error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
+    faults.push(
+      `GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable (${code}) — ` +
+        'ENOENT means the path is wrong, EACCES means the owner or mode is',
+    );
+  }
+
+  if (faults.length === 0) return null;
+
+  return (
+    faults.join('. ALSO: ') +
+    (input.hasFallbackToken
+      ? '. FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm ' +
+        'and poll as the personal access token.'
+      : '. The App is NOT in use.')
+  );
 }

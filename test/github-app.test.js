@@ -22,7 +22,12 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { appJwt, appTokenProvider, staticTokenProvider } from '../dist/github-app.js';
+import {
+  appJwt,
+  appTokenProvider,
+  staticTokenProvider,
+  describeAppFault,
+} from '../dist/github-app.js';
 import { GitHubClient } from '../dist/github.js';
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -248,4 +253,105 @@ test('a plain string still works, so the PAT path is unchanged', async () => {
   }
   assert.deepEqual(seen, ['Bearer ghp_static']);
   assert.equal(await staticTokenProvider('ghp_static')(), 'ghp_static');
+});
+
+
+// ── describeAppFault ────────────────────────────────────────────────────────
+//
+// These exist because the four lines this function replaced were wrong in three
+// consecutive reviews and no test ever noticed: they lived in `main()`, beside
+// a Discord client and a session pool, where nothing was going to assert on
+// them. The warning string is operator-facing output and SETUP.md tells the
+// operator it is the only place they learn what happened, so it is worth the
+// same scrutiny as a return value.
+
+/** An `access` that fails the way the real one does, with a `code`. */
+const accessFailing = (code) => () => {
+  const error = new Error(`${code}: opening '/etc/clawcius/secret-app-key.pem'`);
+  error.code = code;
+  throw error;
+};
+const accessOk = () => {};
+
+test('describeAppFault says nothing when the App is configured correctly', () => {
+  const fault = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: '42', hasFallbackToken: true },
+    accessOk,
+  );
+  assert.equal(fault, null, 'a good configuration must produce no warning at all');
+});
+
+test('describeAppFault reports BOTH faults in one boot', () => {
+  // The two used to share a branch, so a bad id suppressed the key check and
+  // the operator needed two restarts to learn two things knowable at the first.
+  const fault = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: '42\n', hasFallbackToken: true },
+    accessFailing('ENOENT'),
+  );
+  assert.match(fault, /GITHUB_APP_INSTALLATION_ID must be digits only/);
+  assert.match(fault, /GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable \(ENOENT\)/);
+});
+
+test('describeAppFault distinguishes a wrong path from a wrong owner', () => {
+  // ENOENT and EACCES are the operator's actual question, and they are the
+  // reason this reports `error.code` rather than `String(error)`.
+  const missing = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
+    accessFailing('ENOENT'),
+  );
+  const denied = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
+    accessFailing('EACCES'),
+  );
+  assert.match(missing, /\(ENOENT\)/);
+  assert.match(denied, /\(EACCES\)/);
+});
+
+test('describeAppFault never puts the PEM path in the warning', () => {
+  // The `fs` error carries the path in `.message`; the whole point of reading
+  // `.code` is that this line goes to a journal and, via `armed-wake`, to a
+  // mailbox. The path names the file and the file is the key.
+  for (const code of ['ENOENT', 'EACCES']) {
+    const fault = describeAppFault(
+      { privateKeyPath: '/etc/clawcius/secret-app-key.pem', installationId: undefined,
+        hasFallbackToken: true },
+      accessFailing(code),
+    );
+    assert.doesNotMatch(fault, /secret-app-key/, code);
+    assert.doesNotMatch(fault, /etc\/clawcius/, code);
+  }
+});
+
+test('describeAppFault promises a fallback only when there is one to fall back to', () => {
+  // THE ROUND-3 DEFECT, in its third costume. With no PAT the daemon prints, on
+  // the very next line, that watchPr will refuse to arm anything — so an
+  // unconditional "watches will arm and poll" was refuted by the sentence
+  // directly beneath it. A warning the reader watches get disproved is a
+  // warning they learn to skip.
+  const withPat = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: true },
+    accessFailing('ENOENT'),
+  );
+  const withoutPat = describeAppFault(
+    { privateKeyPath: '/k.pem', installationId: undefined, hasFallbackToken: false },
+    accessFailing('ENOENT'),
+  );
+  assert.match(withPat, /watches will arm and poll as the personal access token/);
+  assert.doesNotMatch(withoutPat, /will arm/);
+  assert.doesNotMatch(withoutPat, /FALLING BACK/);
+  // It still says the one thing it does know.
+  assert.match(withoutPat, /The App is NOT in use\./);
+});
+
+test('an empty installation id means unset, in both callers', () => {
+  // `config.github.appInstallationId || undefined` normalises it before `mint`
+  // ever sees it, and the boot check skipped it too. The shared predicate makes
+  // that agreement explicit rather than coincidental.
+  assert.equal(
+    describeAppFault(
+      { privateKeyPath: '/k.pem', installationId: '', hasFallbackToken: true },
+      accessOk,
+    ),
+    null,
+  );
 });

@@ -49,7 +49,6 @@
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
-import { accessSync, constants as fsConstants } from 'node:fs';
 import { loadConfig, type Config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
 import {
@@ -63,7 +62,7 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
-import { appTokenProvider } from './github-app.js';
+import { appTokenProvider, describeAppFault } from './github-app.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -687,58 +686,26 @@ export async function main(): Promise<void> {
     // same answer and deserves it more, because it fails AFTER arming rather
     // than before.
     let appTokenOk = false;
-    let appTokenFault = '';
     if (app) {
-        // Costs no network, no token and no PEM, so there is no reason for it
-        // to wait until first use — and first use is inside `ArmedWaker`'s try,
-        // where the catch deletes the row. A trailing newline in an
-        // EnvironmentFile is an ordinary typo; discovering it at boot is a log
-        // line, discovering it at first poll is a permanent sweep.
-        //
-        // EACH CHECK REPORTS ITSELF. They shared one catch and one message, and
-        // that message named the PEM — so a bad installation id produced a line
-        // opening "GITHUB_APP_PRIVATE_KEY_PATH is set but unreadable" and
-        // closing "fix the path or the ownership", about a file that was fine.
-        // Which is the defect the previous commit fixed, reintroduced by the
-        // fix for it, and it lands where SETUP.md has just told the operator
-        // this line is the only place they can learn what happened.
-        if (config.github.appInstallationId && !/^\d+$/.test(config.github.appInstallationId)) {
-          appTokenFault =
-            'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
-            'and a trailing newline in an EnvironmentFile is the usual cause';
-        } else {
-          try {
-            // `fs.access` rather than a mint: it catches the two failures an
-            // operator actually makes — wrong path, wrong owner — without
-            // spending a token or a round trip at every boot, and without
-            // making startup depend on GitHub being reachable.
-            accessSync(config.github.appPrivateKeyPath, fsConstants.R_OK);
-            appTokenOk = true;
-          } catch (error) {
-            // `error.code` rather than the message. `fs` errors carry the PATH
-            // in `.message`, and this file and `github-app.ts` both state that
-            // the PEM's path is not logged. ENOENT and EACCES also happen to be
-            // the more useful half — they distinguish "wrong path" from "wrong
-            // owner", which is the whole question the operator has.
-            const code =
-              error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
-            appTokenFault =
-              `GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable (${code}) — ` +
-              'ENOENT means the path is wrong, EACCES means the owner or mode is';
-          }
-        }
-        if (appTokenFault) {
-          // Say what actually happens next, which is NOT a refusal: the branch
-          // below falls through to the PAT, `github` is built, and watches arm
-          // and poll normally. Claiming a refusal here was worse than silence —
-          // a warning that gets disproved teaches the reader to ignore the next
-          // one.
-          process.stderr.write(
-            `[armed] ${appTokenFault}. FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, ` +
-              'and watches will arm and poll as the personal access token.\n',
-          );
-        }
-      }
+      // Checked at BOOT because it costs no network, no token and no PEM, so
+      // there is no reason for it to wait until first use — and first use is
+      // inside `ArmedWaker`'s try, where the catch deletes the row. A trailing
+      // newline in an EnvironmentFile is an ordinary typo; discovering it at
+      // boot is a log line, discovering it at first poll is a permanent sweep.
+      //
+      // The checks themselves live in `github-app.ts` as a pure function. They
+      // were four lines here, and those four lines were wrong in three
+      // consecutive reviews without a single test noticing, because nothing was
+      // ever going to grow a test around `main()`. `describeAppFault` is
+      // asserted directly; this call site is now too small to be wrong.
+      const fault = describeAppFault({
+        privateKeyPath: config.github.appPrivateKeyPath,
+        installationId: config.github.appInstallationId || undefined,
+        hasFallbackToken: Boolean(config.github.token),
+      });
+      appTokenOk = fault === null;
+      if (fault) process.stderr.write(`[armed] ${fault}\n`);
+    }
     if (app && appTokenOk) {
       // A PROVIDER, not a token. An installation token lasts an hour and this
       // client lives for the life of the daemon; a poll that throws is disarmed
