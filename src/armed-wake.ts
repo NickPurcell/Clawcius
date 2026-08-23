@@ -366,6 +366,21 @@ export function composeWatchMail(
  */
 export const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
+/**
+ * Consecutive 404s before the target is treated as genuinely gone.
+ *
+ * THREE, AND THE NUMBER COMES FROM THE INCIDENT RATHER THAN FROM TASTE. At the
+ * shipped `pollSeconds` of 120 that is six minutes, and the only credential
+ * rotation this file has evidence of ran from 07:11:11Z to about 07:16Z — five.
+ * Two polls is 120 seconds, which is a real improvement on one and does not
+ * cover the window the comment claimed it covered.
+ *
+ * The cost of being wrong in this direction is three requests about a pull
+ * request that has been deleted. The cost of being wrong in the other is the
+ * bug this whole file is about.
+ */
+export const GONE_404_POLLS = 3;
+
 export type PollFailureClass = {
   /** Consecutive failures of this kind before the watch is given up on. */
   readonly bound: number;
@@ -398,10 +413,13 @@ export type PollFailureClass = {
  *
  * ── What is permanent ──────────────────────────────────────────────────────
  *
- * `404` and `410` are statements about the TARGET, which is the thing the watch
- * is about. A pull request that is gone will not come back, and a watch on it
- * will never fire. Those disarm on the first failure, as before, and the mail
- * says the target is gone rather than that GitHub could not be reached.
+ * `410` is a statement about the TARGET, which is the thing the watch is about,
+ * and it is unambiguous: the resource was here and is deliberately gone. It
+ * disarms on the first failure and the mail says the target is gone rather than
+ * that GitHub could not be reached.
+ *
+ * `404` says the same thing far less reliably HERE, which is why it gets
+ * `GONE_404_POLLS` rather than one. See the constant.
  *
  * A `404` can also mean "you may not see this", which is a permissions change
  * rather than a deletion — but both leave a watch that will never fire, so the
@@ -436,7 +454,7 @@ export function classifyPollFailure(error: unknown): PollFailureClass {
   // and invisibility "both leave a watch that will never fire" — true once the
   // permissions state has settled, and precisely wrong for a credential in the
   // middle of changing, which is the case the rest of this file is about.
-  if (status === 404) return { bound: 2, cause: 'gone' };
+  if (status === 404) return { bound: GONE_404_POLLS, cause: 'gone' };
 
   return { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' };
 }
@@ -516,8 +534,18 @@ export class ArmedWaker {
   #ticking = false;
 
   /**
-   * Consecutive failed polls per condition, so a transient failure can be
-   * retried without a fifth one being forgiven forever.
+   * Consecutive failed polls per condition, WITH THE CLASS THAT PRODUCED THEM.
+   *
+   * The cause is stored because the bound is per-class. A bare count compared
+   * against a per-class bound meant a 404 arriving on top of any existing
+   * streak was over its bound on first sight — so `401` then one `404`, which
+   * is exactly what an installation-token rotation looks like from here,
+   * disarmed immediately and spent the two-poll grace added for that very
+   * sequence. A 503 blip, a DNS timeout or an unreadable PEM did the same.
+   *
+   * A change of class starts the count over, because the question the bound
+   * asks — how many of THIS kind in a row — is not answerable by a number that
+   * has forgotten what it counted.
    *
    * IN MEMORY, NOT IN THE STORE, and that is deliberate. A restart clears it,
    * so a watch that had failed four times gets a full five again — which fails
@@ -526,7 +554,7 @@ export class ArmedWaker {
    * would let a restart during an outage carry strikes forward into the
    * recovery and disarm a watch whose target was healthy again.
    */
-  readonly #failures = new Map<number, number>();
+  readonly #failures = new Map<number, { cause: PollFailureClass['cause']; count: number }>();
 
   constructor(options: ArmedWakerOptions) {
     this.#options = options;
@@ -758,7 +786,8 @@ export class ArmedWaker {
 
     if (!polled) {
       const { bound, cause } = classifyPollFailure(failureError);
-      const strikes = (this.#failures.get(condition.id) ?? 0) + 1;
+      const previous = this.#failures.get(condition.id);
+      const strikes = previous?.cause === cause ? previous.count + 1 : 1;
 
       // TRANSIENT AND NOT YET AT THE BOUND: leave the row alone and say nothing.
       // No mail, because a watch that recovers on the next tick has nothing to
@@ -766,7 +795,7 @@ export class ArmedWaker {
       // this system runs on. The log line is for the operator, who is the one
       // who can act on a pattern of them.
       if (strikes < bound) {
-        this.#failures.set(condition.id, strikes);
+        this.#failures.set(condition.id, { cause, count: strikes });
         // RESCHEDULED, not just returned. Without this the row's `due_at` stays
         // in the past, `ArmedStore.due()` returns it on the very next tick, and
         // the bound becomes N TICKS rather than N POLLS — 60 seconds at the
@@ -787,7 +816,16 @@ export class ArmedWaker {
 
       this.#failures.delete(condition.id);
       this.#options.store.disarm(condition.id);
-      const { subject, body } = composeWatchErrorMail(spec, failure ?? 'unknown error', cause, bound);
+      // `strikes`, not `bound` — the count observed, not the policy. Passing the
+      // policy printed "across 2 consecutive polls" after a single 404, and
+      // "5 times in a row" for a streak with a 404 in the middle of it. This
+      // pull request exists to stop the mail asserting things nobody saw.
+      const { subject, body } = composeWatchErrorMail(
+        spec,
+        failure ?? 'unknown error',
+        cause,
+        strikes,
+      );
       this.#deliver(condition, subject, body);
       return;
     }

@@ -43,6 +43,7 @@ import {
   composeReminderMail,
   classifyPollFailure,
   MAX_CONSECUTIVE_POLL_FAILURES,
+  GONE_404_POLLS,
 } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
@@ -568,7 +569,7 @@ test('a transient failure disarms only after the bound, and says how many', asyn
   registry.close();
 });
 
-test('a 404 disarms on the SECOND consecutive failure, not the first', async () => {
+test('a 404 disarms only after GONE_404_POLLS consecutive ones', async () => {
   // The distinction the old code could not draw, because `String(error)` ran
   // one line before the decision that needed the status. A deleted pull request
   // will not come back; retrying it four more times is four more minutes of
@@ -592,11 +593,13 @@ test('a 404 disarms on the SECOND consecutive failure, not the first', async () 
   const waker = new ArmedWaker({
     store, registry, mail, github: gone, tickMs: 1000, log: () => {},
   });
-  await waker.tick();
-  assert.equal(
-    store.listFor('hamachi-engineer1').length, 1,
-    'one 404 may be an installation token that cannot see the repo yet',
-  );
+  for (let i = 1; i < GONE_404_POLLS; i += 1) {
+    await waker.tick();
+    assert.equal(
+      store.listFor('hamachi-engineer1').length, 1,
+      `404 number ${i} may be an installation token that cannot see the repo yet`,
+    );
+  }
   await waker.tick();
 
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
@@ -621,7 +624,10 @@ test('the classifier decides on status, and is driven by status rather than read
   // for, wearing the status that means permanent. Two consecutive costs one
   // poll interval and covers the rotation window.
   assert.deepEqual(classifyPollFailure(new GitHubError(410, 'x')), { bound: 1, cause: 'gone' });
-  assert.deepEqual(classifyPollFailure(new GitHubError(404, 'x')), { bound: 2, cause: 'gone' });
+  assert.deepEqual(
+    classifyPollFailure(new GitHubError(404, 'x')),
+    { bound: GONE_404_POLLS, cause: 'gone' },
+  );
 
   for (const status of [401, 403, 408, 429, 500, 502, 503, 504]) {
     assert.deepEqual(
@@ -1240,5 +1246,85 @@ test('a retry waits a POLL interval, not a tick — it does not become due again
   // Ticking in between must not poll GitHub again.
   await waker.tick();
   assert.equal(calls, 1, 'a tick inside the poll interval must not re-poll');
+  registry.close();
+});
+
+test('a mixed streak does not spend the 404 grace, and the mail counts what it saw', async () => {
+  // FINDING 7. The strike count had no record of WHICH class produced it, so a
+  // 404 landing on top of any existing streak was over its bound on first
+  // sight. `401` then one `404` is exactly what an installation-token rotation
+  // looks like from here — the old token invalid, then a new one whose
+  // installation cannot see the repository yet — which is the sequence the
+  // 404 grace was added for, and it did not survive it.
+  //
+  // The stub throwing only 404s could not see this, the same shape of blind
+  // spot as `pollSeconds: 0` was in the previous round: a mixed-status streak
+  // is the only case that distinguishes a shared counter from a per-class one.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let status = 401;
+  const rotating = {
+    async getPullRequest() { throw githubError(status, 'x'); },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: rotating, tickMs: 1000, log: () => {},
+  });
+
+  // ENOUGH TRANSIENT STRIKES TO EXCEED THE 404 BOUND, which is the only shape
+  // that distinguishes the two counters. A single 401 followed by a 404 does
+  // NOT — with GONE_404_POLLS at 3, a shared counter reaches 2 and stays under
+  // the bound, so that version of this test passed against the defect. Written
+  // out because I wrote that version first, and it is the same mistake as the
+  // `pollSeconds: 0` one: a fixture that cannot express the failure.
+  for (let i = 0; i < GONE_404_POLLS; i += 1) await waker.tick();
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, '401s must not reach their own bound yet');
+
+  status = 404;
+  await waker.tick();                       // the class changes: count restarts at 1
+  assert.equal(
+    store.listFor('hamachi-engineer1').length, 1,
+    'a preceding streak of 401s must not spend the 404 grace',
+  );
+
+  // …and the count that eventually disarms is a count of 404s alone.
+  for (let i = 1; i < GONE_404_POLLS; i += 1) await waker.tick();
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.body, new RegExp(`${GONE_404_POLLS} consecutive polls`));
+  registry.close();
+});
+
+test('the disarm mail reports the observed count, not the policy', async () => {
+  // `attempts` was passed as `bound`. So "across 2 consecutive polls" printed
+  // after a single 404, and "5 times in a row" printed for a streak with a 404
+  // in the middle of it. Reporting the policy as though it were the observation
+  // is the defect this whole change exists to remove.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const down = {
+    async getPullRequest() { throw githubError(503, 'Server Error'); },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) await waker.tick();
+
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES} times in a row`));
   registry.close();
 });
