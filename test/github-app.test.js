@@ -523,3 +523,39 @@ test('both invisible-character messages name every group they catch', () => {
   assert.match(id, /control character/);
   assert.match(id, /zero-width/);
 });
+
+test('the boundary of the invisible-character class is pinned, so widening it is loud', () => {
+  // WHAT THIS DOES AND DOES NOT DO, because the pull request that added the
+  // message tests claimed more than they delivered.
+  //
+  // The three `assert.match` checks above pin each message against being
+  // NARROWED — drop "zero-width" from the sentence and they fail. They do NOT
+  // pin it against the CHECK being widened: add a fourth group to `INVISIBLE`
+  // tomorrow and every one of them still passes while the message is once again
+  // narrower than the behaviour. That is the fifth-instance defect, one level up.
+  //
+  // A test cannot tie a prose sentence to a regex. What it can do is pin the
+  // BOUNDARY, so that widening the class fails HERE and whoever widens it is
+  // standing in this file, next to the comment telling them the message is the
+  // other half of the change. That is a tripwire rather than a proof, and it is
+  // the honest version of what was claimed.
+  const notCaught = {
+    'U+0301 COMBINING ACUTE ACCENT': '́',
+    'U+FE0F VARIATION SELECTOR-16': '️',
+    'U+E000 PRIVATE USE': '',
+    'U+2800 BRAILLE PATTERN BLANK': '⠀',
+  };
+  for (const [name, ch] of Object.entries(notCaught)) {
+    assert.equal(
+      checkAppConfig(cfg({ appId: `99${ch}` }), accessOk).usable,
+      true,
+      `${name} is outside the class today. If you have just widened INVISIBLE to ` +
+        'include it, that may well be right — and the message ten lines above the ' +
+        'regex has to name the new group too, or it is narrower than the behaviour again.',
+    );
+  }
+
+  // U+180E is category Cf and IS caught, which is the boundary itself: the class
+  // is defined by what the characters ARE, not by a hand-listed set.
+  assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
+});
