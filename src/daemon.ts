@@ -819,7 +819,18 @@ export async function main(): Promise<void> {
   // whole block above is skipped and agents still make REST calls.
   if (!tokenFileRefresher && config.github.token) {
     writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
-    process.stderr.write('[armed] agent REST calls use GITHUB_TOKEN (no App configured)\n');
+    // "(no App credential in use)", not "(no App configured)". Three deployments
+    // reach this line and the old wording was false in two of them: an App that
+    // is configured but unusable, where `checkAppConfig` has just named the
+    // failing variable and this contradicted it one line later; and an App that
+    // is fully configured with `clawsky` or `armed` disabled, where `armedStore`
+    // is null so the check never runs and NOTHING contradicts it — an operator
+    // debugging why their App is not in use reads that it is not configured, and
+    // goes to check a configuration that is already correct.
+    //
+    // This line knows exactly one fact: nothing is refreshing an installation
+    // token. That is what it says now, and it is true in all three.
+    process.stderr.write('[armed] agent REST calls use GITHUB_TOKEN (no App credential in use)\n');
   }
 
   const armedTools = armedStore

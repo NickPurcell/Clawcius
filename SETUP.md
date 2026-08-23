@@ -385,18 +385,37 @@ The fallback is deliberate, for the reason above: a crew that cannot reach GitHu
 is worse than one reaching it as the older identity. But it means a mistyped path
 leaves you running as the older identity with everything apparently working, and
 **the startup line is the only place that says so** — so read it after changing
-any of them. A deployment with neither variable set is unchanged and silent,
-which is how Clawcius keeps working.
+any of them. A deployment with neither variable set still falls back to
+`GITHUB_TOKEN`, which is how Clawcius keeps working — but it is no longer
+*silent* and no longer *unchanged*. It writes the two curl files described below,
+sets `CURL_HOME`, prints one startup line saying no App credential is in use, and
+removes the netrc at shutdown. The credential and the identity are exactly as
+before; the plumbing around them is not.
 
-### Agent sessions and the App
+### Agent sessions and the API
 
-With an App configured, the daemon also keeps **one** file holding a current
-installation token, at `<container.githubTokenDir>/installation-token`, mode
-`0600` — plus a `netrc` and a `.curlrc` beside it, so that agents' **REST** calls
-authenticate too. `CURL_HOME` points at that directory, which means a bare
-`curl https://api.github.com/...` carries the App with no header. An explicit
-`-H "Authorization: …"` replaces it with whatever that header holds, so passing
-one opts out. The **file** is rewritten every five minutes; the **token** in it is
+**Read this even if you have no App.** Most of what follows applies to every
+deployment — the `netrc`, the `.curlrc`, `CURL_HOME` and the removal at shutdown
+all exist whether or not an App is configured. What an App changes is *which
+credential* those files hold, an installation token instead of the PAT, and
+nothing else about the mechanism.
+
+This heading used to end "…and the App", which meant an operator running a
+PAT-only deployment reasonably read past the only description of four things
+their daemon had started doing.
+
+The daemon keeps a `netrc` and a `.curlrc` in `<container.githubTokenDir>`, mode
+`0600`, holding **whichever credential this deployment uses** — an installation
+token where an App is configured and usable, the `GITHUB_TOKEN` otherwise.
+`CURL_HOME` points at that directory, so a bare
+`curl https://api.github.com/...` from an agent is already authenticated. An
+explicit `-H "Authorization: …"` replaces that credential with whatever the
+header holds, so passing one opts out.
+
+**With an App**, a third file sits beside them —
+`<container.githubTokenDir>/installation-token` — which is what the git
+credential helper reads, and which the daemon refreshes because an installation
+token expires in an hour. The **file** is rewritten every five minutes; the **token** in it is
 minted roughly hourly, because the provider caches until shortly before expiry.
 The agents' git credential helper reads that file instead of
 an environment variable.

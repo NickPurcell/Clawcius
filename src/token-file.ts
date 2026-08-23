@@ -360,18 +360,25 @@ export class TokenFileRefresher {
     //
     // Which credential is in force is the RUNNING daemon's business. A stopped
     // one leaves nothing.
+    // Logged, not swallowed, and WITHOUT the asymmetry an earlier version of
+    // this comment defended. That argument was that a netrc left here holds an
+    // installation token, dead within the hour, so the failure was not worth a
+    // line — but `onNoToken` writes the PAT into the netrc when the App is given
+    // up on, and `stop()` runs after that like any other. So the comment
+    // reasoned about WHICH BRANCH when the deciding variable is WHAT THE NETRC
+    // HOLDS, which this method cannot see. It was wrong twice, the same way.
+    //
+    // Saying it unconditionally makes the distinction unnecessary rather than
+    // correcting it a third time. A credential that could not be removed is
+    // worth a line whatever it is.
     try {
       this.#opts.onStop?.();
-    } catch {
-      // Shutdown is not a place to throw.
-      //
-      // SILENT HERE, LOUD IN `daemon.ts`'s equivalent, and the asymmetry is
-      // deliberate. A netrc this branch fails to remove holds an INSTALLATION
-      // token, which is dead within the hour — the "bounded" exposure the module
-      // header describes. The PAT-only branch's netrc never expires, so its
-      // failure is worth a line and this one is not. Written here because
-      // otherwise the two catches look inconsistent and the sentence resolving
-      // them is two hundred lines away.
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
+      this.#opts.log(
+        `[token-file] could not remove the curl credential on shutdown (${code}); ` +
+          'a usable token may remain on disk. Shutdown continues.',
+      );
     }
     try {
       rmSync(this.#opts.path, { force: true });
