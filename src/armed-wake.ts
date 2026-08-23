@@ -68,6 +68,7 @@ import {
   type PrReview,
   type PullRequestSource,
   type PullRequestState,
+  GitHubError,
 } from './github.js';
 import type { MailStore } from './mail.js';
 import type {
@@ -349,19 +350,164 @@ export function composeWatchMail(
   return { subject: `watchPr ${spec.repo}#${spec.pr} — ${summary}`, body: lines.join('\n') };
 }
 
-/** What the watch could not tell the agent, said out loud instead of swallowed. */
-export function composeWatchErrorMail(spec: PrWatchSpec, detail: string): ComposedMail {
+/**
+ * How many consecutive failed polls before a watch is given up on.
+ *
+ * A watch that fails once has lost a packet. A watch that fails five times
+ * running has genuinely lost its target.
+ *
+ * FIVE POLLS, NOT FIVE TICKS, and the distinction is the whole of it: the two
+ * intervals are different numbers — `armed.tickSeconds` is 15 and
+ * `armed.github.pollSeconds` is 120 — so a retry path that did not reschedule
+ * turned this into sixty seconds of grace while claiming ten minutes, and
+ * polled a third party eight times faster precisely while it was unhappy. The
+ * failure this exists to survive is measured in minutes, so the retry must be
+ * spaced in poll intervals.
+ */
+export const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+
+/**
+ * Consecutive 404s before the target is treated as genuinely gone.
+ *
+ * THREE, AND THE NUMBER COMES FROM THE INCIDENT RATHER THAN FROM TASTE. At the
+ * shipped `pollSeconds` of 120 that is six minutes, and the only credential
+ * rotation this file has evidence of ran from 07:11:11Z to about 07:16Z — five.
+ * Two polls is 120 seconds, which is a real improvement on one and does not
+ * cover the window the comment claimed it covered.
+ *
+ * The cost of being wrong in this direction is three requests about a pull
+ * request that has been deleted. The cost of being wrong in the other is the
+ * bug this whole file is about.
+ */
+export const GONE_404_POLLS = 3;
+
+export type PollFailureClass = {
+  /** Consecutive failures of this kind before the watch is given up on. */
+  readonly bound: number;
+  /** What the mail should say happened. */
+  readonly cause: 'gone' | 'unreachable';
+};
+
+/**
+ * Is this failure a reason to give up on the watch, or to try again?
+ *
+ * THE INFORMATION TO ANSWER THIS WAS BEING DISCARDED ONE LINE BEFORE THE
+ * DECISION THAT NEEDED IT. The poll's catch did `String(error)` immediately, so
+ * by the time the disarm ran, a 404 and a 503 were the same 400-character
+ * string and both meant "delete the row".
+ *
+ * On 2026-08-23 a GitHub token rotation produced one `401`, and a live watch on
+ * a pull request that was open, healthy and being actively reviewed was
+ * permanently disarmed. A valid credential existed five minutes later. A single
+ * retry would have survived the entire event.
+ *
+ * ── Why 401 is transient here, when it usually is not ──────────────────────
+ *
+ * A `401` says the credential is not valid. That is a statement about the
+ * CREDENTIAL, and this process does not own it — the token is rotated by an
+ * operator or minted by `token-file.ts` on an hourly cycle. So `401` is exactly
+ * the shape of failure that fixes itself without anyone touching the watch, and
+ * treating it as permanent means every rotation costs the crew every watch it
+ * holds. `403` is left with it: a rate limit arrives as `403`, and a genuine
+ * permissions removal is indistinguishable from one without reading the body.
+ *
+ * ── What is permanent ──────────────────────────────────────────────────────
+ *
+ * `410` is a statement about the TARGET, which is the thing the watch is about,
+ * and it is unambiguous: the resource was here and is deliberately gone. It
+ * disarms on the first failure and the mail says the target is gone rather than
+ * that GitHub could not be reached.
+ *
+ * `404` says the same thing far less reliably HERE, which is why it gets
+ * `GONE_404_POLLS` rather than one. See the constant.
+ *
+ * The mail says which it observed, not which it inferred: a `404` may be a
+ * deletion or a permissions change, and this process cannot tell them apart.
+ *
+ * ── Everything else ────────────────────────────────────────────────────────
+ *
+ * Transient. A timeout, a DNS failure, a socket reset, a 5xx, and the
+ * `readFileSync` that `token-file.ts`'s provider throws when a PEM is briefly
+ * unreadable during a key rotation (#182) all arrive here as ordinary errors
+ * with no status at all. Every one of them is a thing that was working before
+ * and will be working again, and none of them says anything about the pull
+ * request.
+ */
+export function classifyPollFailure(error: unknown): PollFailureClass {
+  const status = error instanceof GitHubError ? error.status : 0;
+
+  // 410 is unambiguous: the resource was here and is deliberately gone. One
+  // failure is enough.
+  if (status === 410) return { bound: 1, cause: 'gone' };
+
+  // 404 IS NOT UNAMBIGUOUS ON THIS REPOSITORY, and that is worth two polls.
+  // The waker authenticates with a GitHub App installation token, and GitHub
+  // answers 404 — not 403 — for a repository an installation cannot see. So a
+  // token minted mid-reconfiguration produces a 404 about a pull request that
+  // exists: the same class of event as the 401 this change was written for,
+  // arriving with the status that means "permanent".
+  //
+  // Requiring two consecutive ones costs a single poll interval and covers the
+  // rotation window. An earlier version of this comment argued that deletion
+  // and invisibility "both leave a watch that will never fire" — true once the
+  // permissions state has settled, and precisely wrong for a credential in the
+  // middle of changing, which is the case the rest of this file is about.
+  if (status === 404) return { bound: GONE_404_POLLS, cause: 'gone' };
+
+  return { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' };
+}
+
+/**
+ * What the watch could not tell the agent, and why it stopped trying.
+ *
+ * THE CAUSE IS A REQUIRED ARGUMENT, not a defaulted one. It was defaulted for
+ * exactly one commit, and in that commit the no-token call site — which never
+ * polls anything — silently inherited the retry wording and mailed an agent
+ * "could not reach GitHub 5 times in a row" after zero requests. A default
+ * parameter rewrote an unrelated call site's message, which is the same defect
+ * this whole change is about: text asserting something nobody observed.
+ */
+export function composeWatchErrorMail(
+  spec: PrWatchSpec,
+  detail: string,
+  cause: 'gone' | 'unreachable' | 'no-token',
+  attempts = 1,
+): ComposedMail {
+  const headline: Record<typeof cause, string> = {
+    gone: 'the target is gone',
+    unreachable: 'the poll kept failing',
+    'no-token': 'this process has no GitHub token',
+  };
+  const opening: Record<typeof cause, string> = {
+    gone:
+      `Your watch on ${spec.repo}#${spec.pr} has been disarmed: GitHub says that pull ` +
+      'request is not there, across ' +
+      `${attempts === 1 ? 'a poll' : `${attempts} consecutive polls`}. It has been deleted, ` +
+      'or it is no longer visible to the credential this process holds — those look the ' +
+      'same from here, and both leave a watch that will never fire.',
+    unreachable:
+      `Your watch on ${spec.repo}#${spec.pr} failed ${attempts} polls in a row and has been ` +
+      'disarmed.',
+    'no-token':
+      `Your watch on ${spec.repo}#${spec.pr} has been disarmed without being polled at all: ` +
+      'this process has no GitHub token. It was armed under a process that had one.',
+  };
+  const closing: Record<typeof cause, string> = {
+    gone:
+      'Arm it again if you believe that is wrong — the check is one request and it costs ' +
+      'nothing to be told twice.',
+    unreachable:
+      'A single failure is no longer enough to do this: a transient one is retried, because ' +
+      'a credential rotation or a 5xx says nothing about the pull request. This many in a ' +
+      'row is treated as the target being genuinely unreachable. Fix the cause and arm it ' +
+      'again.',
+    'no-token':
+      'Nothing was retried and nothing failed — there was no request to make. Give the ' +
+      'process a token and arm it again.',
+  };
   return {
-    subject: `watchPr ${spec.repo}#${spec.pr} — DISARMED, the poll failed`,
-    body: [
-      `Your watch on ${spec.repo}#${spec.pr} could not reach GitHub and has been disarmed.`,
-      '',
-      `What went wrong: ${detail}`,
-      '',
-      'It is disarmed rather than left in place because a watch that cannot poll is a watch ' +
-        'that will never fire, and one that stayed armed would look like a pull request with ' +
-        'nothing happening on it. Fix the cause and arm it again.',
-    ].join('\n'),
+    subject: `watchPr ${spec.repo}#${spec.pr} — DISARMED, ${headline[cause]}`,
+    body: [opening[cause], '', `What went wrong: ${detail}`, '', closing[cause]].join('\n'),
   };
 }
 
@@ -384,6 +530,45 @@ export class ArmedWaker {
    * the agent would be mailed the same review twice.
    */
   #ticking = false;
+
+  /**
+   * Consecutive failed polls per condition, WITH THE CLASS THAT PRODUCED THEM.
+   *
+   * The cause is stored because the bound is per-class. A bare count compared
+   * against a per-class bound meant a 404 arriving on top of any existing
+   * streak was over its bound on first sight — so `401` then one `404`, which
+   * is exactly what an installation-token rotation looks like from here,
+   * disarmed immediately and spent the two-poll grace added for that very
+   * sequence. A 503 blip, a DNS timeout or an unreadable PEM did the same.
+   *
+   * A change of class starts the count over, because the question the bound
+   * asks — how many of THIS kind in a row — is not answerable by a number that
+   * has forgotten what it counted.
+   *
+   * AND A TOTAL ALONGSIDE IT, because restarting on every change of class means
+   * a streak that keeps changing class reaches no bound at all. It does not
+   * need strict alternation: `GONE_404_POLLS` is 3, so one non-404 failure
+   * every third poll is enough, which is a deleted pull request plus a flaky
+   * network rather than a conspiracy. Two hundred ticks of that polled two
+   * hundred times, stayed armed and said nothing — a watch that will never
+   * fire, looking to its owner exactly like a pull request with nothing
+   * happening on it, which is the state this file's header argues against.
+   *
+   * So both: the per-class count answers the per-class bound, and the total
+   * answers "is anything at all working here". A bare total was what round 2's
+   * finding was about; a bare per-class count is this one.
+   *
+   * IN MEMORY, NOT IN THE STORE, and that is deliberate. A restart clears it,
+   * so a watch that had failed four times gets a full five again — which fails
+   * in the safe direction, because a daemon restarting mid-incident is exactly
+   * when the crew can least afford to lose its watches. Persisting the count
+   * would let a restart during an outage carry strikes forward into the
+   * recovery and disarm a watch whose target was healthy again.
+   */
+  readonly #failures = new Map<
+    number,
+    { cause: PollFailureClass['cause']; count: number; total: number }
+  >();
 
   constructor(options: ArmedWakerOptions) {
     this.#options = options;
@@ -417,6 +602,13 @@ export class ArmedWaker {
           // snapshot would make that a lie in the one case an agent went out
           // of its way to prevent.
           if (!this.#options.store.get(condition.id)?.active) {
+            // Its strikes go too. This is the ORDINARY withdrawal — an agent
+            // calling `disarm` between ticks — and it is the path that actually
+            // leaks: the row never appears in `due()` again, so nothing else
+            // would ever collect the entry. The in-flight case below covers
+            // only a withdrawal landing inside the poll's awaits, which is the
+            // rare one.
+            this.#failures.delete(condition.id);
             this.#options.log(
               `condition ${condition.id} was disarmed after this tick's query; skipped`,
             );
@@ -558,6 +750,7 @@ export class ArmedWaker {
       const { subject, body } = composeWatchErrorMail(
         spec,
         'no GitHub token is available to the waker process any more',
+        'no-token',
       );
       this.#deliver(condition, subject, body);
       return;
@@ -565,6 +758,9 @@ export class ArmedWaker {
 
     let polled: { pr: PullRequestState; reviews: PrReview[]; comments: PrComment[] } | null = null;
     let failure: string | null = null;
+    // KEPT, not stringified. `String(error)` here is what made a 404 and a 503
+    // the same value by the time the disarm decision ran, twenty lines below.
+    let failureError: unknown = null;
     try {
       const pr = await github.getPullRequest(spec.repo, spec.pr);
       const [reviews, comments] = await Promise.all([
@@ -573,6 +769,7 @@ export class ArmedWaker {
       ]);
       polled = { pr, reviews, comments };
     } catch (error) {
+      failureError = error;
       failure = String(error).slice(0, 400);
     }
 
@@ -589,6 +786,11 @@ export class ArmedWaker {
     // branch as well as the success one: a watch the owner has withdrawn
     // should not produce "your watch could not reach GitHub" either.
     if (!this.#options.store.get(condition.id)?.active) {
+      // Drop its strikes too. Without this, a condition withdrawn by its owner
+      // while carrying failures leaves an entry in the map for the life of the
+      // process — small, but it is a map keyed by an id that will never be
+      // seen again, which is a leak however slow.
+      this.#failures.delete(condition.id);
       this.#options.log(
         `watch ${condition.id} on ${spec.repo}#${spec.pr} was disarmed while its poll was in ` +
           'flight; nothing delivered',
@@ -597,11 +799,69 @@ export class ArmedWaker {
     }
 
     if (!polled) {
+      const { bound, cause } = classifyPollFailure(failureError);
+      const previous = this.#failures.get(condition.id);
+      const strikes = previous?.cause === cause ? previous.count + 1 : 1;
+      const total = (previous?.total ?? 0) + 1;
+      // Either bound ends it. `attempts` is whichever count justified the
+      // disarm, so the mail still reports an observation rather than a policy.
+      const overClass = strikes >= bound;
+      // WHICH BOUND ENDED IT DECIDES WHAT THE MAIL MAY SAY. Disarming on the
+      // overall bound after a mixed streak is not evidence the target is gone —
+      // it is evidence that nothing worked. Reporting the last failure's class
+      // there would print "the target is not there, across 5 consecutive polls"
+      // for five failures of which two were 404s, which is the mail asserting
+      // something nobody observed. So the overall bound always reports itself
+      // as unreachable, with the total; the class bound reports its own count.
+      const reported: PollFailureClass['cause'] = overClass ? cause : 'unreachable';
+      const attempts = overClass ? strikes : total;
+
+      // TRANSIENT AND NOT YET AT THE BOUND: leave the row alone and say nothing.
+      // No mail, because a watch that recovers on the next tick has nothing to
+      // report and an agent woken by every 5xx learns to ignore the mailbox
+      // this system runs on. The log line is for the operator, who is the one
+      // who can act on a pattern of them.
+      if (!overClass && total < MAX_CONSECUTIVE_POLL_FAILURES) {
+        this.#failures.set(condition.id, { cause, count: strikes, total });
+        // RESCHEDULED, not just returned. Without this the row's `due_at` stays
+        // in the past, `ArmedStore.due()` returns it on the very next tick, and
+        // the bound becomes N TICKS rather than N POLLS — 60 seconds at the
+        // shipped defaults (tickSeconds 15) where this file's own comment
+        // promises ten minutes (pollSeconds 120). It also polled GitHub eight
+        // times faster precisely while GitHub was unhappy, including on 429 and
+        // rate-limit 403, which are the statuses that punish that. The file
+        // header calls the poll interval a courtesy to a third party's API and
+        // `watchPr` tells the agent it polls every `pollSeconds`; a failure is
+        // not a reason to stop meaning either.
+        this.#options.store.reschedule(condition.id, Date.now() + spec.pollSeconds * 1000);
+        this.#options.log(
+          `watch ${condition.id} on ${spec.repo}#${spec.pr} poll failed ` +
+            `(${strikes}/${bound} of this kind, ${total}/${MAX_CONSECUTIVE_POLL_FAILURES} ` +
+            `overall, retrying in ${spec.pollSeconds}s): ${failure ?? 'unknown error'}`,
+        );
+        return;
+      }
+
+      this.#failures.delete(condition.id);
       this.#options.store.disarm(condition.id);
-      const { subject, body } = composeWatchErrorMail(spec, failure ?? 'unknown error');
+      // `strikes`, not `bound` — the count observed, not the policy. Passing the
+      // policy printed "across 2 consecutive polls" after a single 404, and
+      // "5 times in a row" for a streak with a 404 in the middle of it. This
+      // pull request exists to stop the mail asserting things nobody saw.
+      const { subject, body } = composeWatchErrorMail(
+        spec,
+        failure ?? 'unknown error',
+        reported,
+        attempts,
+      );
       this.#deliver(condition, subject, body);
       return;
     }
+
+    // A poll that worked clears the count. The bound is on CONSECUTIVE
+    // failures: five scattered over a week are five transients, and treating
+    // them as evidence of a dead target is the same mistake one failure was.
+    this.#failures.delete(condition.id);
     const { pr, reviews, comments } = polled;
 
     const wants = (event: string): boolean => spec.on.includes(event as never);

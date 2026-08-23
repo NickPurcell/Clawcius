@@ -37,10 +37,17 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
-import { ArmedWaker, composeWatchMail, composeReminderMail } from '../dist/armed-wake.js';
+import {
+  ArmedWaker,
+  composeWatchMail,
+  composeReminderMail,
+  classifyPollFailure,
+  MAX_CONSECUTIVE_POLL_FAILURES,
+  GONE_404_POLLS,
+} from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
-import { quoteExternal, MAX_EXTERNAL_CHARS } from '../dist/github.js';
+import { quoteExternal, MAX_EXTERNAL_CHARS, GitHubError } from '../dist/github.js';
 
 /** A board on disk, so a second process can be simulated by a second store. */
 function board() {
@@ -473,7 +480,31 @@ test('a watch armed only for reviews still announces its own end', async () => {
   registry.close();
 });
 
-test('a poll that cannot reach GitHub disarms and says so, rather than going quiet', async () => {
+/**
+ * A `GitHubError` shaped like the one `GitHubClient.#get` actually throws.
+ *
+ * The first version of these tests built `new GitHubError(503, 'Service
+ * Unavailable')` by hand and then asserted the mail contained "503" — which it
+ * only did because the code under test was prefixing the status back on. The
+ * real client already puts it in the message (`github.ts:190`), so the prefix
+ * was a stutter and the tests were validating a string production never emits.
+ */
+const githubError = (status, body) =>
+  new GitHubError(
+    status,
+    `GitHub answered ${status} for /repos/NickPurcell/Clawcius/pulls/44: ${body}`,
+  );
+
+test('a transient poll failure is retried and the watch survives — THE 2026-08-23 INCIDENT', async () => {
+  // 06:24:08Z watch armed. 07:11:11Z a GitHub token rotation produced ONE 401
+  // and the watch was permanently disarmed. ~07:16Z the service restarted with
+  // a valid credential. The pull request was open, healthy and being actively
+  // reviewed throughout; a single retry would have survived the whole event.
+  //
+  // Worse, the mail tools were down in the same window, so the failure arrived
+  // when the owner could neither be told, nor re-arm, nor report it. The mail
+  // is the recovery mechanism and it runs on the same infrastructure — which is
+  // why a self-healing poll matters more than a well-worded failure mail.
   const { registry, mail, store } = board();
   store.arm(
     'hamachi-engineer1',
@@ -483,9 +514,9 @@ test('a poll that cannot reach GitHub disarms and says so, rather than going qui
     { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
   );
 
-  const broken = {
+  const rotating = {
     async getPullRequest() {
-      throw new Error('GitHub answered 401 for /repos/NickPurcell/Clawcius/pulls/44');
+      throw githubError(401, 'Bad credentials');
     },
     async listReviews() {
       return [];
@@ -494,13 +525,130 @@ test('a poll that cannot reach GitHub disarms and says so, rather than going qui
       return [];
     },
   };
-  await new ArmedWaker({ store, registry, mail, github: broken, tickMs: 1000, log: () => {} }).tick();
+  const waker = new ArmedWaker({
+    store, registry, mail, github: rotating, tickMs: 1000, log: () => {},
+  });
 
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /DISARMED, the poll failed/);
-  assert.match(told.body, /401/);
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  await waker.tick();
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, 'one 401 must not disarm');
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'and must not mail — it may recover');
   registry.close();
+});
+
+test('a transient failure disarms only after the bound, and says how many', async () => {
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const down = {
+    async getPullRequest() {
+      throw githubError(503, 'Server Error');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+
+  for (let i = 1; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) {
+    await waker.tick();
+    assert.equal(store.listFor('hamachi-engineer1').length, 1, `failure ${i} must not disarm`);
+  }
+  await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'the bound must eventually apply');
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /DISARMED, the poll kept failing/);
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
+  assert.match(told.body, /503/);
+  registry.close();
+});
+
+test('a 404 disarms only after GONE_404_POLLS consecutive ones', async () => {
+  // The distinction the old code could not draw, because `String(error)` ran
+  // one line before the decision that needed the status. A deleted pull request
+  // will not come back; retrying it four more times is four more minutes of
+  // pretending. The mail says the target is gone rather than that GitHub could
+  // not be reached, because those send the reader to different places.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const gone = {
+    async getPullRequest() {
+      throw githubError(404, 'Not Found');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: gone, tickMs: 1000, log: () => {},
+  });
+  for (let i = 1; i < GONE_404_POLLS; i += 1) {
+    await waker.tick();
+    assert.equal(
+      store.listFor('hamachi-engineer1').length, 1,
+      `404 number ${i} may be an installation token that cannot see the repo yet`,
+    );
+  }
+  await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /DISARMED, the target is gone/);
+  assert.match(told.body, /not there/);
+  // THE COUNT, which round 2's fix was half about: `attempts` must be the
+  // observed strikes, not the policy. This assertion lived on the mixed-streak
+  // test until that streak was shortened, and was not re-homed — leaving the
+  // `gone` half unpinned while the `unreachable` half stayed covered.
+  assert.match(told.body, new RegExp(`${GONE_404_POLLS} consecutive polls`));
+  // It must not claim to know WHICH of deletion or a permissions change it saw.
+  assert.match(told.body, /no longer visible/);
+  registry.close();
+});
+
+test('the classifier decides on status, and is driven by status rather than read', () => {
+  // Every case enumerated, because the whole defect was that this decision was
+  // being made on a string in which every status looked the same.
+  //
+  // 410 is unambiguous — the resource was here and is deliberately gone — so
+  // one failure is enough. 404 is NOT unambiguous on this repository: the waker
+  // authenticates with a GitHub App installation token, and GitHub answers 404
+  // rather than 403 for a repository an installation cannot see. A token minted
+  // mid-reconfiguration therefore produces a 404 about a pull request that
+  // exists, which is the same class of event as the 401 this change was written
+  // for, wearing the status that means permanent. Two consecutive costs one
+  // poll interval and covers the rotation window.
+  assert.deepEqual(classifyPollFailure(new GitHubError(410, 'x')), { bound: 1, cause: 'gone' });
+  assert.deepEqual(
+    classifyPollFailure(new GitHubError(404, 'x')),
+    { bound: GONE_404_POLLS, cause: 'gone' },
+  );
+
+  for (const status of [401, 403, 408, 429, 500, 502, 503, 504]) {
+    assert.deepEqual(
+      classifyPollFailure(new GitHubError(status, 'x')),
+      { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' },
+      `${status} is about the CREDENTIAL or the SERVICE, not the pull request`,
+    );
+  }
+
+  // No status at all: a timeout, a socket reset, a DNS failure, or the
+  // readFileSync that token-file.ts throws when a PEM is briefly unreadable
+  // during a key rotation (#182). None of them says anything about the PR.
+  for (const e of [new Error('ETIMEDOUT'), Object.assign(new Error('x'), { code: 'ENOENT' }), undefined]) {
+    assert.equal(classifyPollFailure(e).cause, 'unreachable');
+    assert.equal(classifyPollFailure(e).bound, MAX_CONSECUTIVE_POLL_FAILURES);
+  }
 });
 
 // ── 4. Seeing and withdrawing your own, and nobody else's (Clawcius #50) ────
@@ -1056,5 +1204,267 @@ test('a dead agent gets its reminder in the inbox and is not resurrected by it',
   // deliberate rather than accidental, and it is logged every time.
   assert.equal(mail.unread('hamachi-engineer1').length, 1, 'the mail keeps');
   assert.ok(lines.some((line) => /is dead/.test(line) && /does not resurrect/.test(line)));
+  registry.close();
+});
+
+test('a retry waits a POLL interval, not a tick — it does not become due again immediately', async () => {
+  // THE DEFECT THE OTHER TESTS COULD NOT SEE, because they use pollSeconds: 0
+  // and drive tick() by hand, which makes tick-cadence and poll-cadence
+  // indistinguishable.
+  //
+  // The retry path returned without rescheduling, so `due_at` stayed in the
+  // past and `ArmedStore.due()` handed the row back on the very next tick. With
+  // the shipped defaults — tickSeconds 15, pollSeconds 120 — five strikes were
+  // 60 seconds of grace where the comment promised ten minutes, and the waker
+  // hit GitHub eight times faster exactly while GitHub was unhappy, including
+  // on 429 and rate-limit 403.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 120 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let calls = 0;
+  const down = {
+    async getPullRequest() {
+      calls += 1;
+      throw githubError(503, 'Server Error');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+
+  await waker.tick();
+  assert.equal(calls, 1);
+  assert.equal(store.due(Date.now()).length, 0, 'a failed poll must not be due again at once');
+
+  // Still not due most of a poll interval later…
+  assert.equal(store.due(Date.now() + 60_000).length, 0);
+  // …and due again once the interval has passed.
+  assert.equal(store.due(Date.now() + 121_000).length, 1);
+
+  // Ticking in between must not poll GitHub again.
+  await waker.tick();
+  assert.equal(calls, 1, 'a tick inside the poll interval must not re-poll');
+  registry.close();
+});
+
+test('a mixed streak does not spend the 404 grace, and the mail counts what it saw', async () => {
+  // FINDING 7. The strike count had no record of WHICH class produced it, so a
+  // 404 landing on top of any existing streak was over its bound on first
+  // sight. `401` then one `404` is exactly what an installation-token rotation
+  // looks like from here — the old token invalid, then a new one whose
+  // installation cannot see the repository yet — which is the sequence the
+  // 404 grace was added for, and it did not survive it.
+  //
+  // The stub throwing only 404s could not see this, the same shape of blind
+  // spot as `pollSeconds: 0` was in the previous round: a mixed-status streak
+  // is the only case that distinguishes a shared counter from a per-class one.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let status = 401;
+  const rotating = {
+    async getPullRequest() { throw githubError(status, 'x'); },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: rotating, tickMs: 1000, log: () => {},
+  });
+
+  // ENOUGH TRANSIENT STRIKES TO EXCEED THE 404 BOUND, which is the only shape
+  // that distinguishes the two counters. A single 401 followed by a 404 does
+  // NOT — with GONE_404_POLLS at 3, a shared counter reaches 2 and stays under
+  // the bound, so that version of this test passed against the defect. Written
+  // out because I wrote that version first, and it is the same mistake as the
+  // `pollSeconds: 0` one: a fixture that cannot express the failure.
+  for (let i = 0; i < GONE_404_POLLS; i += 1) await waker.tick();
+  assert.equal(store.listFor('hamachi-engineer1').length, 1, '401s must not reach their own bound yet');
+
+  status = 404;
+  await waker.tick();                       // the class changes: count restarts at 1
+  assert.equal(
+    store.listFor('hamachi-engineer1').length, 1,
+    'a preceding streak of 401s must not spend the 404 grace',
+  );
+
+  // The streak stops here rather than running to a 404 disarm, because the
+  // OVERALL bound would end it first: GONE_404_POLLS preceding 401s plus
+  // GONE_404_POLLS 404s is six, and MAX_CONSECUTIVE_POLL_FAILURES is five. The
+  // two bounds interact, and this test is about the per-class one.
+  registry.close();
+});
+
+test('the disarm mail reports the observed count, not the policy', async () => {
+  // `attempts` was passed as `bound`. So "across 2 consecutive polls" printed
+  // after a single 404, and "5 times in a row" printed for a streak with a 404
+  // in the middle of it. Reporting the policy as though it were the observation
+  // is the defect this whole change exists to remove.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  const down = {
+    async getPullRequest() { throw githubError(503, 'Server Error'); },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: down, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) await waker.tick();
+
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
+  registry.close();
+});
+
+test('a streak that keeps changing class still terminates', async () => {
+  // FINDING 10, and it is the cost of the previous round's fix rather than a
+  // mistake in it. Restarting the count on every change of class meant no bound
+  // was ever reached: two hundred ticks of alternating 404/503 polled two
+  // hundred times, stayed armed, and said nothing.
+  //
+  // It does not need strict alternation — GONE_404_POLLS is 3, so one non-404
+  // every third poll suffices, which is a deleted pull request plus a flaky
+  // network. The result is the state this file's header argues against: a watch
+  // that will never fire, looking like a pull request with nothing happening.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const flapping = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n % 2 ? 404 : 503, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: flapping, tickMs: 1000, log: () => {},
+  });
+
+  for (let i = 0; i < 20 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'a mixed streak must still terminate');
+  assert.equal(n, MAX_CONSECUTIVE_POLL_FAILURES, 'and terminate at the overall bound');
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES}`));
+  registry.close();
+});
+
+test('the no-token disarm says nothing about retries — it never polled', async () => {
+  // FINDING 11, re-raised. Nothing in the suite built an ArmedWaker with
+  // `github: null`, so no test failed when this call site lost its 'no-token'
+  // argument and silently inherited the retry wording. That defaulted parameter
+  // is exactly how the defect arrived, and it arrived unwatched.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  await new ArmedWaker({
+    store, registry, mail, github: null, tickMs: 1000, log: () => {},
+  }).tick();
+
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.doesNotMatch(told.body, /times in a row/, 'nothing was polled, so nothing failed N times');
+  assert.match(told.body, /without being polled at all/);
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
+test('a gone-class streak reports its own count, not its bound', async () => {
+  // `404,404,410` is one class with two bounds: 410 has bound 1, so the streak
+  // disarms at strikes = 3 against a bound of 1. Passing the POLICY would print
+  // "across a poll" after three consecutive not-there answers.
+  //
+  // This is the case that shows the `gone` half of the observed-vs-policy fix
+  // still matters, and it is the one nothing covered once the assertion was
+  // dropped from the mixed-streak test.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const vanishing = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n < 3 ? 404 : 410, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: vanishing, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < 3 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /the target is gone/);
+  assert.match(told.body, /3 consecutive polls/, 'the observed count, not the bound of 1');
+  registry.close();
+});
+
+test('the overall bound reports unreachable even when the last failure was a 404', async () => {
+  // `503,503,503,404,404` — the total bound ends it, the last failure is a 404,
+  // and only two of the five were. Reporting the last failure's class would mail
+  // "the target is not there, across 5 consecutive polls", which is the mail
+  // asserting something nobody observed: three of those polls were answered
+  // 503, and 404 never reached its own bound.
+  //
+  // Disarming because nothing worked is not evidence about the target, so only
+  // the bound that is ABOUT a class may speak for that class.
+  //
+  // Added after a mutation check showed this fix had no test at all — removing
+  // it left the suite green, which is the same gap this branch has now opened
+  // three times.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const mixed = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n <= 3 ? 503 : 404, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: mixed, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < 6 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /the poll kept failing/, 'the overall bound must report itself');
+  assert.doesNotMatch(told.subject, /target is gone/);
+  assert.doesNotMatch(told.body, /not there/, 'two 404s among five polls is not a gone target');
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   registry.close();
 });
