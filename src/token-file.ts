@@ -168,6 +168,16 @@ export function netrcPath(githubTokenDir: string): string {
  *
  * A test asserts the written file has exactly one `machine` line and that it is
  * this one, because that is the assertion whose absence would cost something.
+ *
+ * DELIBERATELY NOT DERIVED FROM `agent.armed.github.apiBase`, which is
+ * configurable. Point that at a GitHub Enterprise instance and the daemon's
+ * poller follows while agents' curl carries nothing, because this still names
+ * `api.github.com` — which looks like an oversight and is not. Deriving the
+ * netrc host from configuration is exactly the scope-widening described above,
+ * and it would make the host an operator-settable input to a credential's
+ * blast radius. A crew on Enterprise needs this constant changed with the
+ * change reviewed, rather than inherited silently from a URL somebody edited
+ * for a different reason.
  */
 export const GITHUB_API_HOST = 'api.github.com';
 
@@ -354,6 +364,14 @@ export class TokenFileRefresher {
       this.#opts.onStop?.();
     } catch {
       // Shutdown is not a place to throw.
+      //
+      // SILENT HERE, LOUD IN `daemon.ts`'s equivalent, and the asymmetry is
+      // deliberate. A netrc this branch fails to remove holds an INSTALLATION
+      // token, which is dead within the hour — the "bounded" exposure the module
+      // header describes. The PAT-only branch's netrc never expires, so its
+      // failure is worth a line and this one is not. Written here because
+      // otherwise the two catches look inconsistent and the sentence resolving
+      // them is two hundred lines away.
     }
     try {
       rmSync(this.#opts.path, { force: true });
