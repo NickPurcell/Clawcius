@@ -545,17 +545,29 @@ test('the boundary of the invisible-character class is pinned, so widening it is
     'U+E000 PRIVATE USE': '',
     'U+2800 BRAILLE PATTERN BLANK': '⠀',
   };
+  // BOTH REGEXES. The first version of this test fed only `appId`, so it
+  // guarded `INVISIBLE_OR_SPACE` while its failure message addressed someone
+  // who had widened `INVISIBLE` — the path regex, and the one this whole change
+  // is about. Widening `INVISIBLE` alone left the suite green. That is the
+  // test's prose being wider than the test's behaviour, which is the defect
+  // this file exists to catch, one level further up.
+  const advice = (name) =>
+    `${name} is outside the invisible-character class today. If you have just widened ` +
+    'INVISIBLE or INVISIBLE_OR_SPACE to include it, that may well be right — and two ' +
+    'other things then have to change with it: the warning string in checkAppConfig ' +
+    'for whichever regex you widened, and the docstring above the regexes, which ' +
+    'calls its list of three groups "the whole of the claim".';
   for (const [name, ch] of Object.entries(notCaught)) {
+    assert.equal(checkAppConfig(cfg({ appId: `99${ch}` }), accessOk).usable, true, advice(name));
     assert.equal(
-      checkAppConfig(cfg({ appId: `99${ch}` }), accessOk).usable,
+      checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessOk).usable,
       true,
-      `${name} is outside the class today. If you have just widened INVISIBLE to ` +
-        'include it, that may well be right — and the message ten lines above the ' +
-        'regex has to name the new group too, or it is narrower than the behaviour again.',
+      advice(name),
     );
   }
 
   // U+180E is category Cf and IS caught, which is the boundary itself: the class
   // is defined by what the characters ARE, not by a hand-listed set.
   assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
 });
