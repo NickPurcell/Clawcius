@@ -146,7 +146,9 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  *   C0 controls and DEL   \u0000-\u001F, \u007F   -- \r, \n, \t
  *   Unicode format chars  \p{Cf}                  -- ZWSP, soft hyphen, word
  *                                                    joiner, BOM, ZWJ/ZWNJ
- *   whitespace            \s                      -- APP ID ONLY, see below
+ *   whitespace            \s                      -- ALL of it for the App ID;
+ *                                                    for the path, all of it
+ *                                                    EXCEPT U+0020
  *
  * `\p{Cf}` is here because it is the WORST case, not an exotic one. A trailing
  * space can be found by moving a cursor; a zero-width space cannot be found at
@@ -161,10 +163,17 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  * objection to positive ones above -- that they guess at someone else's
  * alphabet and expire when it changes -- does not apply to it.
  *
- * Whitespace is the one group not shared, because a filesystem path may
- * legitimately contain a space and an App ID may not.
+ * U+0020 IS THE ONLY CHARACTER THE TWO DIFFER ON, and that is the whole of the
+ * difference: a filesystem path may legitimately contain a space, and an App ID
+ * may not. Nobody types NBSP, a figure space or an ideographic space into a path
+ * on purpose either, and letting them through delivered the ENOENT message this
+ * function suppresses for `\r` -- true, unhelpful, and pointing at the visible
+ * half of a value whose problem is the invisible half.
+ *
+ * Written `[^\S ]` -- whitespace that is not a space -- so the exception stays
+ * one character wide and cannot quietly grow into "whitespace is allowed here".
  */
-const INVISIBLE = /[\u0000-\u001F\u007F\p{Cf}]/u;
+const INVISIBLE = /[^\S ]|[\u0000-\u001F\u007F\p{Cf}]/u;
 const INVISIBLE_OR_SPACE = /[\s\u0000-\u001F\u007F\p{Cf}]/u;
 
 type Minted = { token: string; expiresAtMs: number };
@@ -402,14 +411,12 @@ export function checkAppConfig(
     );
   }
 
-  // Only when there is a path to check. Asking `access('')` would answer ENOENT
-  // and produce "GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not
-  // readable" about a variable that is not set — the first four words false,
-  // which is the exact defect this function was extracted to stop making.
-  // Skipped when the path is already known malformed: `access` would answer
-  // ENOENT and add "the key is not readable — ENOENT means the path is wrong",
-  // which is true, unhelpful, and points at the visible half of a value whose
-  // problem is the invisible half.
+  // Skipped in the two cases where `access` would answer ENOENT and attach a
+  // false sentence to it. UNSET: "GITHUB_APP_PRIVATE_KEY_PATH is set but the
+  // key is not readable" has its first four words wrong. MALFORMED: "ENOENT
+  // means the path is wrong" points at the visible half of a value whose
+  // problem is the invisible half. Both are the defect this function exists to
+  // stop making, arrived at through its own readability check.
   if (input.privateKeyPath && !INVISIBLE.test(input.privateKeyPath)) {
     try {
       // `access` rather than a mint: it catches the two failures an operator
@@ -418,11 +425,11 @@ export function checkAppConfig(
       // GitHub being reachable.
       access(input.privateKeyPath);
     } catch (error) {
-    // `error.code` rather than the message. `fs` errors carry the PATH in
-    // `.message`, and this module's header states that the PEM's path is not
-    // logged. ENOENT and EACCES also happen to be the more useful half — they
-    // distinguish "wrong path" from "wrong owner", which is the operator's
-    // actual question.
+      // `error.code` rather than the message. `fs` errors carry the PATH in
+      // `.message`, and this module's header states that the PEM's path is not
+      // logged. ENOENT and EACCES also happen to be the more useful half — they
+      // distinguish "wrong path" from "wrong owner", which is the operator's
+      // actual question.
       const code =
         error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
       faults.push(

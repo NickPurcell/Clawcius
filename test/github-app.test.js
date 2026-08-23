@@ -473,3 +473,35 @@ test('the invisible-character check does not refuse ordinary values', () => {
     'spaces are legal in a path and must not be refused',
   );
 });
+
+test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
+  // The docstring calls its list "the whole of the claim", so the path check has
+  // to implement the whole of it. It excluded ALL whitespace via a comment about
+  // spaces being legal — true of U+0020 and of nothing else in the group. NBSP
+  // and the ideographic space fell through to "the key is not readable (ENOENT)",
+  // which is the message this function suppresses for `\r` for the same reason:
+  // it points at the visible half of a value whose problem is the invisible half.
+  const nonSpaceWhitespace = {
+    'U+00A0 NO-BREAK SPACE': ' ',
+    'U+2007 FIGURE SPACE': ' ',
+    'U+3000 IDEOGRAPHIC SPACE': '　',
+    'U+2028 LINE SEPARATOR': ' ',
+    'U+0009 TAB': '\t',
+  };
+  for (const [name, ch] of Object.entries(nonSpaceWhitespace)) {
+    const { usable, warning } = checkAppConfig(
+      cfg({ privateKeyPath: `/k.pem${ch}` }),
+      accessFailing('ENOENT'),
+    );
+    assert.equal(usable, false, name);
+    assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
+    assert.doesNotMatch(warning, /not readable/, `${name}: the misleading ENOENT must be suppressed`);
+  }
+
+  // …and the one exception stays exactly one character wide.
+  assert.equal(
+    checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
+    true,
+    'U+0020 is the only whitespace a path may contain',
+  );
+});
