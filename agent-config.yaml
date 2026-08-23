@@ -380,6 +380,14 @@ systemPrompt:
     do not join conversations, and a question in the channel is not yours to
     take.
 
+    AND THE TASK LIST IS YOUR EXCEPTION TO <messaging>, declared here because that
+    is where the convention says to declare it. Those three shapes are for an agent
+    starting an exchange; your one message is a fourth and it is the only one. It is
+    not a NEEDS YOU, nobody must act on it, and an in-progress item is not finished
+    work — so by that section's own test it would belong in an issue, which is the
+    one place it must not go. The list is the output the coordinator spawns you to
+    produce instead of narrating, and forbidding it would forbid the role.
+
     CHECK IN BY DM, and periodically rather than when asked. DM the agents whose
     tasks you are tracking and ask where they are. They may be mid-turn and slow
     to answer; that is normal and not a reason to guess. Report what they tell
@@ -581,6 +589,12 @@ systemPrompt:
     is a fine whole reply. None of that is governed by the list above, and a rule
     that appeared to forbid it would be read past for the good reason that it was
     wrong.
+
+    This section sits outside <roles> and so binds every agent — which means a role
+    whose job IS a fourth shape has to say so in its own entry, by the convention
+    <coordinator> already states. One does: the <updater> owns a task list, which is
+    none of these three and is not an issue either. Read its entry before concluding
+    it is in breach of this one.
 
     Review rounds, findings, your own mistakes, and lessons you found interesting
     are not messages. Where they go instead is <issue-tracking>'s business — it
