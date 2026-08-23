@@ -63,7 +63,7 @@ import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
 import type { TokenProvider } from './github-app.js';
-import { appTokenProvider, checkAppConfig } from './github-app.js';
+import { appTokenProvider, checkAppConfig, describeTokenShape } from './github-app.js';
 import {
   TokenFileRefresher,
   tokenFilePath,
@@ -609,6 +609,24 @@ export async function main(): Promise<void> {
   // Every `config.` below is this constant, and every one of them reads the same
   // way as before.
   const config = loadConfig();
+
+  // WHAT IS IN `GITHUB_TOKEN`, said once, before anything can branch past it.
+  //
+  // Deliberately here and not beside the App's check at `checkAppConfig`, which
+  // sits inside `if (armedStore)`. Three deployments reach this line and the
+  // token matters in all three: `clawsky` off, `armed` off, and no App at all
+  // still write it into a netrc below and into every agent's environment, so a
+  // check nested one block deeper would be absent from exactly the deployments
+  // where the PAT is the only credential there is.
+  //
+  // It REPORTS AND CONTINUES. Nothing here rejects a token or refuses to start
+  // — the standing preference is visible failure over guards, and this earns
+  // its place by making a failure legible rather than by preventing one. The
+  // cost it removes is not a bad request; it is an afternoon spent on scopes
+  // and permissions because a 401, or a ByteString error naming a character
+  // index, points at the wrong subject.
+  const tokenShape = describeTokenShape(config.github.token);
+  if (tokenShape) process.stderr.write(`[github] ${tokenShape}\n`);
 
   // Fail before touching Discord if the container stack is not actually up —
   // a missing agent or proxy container reads as a bot that never answers.

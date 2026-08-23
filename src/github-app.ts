@@ -303,6 +303,206 @@ export function staticTokenProvider(token: string): TokenProvider {
   return async () => token;
 }
 
+/** What a given character will actually cause. Worst last; see the docstring. */
+type Outcome = 'tolerated' | 'rejected' | 'throws';
+
+/**
+ * Names for the characters that actually arrive, so the operator does not have
+ * to look up a codepoint to find out what to delete.
+ *
+ * Not a general Unicode name table and not trying to be: anything absent falls
+ * back to the bare `U+XXXX`, which is still a specific claim about a specific
+ * position. These are the ones with a known route into a token -- a paste from
+ * a browser, a shell heredoc, a Windows line ending, an `EnvironmentFile`.
+ */
+const CHARACTER_NAMES: Record<number, string> = {
+  0x0000: '(a NUL)',
+  0x0009: '(a tab)',
+  0x000a: '(a newline)',
+  0x000d: '(a carriage return, as a Windows line ending leaves)',
+  0x0020: '(a space)',
+  0x00a0: '(a non-breaking space)',
+  0x00ad: '(a soft hyphen)',
+  0x200b: '(a zero-width space, which web pages insert into long identifiers)',
+  0x200c: '(a zero-width non-joiner)',
+  0x200d: '(a zero-width joiner)',
+  0x2060: '(a word joiner)',
+  0xfeff: '(a byte-order mark, as a UTF-8 BOM leaves at the front of a file)',
+};
+
+/**
+ * What is in `GITHUB_TOKEN` that the operator cannot see, and what it will
+ * actually do -- as one sentence, or `null` if there is nothing to say.
+ *
+ * ── This diagnoses; it does not validate ────────────────────────────────────
+ *
+ * Nothing here rejects a token, refuses to start, or alters the value. The
+ * standing preference is visible failure over guards, and this earns its place
+ * by making a failure LEGIBLE rather than by preventing one. The cost it
+ * removes is not a bad request; it is an afternoon spent on scopes and
+ * permissions because the signal pointed at the wrong subject.
+ *
+ * Which is also why it must not cry wolf. A warning about a value that works is
+ * worse than silence: it is a second thing to disbelieve, and next time the real
+ * one is disbelieved too.
+ *
+ * ── THREE outcomes, not two, and this was measured ──────────────────────────
+ *
+ * #185 assumed two (throws, or a 401) and explicitly could not tell whether
+ * whitespace caused its 401, because the probe token was fake. Driving the real
+ * header layer settles it, and adds a third case that is the COMMONEST one:
+ *
+ *   TOLERATED  A run of space/tab/CR/LF at the very END. The header value is
+ *              trimmed before it is sent, so `Bearer <tok>\n` goes out byte for
+ *              byte identical to a clean token. A trailing newline from an
+ *              `EnvironmentFile` -- the single likeliest way this happens --
+ *              COSTS NOTHING, and saying otherwise would send someone hunting a
+ *              401 that never occurred.
+ *
+ *   401        An invisible character of U+00FF or below, anywhere the trimming
+ *              does not reach. The header is built and sent, so the failure is
+ *              indistinguishable from a revoked or mistyped token. U+00A0 lives
+ *              here: as invisible as a zero-width space, and behaving like a
+ *              plain one. Note a LEADING space lands here rather than in
+ *              TOLERATED -- the value is `Bearer ` plus the token, so anything
+ *              at the token's front is interior to the value.
+ *
+ *   THROWS     Any codepoint above U+00FF, a NUL, or a CR/LF that is not in
+ *              the trailing run. Nothing is sent at all: the throw happens
+ *              inside the poll's try, and once the retries #193 added are used
+ *              up the watch is disarmed and its owner mailed "could not reach
+ *              GitHub" -- about a request that never left.
+ *
+ *              NOTE THE SET IS WIDER THAN `INVISIBLE_OR_SPACE`, and the filter
+ *              says so explicitly. Stating this row while examining only that
+ *              class is what made the sentence true of the header layer and
+ *              false of this function; smart quotes and en dashes throw and
+ *              were silent.
+ *
+ * The boundary is asserted against `Headers` itself in the tests rather than
+ * restated there, because this paragraph is a claim about someone else's code
+ * and that is the only way it stays true when someone else's code changes.
+ *
+ * DISCORD_TOKEN DELIBERATELY DOES NOT GET ONE OF THESE, and the reason is
+ * recorded so that nobody completes the set later without asking. `main()` ends
+ * in `await client.login(...)`, reached through `await main()` at the top level
+ * of `index.ts`, so an unusable Discord token takes the process down at boot, by
+ * name, every time. That is the visible failure the standing preference asks
+ * for, and a check in front of it would be a guard buying nothing.
+ *
+ * NOT "nothing catches it" -- `daemon.ts` registers an `unhandledRejection`
+ * handler four lines above that `login`, and it only writes a line. It looks
+ * like it would swallow the failure and leave the daemon up. It does not: a
+ * rejected TOP-LEVEL await is not an unhandled rejection, so the handler is
+ * never consulted and node exits 1 with the error printed. Measured rather than
+ * reasoned about, and written down because the reasonable-looking conclusion is
+ * the wrong one -- someone reading the handler alone would come away believing
+ * this paragraph is false.
+ *
+ * The variables that need this are the ones whose failure is DEFERRED and
+ * QUIET. That is what makes GITHUB_TOKEN and the three GITHUB_APP_* values the
+ * whole of the set rather than an arbitrary subset of it.
+ *
+ * ── Not App-specific, and living here anyway ────────────────────────────────
+ *
+ * `GITHUB_TOKEN` is not an App variable, so this module's name is narrower than
+ * its contents. It is here because `INVISIBLE_OR_SPACE` is here, with the
+ * paragraph arguing the class and the boundary test pinning it -- and a second
+ * copy of that class somewhere better-named would be the duplication that
+ * acquires an independent lifetime.
+ */
+export function describeTokenShape(token: string): string | null {
+  if (!token) return null;
+
+  const chars = [...token];
+  // The maximal suffix of characters the header layer trims. Only these four;
+  // U+00A0 is not HTTP whitespace and is not trimmed.
+  let trailingFrom = chars.length;
+  while (trailingFrom > 0 && /[\t\n\r ]/.test(chars[trailingFrom - 1]!)) trailingFrom--;
+
+  const hits = chars
+    .map((ch, i) => ({ ch, i, code: ch.codePointAt(0)! }))
+    // INVISIBLE_OR_SPACE is not the whole set that matters here, and treating
+    // it as though it were made the THROWS row below a claim about the header
+    // layer that was false of THIS function. A smart quote, an en dash or a
+    // CJK character throws exactly as U+200B does -- paste-from-a-document
+    // rather than paste-from-a-web-page, same route in, same bare TypeError
+    // naming a character index. Widening cannot produce a false alarm: above
+    // U+00FF the header cannot be built, whatever the character means.
+    .filter(({ ch, code }) => INVISIBLE_OR_SPACE.test(ch) || code > 0xff)
+    .map((hit) => {
+      const trailing = hit.i >= trailingFrom;
+      const outcome: Outcome =
+        hit.code > 0xff ? 'throws'
+        : // NUL is never trimmed -- it is not in the [\t\n\r ] run undici strips --
+          // and is then rejected wherever it sits, so it goes with CR/LF rather
+          // than with the rest of the <= U+00FF group, and without their trailing
+          // exemption. Unreachable from an environment block, which cannot carry
+          // one; here because the row above presents itself as complete.
+          hit.code === 0x00 ? 'throws'
+        : hit.code === 0x0a || hit.code === 0x0d ? (trailing ? 'tolerated' : 'throws')
+        : trailing ? 'tolerated'
+        : 'rejected';
+      return { ...hit, outcome };
+    });
+  if (hits.length === 0) return null;
+
+  // Name the character responsible for the WORST outcome, not the first one
+  // found: a token with a trailing newline and an embedded zero-width space has
+  // one problem, and it is not the newline.
+  const rank: Record<Outcome, number> = { tolerated: 0, rejected: 1, throws: 2 };
+  const worst = hits.reduce((a, b) => (rank[b.outcome] > rank[a.outcome] ? b : a));
+
+  const hex = `U+${worst.code.toString(16).toUpperCase().padStart(4, '0')}`;
+  const name = CHARACTER_NAMES[worst.code];
+  const named = name ? `${hex} ${name}` : hex;
+  // 1-based, with the length beside it, so "position 40 of 40" reads as "at the
+  // end" without the operator counting anything.
+  const where = `position ${worst.i + 1} of ${chars.length}`;
+
+  // How many share the worst outcome -- not how many were found. An operator who
+  // deletes the character named here and hits the identical failure has repeated
+  // the afternoon this exists to remove. The position of the second one moves
+  // once the first is gone, so only the count is worth giving.
+  const sameOutcome = hits.filter((h) => h.outcome === worst.outcome).length;
+  const rest = sameOutcome > 1 ? ` ${sameOutcome} characters in the value are of this kind.` : '';
+
+  // EVERY CLAUSE BELOW MUST HOLD IN EVERY STATE, which is why they are hedged
+  // on "where this token is the credential" rather than naming the waker. Three
+  // states make an unhedged version false, and #185's own text is false in the
+  // second of them because it predates the fix:
+  //
+  //   * With a usable App, `daemon.ts` builds its client from the App's
+  //     provider and the netrc holds the installation token, so the PAT may be
+  //     doing nothing at all here.
+  //   * A failing poll no longer disarms on the first failure -- #193 retries
+  //     to a bound and only then gives up -- so "the watch is disarmed" without
+  //     "eventually" is the old behaviour.
+  //   * An agent's `curl` authenticates from the netrc and never touches this
+  //     process's HTTP client, so nothing throws for it; it simply gets a 401.
+  const symptom: Record<Outcome, string> = {
+    tolerated:
+      'Trailing whitespace is trimmed from the header before the request is sent, ' +
+      'so this is NOT causing a failure and removing it will not fix one — it is ' +
+      'reported only so that it can be ruled out.',
+    rejected:
+      'The header is still built and sent, so wherever this token is the credential ' +
+      'GitHub answers 401, and the failure is indistinguishable from a revoked or ' +
+      'mistyped token.',
+    throws:
+      'A character above U+00FF cannot go into an HTTP header at all. Wherever this ' +
+      'token is the credential for a request from THIS process, the request throws ' +
+      'before anything is sent — so it surfaces as GitHub being unreachable rather ' +
+      'than as an authentication problem, and a watch polling with it fails every ' +
+      'time and is disarmed once it has used up its retries.',
+  };
+
+  return (
+    `GITHUB_TOKEN contains ${named} at ${where}.${rest} ${symptom[worst.outcome]} ` +
+    'The value is being used unchanged — this is a diagnosis, not a refusal.'
+  );
+}
+
 /**
  * Whether the App is usable, and what to tell the operator if it is not.
  *

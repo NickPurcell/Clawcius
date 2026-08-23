@@ -27,6 +27,7 @@ import {
   appTokenProvider,
   staticTokenProvider,
   checkAppConfig,
+  describeTokenShape,
 } from '../dist/github-app.js';
 import { GitHubClient } from '../dist/github.js';
 
@@ -591,4 +592,258 @@ test('the boundary of the invisible-character class is pinned, so widening it is
   // the direction does not move with it. Name things instead.
   assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
   assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
+});
+
+/**
+ * `describeTokenShape`: the GITHUB_TOKEN half of the boot check (#185).
+ *
+ * WHAT IS PINNED HERE IS A DIAGNOSIS, NOT A VALIDATION. Nothing should ever
+ * assert that a token was rejected, because nothing rejects one -- the value is
+ * used unchanged and this only says what is in it. A test that began asserting
+ * a refusal would be pinning a behaviour the brief ruled out.
+ *
+ * And the sharper half: it must not cry wolf. #185 assumed a trailing newline
+ * caused a 401, and said outright that it could not confirm that. It does not
+ * -- the header value is trimmed, and goes out identical to a clean token. So
+ * the commonest case of all is one where the correct message says "this is not
+ * your problem", and `every message agrees with the real header layer` below is
+ * what keeps that honest.
+ *
+ * EVERY INVISIBLE CHARACTER BELOW IS WRITTEN AS AN ESCAPE, mechanically. A
+ * literal one is invisible in the file, in a diff and to a reviewer -- which is
+ * precisely the defect under test, and it would be absurd to reintroduce here.
+ */
+
+// The characters with a real route into a token: a browser paste, a shell
+// heredoc, a Windows line ending, a BOM on an EnvironmentFile.
+const SAMPLES = [
+  ['tab', '\u0009'],
+  ['newline', '\u000a'],
+  ['carriage return', '\u000d'],
+  ['space', ' '],
+  ['no-break space', '\u00a0'],
+  ['soft hyphen', '\u00ad'],
+  ['zero-width space', '\u200b'],
+  ['zero-width non-joiner', '\u200c'],
+  ['word joiner', '\u2060'],
+  ['byte-order mark', '\ufeff'],
+  // NUL: unreachable from an environment block, and in the class, so it is
+  // here to pin the one outcome the matrix used to get wrong.
+  ['NUL', '\u0000'],
+  // AND THE ONES OUTSIDE `INVISIBLE_OR_SPACE` ENTIRELY. Without these the
+  // agreement test is exhaustive over the characters it already looks at and
+  // blind to the rest -- which is how the THROWS row came to be true of the
+  // header layer and false of the function under test. Paste-from-a-document
+  // rather than paste-from-a-web-page: same route in, same failure.
+  ['right single quote', '\u2019'],
+  ['en dash', '\u2013'],
+  ['CJK', '\u65e5'],
+];
+
+/** Where it sits, which changes the outcome for the very same character. */
+const POSITIONS = [
+  ['leading', (ch) => ch + 'ghp_abc'],
+  ['embedded', (ch) => 'ghp_' + ch + 'abc'],
+  ['trailing', (ch) => 'ghp_abc' + ch],
+];
+
+/** What the runtime ACTUALLY does with this token in an Authorization header. */
+function actualOutcome(token) {
+  let value;
+  try {
+    value = new Headers({ Authorization: `Bearer ${token}` }).get('authorization');
+  } catch {
+    return 'throws';
+  }
+  // Identical to the header a clean token produces => it cannot be the fault.
+  return value === 'Bearer ghp_abc' ? 'tolerated' : 'rejected';
+}
+
+/** Which of the three the message claims. */
+function claimedOutcome(out) {
+  if (out.includes('throws before anything is sent')) return 'throws';
+  if (out.includes('NOT causing a failure')) return 'tolerated';
+  return 'rejected';
+}
+
+test('describeTokenShape says nothing about a token with nothing wrong', () => {
+  assert.equal(describeTokenShape('ghp_' + 'a'.repeat(36)), null);
+  assert.equal(describeTokenShape('ghs_MiXeD09AZ'), null);
+  // Absent is not malformed: `GITHUB_TOKEN` unset has its own message
+  // elsewhere, and a second one here would be a thing to disbelieve.
+  assert.equal(describeTokenShape(''), null);
+});
+
+test('every sample character is detected, wherever it sits', () => {
+  for (const [name, ch] of SAMPLES) {
+    for (const [where, build] of POSITIONS) {
+      const out = describeTokenShape(build(ch));
+      assert.ok(out, `${where} ${name} (U+${ch.codePointAt(0).toString(16)}) went undetected`);
+    }
+  }
+});
+
+/**
+ * THE CLAIM THIS FILE EXISTS FOR.
+ *
+ * The message tells the operator which of three things is about to happen, and
+ * that is its whole value: one says look at the journal, one says look at
+ * GitHub, one says look somewhere else entirely. Getting the third wrong is the
+ * expensive direction -- it invents a fault that is not there.
+ *
+ * Rather than restate the boundary, which would drift the moment the runtime
+ * changed, this drives the REAL header layer and asserts the message agrees
+ * with it, for every sample in every position. If undici ever stops trimming a
+ * trailing newline, this fails and the prose gets fixed. That is the only way a
+ * docstring making a claim about someone else's code stays true.
+ */
+test('every message agrees with the real header layer', () => {
+  const seen = new Set();
+  for (const [name, ch] of SAMPLES) {
+    for (const [where, build] of POSITIONS) {
+      const token = build(ch);
+      const actual = actualOutcome(token);
+      const claimed = claimedOutcome(describeTokenShape(token));
+      assert.equal(
+        claimed,
+        actual,
+        `${where} ${name}: message says ${claimed}, runtime does ${actual}`,
+      );
+      seen.add(actual);
+    }
+  }
+  // Guard against the matrix collapsing to a single outcome and the loop
+  // passing vacuously -- which is how a test of this shape rots without ever
+  // failing.
+  assert.deepEqual([...seen].sort(), ['rejected', 'throws', 'tolerated']);
+});
+
+test('a trailing newline is reported as harmless, in those words', () => {
+  // The commonest case of all: an EnvironmentFile ending in a newline. #185
+  // assumed it caused a 401. It does not, and a message saying so would send
+  // an operator hunting a failure that is not happening.
+  const out = describeTokenShape('ghp_abcdef\u000a');
+  assert.match(out, /U\+000A/);
+  assert.match(out, /NOT causing a failure/);
+  assert.doesNotMatch(out, /401/);
+  assert.doesNotMatch(out, /throws before anything is sent/);
+});
+
+test('U+00A0 is the 401 case, not the throwing case', () => {
+  // The single case that makes "invisible" and "above U+00FF" different sets.
+  // A regression to "is it invisible" would still pass every other sample.
+  const out = describeTokenShape('ghp_abc\u00a0def');
+  assert.match(out, /U\+00A0/);
+  assert.match(out, /401/);
+  assert.doesNotMatch(out, /throws before anything is sent/);
+});
+
+test('a leading space is the 401 case, not the trimmed one', () => {
+  // Not symmetric with trailing, and the asymmetry is easy to get wrong: the
+  // value is `Bearer ` + the token, so anything at the token's front is
+  // interior to the value and survives the trim.
+  const out = describeTokenShape(' ghp_abcdef');
+  assert.match(out, /position 1 of 11\b/);
+  assert.match(out, /401/);
+  assert.doesNotMatch(out, /NOT causing a failure/);
+});
+
+test('the worst outcome is named, not the first character found', () => {
+  // THE MILDER CHARACTER MUST COME FIRST or this proves nothing -- with the
+  // zero-width space at the front, "name the worst" and "name the first" agree
+  // and the test passes against either. It did, until a mutation run caught it.
+  //
+  // So: an embedded space (401) at position 5, a zero-width space (throws) at
+  // position 9. One of these is the fault and it is not the one found first.
+  const out = describeTokenShape('ghp_ abc\u200b');
+  assert.match(out, /U\+200B/);
+  assert.match(out, /position 9 of 9\b/);
+  assert.match(out, /throws before anything is sent/);
+  assert.doesNotMatch(out, /U\+0020/);
+
+  // And the reverse order, so neither "first" nor "last" passes by accident.
+  const flipped = describeTokenShape('ghp_\u200ba c');
+  assert.match(flipped, /U\+200B/);
+  assert.match(flipped, /position 5 of 8\b/);
+});
+
+test('the position is 1-based, and the length is given beside it', () => {
+  assert.match(describeTokenShape('ghp_\u200babc'), /position 5 of 8\b/);
+  assert.match(describeTokenShape('\ufeffghp_abc'), /position 1 of 8\b/);
+  // Position === length reads as "at the end" without the operator counting.
+  assert.match(describeTokenShape('ghp_abc\u000a'), /position 8 of 8\b/);
+});
+
+test('counted by codepoint, not by UTF-16 unit', () => {
+  // An astral character is two UTF-16 units and one position, and getting that
+  // wrong moves every position after it -- the operator then counts along to a
+  // character that is fine.
+  //
+  // This fixture used to report the SPACE, with the emoji as inert padding. Once
+  // the filter widened past `INVISIBLE_OR_SPACE` the emoji became a hit in its
+  // own right, outranked the space, and started reporting itself. So the
+  // observable moved to the LENGTH, which is where the two countings diverge:
+  // eight codepoints, nine units. Index and length are read off the same spread,
+  // so pinning one pins both.
+  assert.match(describeTokenShape('\u{1f600}ghp_abc'), /position 1 of 8\b/);
+});
+
+test('says how many share the outcome, so the second is not a second afternoon', () => {
+  const one = describeTokenShape('ghp_abc\u200bdef');
+  assert.doesNotMatch(one, /characters in the value/);
+  const three = describeTokenShape('\u200bghp_\u200babc\u200b');
+  assert.match(three, /3 characters in the value are of this kind/);
+  assert.match(three, /position 1 of 10\b/);
+  // Counted by OUTCOME, not by hit: a trailing newline alongside two zero-width
+  // spaces must not be counted among them.
+  const mixed = describeTokenShape('ghp_\u200ba\u200bb\u000a');
+  assert.match(mixed, /2 characters in the value are of this kind/);
+});
+
+test('names the character rather than only its codepoint', () => {
+  assert.match(describeTokenShape('ghp_\u200ba'), /zero-width space/);
+  assert.match(describeTokenShape('ghp_\ufeffa'), /byte-order mark/);
+  assert.match(describeTokenShape('ghp_\u000da'), /carriage return/);
+  // Anything without an entry still gets a specific, correct claim.
+  assert.match(describeTokenShape('ghp_\u2061a'), /U\+2061/);
+});
+
+test('never quotes the token, at any length', () => {
+  // This goes to stderr and stderr goes to the journal. Naming a position is
+  // the point precisely BECAUSE it identifies the character without
+  // reproducing the credential around it.
+  const secret = 'ghp_' + 'S3cr3tV4lu3'.repeat(3);
+  const out = describeTokenShape(secret + '\u200b');
+  assert.doesNotMatch(out, /S3cr3tV4lu3/);
+  assert.ok(!out.includes(secret.slice(4)), 'the message carried the token body');
+});
+
+test('a character above U+00FF is diagnosed even though it is not invisible', () => {
+  // The gap round 1 found: the docstring claimed "any codepoint above U+00FF"
+  // while the detector only examined INVISIBLE_OR_SPACE, so these threw and said
+  // nothing -- producing the bare TypeError this whole change exists to replace.
+  for (const [name, ch] of [
+    ['right single quote', '\u2019'],
+    ['left double quote', '\u201c'],
+    ['en dash', '\u2013'],
+    ['CJK', '\u65e5'],
+  ]) {
+    const out = describeTokenShape('ghp_ab' + ch + 'cdef');
+    assert.ok(out, `${name} went undiagnosed`);
+    assert.match(out, /throws before anything is sent/);
+    // No name in the table, so it degrades to a bare codepoint -- still a
+    // specific claim about a specific position.
+    assert.match(out, new RegExp('U\\+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')));
+  }
+});
+
+test('NUL throws wherever it sits, including trailing', () => {
+  // It is not in the [\t\n\r ] run undici strips, so unlike CR/LF it gets no
+  // trailing exemption. Unreachable in production -- an environment block cannot
+  // carry one -- but the boundary sentence claims completeness.
+  for (const token of ['\u0000ghp_abc', 'ghp_\u0000abc', 'ghp_abc\u0000']) {
+    const out = describeTokenShape(token);
+    assert.match(out, /U\+0000/);
+    assert.match(out, /throws before anything is sent/);
+  }
 });
