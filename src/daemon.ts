@@ -1146,7 +1146,35 @@ export async function main(): Promise<void> {
       // rejects for the installation token, which at least has an hour's fuse.
       // Rewritten at the next startup either way; this only shrinks the window,
       // which is the same thing `stop()` is for.
-      if (!tokenFileRefresher) removeCurlConfig(config.agent.container.githubTokenDir);
+      // GUARDED, and this is the one place on this branch where a guard beats
+      // letting it fail. `shutdown()`'s `finally` is `process.exit(0)`, so a
+      // throw here skips `sessions.shutdown()`, `registry.close()` and
+      // `client.destroy()` — and the daemon still exits 0, reporting a clean
+      // shutdown while having released no live session. The failure is not
+      // visible, it is SILENCED, and a guard is the only way the real problem
+      // gets to be seen at all.
+      //
+      // `force` swallows ENOENT and nothing else: a directory at that path
+      // throws EISDIR, an unwritable parent throws EACCES. `writeSecretFile`'s
+      // header names the first case exactly, because that throw took the daemon
+      // down at boot once already.
+      //
+      // AND IT LOGS RATHER THAN SWALLOWING. `removeOnShutdown` two lines up is
+      // silent because a stale status file expires on its own; a netrc that
+      // could not be removed is a live credential still on disk after shutdown,
+      // which is the thing this branch exists to prevent. Silence would be the
+      // wrong half of the neighbour's pattern.
+      if (!tokenFileRefresher) {
+        try {
+          removeCurlConfig(config.agent.container.githubTokenDir);
+        } catch (error) {
+          const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
+          process.stderr.write(
+            `[clawcius] could not remove the curl credential on shutdown (${code}); ` +
+              'a usable token may remain on disk. Shutdown continues.\n',
+          );
+        }
+      }
       await sessions.shutdown();
       registry.close();
       await client.destroy();
