@@ -393,3 +393,43 @@ test('the default access check reads the real filesystem', () => {
   assert.match(warning, /not readable \(ENOENT\)/);
   assert.doesNotMatch(warning, /absent\.pem/);
 });
+
+// ── invisible characters, the class the three variables share ───────────────
+
+test('an App id with a stray character is caught at boot, not at the first mint', () => {
+  // `appId` was checked for PRESENCE and never for SHAPE, then went straight
+  // into the JWT as `iss`. A trailing \r does not fail here — it fails at the
+  // first mint with a 401, inside the poll's try, whose catch disarms the row.
+  // That is the permanent sweep the whole boot check exists to prevent, through
+  // the one variable of the three nothing was checking.
+  for (const bad of ['99\r', '99\n', ' 99', '99 ', '99\t']) {
+    const { usable, warning } = checkAppConfig(cfg({ appId: bad }), accessOk);
+    assert.equal(usable, false, JSON.stringify(bad));
+    assert.match(warning, /GITHUB_APP_ID contains whitespace or a control character/);
+  }
+});
+
+test('a client id is still a valid App id', () => {
+  // GitHub accepts the numeric App ID *or* a client ID as `iss`. Narrowing to
+  // digits would refuse a valid deployment, so this checks the failure mode
+  // rather than guessing GitHub's identifier alphabet — including the older
+  // form, which contains a dot.
+  for (const good of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
+    const { usable, warning } = checkAppConfig(cfg({ appId: good }), accessOk);
+    assert.equal(usable, true, good);
+    assert.equal(warning, null, good);
+  }
+});
+
+test('a key path may contain a space but not a control character', () => {
+  // Spaces are legal in a path and must not be refused; a \r is not, and would
+  // otherwise surface as ENOENT — true, and it sends the operator to stare at a
+  // path that looks correct.
+  const spaced = checkAppConfig(cfg({ privateKeyPath: '/home/my dir/key.pem' }), accessOk);
+  assert.equal(spaced.usable, true, 'a space in a path is legitimate');
+
+  const cr = checkAppConfig(cfg({ privateKeyPath: '/k.pem\r' }), accessFailing('ENOENT'));
+  assert.equal(cr.usable, false);
+  assert.match(cr.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains a control character/);
+  assert.doesNotMatch(cr.warning, /not readable/, 'the misleading ENOENT must be suppressed');
+});

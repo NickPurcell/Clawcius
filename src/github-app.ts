@@ -126,6 +126,27 @@ export function isInstallationIdValid(id: string | undefined): boolean {
   return id === undefined || id === '' || /^\d+$/.test(id);
 }
 
+/**
+ * A character the operator cannot see, in a value the operator typed.
+ *
+ * THE FAILURE THESE THREE VARIABLES SHARE is not a wrong value, it is an
+ * invisible one: a `\r` from a Windows paste, a trailing newline in a systemd
+ * `EnvironmentFile`, a space picked up by a shell heredoc. The value looks
+ * right in the file and in every journal line that echoes it, and it is wrong.
+ *
+ * Checked against the FAILURE MODE rather than against a format, deliberately.
+ * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
+ * ones contain a dot), so a positive pattern would be this module guessing at
+ * GitHub's identifier alphabet and would reject a valid deployment the first
+ * time that alphabet changed. Nothing legitimate in any of the three carries a
+ * control character, and that is knowable without guessing.
+ *
+ * Whitespace is separated from control characters because a filesystem path may
+ * legitimately contain a space and an App ID may not.
+ */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
+const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001F\u007F]/;
+
 type Minted = { token: string; expiresAtMs: number };
 
 /**
@@ -325,6 +346,33 @@ export function checkAppConfig(
     );
   }
 
+  // THE THIRD VARIABLE, and the one this function was checking for presence and
+  // never for shape. `appId` goes straight into the JWT as `iss`
+  // (`appJwt`), so a stray character does not fail here — it fails at the FIRST
+  // MINT, with a 401, inside the poll's try, whose catch disarms the row. That
+  // is the permanent sweep this whole boot check exists to prevent, reached
+  // through the one variable of the three that was not being checked.
+  //
+  // Not digits-only: GitHub accepts the numeric App ID *or* a client ID as
+  // `iss`, and narrowing to digits would refuse a valid deployment.
+  if (input.appId && WHITESPACE_OR_CONTROL.test(input.appId)) {
+    faults.push(
+      'GITHUB_APP_ID contains whitespace or a control character — it is sent as the JWT ' +
+        '`iss` and GitHub answers 401, at the first mint rather than here; a trailing ' +
+        'newline or a \\r from a paste is the usual cause',
+    );
+  }
+
+  // Spaces are legal in a path, so this is the narrower test of the two. A
+  // trailing \r would otherwise surface as ENOENT below, which is true but
+  // sends the operator to stare at a path that looks correct.
+  if (input.privateKeyPath && CONTROL_CHARS.test(input.privateKeyPath)) {
+    faults.push(
+      'GITHUB_APP_PRIVATE_KEY_PATH contains a control character — a trailing newline in ' +
+        'an EnvironmentFile is the usual cause, and it is invisible in the value itself',
+    );
+  }
+
   if (!isInstallationIdValid(input.installationId)) {
     faults.push(
       'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
@@ -336,7 +384,11 @@ export function checkAppConfig(
   // and produce "GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not
   // readable" about a variable that is not set — the first four words false,
   // which is the exact defect this function was extracted to stop making.
-  if (input.privateKeyPath) {
+  // Skipped when the path is already known malformed: `access` would answer
+  // ENOENT and add "the key is not readable — ENOENT means the path is wrong",
+  // which is true, unhelpful, and points at the visible half of a value whose
+  // problem is the invisible half.
+  if (input.privateKeyPath && !CONTROL_CHARS.test(input.privateKeyPath)) {
     try {
       // `access` rather than a mint: it catches the two failures an operator
       // actually makes — wrong path, wrong owner — without spending a token or
