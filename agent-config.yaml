@@ -149,6 +149,13 @@ container:
   # and so are the skills and discord-cli directories — which BOTH deployments
   # share. The loader refuses to start if this lands inside any of them.
   execEnvDir: /var/lib/clawcius/exec-env
+  # Where the daemon keeps the GitHub App installation token that agents' git
+  # credential helper reads. DERIVED from container.stateDir when unset, because
+  # run-container.sh derives it the same way from one variable — a second setting
+  # to keep in step is a setting that eventually is not. Bind-mounted READ-ONLY:
+  # it is a credential the daemon serves TO the sandbox, so the sandbox must not
+  # be able to replace it. Refused inside any bind mount, like execEnvDir.
+  # githubTokenDir: <stateDir>/github-token
 
 model: claude-opus-5[1m]
 

@@ -18,6 +18,10 @@
 #     container.name          hamachi-agent          (its own sandbox)
 #     container.execEnvDir    /var/lib/hamachi/exec-env
 #     sessions.workspaceRoot  /var/lib/hamachi/workspaces
+#     container.githubTokenDir  DERIVED from stateDir, so it is not overridden
+#                               here and must not be — deriving is what stops
+#                               this instance writing its token into the other
+#                               instance's read-only mount.
 #     discord.allowed/followUpChannelIds   the test channel
 #
 # HOUSE STYLE used to be listed here as a difference: a <house-style> block
@@ -191,6 +195,13 @@ container:
   # each state directory is otherwise strictly per-instance; there is no reason
   # to make this the exception. See agent-config.yaml for the full account.
   execEnvDir: /var/lib/hamachi/exec-env
+  # Where the daemon keeps the GitHub App installation token that agents' git
+  # credential helper reads. DERIVED from container.stateDir when unset, because
+  # run-container.sh derives it the same way from one variable — a second setting
+  # to keep in step is a setting that eventually is not. Bind-mounted READ-ONLY:
+  # it is a credential the daemon serves TO the sandbox, so the sandbox must not
+  # be able to replace it. Refused inside any bind mount, like execEnvDir.
+  # githubTokenDir: <stateDir>/github-token
 
 model: claude-opus-5[1m]
 

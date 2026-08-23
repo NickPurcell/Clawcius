@@ -37,7 +37,7 @@ function configure({ token = '', appId = '', githubTokenDir }) {
       modelByRole: {},
       git: { userName: 'a', userEmail: 'a@b.c' },
       container: { githubTokenDir },
-      sessions: { maxConcurrent: 10, idleTimeoutMinutes: 0, workspaceRoot: githubTokenDir },
+      sessions: { maxConcurrent: 10, idleTimeoutMinutes: 0 },
     },
   });
 }

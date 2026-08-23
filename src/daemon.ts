@@ -754,17 +754,24 @@ export async function main(): Promise<void> {
           path: tokenFilePath(config.agent.container.githubTokenDir),
           provider: appProvider,
           log: (message) => process.stderr.write(`${message}\n`),
+          hasFallbackToken: Boolean(config.github.token),
         });
         // Awaited so the file exists before any session spawns, but a failure
         // does NOT stop startup — `start()` logs and retries. Throwing here put
         // the whole daemon into a restart loop over a network call, which is
         // the opposite of what `checkAppConfig` does one screen up for the same
         // kind of problem.
-        await tokenFileRefresher.start();
-        process.stderr.write(
-          '[armed] agent git credentials come from ' +
-            `${tokenFilePath(config.agent.container.githubTokenDir)}\n`,
-        );
+        // Said only if the file is actually there. `start()` no longer throws,
+        // so printing this unconditionally paired "there is no usable
+        // credential at X" with "agent git credentials come from X" in adjacent
+        // lines — the second refuted by the first, which is the defect #180
+        // spent six rounds removing from the neighbouring warning.
+        if (await tokenFileRefresher.start()) {
+          process.stderr.write(
+            '[armed] agent git credentials come from ' +
+              `${tokenFilePath(config.agent.container.githubTokenDir)}\n`,
+          );
+        }
       }
     } else if (config.github.token) {
       github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);

@@ -88,7 +88,9 @@ export const REFRESH_INTERVAL_MS = 5 * 60_000;
  * never exist, even briefly, at the default 0644.
  */
 export function writeTokenFile(path: string, token: string): void {
-  mkdirSync(dirname(path), { recursive: true });
+  // 0700 rather than the default 0755, so the directory's mode does not depend
+  // on whether the daemon or `run-container.sh` created it first.
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   // Defence in depth. `container.githubTokenDir` is refused inside any bind
   // mount and is mounted read-only, so nothing in a container should be able to
   // put a directory here — but `renameSync` throws EISDIR onto a path that has
@@ -143,6 +145,14 @@ export type TokenFileOptions = {
   readonly path: string;
   readonly provider: TokenProvider;
   readonly log: (message: string) => void;
+  /**
+   * Whether a PAT exists to fall back TO. Decides what the failure line may
+   * promise — `github-app.ts` spends a paragraph on why: a warning the reader
+   * watches get disproved is a warning they learn to skip. With no PAT the
+   * helper hands git an empty password, so "agents fall back to GITHUB_TOKEN"
+   * would be refuted by the next thing that happens.
+   */
+  readonly hasFallbackToken?: boolean;
   readonly now?: () => number;
   readonly intervalMs?: number;
 };
@@ -187,12 +197,16 @@ export class TokenFileRefresher {
    * chooses one screen up for the same reason — a crew reaching GitHub as the
    * older identity beats a crew not running.
    */
-  async start(): Promise<void> {
+  async start(): Promise<boolean> {
     await this.#tick();
+    // Reported rather than assumed: the caller announces the file to the
+    // operator and must not announce one that is not there.
+    const wrote = this.#written;
     this.#timer = setInterval(() => {
       void this.#tick();
     }, this.#opts.intervalMs ?? REFRESH_INTERVAL_MS);
     this.#timer.unref?.();
+    return wrote;
   }
 
   /**
@@ -276,8 +290,11 @@ export class TokenFileRefresher {
       }
       this.#opts.log(
         `[token-file] could not obtain an installation token (${code}); there is no ` +
-          `usable credential at ${this.#opts.path}. Agents fall back to GITHUB_TOKEN ` +
-          'until a refresh succeeds; retrying.',
+          `usable credential at ${this.#opts.path}. ` +
+          (this.#opts.hasFallbackToken
+            ? 'Agents fall back to GITHUB_TOKEN until a refresh succeeds; retrying.'
+            : 'GITHUB_TOKEN is not set either, so agent git operations will fail ' +
+              'until a refresh succeeds; retrying.'),
       );
     }
   }

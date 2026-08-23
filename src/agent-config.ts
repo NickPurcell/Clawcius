@@ -470,6 +470,8 @@ const DEFAULTS: Defaults = {
     claudePath: '/usr/local/bin/claude',
     // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
     execEnvDir: '/var/lib/clawcius/exec-env',
+    // Only ever used where there is no stateDir to derive from; the loader
+    // derives it, so this is the shape rather than the value.
     githubTokenDir: '/var/lib/clawcius/github-token',
   },
   prompts: DEFAULT_PROMPTS,
@@ -762,12 +764,22 @@ function isInside(child: string, parent: string): boolean {
  *
  * ── Still NOT exhaustive, and this is the honest remainder ───────────────
  *
- * Two read-only mounts do not appear in this config at all: `gws-cli` and the
- * Google service-account key. They are read-only, so nothing in a container can
- * write them — the risk there is not a forged claim but a shared secret, since
- * a path placed in one would be visible to BOTH deployments' agents. The
- * defence that does not depend on enumeration is the default value: every path
- * this file defaults to is a sibling of the mounts rather than a child.
+ * Two read-only mounts still do not appear here: `gws-cli` and the Google
+ * service-account key. They are read-only, so nothing in a container can write
+ * them — the risk is not a forged claim but a shared secret, since a path placed
+ * in one would be visible to BOTH deployments' agents.
+ *
+ * `container.githubTokenDir` WAS a third such omission and is now in the list,
+ * which is this paragraph's warning coming true in the interval since it was
+ * written: a read-only mount was added and the enumeration was not updated, so
+ * `execEnvDir` could be placed inside a directory mounted into the container.
+ * Unlike the two above it is in this config, so nothing external excused it.
+ *
+ * The defence that does not depend on enumeration is the default value: every
+ * path this file defaults to is a sibling of the mounts rather than a child —
+ * and `githubTokenDir` is now DERIVED from `stateDir` rather than defaulted to a
+ * literal, so a second instance gets its own without anyone remembering to say
+ * so. Deriving beats enumerating for the same reason this paragraph exists.
  */
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
   const state = config.container.stateDir;
@@ -786,6 +798,12 @@ function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
     ),
     ['paths.skillsDir', config.paths.skillsDir],
     ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
+    // Bind-mounted READ-ONLY, and in this list for the same reason the two above
+    // are: what it protects is a credential rather than a claim. Without it,
+    // `container.execEnvDir: <githubTokenDir>/env` passed validation and put the
+    // file holding DISCORD_TOKEN and GITHUB_TOKEN in plain text inside a
+    // directory mounted into the container — exactly what that guard refuses.
+    ['container.githubTokenDir, bind-mounted read-only', config.container.githubTokenDir],
   ];
 }
 
@@ -833,10 +851,25 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'container.execEnvDir',
         DEFAULTS.container.execEnvDir,
       ),
+      // DERIVED FROM stateDir, NOT DEFAULTED TO A LITERAL, and the difference
+      // is one instance serving another instance's crew its credential.
+      //
+      // A hardcoded `/var/lib/clawcius/github-token` was correct for Clawcius
+      // and silently wrong for Hamachi, whose config overrides `stateDir`,
+      // `execEnvDir` and `workspaceRoot` but had no reason to know about a key
+      // added later. Hamachi's daemon would have written its installation token
+      // into Clawcius's directory — which IS mounted read-only into Clawcius's
+      // container — while Hamachi's own agents read a path not mounted into
+      // theirs and fell silently back to the PAT.
+      //
+      // `run-container.sh` derives this from `$CLAWCIUS_STATE`, so deriving it
+      // here from the same variable means the two sides cannot disagree. That
+      // is the argument `bindMountedPaths` already makes for itself: "a second
+      // setting to keep in step is a setting that eventually is not."
       githubTokenDir: str(
         container['githubTokenDir'],
         'container.githubTokenDir',
-        DEFAULTS.container.githubTokenDir,
+        join(requiredAbsPath(container['stateDir'], 'container.stateDir'), 'github-token'),
       ),
     },
     prompts: {
@@ -1049,6 +1082,10 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   }
   const githubTokenDir = resolve(config.container.githubTokenDir);
   for (const [label, mount] of bindMountedPaths(config)) {
+    // Skip its own entry. This directory is itself a bind mount and is in that
+    // list so OTHER paths can be refused inside it — `isInside(x, x)` is true,
+    // so without this the guard rejects every valid configuration.
+    if (resolve(mount) === githubTokenDir) continue;
     if (isInside(githubTokenDir, resolve(mount))) {
       throw new Error(
         `agent-config.yaml: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +

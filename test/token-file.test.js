@@ -47,14 +47,14 @@ test('a directory that does not exist yet is created', () => {
   assert.equal(readFileSync(path, 'utf8'), 'tok');
 });
 
-test('start() writes immediately, and a first-write failure stops startup', async () => {
+test('start() writes immediately, and a first-fetch failure does NOT stop startup', async () => {
   const path = join(dir(), '.github-token');
   const ok = new TokenFileRefresher({
     path,
     provider: async () => 'tok-1',
     log: silent,
   });
-  await ok.start();
+  assert.equal(await ok.start(), true, 'start() must report the file it wrote');
   assert.equal(readFileSync(path, 'utf8'), 'tok-1');
   ok.stop();
 
@@ -71,10 +71,10 @@ test('start() writes immediately, and a first-write failure stops startup', asyn
     },
     log: (m) => logs.push(m),
   });
-  await bad.start();
+  assert.equal(await bad.start(), false, 'start() must report that no file was written');
   bad.stop();
   assert.match(logs.join('\n'), /could not obtain an installation token/);
-  assert.match(logs.join('\n'), /fall back to GITHUB_TOKEN/);
+  assert.match(logs.join('\n'), /fail until a refresh succeeds/);
 });
 
 test('a transient refresh failure KEEPS the token and says so', async () => {
@@ -289,4 +289,29 @@ test('a failed write leaves no temp file holding a live token', () => {
   writeTokenFile(join(d, 'installation-token'), 'ghs_live');
   const leftovers = readdirSync(d).filter((f) => f.endsWith('.tmp'));
   assert.deepEqual(leftovers, [], `temp files survived: ${leftovers.join(', ')}`);
+});
+
+test('the failure line promises a fallback only when there is one', async () => {
+  // `github-app.ts` spends a paragraph on this and #180 spent three rounds on
+  // it: a warning the reader watches get disproved is a warning they learn to
+  // skip. With no PAT the helper hands git an empty password, so "agents fall
+  // back to GITHUB_TOKEN" would be refuted by the next thing that happens.
+  const dead = async () => {
+    throw Object.assign(new Error('nope'), { code: 'ECONNRESET' });
+  };
+  const withPat = [];
+  await new TokenFileRefresher({
+    path: join(dir(), 'installation-token'), provider: dead,
+    hasFallbackToken: true, log: (m) => withPat.push(m),
+  }).start();
+
+  const withoutPat = [];
+  await new TokenFileRefresher({
+    path: join(dir(), 'installation-token'), provider: dead,
+    hasFallbackToken: false, log: (m) => withoutPat.push(m),
+  }).start();
+
+  assert.match(withPat.join('\n'), /fall back to GITHUB_TOKEN/);
+  assert.doesNotMatch(withoutPat.join('\n'), /fall back to/);
+  assert.match(withoutPat.join('\n'), /GITHUB_TOKEN is not set either/);
 });

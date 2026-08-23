@@ -260,3 +260,27 @@ test('both shipped configs put the updater on Haiku, and agree with each other',
   assert.doesNotMatch(clawcius.modelByRole.updater, /\[1m\]/);
   assert.match(clawcius.model, /\[1m\]/, 'the default model still carries the suffix');
 });
+
+test('githubTokenDir is derived per instance, not defaulted to one of them', () => {
+  // BLOCKING FINDING 11 ON #188. The key was defaulted to the literal
+  // `/var/lib/clawcius/github-token`, and agent-config.hamachi.yaml — which
+  // overrides stateDir, execEnvDir and workspaceRoot — had no reason to know a
+  // key added later existed. So Hamachi's daemon would have written its
+  // installation token into Clawcius's directory, which IS mounted read-only
+  // into Clawcius's container, serving one instance's credential to the other
+  // instance's crew. Meanwhile Hamachi's own agents read a path not mounted
+  // into theirs and fell back to the PAT with nothing saying so.
+  //
+  // Both shipped configs are loaded rather than one, because a single-config
+  // test cannot see this class at all.
+  const clawcius = loadAgentConfig('agent-config.yaml');
+  const hamachi = loadAgentConfig('agent-config.hamachi.yaml');
+
+  assert.equal(clawcius.container.githubTokenDir, join(clawcius.container.stateDir, 'github-token'));
+  assert.equal(hamachi.container.githubTokenDir, join(hamachi.container.stateDir, 'github-token'));
+  assert.notEqual(
+    clawcius.container.githubTokenDir,
+    hamachi.container.githubTokenDir,
+    'two instances must never share a credential directory',
+  );
+});
