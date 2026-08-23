@@ -345,6 +345,41 @@ Three things must line up, and all three are wired:
 the container through `--env-file`, so daemons the agent writes can use them
 too, not just the agent process.
 
+**GitHub identity, optionally an App.** Set `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY_PATH` in the instance's EnvironmentFile and the WAKER
+authenticates as the App instead of as the PAT. Add `GITHUB_APP_INSTALLATION_ID`
+only if the App is installed on more than one account; with one, the daemon
+discovers it and refuses to guess between several.
+
+**What that does not do, stated here because this is where you decide whether to
+set it.** It does not change who authors pull requests, and it does not make a
+required-approval ruleset satisfiable. The credential is used by one read-only
+client — the `watchPr` poller — which never opens a pull request and never
+approves one. Authorship still comes from the agent's `GITHUB_TOKEN` inside the
+container. Making the *session* use App credentials is a separate problem with a
+different shape, because an installation token expires in an hour and a
+session's environment is fixed when its process spawns.
+
+If the PEM is missing or unreadable, or `GITHUB_APP_INSTALLATION_ID` is not
+digits, the waker says so at startup and **falls back to `GITHUB_TOKEN`** — the
+App is not in use, and watches arm and poll as the PAT. That is deliberate, for
+the reason above, but it means a mistyped path leaves you running as the older
+identity with everything apparently working. The startup line is the only place
+that says so, so read it after changing either variable.
+
+Both variables are required together — either alone falls back to the PAT rather
+than failing, because a crew that cannot reach GitHub is worse than one reaching
+it as the older identity. A deployment with neither is unchanged, which is how
+Clawcius keeps working.
+
+The private key stays a **path**, never a value, and is read per mint rather
+than held: rotating it on disk takes effect at the next refresh instead of the
+next restart. The PEM should be `0600` and owned by the service user.
+
+**This is the waker's own identity, not the agent's.** The container still gets
+`GITHUB_TOKEN` through `--env-file`, so an agent's `git push` and its API calls
+are unchanged by any of this.
+
 **Skill discovery.** The agent's `cwd` is its per-channel workspace, and the
 SDK defaults to isolation mode where no filesystem settings load. So
 `settingSources: ['project']` is set and a `.claude` symlink is created in each

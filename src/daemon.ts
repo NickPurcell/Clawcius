@@ -49,6 +49,7 @@
 
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
+import { accessSync, constants as fsConstants } from 'node:fs';
 import { loadConfig, type Config } from './config.js';
 import { AgentRegistry, hostAgentId } from './store.js';
 import {
@@ -62,6 +63,7 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
+import { appTokenProvider } from './github-app.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -667,7 +669,74 @@ export async function main(): Promise<void> {
 
   let github: PullRequestSource | null = null;
   if (armedStore) {
-    if (config.github.token) {
+    // Prefer the App when this deployment has one. Both variables are required
+    // — a half-configured deployment falls back rather than failing, because a
+    // crew that cannot poll is worse than one polling as the older identity.
+    const app = config.github.appId && config.github.appPrivateKeyPath;
+    // PROVE IT BEFORE ARMING ANYTHING. Every way an App can be misconfigured —
+    // a typo'd PEM path, a PEM the service user cannot read, a wrong app id, an
+    // uninstalled App, more than one installation — throws when the provider is
+    // FIRST AWAITED, and the first await is inside `#get`, inside the try in
+    // `ArmedWaker`, whose catch calls `store.disarm()`. So a misconfiguration
+    // does not degrade a poll: it permanently deletes every armed row in the
+    // crew, one mail each, which is the exact sweep this file exists to
+    // prevent, reached through a different door.
+    //
+    // An absent GITHUB_TOKEN is already handled by refusing to build the client
+    // and letting `watchPr` decline to arm. A half-configured App deserves the
+    // same answer and deserves it more, because it fails AFTER arming rather
+    // than before.
+    let appTokenOk = false;
+    if (app) {
+      try {
+        // Costs no network, no token and no PEM, so there is no reason for it
+        // to wait until first use — and first use is inside `ArmedWaker`'s try,
+        // where the catch deletes the row. A trailing newline in an
+        // EnvironmentFile is an ordinary typo; discovering it at boot is a log
+        // line, discovering it at first poll is a permanent sweep.
+        if (config.github.appInstallationId && !/^\d+$/.test(config.github.appInstallationId)) {
+          throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
+        }
+        // `fs.access` rather than a mint: it catches the two failures an
+        // operator actually makes — wrong path, wrong owner — without spending
+        // a token or a round trip at every boot, and without making startup
+        // depend on GitHub being reachable.
+        accessSync(config.github.appPrivateKeyPath, fsConstants.R_OK);
+        appTokenOk = true;
+      } catch (error) {
+        // Say what actually happens next, which is NOT a refusal: the branch
+        // below falls through to the PAT, `github` is built, and watches arm
+        // and poll normally. Claiming a refusal here was worse than saying
+        // nothing — an operator who mistypes the path would see a warning, then
+        // see watches working, conclude the warning was spurious, and run
+        // indefinitely as the PAT believing they were the App.
+        process.stderr.write(
+          `[armed] GITHUB_APP_PRIVATE_KEY_PATH is set but unreadable — ${String(error)}. ` +
+            'FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm and ' +
+            'poll as the personal access token. Fix the path or the ownership to use the App.\n',
+        );
+      }
+    }
+    if (app && appTokenOk) {
+      // A PROVIDER, not a token. An installation token lasts an hour and this
+      // client lives for the life of the daemon; a poll that throws is disarmed
+      // rather than retried (`ArmedWaker`), so a stale credential would kill
+      // every armed watch in the crew an hour after startup rather than degrade.
+      github = new GitHubClient(
+        appTokenProvider({
+          appId: config.github.appId,
+          privateKeyPath: config.github.appPrivateKeyPath,
+          installationId: config.github.appInstallationId || undefined,
+          apiBase: config.agent.armed.github.apiBase,
+        }),
+        config.agent.armed.github.apiBase,
+      );
+      // Said only once the key has been shown readable. Printing it before
+      // anything was proven reported success at the exact moment the failure
+      // became undetectable. The id is not a secret; the key and the token are,
+      // and neither the PEM's path nor anything minted from it is logged.
+      process.stderr.write(`[armed] authenticating as GitHub App ${config.github.appId}\n`);
+    } else if (config.github.token) {
       github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);
     } else {
       process.stderr.write(
