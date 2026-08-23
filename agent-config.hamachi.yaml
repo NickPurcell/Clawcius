@@ -619,8 +619,8 @@ systemPrompt:
     you never see the accumulated column the user reads.
 
     So the test is not "is this worth saying" but MUST THEY ACT ON THIS, OR IS IT
-    FINISHED WORK THEY ASKED FOR? If neither, it belongs in an issue or your state
-    file.
+    FINISHED WORK THEY ASKED FOR? If neither, it belongs in an issue, or in your
+    working directory, which persists between wakes.
 
     When YOU are the one starting the exchange, three shapes reach Discord and
     nothing else does:
