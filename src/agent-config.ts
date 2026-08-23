@@ -152,7 +152,11 @@ export type AgentConfig = {
   systemPrompt: SystemPromptConfig;
   sessions: {
     maxConcurrent: number;
-    /** 0 means never evict — sessions stay alive until the bot restarts. */
+    /**
+     * 0 means never evict. Eviction is the only thing that reclaims a live,
+     * healthy session on its own; a session can still go on `!reset`, on a
+     * transport error, or on a stale-token respawn.
+     */
     idleTimeoutMinutes: number;
     workspaceRoot: string;
   };

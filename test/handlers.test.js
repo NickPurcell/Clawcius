@@ -541,7 +541,7 @@ test('an unrecognised ! command falls through to the agent', async () => {
 
 // ── deliver's catch: which failures the channel hears about ─────────────────
 
-test('a full pool is announced, with the numbers and the restart', async () => {
+test('a full pool is announced, with the numbers and the remedies', async () => {
   const { handlers, sessions, sent } = harness();
   sessions.onAcquire = () => {
     throw new AtCapacityError(4, 4);
@@ -557,6 +557,9 @@ test('a full pool is announced, with the numbers and the restart', async () => {
   // `idleTimeoutMinutes: 0` in the fixture is the shipped configuration, where a
   // retry cannot work and "try again" is what a person would naturally do.
   assert.match(sent[0], /will not clear on its own/);
+  // Clawcius #146: this is the sentence a user actually reads, and the whole
+  // point of the fix is that it reaches them here rather than only in a doc.
+  assert.match(sent[0], /`!reset`/);
   assert.match(log, /could not wake/);
 });
 
