@@ -584,6 +584,60 @@ test('an error names the file the key actually came from', () => {
   assert.throws(() => loadAgentConfig(write(shared, ['maxTurns: nope'])), /inst\.yaml: maxTurns/);
 });
 
+test('an indexed key names its own file, and so do the guards (OJ round 2)', () => {
+  // THE TAIL OF FINDING 4. `fileFor` walked up by stripping at the last `.`, so
+  // a path with an `[index]` never reached its own entry: `allowedChannelIds[0]`
+  // jumped straight past `discord.allowedChannelIds` to `discord`, and named
+  // whichever file wrote the parent mapping.
+  //
+  // For this key that is ALWAYS wrong — BASE_FORBIDDEN refuses
+  // `discord.allowedChannelIds` in the base, so it can only have come from an
+  // instance file. An error naming the base names a file the key may not be in.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-idx-'));
+  const write = (baseLines, instanceLines) => {
+    writeFileSync(join(dir, 'base.yaml'), [...baseLines, ''].join('\n'));
+    writeFileSync(join(dir, 'inst.yaml'), ['extends: base.yaml', 'crew: third', ...instanceLines, ''].join('\n'));
+    return join(dir, 'inst.yaml');
+  };
+
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(['discord:', '  followUpWindowSeconds: 300'], ['discord:', '  allowedChannelIds: [12345]']),
+      ),
+    /inst\.yaml: discord\.allowedChannelIds\[0\]/,
+  );
+
+  // Same shape one level deeper, through a list of mappings.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(
+          ['clawsky:', '  enabled: true'],
+          ['clawsky:', '  agents:', '    - id: wrongprefix', '      role: engineer'],
+        ),
+      ),
+    /inst\.yaml: clawsky\.agents\[0\]\.id/,
+  );
+
+  // The bundling check is the clean miss: BOTH keys live in the base and are
+  // refused nowhere, so naming the instance file was simply always wrong.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(['discord:', '  bundleDebounceMs: 1500', '  bundleMaxWaitMs: 100'], []),
+      ),
+    /base\.yaml: discord\.bundleMaxWaitMs must be >=/,
+  );
+
+  // And the containment guards name the file holding the MOUNT, because that is
+  // the half an operator can edit — `status.file` is derived and cannot move.
+  assert.throws(
+    () => loadAgentConfig(write(['paths:', '  skillsDir: /var/lib/third'], [])),
+    /base\.yaml: status\.file .* is inside paths\.skillsDir/,
+  );
+});
+
 test('an explicit stateDir is followed by every derived path or by none', () => {
   // FINDING 5. `githubTokenDir` re-derived from an explicit stateDir while
   // execEnvDir, workspaceRoot and status.file kept computing from

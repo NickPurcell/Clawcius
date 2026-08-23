@@ -610,11 +610,29 @@ let loadingConfigPath = 'agent-config.yaml';
  */
 let keyProvenance = new Map<string, string>();
 
-/** The file to name when complaining about `path`; the root file if unknown. */
+/**
+ * The file to name when complaining about `path`; the root file if unknown.
+ *
+ * Walks UP the dotted path, and strips a trailing `[index]` at each step — which
+ * is the whole of OJ round 2's residual on finding 4. Stripping only at the last
+ * `.` made `discord.allowedChannelIds[0]` walk to `discord.allowedChannelIds`…
+ * no, to `discord.allowedChannelIds[0]` minus nothing, then jump straight past
+ * the array's own entry to `discord`. So an element error named whichever file
+ * wrote the *parent mapping*, and for `discord.allowedChannelIds` that is always
+ * wrong: `BASE_FORBIDDEN` refuses that key in the base, so it can only ever have
+ * come from an instance file.
+ */
 function fileFor(path: string): string {
   for (let at = path; ; ) {
     const file = keyProvenance.get(at);
     if (file !== undefined) return file;
+    if (at.endsWith(']')) {
+      const open = at.lastIndexOf('[');
+      if (open > 0) {
+        at = at.slice(0, open);
+        continue;
+      }
+    }
     const cut = at.lastIndexOf('.');
     if (cut < 0) break;
     at = at.slice(0, cut);
@@ -868,6 +886,15 @@ const PROMPT_CONTENT: ReadonlyArray<[string, string]> = [
  * behaviour anyone would want. A STANDALONE file — no `extends` — is unaffected:
  * there is no shared file to inherit through, and the containment guards need
  * explicit paths to be exercised against.
+ *
+ * ONE AFFORDANCE THIS REMOVES, RECORDED SO NOBODY RESTORES IT WITHOUT MEANING
+ * TO. A layered instance can no longer relocate its state directory at all —
+ * `container.stateDir` is refused here, and standalone is the only mode that
+ * accepts it, which means giving up the shared base entirely. Nobody needs that
+ * today and `/var/lib/<crew>` is right for every crew that exists. If one ever
+ * needs its state on another filesystem, the answer is a new mechanism that
+ * keeps the derivation coherent — not reopening this key, which is how the
+ * half-honoured `stateDir` of OJ round 1 finding 5 happened in the first place.
  */
 const DERIVED_KEYS: ReadonlyArray<[string, string]> = [
   ['container.name', 'is the docker exec target and derives from crew'],
@@ -1134,10 +1161,16 @@ const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only
  * literal, so a second instance gets its own without anyone remembering to say
  * so. Deriving beats enumerating for the same reason this paragraph exists.
  */
-function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
+function bindMountedPaths(config: AgentConfig): Array<[string, string, string?]> {
   const state = config.container.stateDir;
+  // The third element is the CONFIG KEY the mount comes from, where it is one.
+  // A collision names two keys — the thing being placed and the mount it landed
+  // inside — and after the split those can live in different files. The mount is
+  // the actionable half: `status.file` and `sessions.workspaceRoot` are derived
+  // and cannot be moved, so an operator fixes the collision by editing the mount.
+  // OJ round 2 on #207.
   return [
-    ['sessions.workspaceRoot', config.sessions.workspaceRoot],
+    ['sessions.workspaceRoot', config.sessions.workspaceRoot, 'sessions.workspaceRoot'],
     // The three `docker run -v … :rw` paths, by the same derivation the script
     // uses. `sessions.workspaceRoot` above is configurable and usually the same
     // directory as the first of these; both are listed because an operator who
@@ -1149,14 +1182,18 @@ function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
           string,
         ],
     ),
-    ['paths.skillsDir', config.paths.skillsDir],
-    ['the directory containing paths.discordCli', dirname(config.paths.discordCli)],
+    ['paths.skillsDir', config.paths.skillsDir, 'paths.skillsDir'],
+    [
+      'the directory containing paths.discordCli',
+      dirname(config.paths.discordCli),
+      'paths.discordCli',
+    ],
     // Bind-mounted READ-ONLY, and in this list for the same reason the two above
     // are: what it protects is a credential rather than a claim. Without it,
     // `container.execEnvDir: <githubTokenDir>/env` passed validation and put the
     // file holding DISCORD_TOKEN and GITHUB_TOKEN in plain text inside a
     // directory mounted into the container — exactly what that guard refuses.
-    [GITHUB_TOKEN_DIR_MOUNT, config.container.githubTokenDir],
+    [GITHUB_TOKEN_DIR_MOUNT, config.container.githubTokenDir, 'container.githubTokenDir'],
   ];
 }
 
@@ -1472,8 +1509,9 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     config.discord.bundleMaxWaitMs < config.discord.bundleDebounceMs
   ) {
     throw new Error(
-      `${loadingConfigPath}: discord.bundleMaxWaitMs must be >= discord.bundleDebounceMs — ` +
-        'a lower ceiling would flush every bundle before the debounce could coalesce anything.',
+      `${fileFor('discord.bundleMaxWaitMs')}: discord.bundleMaxWaitMs must be >= ` +
+        'discord.bundleDebounceMs — a lower ceiling would flush every bundle before the ' +
+        'debounce could coalesce anything.',
     );
   }
 
@@ -1493,10 +1531,10 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       throw new ConfigError('status.file', 'must be an absolute path');
     }
     const statusFile = resolve(config.status.file);
-    for (const [label, mount] of bindMountedPaths(config)) {
+    for (const [label, mount, mountKey] of bindMountedPaths(config)) {
       if (isInside(statusFile, resolve(mount))) {
         throw new Error(
-          `${loadingConfigPath}: status.file (${statusFile}) is inside ${label} ` +
+          `${fileFor(mountKey ?? 'status.file')}: status.file (${statusFile}) is inside ${label} ` +
             `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
             'container. The ops executor trusts this file when deciding whether recreating ' +
             'the container would kill a live turn; the agent must not be able to write it.',
@@ -1518,10 +1556,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     throw new ConfigError('container.execEnvDir', 'must be an absolute path');
   }
   const execEnvDir = resolve(config.container.execEnvDir);
-  for (const [label, mount] of bindMountedPaths(config)) {
+  for (const [label, mount, mountKey] of bindMountedPaths(config)) {
     if (isInside(execEnvDir, resolve(mount))) {
       throw new Error(
-        `${loadingConfigPath}: container.execEnvDir (${execEnvDir}) is inside ${label} ` +
+        `${fileFor(mountKey ?? 'container.execEnvDir')}: container.execEnvDir (${execEnvDir}) ` +
+          `is inside ${label} ` +
           `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
           'container. That file holds this instance\'s Discord and GitHub tokens; it must ' +
           'not be reachable from inside any sandbox. Put it beside the state directory, ' +
@@ -1557,10 +1596,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   // every valid configuration. Dropping by label rather than by resolved path
   // keeps equality with any OTHER mount a refusal, which is what it must be.
   const others = bindMountedPaths(config).filter(([label]) => label !== GITHUB_TOKEN_DIR_MOUNT);
-  for (const [label, mount] of others) {
+  for (const [label, mount, mountKey] of others) {
     if (isInside(githubTokenDir, resolve(mount))) {
       throw new Error(
-        `${loadingConfigPath}: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +
+        `${fileFor(mountKey ?? 'container.githubTokenDir')}: container.githubTokenDir ` +
+          `(${githubTokenDir}) is inside ${label} ` +
           `(${resolve(mount)}). It holds a GitHub App installation token that every agent ` +
           'consumes; it is mounted read-only on purpose, and a path inside a read-write ' +
           'mount would let the sandbox rewrite or replace the credential the daemon serves ' +

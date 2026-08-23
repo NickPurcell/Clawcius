@@ -2,12 +2,20 @@
 # THE SHARED BASE. Every instance extends this file; no instance may copy it.
 #
 # Nothing in here is specific to one crew, and the loader enforces that rather
-# than trusting it: `src/agent-config.ts` refuses an instance-identity key in
-# this file, and refuses prompt content in an instance file. Both refusals are
-# hard boot errors, not warnings — an edit that does not reach the running
-# system is the exact defect this layering was built to end (#203), so a
-# mechanism that silently dropped one would have reproduced that bug in a
-# smaller place.
+# than trusting it. Three refusals, all hard boot errors rather than warnings —
+# an edit that does not reach the running system is the exact defect this
+# layering was built to end (#203), so a mechanism that silently dropped one
+# would have reproduced that bug in a smaller place:
+#
+#   in THIS file      instance identity — `crew`, `displayName`, the Discord
+#                     channel lists, and the nine derived keys. A value here is
+#                     inherited by every instance that does not override it.
+#   in an INSTANCE    prompt content — `systemPrompt.append`, `prompts.*`.
+#   in an INSTANCE    the nine derived keys, again. Refused in BOTH, because
+#                     they are two different bugs: inheritance here,
+#                     restatement there. An instance that restates
+#                     `container.name` does not fail, it `docker exec`s into
+#                     whichever container it named.
 #
 # ── What lives here, and what lives in an instance file ──────────────────
 #
