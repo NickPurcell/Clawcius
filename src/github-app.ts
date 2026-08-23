@@ -138,14 +138,34 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
  * ones contain a dot), so a positive pattern would be this module guessing at
  * GitHub's identifier alphabet and would reject a valid deployment the first
- * time that alphabet changed. Nothing legitimate in any of the three carries a
- * control character, and that is knowable without guessing.
+ * time that alphabet changed. Nothing legitimate in any of the three carries any
+ * character named below, and that is knowable without guessing.
  *
- * Whitespace is separated from control characters because a filesystem path may
+ * EXACTLY THREE GROUPS, and this list is the whole of the claim:
+ *
+ *   C0 controls and DEL   \u0000-\u001F, \u007F   -- \r, \n, \t
+ *   Unicode format chars  \p{Cf}                  -- ZWSP, soft hyphen, word
+ *                                                    joiner, BOM, ZWJ/ZWNJ
+ *   whitespace            \s                      -- APP ID ONLY, see below
+ *
+ * `\p{Cf}` is here because it is the WORST case, not an exotic one. A trailing
+ * space can be found by moving a cursor; a zero-width space cannot be found at
+ * all, and web UIs insert them into long identifiers to allow line breaking --
+ * so "I copied the App ID off the page" is exactly how one arrives. The
+ * consequence is the one this check exists to prevent, a 401 at first mint
+ * inside the catch that disarms every armed row, reached through the single
+ * input an operator has no way to inspect. The more invisible the character,
+ * the more a boot check is the ONLY thing that can catch it.
+ *
+ * It is also free to be right about: `\p{Cf}` is a NEGATIVE pattern, so the
+ * objection to positive ones above -- that they guess at someone else's
+ * alphabet and expire when it changes -- does not apply to it.
+ *
+ * Whitespace is the one group not shared, because a filesystem path may
  * legitimately contain a space and an App ID may not.
  */
-const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
-const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001F\u007F]/;
+const INVISIBLE = /[\u0000-\u001F\u007F\p{Cf}]/u;
+const INVISIBLE_OR_SPACE = /[\s\u0000-\u001F\u007F\p{Cf}]/u;
 
 type Minted = { token: string; expiresAtMs: number };
 
@@ -355,21 +375,23 @@ export function checkAppConfig(
   //
   // Not digits-only: GitHub accepts the numeric App ID *or* a client ID as
   // `iss`, and narrowing to digits would refuse a valid deployment.
-  if (input.appId && WHITESPACE_OR_CONTROL.test(input.appId)) {
+  if (input.appId && INVISIBLE_OR_SPACE.test(input.appId)) {
     faults.push(
-      'GITHUB_APP_ID contains whitespace or a control character — it is sent as the JWT ' +
-        '`iss` and GitHub answers 401, at the first mint rather than here; a trailing ' +
-        'newline or a \\r from a paste is the usual cause',
+      'GITHUB_APP_ID contains an invisible character — whitespace, a control character, ' +
+        'or a zero-width one such as U+200B, which a web UI inserts into long ' +
+        'identifiers and no editor shows you. It is sent as the JWT `iss`, so GitHub ' +
+        'answers 401 at the first mint rather than here',
     );
   }
 
   // Spaces are legal in a path, so this is the narrower test of the two. A
   // trailing \r would otherwise surface as ENOENT below, which is true but
   // sends the operator to stare at a path that looks correct.
-  if (input.privateKeyPath && CONTROL_CHARS.test(input.privateKeyPath)) {
+  if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
     faults.push(
-      'GITHUB_APP_PRIVATE_KEY_PATH contains a control character — a trailing newline in ' +
-        'an EnvironmentFile is the usual cause, and it is invisible in the value itself',
+      'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — a control character ' +
+        'or a zero-width one. A trailing newline in an EnvironmentFile is the usual ' +
+        'cause, and nothing in the value itself shows it',
     );
   }
 
@@ -388,7 +410,7 @@ export function checkAppConfig(
   // ENOENT and add "the key is not readable — ENOENT means the path is wrong",
   // which is true, unhelpful, and points at the visible half of a value whose
   // problem is the invisible half.
-  if (input.privateKeyPath && !CONTROL_CHARS.test(input.privateKeyPath)) {
+  if (input.privateKeyPath && !INVISIBLE.test(input.privateKeyPath)) {
     try {
       // `access` rather than a mint: it catches the two failures an operator
       // actually makes — wrong path, wrong owner — without spending a token or

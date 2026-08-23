@@ -405,7 +405,7 @@ test('an App id with a stray character is caught at boot, not at the first mint'
   for (const bad of ['99\r', '99\n', ' 99', '99 ', '99\t']) {
     const { usable, warning } = checkAppConfig(cfg({ appId: bad }), accessOk);
     assert.equal(usable, false, JSON.stringify(bad));
-    assert.match(warning, /GITHUB_APP_ID contains whitespace or a control character/);
+    assert.match(warning, /GITHUB_APP_ID contains an invisible character/);
   }
 });
 
@@ -430,6 +430,46 @@ test('a key path may contain a space but not a control character', () => {
 
   const cr = checkAppConfig(cfg({ privateKeyPath: '/k.pem\r' }), accessFailing('ENOENT'));
   assert.equal(cr.usable, false);
-  assert.match(cr.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains a control character/);
+  assert.match(cr.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/);
   assert.doesNotMatch(cr.warning, /not readable/, 'the misleading ENOENT must be suppressed');
+});
+
+test('a zero-width character is caught too, and it is the worst case', () => {
+  // A trailing space can be found by moving a cursor; U+200B cannot be found at
+  // all. Web UIs insert zero-width characters into long identifiers so they can
+  // line-break, so "I copied the App ID off the page" is how one arrives — and
+  // the consequence is the same 401 at first mint, inside the catch that
+  // disarms every armed row. The prose above the regex claims "a character the
+  // operator cannot see"; these are the characters that claim is most about.
+  const zeroWidth = {
+    'U+200B ZERO WIDTH SPACE': '​',
+    'U+00AD SOFT HYPHEN': '­',
+    'U+2060 WORD JOINER': '⁠',
+    'U+FEFF BYTE ORDER MARK': '﻿',
+    'U+200D ZERO WIDTH JOINER': '‍',
+  };
+  for (const [name, ch] of Object.entries(zeroWidth)) {
+    const id = checkAppConfig(cfg({ appId: `99${ch}` }), accessOk);
+    assert.equal(id.usable, false, name);
+    assert.match(id.warning, /GITHUB_APP_ID contains an invisible character/, name);
+
+    const path = checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessFailing('ENOENT'));
+    assert.equal(path.usable, false, name);
+    assert.match(path.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
+    assert.doesNotMatch(path.warning, /not readable/, `${name}: misleading ENOENT must be suppressed`);
+  }
+});
+
+test('the invisible-character check does not refuse ordinary values', () => {
+  // The regex is negative, so the risk it carries is over-rejection. These are
+  // the shapes a real deployment uses: both App ID forms, the older dotted
+  // client ID, and a path with a space in it.
+  for (const appId of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
+    assert.equal(checkAppConfig(cfg({ appId }), accessOk).usable, true, appId);
+  }
+  assert.equal(
+    checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
+    true,
+    'spaces are legal in a path and must not be refused',
+  );
 });
