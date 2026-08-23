@@ -313,7 +313,7 @@ type Outcome = 'tolerated' | 'rejected' | 'throws';
  * Not a general Unicode name table and not trying to be: anything absent falls
  * back to the bare `U+XXXX`, which is still a specific claim about a specific
  * position. These are the ones with a known route into a token -- a paste from
- * a browser, a shell heredoc, a Windows line ending, an `EnvironmentFile`.
+ * a browser, a shell heredoc, a Windows line ending.
  */
 const CHARACTER_NAMES: Record<number, string> = {
   0x0000: '(a NUL)',
@@ -354,10 +354,24 @@ const CHARACTER_NAMES: Record<number, string> = {
  *
  *   TOLERATED  A run of space/tab/CR/LF at the very END. The header value is
  *              trimmed before it is sent, so `Bearer <tok>\n` goes out byte for
- *              byte identical to a clean token. A trailing newline from an
- *              `EnvironmentFile` -- the single likeliest way this happens --
- *              COSTS NOTHING, and saying otherwise would send someone hunting a
- *              401 that never occurred.
+ *              byte identical to a clean token. It COSTS NOTHING, and saying
+ *              otherwise would send someone hunting a 401 that never occurred.
+ *
+ *              NO CLAIM IS MADE HERE ABOUT HOW OFTEN THIS ARRIVES, and the
+ *              omission is deliberate. An earlier draft called it the likeliest
+ *              case and blamed a trailing newline in an `EnvironmentFile`. That
+ *              is a claim about a LOADER, not about this code: systemd's
+ *              `EnvironmentFile=` documents leading and trailing space, tab and
+ *              CR as discarded from an unquoted value, and Docker's
+ *              `--env-file` -- which is what actually carries this variable into
+ *              an agent container -- is a second parser whose rules nobody here
+ *              has compared with it. Both read the same `.env`, so identical
+ *              bytes may not yield identical values.
+ *
+ *              The behaviour below is measured and stands on its own. "This is
+ *              what happens if such a character reaches the value" needs no
+ *              frequency claim to be useful, and a frequency claim that cannot
+ *              be checked from inside a container is one nobody can maintain.
  *
  *   401        An invisible character of U+00FF or below, anywhere the trimming
  *              does not reach. The header is built and sent, so the failure is
@@ -480,6 +494,27 @@ export function describeTokenShape(token: string): string | null {
   //     "eventually" is the old behaviour.
   //   * An agent's `curl` authenticates from the netrc and never touches this
   //     process's HTTP client, so nothing throws for it; it simply gets a 401.
+  // THE REASON IS KEYED ON THE CAUSE, NOT THE OUTCOME, and that distinction is
+  // the whole of this block. `throws` has THREE disjoint causes -- a codepoint
+  // above U+00FF, an interior CR/LF, and NUL -- and `symptom` is a record keyed
+  // on the outcome, so all three got the one sentence written for the first.
+  //
+  // The result was a message that named U+000D, told the operator it was a
+  // Windows line ending, and then explained the failure with a rule U+000D does
+  // not satisfy: two adjacent sentences contradicting each other, sending
+  // someone to hunt a non-ASCII character they had just been told was not
+  // there. That is the wrong-subject failure #185 opens with, reproduced inside
+  // the tool built to remove it -- and the classification was right the whole
+  // time, so only the reason was false.
+  //
+  // Keyed on the cause it cannot recur: a fourth cause added to the outcome
+  // gets no sentence rather than the wrong one.
+  const cannotBeSent =
+    worst.code > 0xff
+      ? 'A character above U+00FF cannot go into an HTTP header at all.'
+      : 'An HTTP header value cannot contain a newline, a carriage return or a NUL, ' +
+        'wherever in the value it sits.';
+
   const symptom: Record<Outcome, string> = {
     tolerated:
       'Trailing whitespace is trimmed from the header before the request is sent, ' +
@@ -490,7 +525,7 @@ export function describeTokenShape(token: string): string | null {
       'GitHub answers 401, and the failure is indistinguishable from a revoked or ' +
       'mistyped token.',
     throws:
-      'A character above U+00FF cannot go into an HTTP header at all. Wherever this ' +
+      `${cannotBeSent} Wherever this ` +
       'token is the credential for a request from THIS process, the request throws ' +
       'before anything is sent — so it surfaces as GitHub being unreachable rather ' +
       'than as an authentication problem, and a watch polling with it fails every ' +

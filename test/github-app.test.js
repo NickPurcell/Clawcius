@@ -605,9 +605,10 @@ test('the boundary of the invisible-character class is pinned, so widening it is
  * And the sharper half: it must not cry wolf. #185 assumed a trailing newline
  * caused a 401, and said outright that it could not confirm that. It does not
  * -- the header value is trimmed, and goes out identical to a clean token. So
- * the commonest case of all is one where the correct message says "this is not
- * your problem", and `every message agrees with the real header layer` below is
- * what keeps that honest.
+ * a trailing newline is a case where the correct message says "this is not your
+ * problem", and `every message agrees with the real header layer` below is what
+ * keeps that honest. How often it arrives is a claim about a LOADER and is
+ * deliberately made nowhere -- see the docstring.
  *
  * EVERY INVISIBLE CHARACTER BELOW IS WRITTEN AS AN ESCAPE, mechanically. A
  * literal one is invisible in the file, in a diff and to a reviewer -- which is
@@ -615,7 +616,7 @@ test('the boundary of the invisible-character class is pinned, so widening it is
  */
 
 // The characters with a real route into a token: a browser paste, a shell
-// heredoc, a Windows line ending, a BOM on an EnvironmentFile.
+// heredoc, a Windows line ending, a BOM at the front of a file.
 const SAMPLES = [
   ['tab', '\u0009'],
   ['newline', '\u000a'],
@@ -719,9 +720,10 @@ test('every message agrees with the real header layer', () => {
 });
 
 test('a trailing newline is reported as harmless, in those words', () => {
-  // The commonest case of all: an EnvironmentFile ending in a newline. #185
-  // assumed it caused a 401. It does not, and a message saying so would send
-  // an operator hunting a failure that is not happening.
+  // #185 assumed a trailing newline caused a 401. It does not, and a message
+  // saying so would send an operator hunting a failure that is not happening.
+  // No claim about how often it arrives: that depends which loader wrote the
+  // variable, and this cannot be tested from inside a container.
   const out = describeTokenShape('ghp_abcdef\u000a');
   assert.match(out, /U\+000A/);
   assert.match(out, /NOT causing a failure/);
@@ -846,4 +848,53 @@ test('NUL throws wherever it sits, including trailing', () => {
     assert.match(out, /U\+0000/);
     assert.match(out, /throws before anything is sent/);
   }
+});
+
+/**
+ * The reason clause, which round 2 found false for four of the cases the suite
+ * already exercised.
+ *
+ * `claimedOutcome` matches on "throws before anything is sent" -- a substring of
+ * the SECOND sentence -- so the first sentence was asserted nowhere, and a
+ * newline was being told it was a character above U+00FF. The classification was
+ * right the whole time; only the reason was wrong, and no assertion looked at it.
+ *
+ * This looks at it, for every sample in every position, rather than pinning the
+ * four cases that happened to be wrong.
+ */
+test('the reason given is true of the character named', () => {
+  let throwing = 0;
+  for (const [name, ch] of SAMPLES) {
+    for (const [where, build] of POSITIONS) {
+      const out = describeTokenShape(build(ch));
+      if (!out.includes('throws before anything is sent')) continue;
+      throwing++;
+      const code = ch.codePointAt(0);
+      const claimsAbove = out.includes('above U+00FF');
+      assert.equal(
+        claimsAbove,
+        code > 0xff,
+        `${where} ${name} (U+${code.toString(16)}): message ` +
+          `${claimsAbove ? 'claims' : 'does not claim'} "above U+00FF", which is ` +
+          `${code > 0xff ? 'true' : 'FALSE'} of it`,
+      );
+      // The alternative clause must actually be there rather than the sentence
+      // silently going missing for the non-ASCII-range causes.
+      if (!claimsAbove) {
+        assert.match(out, /cannot contain a newline, a carriage return or a NUL/);
+      }
+    }
+  }
+  // Not vacuous: the loop must have found throwing cases of BOTH kinds.
+  assert.ok(throwing >= 8, `only ${throwing} throwing cases exercised`);
+});
+
+test('a Windows line ending is not explained by a rule it does not satisfy', () => {
+  // The case round 2 quoted: the message names U+000D, says it is a Windows line
+  // ending, and then must not explain the failure with a rule about U+00FF.
+  const out = describeTokenShape('ghp_\u000dabc');
+  assert.match(out, /U\+000D/);
+  assert.match(out, /Windows line ending/);
+  assert.doesNotMatch(out, /above U\+00FF/);
+  assert.match(out, /cannot contain a newline, a carriage return or a NUL/);
 });
