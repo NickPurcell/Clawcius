@@ -568,6 +568,13 @@ test('the boundary of the invisible-character class is pinned, so widening it is
 
   // U+180E is category Cf and IS caught, which is the boundary itself: the class
   // is defined by what the characters ARE, not by a hand-listed set.
+  //
+  // `accessOk` IS LOAD-BEARING HERE — do not "harmonise" it with the
+  // `accessFailing('ENOENT')` used by the path tests below. If `INVISIBLE` ever
+  // stopped matching U+180E, control would fall through to the `access` branch;
+  // with `accessOk` that yields `usable: true` and this assertion fails, which
+  // is the point. With a failing `access` it would yield `usable: false` and the
+  // assertion would pass for the wrong reason, silently.
   assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
   assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
 });
