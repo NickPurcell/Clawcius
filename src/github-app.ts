@@ -406,9 +406,10 @@ export function checkAppConfig(
   // sends the operator to stare at a path that looks correct.
   if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
     faults.push(
-      'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — a control character ' +
-        'or a zero-width one. A trailing newline in an EnvironmentFile is the usual ' +
-        'cause, and nothing in the value itself shows it',
+      'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — whitespace other ' +
+        'than a plain space, a control character, or a zero-width one. A trailing ' +
+        'newline in an EnvironmentFile is the usual cause, and nothing in the value ' +
+        'itself shows it',
     );
   }
 

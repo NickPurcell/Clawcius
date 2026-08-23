@@ -505,3 +505,90 @@ test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
     'U+0020 is the only whitespace a path may contain',
   );
 });
+
+test('both invisible-character messages name every group they catch', () => {
+  // The path message listed "a control character or a zero-width one" after the
+  // check had grown to catch non-space whitespace too, so an operator with an
+  // NBSP in their path was named by neither example and could reasonably read
+  // the warning as being about someone else's problem. The claim was true and
+  // the examples were narrower than the behaviour — the same defect as the
+  // docstring's, inverted.
+  const nbsp = checkAppConfig(cfg({ privateKeyPath: '/k.pem ' }), accessOk).warning;
+  assert.match(nbsp, /whitespace other than a plain space/);
+  assert.match(nbsp, /control character/);
+  assert.match(nbsp, /zero-width/);
+
+  const id = checkAppConfig(cfg({ appId: '99 ' }), accessOk).warning;
+  assert.match(id, /whitespace/);
+  assert.match(id, /control character/);
+  assert.match(id, /zero-width/);
+});
+
+test('the boundary of the invisible-character class is pinned, so widening it is loud', () => {
+  // WHAT THIS DOES AND DOES NOT DO, because the pull request that added the
+  // message tests claimed more than they delivered.
+  //
+  // The three `assert.match` checks above pin each message against being
+  // NARROWED — drop "zero-width" from the sentence and they fail. They do NOT
+  // pin it against the CHECK being widened: add a fourth group to `INVISIBLE`
+  // tomorrow and every one of them still passes while the message is once again
+  // narrower than the behaviour. That is the fifth-instance defect, one level up.
+  //
+  // A test cannot tie a prose sentence to a regex. What it can do is pin the
+  // BOUNDARY, so that widening the class fails HERE and whoever widens it is
+  // standing in this file, next to the comment telling them the message is the
+  // other half of the change. That is a tripwire rather than a proof, and it is
+  // the honest version of what was claimed.
+  const notCaught = {
+    'U+0301 COMBINING ACUTE ACCENT': '́',
+    'U+FE0F VARIATION SELECTOR-16': '️',
+    'U+E000 PRIVATE USE': '',
+    'U+2800 BRAILLE PATTERN BLANK': '⠀',
+  };
+  // BOTH REGEXES. The first version of this test fed only `appId`, so it
+  // guarded `INVISIBLE_OR_SPACE` while its failure message addressed someone
+  // who had widened `INVISIBLE` — the path regex, and the one this whole change
+  // is about. Widening `INVISIBLE` alone left the suite green. That is the
+  // test's prose being wider than the test's behaviour, which is the defect
+  // this file exists to catch, one level further up.
+  const advice = (name) =>
+    `${name} is outside the invisible-character class today. If you have just widened ` +
+    'INVISIBLE or INVISIBLE_OR_SPACE to include it, that may well be right — and two ' +
+    'other things then have to change with it: the warning string in checkAppConfig ' +
+    'for whichever regex you widened, and the docstring above the regexes, which ' +
+    'calls its list of three groups "the whole of the claim".';
+  for (const [name, ch] of Object.entries(notCaught)) {
+    assert.equal(checkAppConfig(cfg({ appId: `99${ch}` }), accessOk).usable, true, advice(name));
+    assert.equal(
+      checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessOk).usable,
+      true,
+      advice(name),
+    );
+  }
+
+  // U+180E is category Cf and IS caught, which is the boundary itself: the class
+  // is defined by what the characters ARE, not by a hand-listed set.
+  //
+  // `accessOk` IS LOAD-BEARING ON BOTH LINES — do not "harmonise" either with
+  // the `accessFailing('ENOENT')` that the other path tests in this file use.
+  // Under a failing `access` both assertions go green for the wrong reason,
+  // silently, by two different routes:
+  //
+  //   path:  if `INVISIBLE` stopped matching U+180E, control would fall through
+  //          to the `access` branch, and a failing one yields `usable: false`
+  //          — the answer this asserts, arrived at without the regex.
+  //   appId: the App ID check never reaches `access` at all. What protects that
+  //          line is `cfg()`'s default `privateKeyPath`, which a failing
+  //          `access` would fault into `usable: false` regardless of the App ID.
+  //
+  // Same conclusion, different mechanism. Stated separately because a reader who
+  // checks the appId line against the path's mechanism finds it does not apply,
+  // and could reasonably conclude the warning is over-broad there — which is
+  // exactly the edit that breaks it.
+  //
+  // NO DIRECTIONS. This is the third locator in this test to be written as
+  // "above" or "below" and the second to point the wrong way; the file moves and
+  // the direction does not move with it. Name things instead.
+  assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
+  assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
+});
