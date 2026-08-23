@@ -66,7 +66,15 @@ export type Config = {
    * SSH is not HTTP, so `git@github.com` has no path out of the sandbox at
    * all. HTTPS goes over CONNECT like every other allowed request.
    */
-  readonly github: { readonly token: string };
+  readonly github: {
+    readonly token: string;
+    /** GitHub App id, or '' if this deployment authenticates with a PAT. */
+    readonly appId: string;
+    /** Path to the App's PEM. A path, never the key — see loadConfig below. */
+    readonly appPrivateKeyPath: string;
+    /** Pin the installation when the App is installed on more than one account. */
+    readonly appInstallationId: string;
+  };
 
   readonly storage: { readonly dbPath: string };
 
@@ -100,6 +108,23 @@ export function loadConfig(): Config {
     },
     github: {
       token: process.env['GITHUB_TOKEN'] ?? '',
+      /**
+       * GitHub App credentials, if this deployment has them.
+       *
+       * Both must be present for the App path to be taken; either alone is a
+       * half-configured deployment and falls back to the PAT rather than
+       * failing, because a crew that cannot reach GitHub is worse than one
+       * reaching it as the wrong identity — and the fallback is what keeps
+       * Clawcius, which has no App, working unchanged.
+       *
+       * The private key stays a PATH. Reading it here would put the PEM in this
+       * process's memory for its whole life and in every core dump; it is read
+       * per mint instead, which also means rotating the key on disk takes
+       * effect at the next refresh rather than the next restart.
+       */
+      appId: process.env['GITHUB_APP_ID'] ?? '',
+      appPrivateKeyPath: process.env['GITHUB_APP_PRIVATE_KEY_PATH'] ?? '',
+      appInstallationId: process.env['GITHUB_APP_INSTALLATION_ID'] ?? '',
     },
     storage: {
       dbPath: process.env['CLAWCIUS_DB_PATH'] ?? '/var/lib/clawcius/clawcius.db',

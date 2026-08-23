@@ -48,6 +48,7 @@
 export const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /** Refuse a response larger than this rather than parsing it. */
+import { staticTokenProvider, type TokenProvider } from './github-app.js';
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 /** A slow poll must not hold a tick open forever. */
@@ -137,10 +138,25 @@ function login(container: unknown): string {
 }
 
 export class GitHubClient implements PullRequestSource {
-  readonly #token: string;
+  /**
+   * A FUNCTION, not a string, and that is the whole of this change.
+   *
+   * This client is built once at startup and used by every `watchPr` poll for
+   * as long as the daemon runs — days. A personal access token survives that; a
+   * GitHub App installation token expires in an hour. Holding the string meant
+   * the daemon held a credential that stopped being true while nothing looked
+   * at it, and the failure is not a slope: `ArmedWaker` disarms a watch whose
+   * poll throws rather than retrying it, so one expired token permanently kills
+   * every armed watch in the crew on its next tick.
+   *
+   * Asking per request costs nothing — the provider caches and refreshes ahead
+   * of expiry — and it means the freshness question is answered in one place
+   * instead of being a property of when this object happened to be constructed.
+   */
+  readonly #token: TokenProvider;
   readonly #base: string;
 
-  constructor(token: string, apiBase = 'https://api.github.com') {
+  constructor(token: string | TokenProvider, apiBase = 'https://api.github.com') {
     if (!token) {
       // Constructing a client with no token would produce a watch that polls
       // forever and is refused every time. The caller checks for a token
@@ -148,14 +164,17 @@ export class GitHubClient implements PullRequestSource {
       // arm time rather than two minutes later in a journal nobody is reading.
       throw new Error('GitHubClient needs a token');
     }
-    this.#token = token;
+    // A string still works and still means what it meant. Every existing caller
+    // and test passes one, and this keeps the PAT path byte-identical rather
+    // than making every caller learn about providers to stay still.
+    this.#token = typeof token === 'string' ? staticTokenProvider(token) : token;
     this.#base = apiBase.replace(/\/+$/, '');
   }
 
   async #get(path: string): Promise<{ body: unknown; link: string }> {
     const response = await fetch(`${this.#base}${path}`, {
       headers: {
-        Authorization: `Bearer ${this.#token}`,
+        Authorization: `Bearer ${await this.#token()}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'clawsky-watchpr',

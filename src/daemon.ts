@@ -62,6 +62,7 @@ import { MailWaker } from './mail-wake.js';
 import { ArmedStore } from './armed.js';
 import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
+import { appTokenProvider } from './github-app.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -667,7 +668,28 @@ export async function main(): Promise<void> {
 
   let github: PullRequestSource | null = null;
   if (armedStore) {
-    if (config.github.token) {
+    // Prefer the App when this deployment has one. Both variables are required
+    // — a half-configured deployment falls back rather than failing, because a
+    // crew that cannot poll is worse than one polling as the older identity.
+    const app = config.github.appId && config.github.appPrivateKeyPath;
+    if (app) {
+      // A PROVIDER, not a token. An installation token lasts an hour and this
+      // client lives for the life of the daemon; a poll that throws is disarmed
+      // rather than retried (`ArmedWaker`), so a stale credential would kill
+      // every armed watch in the crew an hour after startup rather than degrade.
+      github = new GitHubClient(
+        appTokenProvider({
+          appId: config.github.appId,
+          privateKeyPath: config.github.appPrivateKeyPath,
+          installationId: config.github.appInstallationId || undefined,
+          apiBase: config.agent.armed.github.apiBase,
+        }),
+        config.agent.armed.github.apiBase,
+      );
+      // The id is not a secret; the key and the token are, and neither the PEM's
+      // path nor anything minted from it is logged here or anywhere else.
+      process.stderr.write(`[armed] authenticating as GitHub App ${config.github.appId}\n`);
+    } else if (config.github.token) {
       github = new GitHubClient(config.github.token, config.agent.armed.github.apiBase);
     } else {
       process.stderr.write(
