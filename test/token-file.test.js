@@ -16,7 +16,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { TokenFileRefresher, writeTokenFile } from '../dist/token-file.js';
+import {
+  TokenFileRefresher,
+  writeTokenFile,
+  writeCurlConfig,
+  netrcPath,
+  curlrcPath,
+} from '../dist/token-file.js';
 
 const dir = () => mkdtempSync(join(tmpdir(), 'clawsky-token-'));
 const silent = () => {};
@@ -314,4 +320,95 @@ test('the failure line promises a fallback only when there is one', async () => 
   assert.match(withPat.join('\n'), /fall back to GITHUB_TOKEN/);
   assert.doesNotMatch(withoutPat.join('\n'), /fall back to/);
   assert.match(withoutPat.join('\n'), /GITHUB_TOKEN is not set either/);
+});
+
+// ── the curl credential, and the one assertion whose absence would cost ─────
+
+test('the netrc is scoped to exactly one machine, and that machine is api.github.com', () => {
+  // THE ONLY SAFETY PROPERTY A NETRC HAS IS ITS SCOPE. `machine api.github.com`
+  // attaches the credential to that host and nothing else — confirmed by hand
+  // including across `curl -L`, which does not carry it to a redirect target.
+  //
+  // A `default` entry, or a second `machine` line, silently hands the App token
+  // to any host an agent curls, and nothing downstream would notice: the file
+  // is still well-formed, curl still works, every test still passes. This is
+  // the assertion whose absence would cost something.
+  const d = dir();
+  writeCurlConfig(d, 'ghs_installation_token');
+  const netrc = readFileSync(netrcPath(d), 'utf8');
+
+  const machines = netrc.split('\n').filter((l) => /^\s*machine\s/.test(l));
+  assert.equal(machines.length, 1, `expected exactly one machine line, got: ${machines.join(' | ')}`);
+  assert.match(machines[0], /^machine api\.github\.com$/);
+  assert.doesNotMatch(netrc, /^\s*default\b/m, 'a default entry would match every host');
+});
+
+test('the curl credential is 0600 and holds the token it was given', () => {
+  const d = dir();
+  writeCurlConfig(d, 'ghs_installation_token');
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password ghs_installation_token/);
+  assert.equal(statSync(netrcPath(d)).mode & 0o777, 0o600);
+  // `netrc-optional`, not `netrc`: a missing file must not make every unrelated
+  // curl in the container fail.
+  const curlrc = readFileSync(curlrcPath(d), 'utf8');
+  assert.match(curlrc, /^netrc-optional$/m);
+  assert.match(curlrc, new RegExp(`netrc-file = ${netrcPath(d)}`));
+});
+
+test('a refresh keeps the netrc in step with the token file', async () => {
+  // Drift between the two is the defect this module exists to prevent, one
+  // directory over: git pushing with this hour's token while curl posts with
+  // last hour's would be two credentials to reason about instead of one.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  let n = 0;
+  const r = new TokenFileRefresher({
+    path,
+    provider: async () => `tok-${++n}`,
+    log: silent,
+    onToken: (t) => writeCurlConfig(d, t),
+  });
+  await r.start();
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password tok-1/);
+
+  await r.refreshNow();
+  assert.equal(readFileSync(path, 'utf8'), 'tok-2');
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password tok-2/, 'netrc must follow the token');
+  r.stop();
+});
+
+test('giving up on the installation token falls back to the PAT rather than leaving nothing', async () => {
+  // FALLBACK AT THE WRITER. Curl cannot do the git helper's
+  // file-first/environment-second ordering — with no netrc it sends nothing and
+  // takes a 401 rather than falling back. So when the installation token is
+  // given up on, the netrc is rewritten with the PAT if there is one.
+  const d = dir();
+  const path = join(d, 'installation-token');
+  let clock = 1_000_000;
+  let calls = 0;
+  const r = new TokenFileRefresher({
+    path,
+    now: () => clock,
+    log: silent,
+    provider: async () => {
+      calls += 1;
+      if (calls === 1) return 'ghs_app';
+      throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+    },
+    onToken: (t) => writeCurlConfig(d, t),
+    onNoToken: () => writeCurlConfig(d, 'ghp_the_pat'),
+  });
+
+  await r.start();
+  assert.match(readFileSync(netrcPath(d), 'utf8'), /password ghs_app/);
+
+  clock += 56 * 60_000;
+  await r.refreshNow();
+  assert.equal(existsSync(path), false, 'the dead installation token must go');
+  assert.match(
+    readFileSync(netrcPath(d), 'utf8'),
+    /password ghp_the_pat/,
+    'and the netrc must hold the credential that still works, not nothing',
+  );
+  r.stop();
 });

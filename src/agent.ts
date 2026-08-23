@@ -226,6 +226,16 @@ export function gitEnv(): Record<string, string> {
   if (config().github.token) env['GITHUB_TOKEN'] = config().github.token;
   // The path, not the token. Named so the helper can quote it; see above.
   env['CLAWSKY_GITHUB_TOKEN_FILE'] = tokenFilePath(config().agent.container.githubTokenDir);
+  // CURL_HOME makes bare `curl https://api.github.com/...` authenticate without
+  // a header, because curl reads `$CURL_HOME/.curlrc` and that file points at a
+  // netrc the daemon keeps current. Curl re-reads it per invocation, so a
+  // session that outlives an installation token picks up the replacement —
+  // which is the property the credential helper has and an env var cannot.
+  //
+  // Scoped to api.github.com by the netrc's `machine` line, verified not to
+  // follow a redirect off-host. An agent curling an arbitrary URL is not handed
+  // the crew's credential.
+  env['CURL_HOME'] = config().agent.container.githubTokenDir;
   return env;
 }
 

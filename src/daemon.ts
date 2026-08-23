@@ -64,7 +64,12 @@ import { ArmedWaker } from './armed-wake.js';
 import { GitHubClient, type PullRequestSource } from './github.js';
 import type { TokenProvider } from './github-app.js';
 import { appTokenProvider, checkAppConfig } from './github-app.js';
-import { TokenFileRefresher, tokenFilePath } from './token-file.js';
+import {
+  TokenFileRefresher,
+  tokenFilePath,
+  writeCurlConfig,
+  removeCurlConfig,
+} from './token-file.js';
 import { WakerStatusPublisher } from './waker-status.js';
 import { ConversationWindows } from './window.js';
 import { MessageBundler, type BufferedMessage } from './bundler.js';
@@ -755,6 +760,23 @@ export async function main(): Promise<void> {
           provider: appProvider,
           log: (message) => process.stderr.write(`${message}\n`),
           hasFallbackToken: Boolean(config.github.token),
+          // Keep the REST credential in step with the git one. Written here
+          // rather than by a second timer so there is one provider, one cache
+          // and one moment at which the crew's credential changes.
+          onToken: (token) => writeCurlConfig(config.agent.container.githubTokenDir, token),
+          // FALLBACK AT THE WRITER, which is where it has to live. Curl cannot
+          // do the git helper's file-first/environment-second ordering: with no
+          // netrc it sends nothing and takes a 401 rather than falling back.
+          // So when the installation token is given up on, the netrc is
+          // rewritten with the PAT if there is one — and only removed when
+          // there is no credential at all to serve.
+          onNoToken: () => {
+            if (config.github.token) {
+              writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
+            } else {
+              removeCurlConfig(config.agent.container.githubTokenDir);
+            }
+          },
         });
         // Awaited so the file exists before any session spawns, but a failure
         // does NOT stop startup — `start()` logs and retries. Throwing here put
@@ -782,6 +804,20 @@ export async function main(): Promise<void> {
           'the container.\n',
       );
     }
+  }
+
+  // THE PAT-ONLY DEPLOYMENT, which is Clawcius and which must not change. The
+  // refresher only runs when an App is usable, so without this a crew with no
+  // App has no netrc — and bare curl then sends nothing and takes a 401, where
+  // before it used $GITHUB_TOKEN and worked. Curl cannot do the git helper's
+  // file-first/environment-second ordering, so the choice of credential is made
+  // here, once, rather than at each call.
+  //
+  // Also covers `clawsky.enabled: false` and `armed.enabled: false`, where the
+  // whole block above is skipped and agents still make REST calls.
+  if (!tokenFileRefresher && config.github.token) {
+    writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
+    process.stderr.write('[armed] agent REST calls use GITHUB_TOKEN (no App configured)\n');
   }
 
   const armedTools = armedStore

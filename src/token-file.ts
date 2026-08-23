@@ -67,7 +67,7 @@
  */
 
 import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { TokenProvider } from './github-app.js';
 
 /** How long before a written token is treated as too old to keep serving. */
@@ -88,6 +88,11 @@ export const REFRESH_INTERVAL_MS = 5 * 60_000;
  * never exist, even briefly, at the default 0644.
  */
 export function writeTokenFile(path: string, token: string): void {
+  writeSecretFile(path, token);
+}
+
+/** Atomic, 0600, and never observable half-written. See `writeTokenFile`. */
+export function writeSecretFile(path: string, contents: string): void {
   // 0700 rather than the default 0755, so the directory's mode does not depend
   // on whether the daemon or `run-container.sh` created it first.
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -99,11 +104,13 @@ export function writeTokenFile(path: string, token: string): void {
   // explains nothing.
   const existing = statSync(path, { throwIfNoEntry: false });
   if (existing && !existing.isFile()) rmSync(path, { recursive: true, force: true });
-  // Named per process so two daemons on one host cannot rename each other's
-  // half-written file into place.
-  const tmp = join(dirname(path), `.github-token.${process.pid}.tmp`);
+  // Named per TARGET and per process: per process so two daemons on one host
+  // cannot rename each other's half-written file into place, and per target
+  // because this now writes three files into one directory and a shared temp
+  // name would have them treading on each other the moment any two overlap.
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
   try {
-    writeFileSync(tmp, token, { mode: 0o600 });
+    writeFileSync(tmp, contents, { mode: 0o600 });
     renameSync(tmp, path);
   } finally {
     // A rename that fails, or a process that dies between the two, would
@@ -141,10 +148,103 @@ export function tokenFilePath(githubTokenDir: string): string {
   return join(githubTokenDir, 'installation-token');
 }
 
+/** Curl reads `$CURL_HOME/.curlrc`; this is the directory we point it at. */
+export function curlrcPath(githubTokenDir: string): string {
+  return join(githubTokenDir, '.curlrc');
+}
+
+export function netrcPath(githubTokenDir: string): string {
+  return join(githubTokenDir, 'netrc');
+}
+
+/**
+ * The GitHub host this credential is scoped to, named once.
+ *
+ * SCOPE IS THE WHOLE SAFETY PROPERTY OF A NETRC. `machine api.github.com`
+ * attaches the credential to that host and nothing else — verified including
+ * across `curl -L`, which does not carry the header to a redirect target. A
+ * `default` entry, or a second `machine` line, silently hands the App token to
+ * any host an agent curls, and nothing downstream would notice.
+ *
+ * A test asserts the written file has exactly one `machine` line and that it is
+ * this one, because that is the assertion whose absence would cost something.
+ */
+export const GITHUB_API_HOST = 'api.github.com';
+
+/**
+ * Make a bare `curl https://api.github.com/...` authenticate, per call.
+ *
+ * ── Why this exists at all ─────────────────────────────────────────────────
+ *
+ * `gitEnv`'s credential helper routes GIT through the token file, so pushes
+ * carry the App. But opening a pull request, commenting, labelling and merging
+ * are REST calls, and those were still using `$GITHUB_TOKEN` — the PAT. So
+ * every pull request was authored by the account, which is what stops anyone
+ * approving the crew's work.
+ *
+ * The obvious fix — put the installation token in `$GITHUB_TOKEN` — is the
+ * defect this repository already fixed once. A session's environment is fixed
+ * when its process spawns and an installation token dies in an hour, so a long
+ * session would end up holding a corpse. Whatever an agent uses for REST has to
+ * resolve the credential AT CALL TIME.
+ *
+ * Curl re-reads its netrc on every invocation, so a file the daemon keeps
+ * current is exactly that — the same shape as the git credential helper, and
+ * for the same reason.
+ *
+ * ── The fallback lives here rather than at the call ────────────────────────
+ *
+ * The git helper reads the file first and `$GITHUB_TOKEN` second, resolving per
+ * call. Curl cannot do that: with no netrc it sends nothing and gets a 401
+ * rather than falling back. Verified.
+ *
+ * So the daemon writes WHICHEVER CREDENTIAL IS IN FORCE — the installation
+ * token when the App is usable, the PAT otherwise. That is not a compromise. The
+ * helper's ordering depends on the file being ABSENT at the right moment, which
+ * is the gap where a file holding a useless token is present and the fallback
+ * never fires; writing the credential in force makes the fallback happen on
+ * every refresh instead of at one branch point.
+ *
+ * ── What this does not cover, stated rather than implied ───────────────────
+ *
+ * A netrc holding a token that lacks the permission the call needs is
+ * well-formed and present, and fails as a 403 at the call. Presence cannot see
+ * that, and neither can this.
+ *
+ * And it is CURL-SPECIFIC. An agent using a Python request or a fetch is
+ * unaffected and silently stays on whatever `$GITHUB_TOKEN` holds. Most agent
+ * REST goes through curl, which is why this is worth doing; it is not the same
+ * claim as "agents authenticate as the App".
+ */
+export function writeCurlConfig(githubTokenDir: string, token: string): void {
+  writeSecretFile(
+    netrcPath(githubTokenDir),
+    `machine ${GITHUB_API_HOST}\n  login x-access-token\n  password ${token}\n`,
+  );
+  // `netrc-optional` rather than `netrc`: a missing file must not make every
+  // unrelated curl in the container fail.
+  writeSecretFile(
+    curlrcPath(githubTokenDir),
+    `netrc-optional\nnetrc-file = ${netrcPath(githubTokenDir)}\n`,
+  );
+}
+
+/** Remove the curl credential without disturbing the token file. */
+export function removeCurlConfig(githubTokenDir: string): void {
+  rmSync(netrcPath(githubTokenDir), { force: true });
+}
+
 export type TokenFileOptions = {
   readonly path: string;
   readonly provider: TokenProvider;
   readonly log: (message: string) => void;
+  /**
+   * Called with every token actually written, so a second consumer can be kept
+   * in step without a second provider and a second cache.
+   */
+  readonly onToken?: (token: string) => void;
+  /** Called when the written token is given up on, for the same reason. */
+  readonly onNoToken?: () => void;
   /**
    * Whether a PAT exists to fall back TO. Decides what the failure line may
    * promise — `github-app.ts` spends a paragraph on why: a warning the reader
@@ -224,6 +324,7 @@ export class TokenFileRefresher {
     this.#timer = null;
     this.#written = false;
     this.#lastToken = null;
+    this.#opts.onNoToken?.();
     try {
       rmSync(this.#opts.path, { force: true });
     } catch {
@@ -239,6 +340,10 @@ export class TokenFileRefresher {
   async #write(): Promise<void> {
     const token = await this.#opts.provider();
     writeTokenFile(this.#opts.path, token);
+    // In step, always. A netrc holding last hour's token while the token file
+    // holds this hour's is the drift this whole module exists to prevent,
+    // reintroduced one directory over.
+    this.#opts.onToken?.(token);
     // THE CLOCK TRACKS THE TOKEN, NOT THE WRITE, and the difference is 45
     // minutes of serving a corpse.
     //
@@ -288,6 +393,7 @@ export class TokenFileRefresher {
         // uncaught exception. There is nothing useful to do about a failed
         // unlink and nothing at all to gain by dying of it.
       }
+      this.#opts.onNoToken?.();
       this.#opts.log(
         `[token-file] could not obtain an installation token (${code}); there is no ` +
           `usable credential at ${this.#opts.path}. ` +
