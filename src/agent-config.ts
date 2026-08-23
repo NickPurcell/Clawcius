@@ -735,6 +735,19 @@ function isInside(child: string, parent: string): boolean {
 }
 
 /**
+ * The label of `githubTokenDir`'s own entry, named once so its guard can skip
+ * that ENTRY rather than skipping a PATH VALUE.
+ *
+ * The difference is a hole. Comparing resolved paths, `githubTokenDir` set
+ * exactly equal to any OTHER mount also matched the skip — so
+ * `githubTokenDir: <stateDir>/workspaces` was accepted, which is the read-write
+ * mount that is the container's working directory and the exact placement the
+ * whole guard exists to refuse. Equality with a mount is the WORST case, not
+ * the exempt one; only the entry describing this key itself is exempt.
+ */
+const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only';
+
+/**
  * Host paths that `docker/run-container.sh` bind-mounts into the agent
  * container, as far as this file can know them.
  *
@@ -781,19 +794,6 @@ function isInside(child: string, parent: string): boolean {
  * literal, so a second instance gets its own without anyone remembering to say
  * so. Deriving beats enumerating for the same reason this paragraph exists.
  */
-/**
- * The label of `githubTokenDir`'s own entry, named once so its guard can skip
- * that ENTRY rather than skipping a PATH VALUE.
- *
- * The difference is a hole. Comparing resolved paths, `githubTokenDir` set
- * exactly equal to any OTHER mount also matched the skip — so
- * `githubTokenDir: <stateDir>/workspaces` was accepted, which is the read-write
- * mount that is the container's working directory and the exact placement the
- * whole guard exists to refuse. Equality with a mount is the WORST case, not
- * the exempt one; only the entry describing this key itself is exempt.
- */
-const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only';
-
 function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
   const state = config.container.stateDir;
   return [
