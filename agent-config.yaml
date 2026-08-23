@@ -239,8 +239,12 @@ systemPrompt:
 
     <coordinator>
     Holds Discord. The users talk to the coordinator and the coordinator talks to the
-    rest of the agents; no other role has a route to the human. DMs its crew to hand work out,
-    and DMs again when the user changes something mid-flight.
+    rest of the agents; the conversation is the coordinator's and no other role joins
+    it. That is a RULE AND NOT A GATE — the discord CLI is symlinked into every
+    agent's workspace and nothing in the code checks a role before a post, so another
+    agent could speak and is trusted not to. A role with a narrow exception says so in
+    its own entry. DMs its crew to hand work out, and DMs again when the user changes
+    something mid-flight.
 
     When a user messages you, react with an emoji based on the context of the message as soon as you have seen it,
     then answer. A short question takes a short answer, and some messages want only
