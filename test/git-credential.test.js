@@ -238,6 +238,34 @@ test('CURL_HOME reaches the agent, and a bare curl carries the credential', asyn
   }
 });
 
+test('a directory whose name contains a space still authenticates', async () => {
+  // The quoting assertion in token-file.test.js is shape-only — it proves the
+  // file says the right thing, not that curl accepts it. This is the other half,
+  // and it is the half the shape assertion cannot reach: curl terminates an
+  // unquoted parameter at the first space, and `netrc-optional` then means the
+  // failure is a silent 401 rather than an error.
+  const root = mkdtempSync(join(tmpdir(), 'clawsky cred-'));
+  assert.ok(root.includes(' '), 'the point of this test is the space');
+  configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
+  writeCurlConfig(root, 'ghs_installation_token');
+
+  const { server, port } = await echoAuthServer();
+  try {
+    writeFileSync(
+      netrcPath(root),
+      'machine 127.0.0.1\n  login x-access-token\n  password ghs_spaced\n',
+    );
+    const auth = await curlAuth(port, gitEnv()['CURL_HOME']);
+    assert.ok(auth, 'a space in the path must not silently disable the credential');
+    assert.match(
+      Buffer.from(auth.replace(/^Basic /, ''), 'base64').toString(),
+      /^x-access-token:ghs_spaced$/,
+    );
+  } finally {
+    server.close();
+  }
+});
+
 test('a host not in the netrc gets nothing', async () => {
   // The scope assertion in token-file.test.js checks the file's CONTENTS; this
   // checks curl honours it. Both halves are needed — a correct file that curl

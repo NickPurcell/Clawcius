@@ -515,11 +515,17 @@ systemPrompt:
     /repos/{owner}/{repo}/issues/{n}/labels`.
 
     USE A BARE `curl`. Do NOT pass `-H "Authorization: Bearer $GITHUB_TOKEN"`.
-    The daemon keeps a credential where curl finds it by itself, so a plain
-    `curl https://api.github.com/...` authenticates as the App — which is what
-    makes a pull request you open reviewable by the account, rather than authored
-    by it. An explicit header REPLACES that credential with the older identity, so
-    adding one is not belt-and-braces; it is opting out.
+    The daemon keeps this crew's current credential where curl finds it by itself,
+    so a plain `curl https://api.github.com/...` is already authenticated. An
+    explicit header REPLACES it and pins you to `$GITHUB_TOKEN`, so adding one is
+    not belt-and-braces; it is opting out.
+
+    On a deployment with a GitHub App that credential is the App, and using it is
+    what makes a pull request you open reviewable by the account rather than
+    authored by it. On a deployment without one it is the same token as before and
+    nothing changes — which is why the rule is about the SHAPE rather than about
+    the identity: bare curl is correct on both, and stays correct the day a crew
+    gains an App without anyone editing this paragraph.
 
     That is also the diagnostic, because from outside these states are identical.
     OJ polls once a minute and posts an acknowledgement the moment a round

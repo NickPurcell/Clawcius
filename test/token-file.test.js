@@ -478,10 +478,18 @@ test('a failing curl write does not delete a healthy token or blame the provider
   await r.start();
   assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'the token was obtained and written');
   assert.match(logs.join('\n'), /curl credential could not be written \(ENOSPC\)/);
+  // …and it must not promise a fallback that does not exist. With no netrc curl
+  // sends nothing and takes a 401; the credential is unchanged, not replaced.
+  assert.match(logs.join('\n'), /it is UNCHANGED/);
+  assert.doesNotMatch(logs.join('\n'), /fall back/);
   assert.doesNotMatch(logs.join('\n'), /could not obtain an installation token/);
 
-  // …and the staleness clock must still have advanced, or a persistently failing
-  // netrc write would freeze it and demote every agent an hour later.
+  // …and an hour on, the token file is still healthy. What this proves is that
+  // `#write` no longer THROWS, so the staleness branch is never reached at all —
+  // not that the clock advanced. It cannot have: the provider returns a constant,
+  // so `token !== #lastToken` is false and `#mintedAtMs` is deliberately not
+  // re-stamped, per the caching-provider comment. Right assertion, and the
+  // reason first attached to it was wrong.
   clock += 56 * 60_000;
   await r.refreshNow();
   assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'still healthy an hour on');

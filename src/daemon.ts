@@ -1139,6 +1139,14 @@ export async function main(): Promise<void> {
       clearInterval(windowSweeper);
       bundler.flushAll();
       tokenFileRefresher?.stop();
+      // AND THE BRANCH WITH NO REFRESHER TO HANG IT ON. The PAT-only path writes
+      // a netrc at startup and has no `stop()` to clear it, so a non-expiring
+      // credential sat in the bind-mounted directory across every shutdown and
+      // redeploy — indefinitely. That is the exposure `stop()`'s own principle
+      // rejects for the installation token, which at least has an hour's fuse.
+      // Rewritten at the next startup either way; this only shrinks the window,
+      // which is the same thing `stop()` is for.
+      if (!tokenFileRefresher) removeCurlConfig(config.agent.container.githubTokenDir);
       await sessions.shutdown();
       registry.close();
       await client.destroy();

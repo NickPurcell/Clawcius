@@ -243,8 +243,7 @@ export function writeCurlConfig(githubTokenDir: string, token: string): void {
  * The netrc only, deliberately — `.curlrc` is left pointing at a path that no
  * longer exists, which is exactly what `netrc-optional` is for: curl finds no
  * netrc, sends no credential, and does not error. Removing both would be tidier
- * and would buy nothing, and re-creating `.curlrc` on every refresh is a write
- * of a file whose contents never change.
+ * and would buy nothing.
  */
 export function removeCurlConfig(githubTokenDir: string): void {
   rmSync(netrcPath(githubTokenDir), { force: true });
@@ -407,7 +406,9 @@ export class TokenFileRefresher {
       const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
       this.#opts.log(
         `[token-file] the git credential is current, but the curl credential could not ` +
-          `be written (${code}); REST calls fall back until the next refresh.`,
+          `be written (${code}); it is UNCHANGED — REST keeps using whatever was last ` +
+          'written there, or nothing if there never was any. There is no fallback: with ' +
+          'no netrc curl sends nothing and takes a 401.',
       );
     }
   }
