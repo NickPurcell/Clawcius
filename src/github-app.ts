@@ -332,10 +332,10 @@ const CHARACTER_NAMES: Record<number, string> = {
   // the paste-from-a-document artifacts, and they are the half this table
   // used to be silent about -- not invisible, but nobody reads an opaque
   // forty-character credential closely enough to see one.
-  0x2018: "(a curly left quote, as a document substitutes for ')",
-  0x2019: "(a curly right quote, as a document substitutes for ')",
-  0x201c: '(a curly left quote, as a document substitutes for ")',
-  0x201d: '(a curly right quote, as a document substitutes for ")',
+  0x2018: "(a curly left single quote, as a document substitutes for ')",
+  0x2019: "(a curly right single quote, as a document substitutes for ')",
+  0x201c: '(a curly left double quote, as a document substitutes for ")',
+  0x201d: '(a curly right double quote, as a document substitutes for ")',
   0x2013: '(an en dash, as a document substitutes for -)',
   0x2014: '(an em dash, as a document substitutes for --)',
   0x2026: '(an ellipsis, as a document substitutes for ...)',

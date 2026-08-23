@@ -6,7 +6,9 @@
  * `c239a48` ("Classify a failed poll before deciding the watch is dead") orphaned
  * `composeWatchErrorMail` in `armed-wake.ts` the same way. That one was repaired
  * before it merged and is NOT live on `main` -- run this against history and it
- * reappears, which is the point of saying which commit. These modules are long runs of exported declarations each carrying a
+ * reappears, which is the point of saying which commit.
+ *
+ * These modules are long runs of exported declarations each carrying a
  * block comment separated by a blank line, so inserting a new declaration lands
  * *inside* the run — and if it lands between an existing docstring and the thing
  * that docstring describes, the doc silently reattaches to the newcomer. Two

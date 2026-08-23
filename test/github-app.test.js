@@ -905,11 +905,16 @@ test('the paste-from-a-document characters are named, not just numbered', () => 
   // and they are the exact characters the detector was silent about before the
   // filter widened. A bare codepoint is a correct claim the operator then has
   // to go and look up; the table exists to remove that step.
+  // SINGLE and DOUBLE must appear, not just LEFT and RIGHT. With both left
+  // entries reading "curly left quote", a table with U+2018 and U+201C swapped
+  // passed this test and then told the operator U+2018 stands in for a double
+  // quote. An assertion two entries can both satisfy does not discriminate
+  // between them, which is the whole defect this branch has been fixing.
   const family = [
-    ['\u2018', /curly left quote/],
-    ['\u2019', /curly right quote/],
-    ['\u201c', /curly left quote/],
-    ['\u201d', /curly right quote/],
+    ['\u2018', /curly left single quote/],
+    ['\u2019', /curly right single quote/],
+    ['\u201c', /curly left double quote/],
+    ['\u201d', /curly right double quote/],
     ['\u2013', /en dash/],
     ['\u2014', /em dash/],
     ['\u2026', /ellipsis/],
