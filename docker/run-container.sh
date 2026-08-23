@@ -55,6 +55,13 @@ MEMORY=${CLAWCIUS_CONTAINER_MEMORY:-2g}
 # silently start a new session instead of resuming.
 CLAWCIUS_STATE=${CLAWCIUS_STATE_DIR:-/var/lib/clawcius}
 WORKSPACES=$CLAWCIUS_STATE/workspaces
+# The GitHub App installation token that agents' git credential helper reads.
+# NOT under $CLAWCIUS_STATE/workspaces and NOT any read-write mount: it is a
+# credential the daemon serves TO the sandbox, so the sandbox must not be able
+# to replace it, or to drop a directory at the path and make the daemon's
+# rename fail at boot. Mounted :ro below for the same reason the skills and CLI
+# mounts are. agent-config.ts refuses a githubTokenDir inside any bind mount.
+GITHUB_TOKEN_DIR=${CLAWCIUS_GITHUB_TOKEN_DIR:-$CLAWCIUS_STATE/github-token}
 # The container's only read-write window onto the host filesystem.
 #
 # It used to hold two spools: `run/wake`, where the agent dropped a file to ask
@@ -167,6 +174,10 @@ mkdir -p "$STATE_RUN"
 # The parent still has to exist and be ours — /var/lib is root-owned, so each
 # instance's unit declares StateDirectory and systemd creates the top level.
 mkdir -p "$WORKSPACES"
+# Created here so the :ro mount below has something to bind. Docker would create
+# a missing source as root-owned, which the daemon then could not write.
+mkdir -p "$GITHUB_TOKEN_DIR"
+chmod 700 "$GITHUB_TOKEN_DIR"
 # Created, not asserted: a brand-new instance has no agent home until its first
 # start, and `claude auth login` inside the container populates it. Asserting
 # would make the first start of every deployment a manual step.
@@ -592,6 +603,7 @@ docker run -d \
   -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
   -v "$GWS_CLI:$GWS_CLI:ro" \
   -v "$BROWSER_CLI:$BROWSER_CLI:ro" \
+  -v "$GITHUB_TOKEN_DIR:$GITHUB_TOKEN_DIR:ro" \
   -e BROWSE_LOG="$WORKSPACES/.browse/navigation.jsonl" \
   "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \

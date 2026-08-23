@@ -21,6 +21,7 @@ import { query, type McpServerConfig, type Options, type Query, type SDKMessage,
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
+import { tokenFilePath } from './token-file.js';
 import { buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
@@ -143,26 +144,73 @@ function linkSkills(workspacePath: string): void {
  * Git configuration for the agent, injected purely through the environment.
  *
  * `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` is git's own mechanism for config with
- * no file behind it. That matters twice over: the token never lands on disk,
- * and the service user's own ~/.gitconfig is left completely alone — the agent
- * gets its own identity without inheriting or clobbering yours.
+ * no file behind it. That matters because the service user's own ~/.gitconfig is
+ * left completely alone — the agent gets its own identity without inheriting or
+ * clobbering yours — and because no credential is ever in the config itself.
  *
- * The credential helper is scoped to github.com and reads GITHUB_TOKEN at call
- * time, so the token appears in no URL, no remote, and no reflog.
+ * The credential helper is scoped to github.com and reads its credential at CALL
+ * TIME, so the token appears in no URL, no remote, and no reflog.
+ *
+ * WHERE it reads from depends on which credential this deployment uses, and the
+ * difference is lifetime rather than taste. A PAT does not expire, so handing it
+ * over in the environment at spawn is correct forever. An INSTALLATION TOKEN
+ * expires in an hour and a session outlives that, and a session's environment is
+ * fixed when its process spawns — so it is read from a file the daemon keeps
+ * current (`token-file.ts`), because there is no way to update an env var inside
+ * a running process from outside it.
+ *
+ * That makes the sentence this comment used to carry — "the token never lands on
+ * disk" — false in the App case, deliberately. `token-file.ts` states what that
+ * costs and what bounds it; the short version is that every process in the
+ * container already shares one uid and can read `/proc/1/environ`, so the file
+ * adds no reader, and the real change is that a bind-mounted file outlives the
+ * container where an env var does not.
  *
  * HTTPS only. The agent has no route out except the proxy bridge, and SSH is
  * not HTTP — `git@github.com` cannot leave the sandbox at all.
  */
-function gitEnv(): Record<string, string> {
+export function gitEnv(): Record<string, string> {
   const entries: Array<[string, string]> = [
     ['user.name', config().agent.git.userName],
     ['user.email', config().agent.git.userEmail],
   ];
 
-  if (config().github.token) {
+  // THE CONDITION MUST DESCRIBE THE SAME DEPLOYMENT AS THE WRITER'S.
+  //
+  // `github.appId` alone was wider: the file is only written under
+  // `armedStore && app && appTokenOk`, and `armedStore` also needs
+  // `clawsky.enabled && armed.enabled`. So an App-configured deployment with
+  // armed watching off wrote no file and started no refresher — meaning not
+  // even the refresher's "no usable credential" line — and with no PAT either
+  // the helper handed git an EMPTY password. Git then fails on an empty
+  // credential rather than on an absent one, which is the less nameable of the
+  // two: no helper at all makes git say it could not read a username.
+  const appWritesTheFile =
+    Boolean(config().github.appId) &&
+    config().agent.clawsky.enabled &&
+    config().agent.armed.enabled;
+  if (config().github.token || appWritesTheFile) {
     entries.push([
       'credential.https://github.com.helper',
-      '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f',
+      // FILE FIRST, ENVIRONMENT SECOND, resolved on every call rather than at
+      // spawn. That ordering is what makes a half-configured App safe: if the
+      // daemon decided the App was unusable it writes no file, `cat` fails, and
+      // the agent falls through to the PAT that was working before — instead of
+      // every push failing because the session was told at spawn to expect a
+      // file that never appeared.
+      //
+      // THE PATH IS PASSED IN AN ENV VAR AND QUOTED, not interpolated. Spliced
+      // in raw, a workspace path containing a space split into two `cat`
+      // arguments, `2>/dev/null` swallowed the error, and the helper silently
+      // served the PAT — or an empty password when there was none. Silent is
+      // the part that mattered: nothing anywhere would have said why.
+      //
+      // `2>/dev/null` stays, because a missing file is the FALLBACK rather than
+      // an error, and `cat`'s complaint would otherwise be read by git as part
+      // of the credential exchange.
+      '!f() { echo username=x-access-token; ' +
+        'echo "password=$(cat "$CLAWSKY_GITHUB_TOKEN_FILE" 2>/dev/null ' +
+        '|| printf %s "$GITHUB_TOKEN")"; }; f',
     ]);
     // Rewrite SSH remotes to HTTPS, so a repo cloned with a git@ URL — or an
     // agent reaching for the SSH form out of habit — still works instead of
@@ -176,6 +224,8 @@ function gitEnv(): Record<string, string> {
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   if (config().github.token) env['GITHUB_TOKEN'] = config().github.token;
+  // The path, not the token. Named so the helper can quote it; see above.
+  env['CLAWSKY_GITHUB_TOKEN_FILE'] = tokenFilePath(config().agent.container.githubTokenDir);
   return env;
 }
 

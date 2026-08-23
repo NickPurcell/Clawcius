@@ -13,9 +13,16 @@
  * approves.
  *
  * So this does NOT change who authors pull requests, and does NOT make a
- * required-approval ruleset satisfiable. Authorship comes from the agent's
- * `GITHUB_TOKEN` inside the container, which this file deliberately does not
- * touch — see below. What it buys is that the waker's own reads carry an
+ * required-approval ruleset satisfiable.
+ *
+ * WHAT AUTHORSHIP DOES COME FROM CHANGED, and this paragraph is where a reader
+ * comes to find out, so it says so rather than being left to go stale: agents
+ * now read their credential from a file `token-file.ts` keeps current, so a
+ * `git push` carries the INSTALLATION token where it used to carry the PAT.
+ * That means the App needs `Contents: write`. The mechanism lives in
+ * `token-file.ts` and not here, because the two consumers have different
+ * lifetimes and mixing them would make neither reviewable. What it buys is
+ * that the waker's own reads carry an
  * identity separable from the crew's, and that the credential it carries can be
  * rotated without touching the agent.
  *
@@ -44,9 +51,10 @@
  *
  * ── What is deliberately NOT here ───────────────────────────────────────────
  *
- * Nothing about the agent's session environment. That is the other consumer and
- * a separate decision — the token reaches a container through a mechanism this
- * file cannot see, and mixing the two would make neither reviewable.
+ * Nothing about the agent's session environment. That is the other consumer,
+ * and it lives in `token-file.ts`: the token reaches a container through a
+ * mechanism this file cannot see, and mixing the two would make neither
+ * reviewable.
  *
  * ── Logging ─────────────────────────────────────────────────────────────────
  *

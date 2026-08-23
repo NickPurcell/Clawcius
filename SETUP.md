@@ -352,13 +352,19 @@ only if the App is installed on more than one account; with one, the daemon
 discovers it and refuses to guess between several.
 
 **What that does not do, stated here because this is where you decide whether to
-set it.** It does not change who authors pull requests, and it does not make a
-required-approval ruleset satisfiable. The credential is used by one read-only
-client — the `watchPr` poller — which never opens a pull request and never
-approves one. Authorship still comes from the agent's `GITHUB_TOKEN` inside the
-container. Making the *session* use App credentials is a separate problem with a
-different shape, because an installation token expires in an hour and a
-session's environment is fixed when its process spawns.
+set it.** It does not make a required-approval ruleset satisfiable — a review
+from an App is not an approval from a human.
+
+**What it DOES do, which changed:** agents now read their git credential from a
+file the daemon keeps current, so a `git push` carries the **installation
+token** rather than the PAT. Pull requests and commits are authored by the App's
+identity, not the account whose PAT you used to use.
+
+**So the App needs `Contents: write`.** If you set it up before this and granted
+read-only permissions, the first agent push will `403` — and the PAT fallback
+will not save you, because it is keyed on the credential file being *absent*, and
+a file holding a token without push permission is present. Grant the permission
+or the App is worse than the PAT it replaced.
 
 The waker checks five things at startup and **falls back to `GITHUB_TOKEN`** if
 any of them fails:
@@ -382,13 +388,56 @@ leaves you running as the older identity with everything apparently working, and
 any of them. A deployment with neither variable set is unchanged and silent,
 which is how Clawcius keeps working.
 
+### Agent sessions and the App
+
+With an App configured, the daemon also keeps **one** file holding a current
+installation token, at `<container.githubTokenDir>/installation-token`, mode
+`0600`. The **file** is rewritten every five minutes; the **token** in it is
+minted roughly hourly, because the provider caches until shortly before expiry.
+The agents' git credential helper reads that file instead of
+an environment variable.
+
+It has to be a file rather than an env var because **a session's environment is
+fixed when its process spawns**. A PAT never expires, so handing it over at spawn
+was correct forever; an installation token expires in an hour and sessions
+outlive that, and nothing can update an env var inside a running process from
+outside it.
+
+The helper reads **the file first and `GITHUB_TOKEN` second**, resolved on every
+call. So a deployment whose App is configured but unusable — typo'd key path,
+rotated key, wrong installation id — writes no file and its agents keep pushing
+with the PAT, rather than every push failing for a crew whose credential was fine
+the whole time.
+
+If a refresh fails while the written token is still young, the file is **kept**
+and the failure is logged: turning a brief credential blip into an outage for
+every agent is the mistake issue #176 describes. If a refresh fails once the
+written token is past its life, the file is **removed** — an absent file fails
+immediately and names itself, where a stale one keeps working until it does not
+and then fails as a `401` that explains nothing.
+
+**The directory is mounted read-only** (`run-container.sh`), and
+`agent-config.ts` refuses a `container.githubTokenDir` that sits inside any bind
+mount — the same rule, and the same reason, as `container.execEnvDir`. That is
+not incidental: this is a credential the daemon serves *to* the sandbox, so the
+sandbox must not be able to replace it, nor to leave something at the path that
+makes the daemon fail at boot.
+
+Reading it is not a new exposure: every process in the container already runs as
+uid 1000 `agent` and can read `/proc/1/environ`. It is wider in one way — a file
+outlives the container where an env var does not — and that is bounded by
+`docker/snapshot.sh` using `docker commit`, which excludes mounts. The file is
+removed on a clean shutdown.
+
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the
 next restart. The PEM should be `0600` and owned by the service user.
 
-**This is the waker's own identity, not the agent's.** The container still gets
-`GITHUB_TOKEN` through `--env-file`, so an agent's `git push` and its API calls
-are unchanged by any of this.
+**This is not only the waker's identity any more.** It was, until agents began
+reading the same credential from a file — see *Agent sessions and the App* above.
+`GITHUB_TOKEN` still reaches the container through `--env-file` and is still what
+the helper falls back to when no credential file exists, which is what keeps a
+half-configured App from breaking every push.
 
 **Skill discovery.** The agent's `cwd` is its per-channel workspace, and the
 SDK defaults to isolation mode where no filesystem settings load. So
