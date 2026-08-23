@@ -413,9 +413,9 @@ explicit `-H "Authorization: …"` replaces that credential with whatever the
 header holds, so passing one opts out.
 
 **With an App**, a third file sits beside them —
-`<container.githubTokenDir>/installation-token` — which is what the git
-credential helper reads, and which the daemon refreshes because an installation
-token expires in an hour. The **file** is rewritten every five minutes; the **token** in it is
+`<container.githubTokenDir>/installation-token`, also mode `0600` — which is what
+the git credential helper reads, and which the daemon refreshes because an
+installation token expires in an hour. The **file** is rewritten every five minutes; the **token** in it is
 minted roughly hourly, because the provider caches until shortly before expiry.
 The agents' git credential helper reads that file instead of
 an environment variable.
@@ -449,16 +449,18 @@ makes the daemon fail at boot.
 Reading it is not a new exposure: every process in the container already runs as
 uid 1000 `agent` and can read `/proc/1/environ`. It is wider in one way — a file
 outlives the container where an env var does not — and that is bounded by
-`docker/snapshot.sh` using `docker commit`, which excludes mounts. The files are
-removed on a clean shutdown — including the netrc, which is deliberately not
-replaced by the PAT there: a stopped daemon leaves nothing.
+`docker/snapshot.sh` using `docker commit`, which excludes mounts. The netrc and the
+installation-token file are removed on a clean shutdown, and the netrc is
+deliberately not replaced by the PAT there: a stopped daemon leaves nothing. The
+`.curlrc` stays — it holds no credential, only a path, and `netrc-optional` means
+it does no harm pointing at a file that is gone.
 
 The private key stays a **path**, never a value, and is read per mint rather
 than held: rotating it on disk takes effect at the next refresh instead of the
 next restart. The PEM should be `0600` and owned by the service user.
 
 **This is not only the waker's identity any more.** It was, until agents began
-reading the same credential from a file — see *Agent sessions and the App* above.
+reading the same credential from a file — see *Agent sessions and the API* above.
 `GITHUB_TOKEN` still reaches the container through `--env-file` and is still what
 the helper falls back to when no credential file exists, which is what keeps a
 half-configured App from breaking every push.
