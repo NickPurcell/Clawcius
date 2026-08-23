@@ -421,10 +421,8 @@ export type PollFailureClass = {
  * `404` says the same thing far less reliably HERE, which is why it gets
  * `GONE_404_POLLS` rather than one. See the constant.
  *
- * A `404` can also mean "you may not see this", which is a permissions change
- * rather than a deletion — but both leave a watch that will never fire, so the
- * action is the same even though the cause differs. The mail says which it
- * observed, not which it inferred.
+ * The mail says which it observed, not which it inferred: a `404` may be a
+ * deletion or a permissions change, and this process cannot tell them apart.
  *
  * ── Everything else ────────────────────────────────────────────────────────
  *
@@ -547,6 +545,19 @@ export class ArmedWaker {
    * asks — how many of THIS kind in a row — is not answerable by a number that
    * has forgotten what it counted.
    *
+   * AND A TOTAL ALONGSIDE IT, because restarting on every change of class means
+   * a streak that keeps changing class reaches no bound at all. It does not
+   * need strict alternation: `GONE_404_POLLS` is 3, so one non-404 failure
+   * every third poll is enough, which is a deleted pull request plus a flaky
+   * network rather than a conspiracy. Two hundred ticks of that polled two
+   * hundred times, stayed armed and said nothing — a watch that will never
+   * fire, looking to its owner exactly like a pull request with nothing
+   * happening on it, which is the state this file's header argues against.
+   *
+   * So both: the per-class count answers the per-class bound, and the total
+   * answers "is anything at all working here". A bare total was what round 2's
+   * finding was about; a bare per-class count is this one.
+   *
    * IN MEMORY, NOT IN THE STORE, and that is deliberate. A restart clears it,
    * so a watch that had failed four times gets a full five again — which fails
    * in the safe direction, because a daemon restarting mid-incident is exactly
@@ -554,7 +565,10 @@ export class ArmedWaker {
    * would let a restart during an outage carry strikes forward into the
    * recovery and disarm a watch whose target was healthy again.
    */
-  readonly #failures = new Map<number, { cause: PollFailureClass['cause']; count: number }>();
+  readonly #failures = new Map<
+    number,
+    { cause: PollFailureClass['cause']; count: number; total: number }
+  >();
 
   constructor(options: ArmedWakerOptions) {
     this.#options = options;
@@ -788,14 +802,27 @@ export class ArmedWaker {
       const { bound, cause } = classifyPollFailure(failureError);
       const previous = this.#failures.get(condition.id);
       const strikes = previous?.cause === cause ? previous.count + 1 : 1;
+      const total = (previous?.total ?? 0) + 1;
+      // Either bound ends it. `attempts` is whichever count justified the
+      // disarm, so the mail still reports an observation rather than a policy.
+      const overClass = strikes >= bound;
+      // WHICH BOUND ENDED IT DECIDES WHAT THE MAIL MAY SAY. Disarming on the
+      // overall bound after a mixed streak is not evidence the target is gone —
+      // it is evidence that nothing worked. Reporting the last failure's class
+      // there would print "the target is not there, across 5 consecutive polls"
+      // for five failures of which two were 404s, which is the mail asserting
+      // something nobody observed. So the overall bound always reports itself
+      // as unreachable, with the total; the class bound reports its own count.
+      const reported: PollFailureClass['cause'] = overClass ? cause : 'unreachable';
+      const attempts = overClass ? strikes : total;
 
       // TRANSIENT AND NOT YET AT THE BOUND: leave the row alone and say nothing.
       // No mail, because a watch that recovers on the next tick has nothing to
       // report and an agent woken by every 5xx learns to ignore the mailbox
       // this system runs on. The log line is for the operator, who is the one
       // who can act on a pattern of them.
-      if (strikes < bound) {
-        this.#failures.set(condition.id, { cause, count: strikes });
+      if (!overClass && total < MAX_CONSECUTIVE_POLL_FAILURES) {
+        this.#failures.set(condition.id, { cause, count: strikes, total });
         // RESCHEDULED, not just returned. Without this the row's `due_at` stays
         // in the past, `ArmedStore.due()` returns it on the very next tick, and
         // the bound becomes N TICKS rather than N POLLS — 60 seconds at the
@@ -809,7 +836,8 @@ export class ArmedWaker {
         this.#options.store.reschedule(condition.id, Date.now() + spec.pollSeconds * 1000);
         this.#options.log(
           `watch ${condition.id} on ${spec.repo}#${spec.pr} poll failed ` +
-            `(${strikes}/${bound}, retrying in ${spec.pollSeconds}s): ${failure ?? 'unknown error'}`,
+            `(${strikes}/${bound} of this kind, ${total}/${MAX_CONSECUTIVE_POLL_FAILURES} ` +
+            `overall, retrying in ${spec.pollSeconds}s): ${failure ?? 'unknown error'}`,
         );
         return;
       }
@@ -823,8 +851,8 @@ export class ArmedWaker {
       const { subject, body } = composeWatchErrorMail(
         spec,
         failure ?? 'unknown error',
-        cause,
-        strikes,
+        reported,
+        attempts,
       );
       this.#deliver(condition, subject, body);
       return;

@@ -1294,12 +1294,10 @@ test('a mixed streak does not spend the 404 grace, and the mail counts what it s
     'a preceding streak of 401s must not spend the 404 grace',
   );
 
-  // …and the count that eventually disarms is a count of 404s alone.
-  for (let i = 1; i < GONE_404_POLLS; i += 1) await waker.tick();
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
-
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.body, new RegExp(`${GONE_404_POLLS} consecutive polls`));
+  // The streak stops here rather than running to a 404 disarm, because the
+  // OVERALL bound would end it first: GONE_404_POLLS preceding 401s plus
+  // GONE_404_POLLS 404s is six, and MAX_CONSECUTIVE_POLL_FAILURES is five. The
+  // two bounds interact, and this test is about the per-class one.
   registry.close();
 });
 
@@ -1326,5 +1324,65 @@ test('the disarm mail reports the observed count, not the policy', async () => {
 
   const [told] = mail.unread('hamachi-engineer1');
   assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES} times in a row`));
+  registry.close();
+});
+
+test('a streak that keeps changing class still terminates', async () => {
+  // FINDING 10, and it is the cost of the previous round's fix rather than a
+  // mistake in it. Restarting the count on every change of class meant no bound
+  // was ever reached: two hundred ticks of alternating 404/503 polled two
+  // hundred times, stayed armed, and said nothing.
+  //
+  // It does not need strict alternation — GONE_404_POLLS is 3, so one non-404
+  // every third poll suffices, which is a deleted pull request plus a flaky
+  // network. The result is the state this file's header argues against: a watch
+  // that will never fire, looking like a pull request with nothing happening.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const flapping = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n % 2 ? 404 : 503, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: flapping, tickMs: 1000, log: () => {},
+  });
+
+  for (let i = 0; i < 20 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'a mixed streak must still terminate');
+  assert.equal(n, MAX_CONSECUTIVE_POLL_FAILURES, 'and terminate at the overall bound');
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES}`));
+  registry.close();
+});
+
+test('the no-token disarm says nothing about retries — it never polled', async () => {
+  // FINDING 11, re-raised. Nothing in the suite built an ArmedWaker with
+  // `github: null`, so no test failed when this call site lost its 'no-token'
+  // argument and silently inherited the retry wording. That defaulted parameter
+  // is exactly how the defect arrived, and it arrived unwatched.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  await new ArmedWaker({
+    store, registry, mail, github: null, tickMs: 1000, log: () => {},
+  }).tick();
+
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.doesNotMatch(told.body, /times in a row/, 'nothing was polled, so nothing failed N times');
+  assert.match(told.body, /without being polled at all/);
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
   registry.close();
 });
