@@ -1,10 +1,17 @@
 /**
- * Agent behaviour, loaded from `agent-config.yaml`.
+ * Agent behaviour, loaded from an INSTANCE file that names a shared base.
  *
  * The split with `.env` is deliberate: the environment carries only secrets and
  * deployment identity, everything describing how the agent *behaves* lives in
  * version-controllable YAML. Changing the agent's personality should be a diff,
  * not an edit to a file full of tokens.
+ *
+ * The split BETWEEN the YAML files is the same argument one level down, and is
+ * #203. `AGENT_CONFIG_PATH` names a small per-instance file — `crew`,
+ * `displayName`, Discord channels — which names `agent-config.base.yaml` with
+ * `extends:`. Everything true of every crew lives in the base exactly once.
+ * Before that the instance files were deliberate full copies, 937 and 972
+ * lines, of which 111 differed and three were config values.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -97,6 +104,28 @@ export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[
 };
 
 export type AgentConfig = {
+  /**
+   * This instance's crew name, and the single fact everything else comes off.
+   *
+   * REQUIRED, with no default, for the reason `container.stateDir` used to be:
+   * a default is a literal and a literal belongs to whichever crew was written
+   * first. It was `clawsky.crew` until #203 and is top-level now because it is
+   * no longer only clawsky's — the container name, the state directory, the
+   * status file and the git identity are all derived from it, and a name that
+   * decides where a credential is written does not belong inside the block
+   * about the message board.
+   */
+  crew: string;
+  /**
+   * The crew's name as it says it — `Clawcius`, `Hamachi`. Defaults to `crew`
+   * capitalised.
+   *
+   * Two consumers, and they are the only two: `{{Crew}}` in
+   * `systemPrompt.append`, and `git.userName`. It is separate from `crew`
+   * because `crew` is matched as an exact lowercase string by the ops
+   * allowlist and by every agent id, and a display name is prose.
+   */
+  displayName: string;
   container: {
     name: string;
     /** In-container path to the claude binary. */
@@ -121,13 +150,18 @@ export type AgentConfig = {
      * the container can write", and getting it wrong makes that answer wrong in
      * the direction of passing.
      *
-     * So it is REQUIRED and must be ABSOLUTE, and it has no default. All three
-     * of those are the same decision. A relative value resolves against the
-     * waker's working directory and every check downstream then compares against
-     * a directory that does not exist; a default would be `/var/lib/clawcius`,
-     * correct for one instance and quietly wrong for the other, which is the
-     * shape of the bug this key was added to fix rather than a smaller version
-     * of it. A missing key fails the boot with the key named.
+     * DERIVED from `crew` as `/var/lib/{crew}` since #203, and must be ABSOLUTE
+     * if stated explicitly. It used to be required with no default, and the
+     * reason given was that a default would be `/var/lib/clawcius` — correct
+     * for one instance and quietly wrong for the other. That reason is intact
+     * and is why this is derived rather than defaulted: a derivation from the
+     * instance's own name cannot name its neighbour, which a literal always
+     * can. Measured before the change, both shipped instances already held
+     * exactly `/var/lib/{crew}`, so deriving it moved no value.
+     *
+     * A relative override still resolves against the waker's working directory
+     * and would leave every check downstream comparing against a directory that
+     * does not exist, so it is still refused.
      */
     stateDir: string;
     /**
@@ -460,19 +494,30 @@ If you need something you are not permitted to do yourself, say so to
  * Clawcius #55 was, one level up. Omitting it from this type is what makes
  * "somebody must write this down" a compile-time fact instead of a convention.
  */
-type Defaults = Omit<AgentConfig, 'container'> & {
-  container: Omit<AgentConfig['container'], 'stateDir'>;
+type Defaults = Omit<AgentConfig, 'container' | 'crew' | 'displayName' | 'git' | 'sessions'> & {
+  container: Pick<AgentConfig['container'], 'claudePath'>;
+  sessions: Omit<AgentConfig['sessions'], 'workspaceRoot'>;
 };
 
+/**
+ * Defaults for the keys that are the same for every crew.
+ *
+ * EVERY PER-INSTANCE KEY IS ABSENT FROM THIS TYPE, and that omission is the
+ * point rather than tidiness. Until #203 this object held `clawcius-agent`,
+ * `/var/lib/clawcius/exec-env`, `/var/lib/clawcius/workspaces`,
+ * `/var/lib/clawcius/waker-status.json`, `clawcius` and `Clawcius`. A second
+ * instance that set its crew and forgot one of those keys did not fail — it
+ * inherited the first crew's value, which for `container.name` means running
+ * its turns inside the first crew's container (`src/container.ts:323`).
+ *
+ * `stateDir` was omitted from this type for exactly that reason and the comment
+ * called it "a compile-time fact instead of a convention". The others are now
+ * omitted on the same grounds; they come from `deriveInstancePaths` instead, so
+ * the compiler refuses to let anyone put a crew's name back in here.
+ */
 const DEFAULTS: Defaults = {
   container: {
-    name: 'clawcius-agent',
     claudePath: '/usr/local/bin/claude',
-    // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
-    execEnvDir: '/var/lib/clawcius/exec-env',
-    // Only ever used where there is no stateDir to derive from; the loader
-    // derives it, so this is the shape rather than the value.
-    githubTokenDir: '/var/lib/clawcius/github-token',
   },
   prompts: DEFAULT_PROMPTS,
   model: 'claude-opus-5',
@@ -488,7 +533,6 @@ const DEFAULTS: Defaults = {
   sessions: {
     maxConcurrent: 3,
     idleTimeoutMinutes: 0,
-    workspaceRoot: '/var/lib/clawcius/workspaces',
   },
   discord: {
     allowedChannelIds: [],
@@ -502,13 +546,11 @@ const DEFAULTS: Defaults = {
     discordCli: '/home/npurcell/clawcius/discord-cli/discord',
     skillsDir: '/home/npurcell/clawcius/.claude',
   },
-  git: {
-    userName: 'Clawcius',
-    userEmail: 'clawcius@users.noreply.github.com',
-  },
   clawsky: {
     enabled: true,
-    crew: 'clawcius',
+    // Not a default. `crew` is required at the top level and every consumer
+    // reads it from there; this is only here to satisfy the shared type.
+    crew: '',
     wakeOnMail: true,
     agents: [],
   },
@@ -522,16 +564,34 @@ const DEFAULTS: Defaults = {
     },
   },
   status: {
-    // Deliberately a sibling of `run/`, not a child. `run/` is the bind mount.
-    file: '/var/lib/clawcius/waker-status.json',
+    // Not defaults: both are derived per instance. `file` is deliberately a
+    // sibling of `run/`, not a child, because `run/` is the bind mount.
+    file: '',
     intervalSeconds: 20,
-    instance: 'clawcius',
+    instance: '',
   },
 };
 
+/**
+ * The instance file currently being loaded, for error messages.
+ *
+ * Module-scoped mutable state, which needs the justification: every one of
+ * these errors used to begin with the literal `agent-config.yaml:`, and that
+ * was already a small lie for the second instance — an operator debugging
+ * Hamachi was told to open Clawcius's file. Since #203 there are three files
+ * rather than two and the lie is worse, so the prefix names the file the load
+ * actually started from.
+ *
+ * `loadAgentConfig` is synchronous end to end, so nothing can interleave
+ * between the assignment and the throws that read it. Errors that name the BASE
+ * file specifically build their own prefix (`refuseKeys`), because those are the
+ * ones where the distinction is the whole point.
+ */
+let loadingConfigPath = 'agent-config.yaml';
+
 class ConfigError extends Error {
   constructor(path: string, message: string) {
-    super(`agent-config.yaml: ${path} ${message}`);
+    super(`${loadingConfigPath}: ${path} ${message}`);
   }
 }
 
@@ -721,6 +781,184 @@ function section(raw: unknown, path: string): Record<string, unknown> {
   return raw;
 }
 
+// ── Layering ────────────────────────────────────────────────────────────────
+//
+// One shared base file, one small file per instance, and two lists saying which
+// keys belong to which. Before #203 there was no base: `agent-config.yaml` and
+// `agent-config.hamachi.yaml` were deliberate full copies, 937 and 972 lines,
+// of which 111 differed and exactly THREE were config values — the rest was the
+// same prose twice, hand-synced, and drifting when somebody forgot. The header
+// of the copy said so itself.
+//
+// The two lists below are enforcement, not documentation. A mechanism that
+// silently ignored a misplaced key would have rebuilt the original defect one
+// layer up: an edit that does not reach the running system. So both are hard
+// boot errors that name the file, the key and the rule.
+
+/**
+ * Prompt CONTENT. An instance file may not carry any of it.
+ *
+ * This is the rule that "a standard system prompt for all the agents" turns
+ * into, and it is deliberately about content rather than about wording. Crews
+ * DO differ — one had a GitHub App before the other — and the answer is not a
+ * per-crew paragraph but a paragraph true of the MECHANISM, with the differing
+ * fact interpolated. #197 reached that answer under duress, because the two
+ * copies were not allowed to diverge; this makes it the rule.
+ *
+ * The argument against the alternative is a state, not a preference. A per-crew
+ * sentence saying "your crew has no App" is false the day that crew gets one,
+ * and once the prompt is genuinely shared there is no drift check left that
+ * would notice — an override would be the last place a stale sentence could
+ * hide, inside the mechanism built to end stale sentences.
+ */
+const INSTANCE_FORBIDDEN: ReadonlyArray<[string, string]> = [
+  ['systemPrompt.append', 'the system prompt is shared by every crew'],
+  ['prompts', 'the prompt templates are shared by every crew'],
+];
+
+/**
+ * Instance identity. The BASE file may not carry any of it.
+ *
+ * Not symmetry with the list above — this one prevents a specific, demonstrated
+ * bug. A shared file that carries `container.name` hands its value to every
+ * instance that does not override it, and `container.name` is the `docker exec`
+ * target (`src/container.ts:323`), so the inheriting crew does not fail: it
+ * runs its turns inside the other crew's container, with that container's
+ * mounts and that container's read-only credential directory.
+ *
+ * That is not hypothetical. Until #203 `DEFAULTS` held `clawcius-agent`,
+ * `/var/lib/clawcius/exec-env`, `/var/lib/clawcius/workspaces`,
+ * `/var/lib/clawcius/waker-status.json`, `clawcius` and `Clawcius` — six
+ * literals, each one a second instance's silent cross-over. `githubTokenDir`
+ * was the seventh until #188 finding 11 derived it, and derived exactly one key
+ * where the class needed deriving. This list is the rest of that fix.
+ */
+const BASE_FORBIDDEN: ReadonlyArray<[string, string]> = [
+  ['crew', 'names one instance'],
+  ['displayName', 'names one instance'],
+  ['container.name', 'is the docker exec target and is derived from crew'],
+  ['container.stateDir', 'is derived from crew'],
+  ['container.execEnvDir', 'holds one instance\'s tokens and is derived from crew'],
+  ['container.githubTokenDir', 'holds one instance\'s credential and is derived from crew'],
+  ['sessions.workspaceRoot', 'is derived from crew'],
+  ['status.file', 'is read per instance by the ops executor and is derived from crew'],
+  ['status.instance', 'is matched against the ops allowlist and is derived from crew'],
+  ['git.userName', 'is derived from displayName'],
+  ['git.userEmail', 'is derived from crew'],
+  ['discord.allowedChannelIds', 'each crew lives in its own guild'],
+  ['discord.followUpChannelIds', 'each crew lives in its own guild'],
+  ['discord.alwaysOnChannelIds', 'each crew lives in its own guild'],
+];
+
+/** Is `dotted` present in `root`? Presence, not truthiness — `[]` counts. */
+function hasKey(root: Record<string, unknown>, dotted: string): boolean {
+  const parts = dotted.split('.');
+  let node: unknown = root;
+  for (const part of parts) {
+    if (!isRecord(node) || !(part in node)) return false;
+    node = node[part];
+  }
+  return true;
+}
+
+function refuseKeys(
+  root: Record<string, unknown>,
+  file: string,
+  forbidden: ReadonlyArray<[string, string]>,
+  rule: string,
+): void {
+  const found = forbidden.filter(([key]) => hasKey(root, key));
+  if (found.length === 0) return;
+  throw new Error(
+    `${file}: ${found.map(([key]) => key).join(', ')} ` +
+      `${found.length > 1 ? 'do' : 'does'} not belong in this file. ${rule}\n` +
+      found.map(([key, why]) => `  ${key} — ${why}`).join('\n'),
+  );
+}
+
+/**
+ * Merge an instance file over the base. Mappings merge key by key; anything
+ * else replaces wholesale.
+ *
+ * Arrays replace rather than concatenate, and that is the only choice that is
+ * safe here: the arrays in this config are channel allowlists, and a merge that
+ * appended would make an instance unable to NARROW an inherited list — it could
+ * only ever widen who may wake it. The base carries none of them anyway
+ * (`BASE_FORBIDDEN`), so today this is belt on top of braces.
+ */
+function deepMerge(
+  base: Record<string, unknown>,
+  over: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(over)) {
+    const existing = out[key];
+    out[key] = isRecord(existing) && isRecord(value) ? deepMerge(existing, value) : value;
+  }
+  return out;
+}
+
+/**
+ * The one substitution the shared prompt gets, and the delimiter is the design.
+ *
+ * `{{Crew}}`, doubled, because the prompt is 24kB of prose that ALREADY
+ * contains single-brace tokens: it documents GitHub REST paths, so
+ * `/repos/{owner}/{repo}/issues/{n}/labels` appears in `<habits>` twice. The
+ * `{name}` syntax the `prompts.*` templates use is therefore unusable here in
+ * both directions — a validator would fail the boot on a pasted URL template,
+ * and a substituter would rewrite one.
+ *
+ * Three sites, all identity, all in `<system description>` and `<style>`.
+ * Everything else that says `Clawcius` in the shared prompt is the REPOSITORY
+ * or an issue in it — `NickPurcell/Clawcius`, `Clawcius #93`, `Clawcius#88` —
+ * and is correct in every crew's prompt. A substitution keyed on the literal
+ * name would have rewritten Hamachi's copy to `NickPurcell/Hamachi`, a
+ * repository that does not exist, taking `<issue-tracking>` with it and
+ * surfacing as a 404 the first time some agent tried to file. Double braces
+ * make that mistake unavailable rather than merely documented.
+ */
+const CREW_PLACEHOLDER = 'Crew';
+
+function substituteCrew(text: string, displayName: string, key: string): string {
+  const used = [...text.matchAll(/\{\{([^}\n]*)\}\}/g)].map((m) => m[1] as string);
+  const unknown = [...new Set(used)].filter((name) => name !== CREW_PLACEHOLDER);
+  if (unknown.length > 0) {
+    throw new ConfigError(
+      key,
+      `uses unknown placeholder${unknown.length > 1 ? 's' : ''} ` +
+        `${unknown.map((u) => `{{${u}}}`).join(', ')}. ` +
+        `The only one available here is {{${CREW_PLACEHOLDER}}}. ` +
+        'Single braces are prose and are left alone.',
+    );
+  }
+  return text.split(`{{${CREW_PLACEHOLDER}}}`).join(displayName);
+}
+
+/**
+ * Every path and identity that comes off the crew name, in one place.
+ *
+ * Measured on 2026-08-23, before any of this existed: all nine already held
+ * exactly this shape in both shipped configs. So this is not a new convention
+ * being imposed, it is the convention that was already being hand-maintained,
+ * moved somewhere it cannot be forgotten.
+ */
+function deriveInstancePaths(crew: string, displayName: string) {
+  const stateDir = `/var/lib/${crew}`;
+  return {
+    containerName: `${crew}-agent`,
+    stateDir,
+    execEnvDir: join(stateDir, 'exec-env'),
+    githubTokenDir: join(stateDir, 'github-token'),
+    workspaceRoot: join(stateDir, 'workspaces'),
+    statusFile: join(stateDir, 'waker-status.json'),
+    statusInstance: crew,
+    gitUserName: displayName,
+    gitUserEmail: `${crew}@users.noreply.github.com`,
+  };
+}
+
+const CREW_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
 /**
  * Is `child` inside `parent`? Both must already be resolved.
  *
@@ -820,24 +1058,106 @@ function bindMountedPaths(config: AgentConfig): Array<[string, string]> {
   ];
 }
 
-export function loadAgentConfig(configPath?: string): AgentConfig {
-  const path = resolve(configPath ?? process.env['AGENT_CONFIG_PATH'] ?? 'agent-config.yaml');
-
+function readYaml(path: string, what: string): Record<string, unknown> {
   if (!existsSync(path)) {
     throw new Error(
-      `Agent config not found at ${path}. ` +
+      `${what} not found at ${path}. ` +
         'Expected agent-config.yaml in the working directory, or set AGENT_CONFIG_PATH.',
     );
   }
-
   let parsed: unknown;
   try {
     parsed = parse(readFileSync(path, 'utf8'));
   } catch (error) {
     throw new Error(`Could not parse ${path}: ${error instanceof Error ? error.message : error}`);
   }
+  return section(parsed, 'root');
+}
 
-  const root = section(parsed, 'root');
+export function loadAgentConfig(configPath?: string): AgentConfig {
+  const path = resolve(configPath ?? process.env['AGENT_CONFIG_PATH'] ?? 'agent-config.yaml');
+  loadingConfigPath = path;
+  const instance = readYaml(path, 'Agent config');
+
+  // `extends` is resolved against the INSTANCE FILE's directory, not the
+  // process's working directory. The waker is started by systemd with a
+  // WorkingDirectory it did not choose, and an instance file that only resolves
+  // when launched from the right cwd is a file that works in development and
+  // fails at boot.
+  const extendsRaw = instance['extends'];
+  let root: Record<string, unknown>;
+
+  if (extendsRaw === undefined || extendsRaw === null) {
+    // Standalone: one file, no layering, and therefore nothing the two lists
+    // protect against — they exist to stop one instance inheriting another's
+    // identity through a SHARED file, and there is no shared file here. Both
+    // shipped configs use `extends`, and a test asserts it.
+    root = instance;
+  } else {
+    if (typeof extendsRaw !== 'string' || extendsRaw.trim() === '') {
+      throw new ConfigError('extends', 'must be a path to the shared base config');
+    }
+    const basePath = resolve(dirname(path), extendsRaw);
+    if (basePath === path) {
+      throw new ConfigError('extends', `cannot point at the file itself (${basePath})`);
+    }
+    const base = readYaml(basePath, 'Base config named by `extends`');
+    if (base['extends'] !== undefined) {
+      // One level, deliberately. A chain would make "which file is this value
+      // from" a question you answer by tracing, which is the state this whole
+      // change is getting out of.
+      throw new ConfigError('extends', `${basePath} itself has an \`extends\`; chains are not supported`);
+    }
+
+    refuseKeys(
+      instance,
+      path,
+      INSTANCE_FORBIDDEN,
+      'Prompt content is shared: every crew reads the same words, and differs only in ' +
+        `facts interpolated into them. Put it in ${basePath}, and if it is true of one crew ` +
+        'and not another, rewrite it to be true of the mechanism.',
+    );
+    refuseKeys(
+      base,
+      basePath,
+      BASE_FORBIDDEN,
+      'This file is shared by every instance, so a value here is inherited by any instance ' +
+        'that does not override it — silently, and as the other crew\'s identity. Put it in ' +
+        'the instance file, or let it derive from `crew`.',
+    );
+
+    root = deepMerge(base, instance);
+  }
+  delete root['extends'];
+
+  // Refused wherever it appears, including a standalone file, because unlike
+  // everything else here this key MOVED. Left working under its old name it
+  // would be a second place to write the crew name, and the one thing the
+  // derivation cannot survive is two sources for the fact it derives from.
+  if (hasKey(root, 'clawsky.crew')) {
+    throw new ConfigError(
+      'clawsky.crew',
+      'moved to the top level as `crew` in #203 — every path and identity in the ' +
+        'deployment derives from it now, not just the message board. Set `crew:` instead.',
+    );
+  }
+
+  const crew = str(root['crew'], 'crew', '');
+  if (!CREW_NAME.test(crew)) {
+    throw new ConfigError(
+      'crew',
+      crew === ''
+        ? 'is required and has no default. It names this instance, and every path and ' +
+            'identity is derived from it — a default would be one crew\'s name handed to ' +
+            'another crew that forgot to say its own'
+        : 'must be a short lowercase identifier — it prefixes every agent id in this ' +
+            'crew, names its container and its state directory, and is compared as an ' +
+            'exact string',
+    );
+  }
+  const displayName = str(root['displayName'], 'displayName', crew[0]!.toUpperCase() + crew.slice(1));
+  const derived = deriveInstancePaths(crew, displayName);
+
   const prompt = section(root['systemPrompt'], 'systemPrompt');
   const sessions = section(root['sessions'], 'sessions');
   const discord = section(root['discord'], 'discord');
@@ -851,19 +1171,20 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const container = section(root['container'], 'container');
 
   const config: AgentConfig = {
+    crew,
+    displayName,
     container: {
-      name: str(container['name'], 'container.name', DEFAULTS.container.name),
+      name: str(container['name'], 'container.name', derived.containerName),
       claudePath: str(container['claudePath'], 'container.claudePath', DEFAULTS.container.claudePath),
-      // Required, absolute, and with no default — see `requiredAbsPath`, and
-      // Clawcius #55, which this key exists to close. A default here would be
-      // `/var/lib/clawcius`, which is right for one of the two instances and
-      // would point the other's containment check at its neighbour's mount.
-      stateDir: requiredAbsPath(container['stateDir'], 'container.stateDir'),
-      execEnvDir: str(
-        container['execEnvDir'],
-        'container.execEnvDir',
-        DEFAULTS.container.execEnvDir,
-      ),
+      // Derived from `crew` as `/var/lib/{crew}` — see Clawcius #55, which this
+      // key exists to close, and #203, which stopped it being restated per file.
+      // An explicit value is still honoured and still has to be absolute: the
+      // containment checks below compare against it, and a relative one would
+      // make every one of them compare against a directory that does not exist.
+      stateDir: container['stateDir'] === undefined
+        ? derived.stateDir
+        : requiredAbsPath(container['stateDir'], 'container.stateDir'),
+      execEnvDir: str(container['execEnvDir'], 'container.execEnvDir', derived.execEnvDir),
       // DERIVED FROM stateDir, NOT DEFAULTED TO A LITERAL, and the difference
       // is one instance serving another instance's crew its credential.
       //
@@ -882,7 +1203,9 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       githubTokenDir: str(
         container['githubTokenDir'],
         'container.githubTokenDir',
-        join(requiredAbsPath(container['stateDir'], 'container.stateDir'), 'github-token'),
+        container['stateDir'] === undefined
+          ? derived.githubTokenDir
+          : join(requiredAbsPath(container['stateDir'], 'container.stateDir'), 'github-token'),
       ),
     },
     prompts: {
@@ -906,7 +1229,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         'systemPrompt.useClaudeCodeDefault',
         DEFAULTS.systemPrompt.useClaudeCodeDefault,
       ),
-      append: str(prompt['append'], 'systemPrompt.append', DEFAULTS.systemPrompt.append),
+      append: substituteCrew(
+        str(prompt['append'], 'systemPrompt.append', DEFAULTS.systemPrompt.append),
+        displayName,
+        'systemPrompt.append',
+      ),
     },
     sessions: {
       maxConcurrent: num(
@@ -924,7 +1251,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       workspaceRoot: str(
         sessions['workspaceRoot'],
         'sessions.workspaceRoot',
-        DEFAULTS.sessions.workspaceRoot,
+        derived.workspaceRoot,
       ),
     },
     discord: {
@@ -967,18 +1294,16 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       skillsDir: str(paths['skillsDir'], 'paths.skillsDir', DEFAULTS.paths.skillsDir),
     },
     git: {
-      userName: str(git['userName'], 'git.userName', DEFAULTS.git.userName),
-      userEmail: str(git['userEmail'], 'git.userEmail', DEFAULTS.git.userEmail),
+      userName: str(git['userName'], 'git.userName', derived.gitUserName),
+      userEmail: str(git['userEmail'], 'git.userEmail', derived.gitUserEmail),
     },
     clawsky: {
       enabled: bool(clawsky['enabled'], 'clawsky.enabled', DEFAULTS.clawsky.enabled),
-      crew: str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
+      // Not a key any more — the top-level `crew` is the only source, and
+      // `clawsky.crew` is refused above rather than quietly shadowed.
+      crew,
       wakeOnMail: bool(clawsky['wakeOnMail'], 'clawsky.wakeOnMail', DEFAULTS.clawsky.wakeOnMail),
-      agents: agentList(
-        clawsky['agents'],
-        'clawsky.agents',
-        str(clawsky['crew'], 'clawsky.crew', DEFAULTS.clawsky.crew),
-      ),
+      agents: agentList(clawsky['agents'], 'clawsky.agents', crew),
     },
     armed: {
       enabled: bool(armed['enabled'], 'armed.enabled', DEFAULTS.armed.enabled),
@@ -998,7 +1323,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       },
     },
     status: {
-      file: str(status['file'], 'status.file', DEFAULTS.status.file),
+      file: str(status['file'], 'status.file', derived.statusFile),
       intervalSeconds: num(
         status['intervalSeconds'],
         'status.intervalSeconds',
@@ -1006,7 +1331,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         1,
         3600,
       ),
-      instance: str(status['instance'], 'status.instance', DEFAULTS.status.instance),
+      instance: str(status['instance'], 'status.instance', derived.statusInstance),
     },
   };
 
@@ -1015,7 +1340,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     config.discord.bundleMaxWaitMs < config.discord.bundleDebounceMs
   ) {
     throw new Error(
-      'agent-config.yaml: discord.bundleMaxWaitMs must be >= discord.bundleDebounceMs — ' +
+      `${loadingConfigPath}: discord.bundleMaxWaitMs must be >= discord.bundleDebounceMs — ` +
         'a lower ceiling would flush every bundle before the debounce could coalesce anything.',
     );
   }
@@ -1039,7 +1364,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     for (const [label, mount] of bindMountedPaths(config)) {
       if (isInside(statusFile, resolve(mount))) {
         throw new Error(
-          `agent-config.yaml: status.file (${statusFile}) is inside ${label} ` +
+          `${loadingConfigPath}: status.file (${statusFile}) is inside ${label} ` +
             `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
             'container. The ops executor trusts this file when deciding whether recreating ' +
             'the container would kill a live turn; the agent must not be able to write it.',
@@ -1064,7 +1389,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   for (const [label, mount] of bindMountedPaths(config)) {
     if (isInside(execEnvDir, resolve(mount))) {
       throw new Error(
-        `agent-config.yaml: container.execEnvDir (${execEnvDir}) is inside ${label} ` +
+        `${loadingConfigPath}: container.execEnvDir (${execEnvDir}) is inside ${label} ` +
           `(${resolve(mount)}), which docker/run-container.sh bind-mounts into the agent ` +
           'container. That file holds this instance\'s Discord and GitHub tokens; it must ' +
           'not be reachable from inside any sandbox. Put it beside the state directory, ' +
@@ -1103,7 +1428,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   for (const [label, mount] of others) {
     if (isInside(githubTokenDir, resolve(mount))) {
       throw new Error(
-        `agent-config.yaml: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +
+        `${loadingConfigPath}: container.githubTokenDir (${githubTokenDir}) is inside ${label} ` +
           `(${resolve(mount)}). It holds a GitHub App installation token that every agent ` +
           'consumes; it is mounted read-only on purpose, and a path inside a read-write ' +
           'mount would let the sandbox rewrite or replace the credential the daemon serves ' +
@@ -1113,15 +1438,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     }
   }
 
-  if (config.clawsky.enabled) {
-    if (!/^[a-z][a-z0-9-]{0,31}$/.test(config.clawsky.crew)) {
-      throw new ConfigError(
-        'clawsky.crew',
-        'must be a short lowercase identifier — it prefixes every agent id in ' +
-          'this crew and is compared as an exact string',
-      );
-    }
-  }
+  // `clawsky.crew` used to be validated here, gated on `clawsky.enabled`. Both
+  // halves are gone: the name is now the top-level `crew`, checked against the
+  // same pattern before anything is derived from it, and it is checked
+  // unconditionally because the container name and the state directory come off
+  // it whether or not the message board is switched on.
 
   // Checked at startup rather than at arm time. This string is the default for
   // every `watchPr` call that omits a repository, so a typo here is a tool that

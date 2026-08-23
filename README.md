@@ -126,7 +126,8 @@ decided it.
 
 | File | Holds | Committed |
 |---|---|---|
-| `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | yes |
+| `agent-config.base.yaml` | Model, turn cap, system prompt, prompt templates, sessions, scheduling — everything shared by every crew | yes |
+| `agent-config.yaml`, `agent-config.<crew>.yaml` | One instance each: its `crew`, `displayName` and Discord channels, and nothing else. `AGENT_CONFIG_PATH` picks one; it names the base with `extends:` | yes |
 | `squid/squid.conf` | The egress policy — the only copy. A blocklist, not an allowlist, since 2026-08-01 | yes |
 | `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do. Ships `dryRun: true` and keeps saying it | yes |
 | `systemd/clawcius-ops.service.d/live.conf` | `Environment=OPS_DRY_RUN=false` — the one setting that legitimately differs between this repository and this machine. A drop-in rather than a line in the unit, so that installing the unit alone can never turn the executor live | yes; installing it is an operator step |
