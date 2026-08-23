@@ -360,8 +360,12 @@ container. Making the *session* use App credentials is a separate problem with a
 different shape, because an installation token expires in an hour and a
 session's environment is fixed when its process spawns.
 
-If the PEM is missing or unreadable the waker says so and `watchPr` refuses to
-arm, rather than arming watches that would be disarmed on their first poll.
+If the PEM is missing or unreadable, or `GITHUB_APP_INSTALLATION_ID` is not
+digits, the waker says so at startup and **falls back to `GITHUB_TOKEN`** — the
+App is not in use, and watches arm and poll as the PAT. That is deliberate, for
+the reason above, but it means a mistyped path leaves you running as the older
+identity with everything apparently working. The startup line is the only place
+that says so, so read it after changing either variable.
 
 Both variables are required together — either alone falls back to the PAT rather
 than failing, because a crew that cannot reach GitHub is worse than one reaching

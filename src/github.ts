@@ -1,4 +1,3 @@
-import { staticTokenProvider, type TokenProvider } from './github-app.js';
 /**
  * A read-only view of one pull request, and the frame everything it says
  * arrives in.
@@ -44,6 +43,8 @@ import { staticTokenProvider, type TokenProvider } from './github-app.js';
  * fetched rather than assumed. This is one repo and a handful of PRs; walking
  * every page would be more code for a case that does not occur.
  */
+
+import { staticTokenProvider, type TokenProvider } from './github-app.js';
 
 /** `owner/name`. Checked before storing and again before use. */
 export const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;

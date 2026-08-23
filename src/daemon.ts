@@ -689,6 +689,14 @@ export async function main(): Promise<void> {
     let appTokenOk = false;
     if (app) {
       try {
+        // Costs no network, no token and no PEM, so there is no reason for it
+        // to wait until first use — and first use is inside `ArmedWaker`'s try,
+        // where the catch deletes the row. A trailing newline in an
+        // EnvironmentFile is an ordinary typo; discovering it at boot is a log
+        // line, discovering it at first poll is a permanent sweep.
+        if (config.github.appInstallationId && !/^\d+$/.test(config.github.appInstallationId)) {
+          throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
+        }
         // `fs.access` rather than a mint: it catches the two failures an
         // operator actually makes — wrong path, wrong owner — without spending
         // a token or a round trip at every boot, and without making startup
@@ -696,10 +704,16 @@ export async function main(): Promise<void> {
         accessSync(config.github.appPrivateKeyPath, fsConstants.R_OK);
         appTokenOk = true;
       } catch (error) {
+        // Say what actually happens next, which is NOT a refusal: the branch
+        // below falls through to the PAT, `github` is built, and watches arm
+        // and poll normally. Claiming a refusal here was worse than saying
+        // nothing — an operator who mistypes the path would see a warning, then
+        // see watches working, conclude the warning was spurious, and run
+        // indefinitely as the PAT believing they were the App.
         process.stderr.write(
           `[armed] GITHUB_APP_PRIVATE_KEY_PATH is set but unreadable — ${String(error)}. ` +
-            'watchPr will refuse to arm rather than arm watches that would be disarmed on ' +
-            'their first poll.\n',
+            'FALLING BACK TO GITHUB_TOKEN: the App is NOT in use, and watches will arm and ' +
+            'poll as the personal access token. Fix the path or the ownership to use the App.\n',
         );
       }
     }
