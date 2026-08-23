@@ -486,8 +486,8 @@ export function composeWatchErrorMail(
       'or it is no longer visible to the credential this process holds — those look the ' +
       'same from here, and both leave a watch that will never fire.',
     unreachable:
-      `Your watch on ${spec.repo}#${spec.pr} could not reach GitHub ${attempts} times in a ` +
-      'row and has been disarmed.',
+      `Your watch on ${spec.repo}#${spec.pr} failed ${attempts} polls in a row and has been ` +
+      'disarmed.',
     'no-token':
       `Your watch on ${spec.repo}#${spec.pr} has been disarmed without being polled at all: ` +
       'this process has no GitHub token. It was armed under a process that had one.',

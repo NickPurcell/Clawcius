@@ -564,7 +564,7 @@ test('a transient failure disarms only after the bound, and says how many', asyn
   assert.equal(store.listFor('hamachi-engineer1').length, 0, 'the bound must eventually apply');
   const [told] = mail.unread('hamachi-engineer1');
   assert.match(told.subject, /DISARMED, the poll kept failing/);
-  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES} times in a row`));
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   assert.match(told.body, /503/);
   registry.close();
 });
@@ -606,6 +606,11 @@ test('a 404 disarms only after GONE_404_POLLS consecutive ones', async () => {
   const [told] = mail.unread('hamachi-engineer1');
   assert.match(told.subject, /DISARMED, the target is gone/);
   assert.match(told.body, /not there/);
+  // THE COUNT, which round 2's fix was half about: `attempts` must be the
+  // observed strikes, not the policy. This assertion lived on the mixed-streak
+  // test until that streak was shortened, and was not re-homed — leaving the
+  // `gone` half unpinned while the `unreachable` half stayed covered.
+  assert.match(told.body, new RegExp(`${GONE_404_POLLS} consecutive polls`));
   // It must not claim to know WHICH of deletion or a permissions change it saw.
   assert.match(told.body, /no longer visible/);
   registry.close();
@@ -1323,7 +1328,7 @@ test('the disarm mail reports the observed count, not the policy', async () => {
   for (let i = 0; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) await waker.tick();
 
   const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES} times in a row`));
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   registry.close();
 });
 
@@ -1384,5 +1389,82 @@ test('the no-token disarm says nothing about retries — it never polled', async
   assert.doesNotMatch(told.body, /times in a row/, 'nothing was polled, so nothing failed N times');
   assert.match(told.body, /without being polled at all/);
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  registry.close();
+});
+
+test('a gone-class streak reports its own count, not its bound', async () => {
+  // `404,404,410` is one class with two bounds: 410 has bound 1, so the streak
+  // disarms at strikes = 3 against a bound of 1. Passing the POLICY would print
+  // "across a poll" after three consecutive not-there answers.
+  //
+  // This is the case that shows the `gone` half of the observed-vs-policy fix
+  // still matters, and it is the one nothing covered once the assertion was
+  // dropped from the mixed-streak test.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const vanishing = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n < 3 ? 404 : 410, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: vanishing, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < 3 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /the target is gone/);
+  assert.match(told.body, /3 consecutive polls/, 'the observed count, not the bound of 1');
+  registry.close();
+});
+
+test('the overall bound reports unreachable even when the last failure was a 404', async () => {
+  // `503,503,503,404,404` — the total bound ends it, the last failure is a 404,
+  // and only two of the five were. Reporting the last failure's class would mail
+  // "the target is not there, across 5 consecutive polls", which is the mail
+  // asserting something nobody observed: three of those polls were answered
+  // 503, and 404 never reached its own bound.
+  //
+  // Disarming because nothing worked is not evidence about the target, so only
+  // the bound that is ABOUT a class may speak for that class.
+  //
+  // Added after a mutation check showed this fix had no test at all — removing
+  // it left the suite green, which is the same gap this branch has now opened
+  // three times.
+  const { registry, mail, store } = board();
+  store.arm(
+    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+  let n = 0;
+  const mixed = {
+    async getPullRequest() {
+      n += 1;
+      throw githubError(n <= 3 ? 503 : 404, 'x');
+    },
+    async listReviews() { return []; },
+    async listComments() { return []; },
+  };
+  const waker = new ArmedWaker({
+    store, registry, mail, github: mixed, tickMs: 1000, log: () => {},
+  });
+  for (let i = 0; i < 6 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
+
+  assert.equal(store.listFor('hamachi-engineer1').length, 0);
+  const [told] = mail.unread('hamachi-engineer1');
+  assert.match(told.subject, /the poll kept failing/, 'the overall bound must report itself');
+  assert.doesNotMatch(told.subject, /target is gone/);
+  assert.doesNotMatch(told.body, /not there/, 'two 404s among five polls is not a gone target');
+  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   registry.close();
 });
