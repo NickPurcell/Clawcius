@@ -1063,7 +1063,7 @@ export class SessionManager {
   #registry: AgentRegistry;
   #mail: MailStore | null;
   /**
-   * What `remindMe` and `watchPr` need, or null when armed conditions are off.
+   * What the armed tools need, or null when armed conditions are off.
    *
    * The store and the GitHub client are shared across every session — they are
    * a table and an HTTP client, neither of which is per-agent — while the tools

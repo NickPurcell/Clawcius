@@ -1,12 +1,13 @@
 /**
  * Armed conditions: a thing that will produce mail when it comes true.
  *
- * `remindMe` and `watchPr` look like two features and are one mechanism. Both
- * are a row in this table saying *whose* condition it is, *what* would satisfy
- * it, and *when to look next*; the waker looks, and when the condition is met
- * it delivers mail from the owner to the owner. Nothing else is needed, because
- * mail already wakes an idle agent (CLAWSKY.md phase 3) — so a reminder that
- * fires and a colleague's DM take the same route into the same inbox.
+ * `remindMe`, `scheduleRecurring` and `watchPr` look like three features and
+ * are one mechanism. Each is a row in this table saying *whose* condition it
+ * is, *what* would satisfy it, and *when to look next*; the waker looks, and
+ * when the condition is met it delivers mail from the owner to the owner.
+ * Nothing else is needed, because mail already wakes an idle agent (CLAWSKY.md
+ * phase 3) — so a reminder that fires and a colleague's DM take the same route
+ * into the same inbox.
  *
  * ── The row is on disk, and that is the whole point ─────────────────────────
  *
@@ -68,12 +69,14 @@
  *
  * ── Self-terminating is not the same as harmless ────────────────────────────
  *
- * Both kinds end by themselves, which was the argument for shipping without a
- * way to read the table back or cancel a row. It held for one condition and
- * not for two: duplicates last as long as the thing they watch and multiply
- * the mail for the whole of it. That is Clawcius #50, and it happened — two
- * watches on one pull request, armed by two agents that each had no way to see
- * the other's, delivering every event twice with no way to stop it.
+ * A reminder and a PR watch both end by themselves, which was the argument for
+ * shipping without a way to read the table back or cancel a row — a schedule
+ * does not, which is what `A reminder is one-shot, and a schedule is the other
+ * thing` argues above. It held for one condition and not for two: duplicates
+ * last as long as the thing they watch and multiply the mail for the whole of
+ * it. That is Clawcius #50, and it happened — two watches on one pull request,
+ * armed by two agents that each had no way to see the other's, delivering every
+ * event twice with no way to stop it.
  *
  * So `listFor` and `spentFor` are read by a tool now, `disarmFor` withdraws a
  * row on an agent's say-so, and `findPrWatch` lets the arming tool refuse the

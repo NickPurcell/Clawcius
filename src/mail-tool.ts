@@ -214,8 +214,8 @@ export function buildMailTools(
 }
 
 /**
- * `extra` is how `remindMe` and `watchPr` join this server rather than starting
- * a second one. They are built the same way — per session, closed over the same
+ * `extra` is how the armed tools join this server rather than starting a second
+ * one. They are built the same way — per session, closed over the same
  * agent id — and an agent that had to look in two places for "things that reach
  * my inbox" would find one of them.
  */

@@ -804,13 +804,16 @@ server-side (5 minutes, or an hour) and independent of process lifetime.
 ## 6b. Self-scheduling
 
 An agent schedules itself by calling a tool. `remindMe` takes a note and a time
-and delivers it as mail from the agent to itself; `watchPr` waits for a stranger
-to review, comment on or merge a pull request. Both are rows in SQLite, so a
-condition that comes due while the process is down fires late on the next start
-rather than not at all, and both are built per session and closed over that
-session's agent id — "an agent may only schedule itself" is the absence of an
-argument rather than the rejection of one. `src/armed.ts`, `src/armed-tool.ts`
-and `src/armed-wake.ts`; configuration is the `armed:` block.
+and delivers it as mail from the agent to itself; `scheduleRecurring` does the
+same on a repeating calendar schedule, storing a cron expression and an IANA
+timezone **with** the row so 9am stays 9am across the clock changes; `watchPr`
+waits for a stranger to review, comment on or merge a pull request. Each is a
+row in SQLite, so a condition that comes due while the process is down fires
+late on the next start rather than not at all, and each is built per session and
+closed over that session's agent id — "an agent may only schedule itself" is the
+absence of an argument rather than the rejection of one. `src/armed.ts`,
+`src/armed-tool.ts`, `src/armed-wake.ts` and `src/schedule.ts`; configuration is
+the `armed:` block.
 
 Until 2026-08-16 there was a second way, and it is worth knowing it existed
 because a rollback to an older `dist/` brings it back. The agent asked to be
