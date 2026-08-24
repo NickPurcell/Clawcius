@@ -14,6 +14,7 @@
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
+import { isAgentRole } from './store.js';
 import type { WakeContext } from './types.js';
 import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
@@ -28,6 +29,15 @@ function render(template: string, vars: Record<string, string>): string {
 }
 
 /**
+ * Who the session is, as the system prompt needs to say it.
+ *
+ * Resolved by `SessionPool.acquire`, which holds the registry row, and passed
+ * in -- the same shape `model` already uses, and for the reason `AgentSession`'s
+ * own comment gives: this module knows nothing about the registry.
+ */
+export type PromptIdentity = { id: string; crew: string; role: string };
+
+/**
  * Assemble the SDK `systemPrompt`.
  *
  * `useClaudeCodeDefault: true` keeps Claude Code's own prompt as the base and
@@ -38,12 +48,29 @@ function render(template: string, vars: Record<string, string>): string {
  * Order is protocol then append: the operator's instructions land last and so
  * are the most recent thing in context.
  */
-export function buildSystemPrompt(): Options['systemPrompt'] {
+export function buildSystemPrompt(identity: PromptIdentity): Options['systemPrompt'] {
   const protocol = render(config().agent.prompts.protocol, {
     cli: config().agent.paths.discordCli,
   });
 
-  const layered = [protocol, config().agent.systemPrompt.append.trim()]
+  // WHY THE SYSTEM PROMPT AND NOT A FIRST-TURN MESSAGE. This is rebuilt every
+  // time a session is constructed, including on resume, so it cannot drift out
+  // of step with a session that already carries an old preamble in its history
+  // -- and it survives compaction, which a first turn does not.
+  //
+  // A ROLE THE CREW DOES NOT DEFINE GETS A DIFFERENT TEMPLATE, not a decorated
+  // value. Decorating produced `<sousaphonist (not a role this crew defines)>`
+  // in the clause that says which section is yours -- still telling the agent a
+  // section exists, and naming a nonsense one. Two templates means the unknown
+  // case simply has no such clause. It also keeps this file's own rule from the
+  // header: no prose the agent sees lives in code, only substitution.
+  const known = isAgentRole(identity.role);
+  const roleNotice = render(
+    known ? config().agent.prompts.roleNotice : config().agent.prompts.roleNoticeUnknown,
+    { id: identity.id, crew: identity.crew, role: identity.role },
+  );
+
+  const layered = [protocol, roleNotice, config().agent.systemPrompt.append.trim()]
     .filter(Boolean)
     .join('\n\n');
 
@@ -120,7 +147,6 @@ export function buildWakeMessage(context: WakeContext): string {
 
   return render(prompts.messageWake, {
     cli,
-    roleNotice: prompts.roleNotice,
     count: String(messages.length),
     plural: messages.length === 1 ? 'message' : 'messages',
     messages: rendered,

@@ -467,15 +467,26 @@ Which imposes a drafting rule — **state restrictions as system facts, not as
 personal instructions.** "You are the poster, you post to the feed" is
 confusing read from an engineer's seat. "Only the poster writes to the feed;
 everyone else reads it" is true from every seat and needs no per-role variant.
-One prompt, no branching.
+One prompt, no branching — **in the role text.**
+
+The one thing that does differ per agent is a single sentence saying who the
+agent is: `prompts.roleNotice`, rendered into the system prompt at session
+initialization with the agent's id, crew and role. It states identity and points
+at `<roles>`; it does not restate any role's duties, which is what the rule above
+is protecting. Before that there was no such sentence: a spawned agent's only
+identity text was its `spawnCharter` mail, which is history in a transcript and
+does not survive compaction. The literal that existed reached Discord-channel
+sessions alone, where it happened to be true.
 
 The role text lives in a `roles:` block inside `systemPrompt.append` in
 `agent-config.base.yaml`, so it is version-controlled and reviewable rather
 than hardcoded — and shared, so every crew reads the same words. An instance
 file may not override it; the loader refuses prompt content there (#203). `src/agent.ts` passes
-`systemPrompt: buildSystemPrompt()` on every start including resumes, so
+`systemPrompt: buildSystemPrompt(identity)` on every start including resumes, so
 editing that block reaches agents that already exist, on their next wake — no
-crew-wide respawn needed.
+crew-wide respawn needed. The identity argument is why the notice survives
+compaction and cannot go stale on a resumed session: it is rebuilt, not
+remembered.
 
 ### Subagents
 

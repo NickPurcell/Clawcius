@@ -143,20 +143,55 @@ prompts:
     and saying how late. Write the note as a self-contained instruction: your
     future self reads it without the conversation that produced it.
 
-  # Rides along on every wake, wherever {roleNotice} appears below.
+  # SAID ONCE, AT SESSION INITIALIZATION, IN THE SYSTEM PROMPT — not on every
+  # wake. Placeholders: {id} {crew} {role}, resolved from the agent's registry
+  # row by SessionPool.acquire.
   #
-  # Every agent in the team shares one system prompt, so nothing in it says
-  # which role is reading. Wake messages reach ONLY the main agent — subagents
-  # are spawned by it and never woken by the waker — so this is where to say so.
+  # It used to be a literal: "You are the team leader — the main agent for this
+  # channel", substituted into messageWake.
   #
-  # Set to "" to drop the line; surrounding blank lines collapse automatically.
-  roleNotice: "You are the team leader — the main agent for this channel."
+  # THE DEFECT IS NOT THE ONE THAT IS EASY TO ASSUME. It was not that every agent
+  # was told it led the team — {roleNotice} lived only in messageWake, and
+  # messageWake renders only for a Discord-channel wake. A spawned agent is woken
+  # by mail (mail-wake.ts), which renders mailWake and never carried it. So the
+  # agents the sentence was false about never read it, and the sessions that did
+  # read it get role: coordinator from DEFAULT_CHANNEL_ROLE, where it was true.
+  #
+  # The real gap is larger: a spawned engineer had NO durable statement of its own
+  # role anywhere. Its only identity text was the spawnCharter mail delivered as
+  # turn one — history in a transcript, which does not survive compaction. The
+  # coordinator got a redundant reminder on every wake; everyone else got nothing.
+  #
+  # In the system prompt rather than a first turn because that is rebuilt on
+  # every construction, including resume, and survives compaction — a preamble
+  # does neither, and would have to decide what to do about a resumed session
+  # already carrying the old one in its history.
+  #
+  # DO NOT RESTATE THE ROLE'S DUTIES HERE. <roles> already describes all six and
+  # a second copy drifts from the first. Point at it instead.
+  #
+  # Two edge cases, both handled by naming what is true rather than guessing:
+  # an agent with no registry row yet gets the crew default (a Discord channel
+  # really is the coordinator, so that one is correct), and a role string that
+  # is not one of the six is rendered as "not a role this crew defines" rather
+  # than printed as though <roles> described it. A wrong role asserted
+  # confidently is the defect this replaced.
+  #
+  # Set to "" to drop it entirely.
+  roleNotice: "You are `{id}` — crew `{crew}`, role `{role}`. The `<roles>` section below describes the whole crew; `<{role}>` is yours. Wakes reach only the main agent of a session: subagents you spawn are never woken this way."
 
-  # Wake message when Discord messages arrive.
-  # Placeholders: {roleNotice} {count} {plural} {messages} {channelId} {latestMessageId} {cli}
+  # Used instead of roleNotice when the row carries a role the crew does not
+  # define. A SEPARATE TEMPLATE rather than a decorated {role}, because the
+  # decorated version still rendered "`<{role}>` is yours" and named a section
+  # that cannot exist. This one has no such clause. Placeholders: {id} {crew}
+  # {role}.
+  roleNoticeUnknown: "You are `{id}` — crew `{crew}`. Your role is recorded as `{role}`, which is not one this crew defines, so `<roles>` below does not describe it. Tell your coordinator if it matters. Wakes reach only the main agent of a session: subagents you spawn are never woken this way."
+
+  # Wake message when Discord messages arrive. Carries the new messages and the
+  # operational tail and nothing else — identity is said once, above, at session
+  # initialization rather than repeated on every wake.
+  # Placeholders: {count} {plural} {messages} {channelId} {latestMessageId} {cli}
   messageWake: |-
-    {roleNotice}
-
     {count} new {plural}:
 
     {messages}

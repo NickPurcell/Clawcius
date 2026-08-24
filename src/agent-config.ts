@@ -43,15 +43,23 @@ export type PromptTemplates = {
   /** Standing instructions, prepended to systemPrompt.append. */
   protocol: string;
   /**
-   * Rides along on every wake, via `{roleNotice}` in the wake templates.
+   * Said ONCE, at session initialization, in the system prompt. It used to
+   * ride along via `{roleNotice}` in `messageWake` -- that one template, and
+   * placeholder is now rejected there, so re-adding it is a boot error.
    *
-   * Every agent in the team shares one system prompt, so nothing in it says
-   * *which* role is reading. Wake messages are the one channel that reaches
-   * only the main agent — subagents are spawned by it and never woken by the
-   * waker — which makes this the right place to say so. Set it empty to drop
-   * the line entirely.
+   * The system prompt DOES now say which role is reading — that is what this
+   * template is. It used to say the opposite, in this comment, while the string
+   * below asserted a role anyway; the wake was the wrong channel for it because
+   * identity is not per-wake data. Set it empty to drop the line entirely.
    */
   roleNotice: string;
+  /**
+   * Used instead of `roleNotice` when the row carries a role outside
+   * `AgentRole`. A separate template rather than a decorated `{role}`, because
+   * decorating still rendered "`<{role}>` is yours" and named a section that
+   * cannot exist.
+   */
+  roleNoticeUnknown: string;
   /** Wake message for incoming Discord messages. */
   messageWake: string;
   /** How one message inside a bundle renders. */
@@ -63,17 +71,21 @@ export type PromptTemplates = {
    * own output, verbatim, and everything wrapped around it is wrapping around
    * the agent's own tool result — so the more this says, the more it reads as
    * somebody else having prodded the agent, which is exactly what the design
-   * is trying not to do. No `{roleNotice}` for the same reason.
+   * is trying not to do. `{roleNotice}` is not available in any template now
+   * — identity is rendered into the system prompt instead.
    */
   mailWake: string;
   /**
    * The first message a spawned agent receives — CLAWSKY.md phase 5.
    *
    * It is a MAIL BODY, not a system prompt, and that is the whole design.
-   * Every agent shares one system prompt (`buildSystemPrompt` takes no
-   * arguments), so an agent's role cannot be baked into it; and baking a task
-   * into identity would mean a resurrected engineer wakes believing it still
-   * owns work that closed three weeks ago. Delivered as turn one it replays on
+   * The reason is the second half of what this used to say, not the first: the
+   * first was "every agent shares one system prompt (`buildSystemPrompt` takes
+   * no arguments), so a role cannot be baked into it", and that premise is now
+   * false — it takes an identity and the ROLE is baked in. What still holds, and
+   * always carried the argument, is that baking a TASK into identity would mean
+   * a resurrected engineer wakes believing it still owns work that closed three
+   * weeks ago. Delivered as turn one it replays on
    * resume as *history*: the agent can see what it was originally asked to do
    * without being told it is still current.
    *
@@ -96,8 +108,9 @@ export type PromptTemplates = {
 /** Placeholders each template may use. Anything else is a startup error. */
 export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[]> = {
   protocol: ['cli'],
-  roleNotice: [],
-  messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
+  roleNotice: ['id', 'crew', 'role'],
+  roleNoticeUnknown: ['id', 'crew', 'role'],
+  messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
   mailWake: ['mail', 'count', 'plural'],
   spawnCharter: ['id', 'role', 'crew', 'spawnedBy', 'instructions'],
@@ -417,12 +430,17 @@ There are limits on how often and how many wakes you may schedule. A rejected
 call says which limit it hit.`,
 
   roleNotice:
-    'You are the team leader — the main agent for this channel. This wake is ' +
-    'addressed to you; subagents you spawn are never woken this way.',
+    'You are `{id}` — crew `{crew}`, role `{role}`. The `<roles>` section below ' +
+    'describes the whole crew; `<{role}>` is yours. Wakes reach only the main ' +
+    'agent of a session: subagents you spawn are never woken this way.',
 
-  messageWake: `{roleNotice}
+  roleNoticeUnknown:
+    'You are `{id}` — crew `{crew}`. Your role is recorded as `{role}`, which is ' +
+    'not one this crew defines, so `<roles>` below does not describe it. Tell ' +
+    'your coordinator if it matters. Wakes reach only the main agent of a session: subagents you ' +
+    'spawn are never woken this way.',
 
-{count} new {plural}:
+  messageWake: `{count} new {plural}:
 
 {messages}
 
@@ -1514,6 +1532,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     prompts: {
       protocol: template(prompts['protocol'], 'protocol', DEFAULT_PROMPTS.protocol),
       roleNotice: template(prompts['roleNotice'], 'roleNotice', DEFAULT_PROMPTS.roleNotice),
+      roleNoticeUnknown: template(
+        prompts['roleNoticeUnknown'],
+        'roleNoticeUnknown',
+        DEFAULT_PROMPTS.roleNoticeUnknown,
+      ),
       messageWake: template(prompts['messageWake'], 'messageWake', DEFAULT_PROMPTS.messageWake),
       messageLine: template(prompts['messageLine'], 'messageLine', DEFAULT_PROMPTS.messageLine),
       mailWake: template(prompts['mailWake'], 'mailWake', DEFAULT_PROMPTS.mailWake),

@@ -33,6 +33,8 @@ import { tmpdir } from 'node:os';
 import { parse, stringify } from 'yaml';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
+import { setConfig } from '../dist/config.js';
+import { buildSystemPrompt, buildWakeMessage } from '../dist/prompt.js';
 
 /**
  * Exactly the lines given, for tests about the container block itself.
@@ -1007,4 +1009,90 @@ test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to 
     () => loadAgentConfig(writeUndeclared(['crew: x'])),
     /has no `extends:` and does not declare itself standalone/,
   );
+});
+
+// ── identity at session initialization ──────────────────────────────────────
+//
+// What these pin: every role now gets a durable statement of its OWN role.
+//
+// Not "the literal was read by everyone" — it was not. It lived only in
+// `messageWake`, which renders for a Discord-channel wake alone, and those
+// sessions are coordinators. Spawned agents are woken by mail and had no role
+// statement at all; that absence is the gap, and it is the larger one.
+//
+// Driven through the REAL base config rather than a hand-built stub, so these
+// fail if the shipped YAML stops saying it.
+
+function withRealPrompts() {
+  // `extends: BASE` is the whole point: without it this loads DEFAULT_PROMPTS
+  // out of the compiled TypeScript and the assertions below say nothing about
+  // the file that actually ships. `loadAgentConfig` takes ONE argument -- a
+  // second one is silently ignored, which is how the first draft of these tests
+  // passed against a mutated YAML.
+  const loaded = loadAgentConfig(writeConfigRaw(['crew: x', `extends: ${BASE}`]));
+  setConfig({
+    discord: { token: 'u', guildId: 'u' },
+    github: { token: '', appId: '' },
+    storage: { dbPath: 'u' },
+    agent: loaded,
+  });
+}
+
+test('each role is told its own role, not the coordinator\'s', () => {
+  withRealPrompts();
+  const text = (identity) => {
+    const sp = buildSystemPrompt(identity);
+    return typeof sp === 'string' ? sp : sp.append;
+  };
+
+  for (const role of ['coordinator', 'engineer', 'researcher', 'poster', 'updater', 'host']) {
+    const out = text({ id: `hamachi-${role}1`, crew: 'hamachi', role });
+    assert.match(out, new RegExp('role `' + role + '`'), `${role} not named`);
+    assert.match(out, new RegExp('You are `hamachi-' + role + '1`'), `${role} id missing`);
+    // The specific regression: nobody but the coordinator is called the leader.
+    if (role !== 'coordinator') {
+      assert.doesNotMatch(out, /team leader/, `${role} was told it leads the team`);
+    }
+  }
+});
+
+test('an unrecognised role is named as unrecognised, not passed off as real', () => {
+  withRealPrompts();
+  const sp = buildSystemPrompt({ id: 'hamachi-x1', crew: 'hamachi', role: 'sousaphonist' });
+  const out = typeof sp === 'string' ? sp : sp.append;
+  // Truthful beats confident: it must not read as though <roles> describes it,
+  // because the agent would go looking and find nothing.
+  assert.match(out, /not one this crew defines/);
+  assert.match(out, /sousaphonist/);
+  // THE ASSERTION THAT MATTERS, and the one the first draft lacked: no clause
+  // may tell an unrecognised role which section is "yours". The earlier version
+  // decorated {role} in place, so `<sousaphonist (not a role...)>` was named as
+  // the agent's section — and both patterns above matched the FIRST occurrence,
+  // so neither noticed.
+  assert.doesNotMatch(out, /is yours/);
+  assert.doesNotMatch(out, /<sousaphonist/);
+});
+
+test('the wake carries messages, not identity', () => {
+  withRealPrompts();
+  const out = String(
+    // The REAL shape: `types.ts:12` says `kind: 'messages'` and `authorTag`.
+    // The first draft said 'message' and `author`, and reached the right branch
+    // anyway because `buildWakeMessage` returns early on 'mail' and lets
+    // everything else fall through — so it rendered `undefined: hi` and nothing
+    // asserted on the author. A fixture that only resembles the type stops
+    // exercising the right path the moment that branch becomes positive.
+    buildWakeMessage({
+      kind: 'messages',
+      channelId: 'C1',
+      messages: [
+        { at: Date.now(), authorTag: 'nick', authorId: 'u1', messageId: 'm1', content: 'hi' },
+      ],
+    }),
+  );
+  assert.doesNotMatch(out, /team leader/);
+  assert.doesNotMatch(out, /role `/);
+  // The operational tail is per-wake data and stays.
+  assert.match(out, /channel_id: C1/);
+  assert.match(out, /latest message_id: m1/);
 });
