@@ -1455,11 +1455,19 @@ export class SessionManager {
     const cutoff = Date.now() - config().agent.sessions.idleTimeoutMinutes * 60_000;
     for (const [channelId, session] of this.#sessions) {
       if (session.busy || session.lastActiveAt > cutoff) continue;
-      // ANNOUNCED, because this is the only release in the tree that happened
-      // silently. `onError` writes the error first, `onNeedsRespawn` writes
-      // "respawning", `!reset` replies in the channel, `spawn` logs the queue —
-      // and eviction, now that it is on, shrinks the pool on its own with
-      // nothing recording when, which agent, or how long it had been idle.
+      // ANNOUNCED, because this was the only release that happened silently
+      // WHILE THE PROCESS IS RUNNING. `onError` writes the error first,
+      // `onNeedsRespawn` writes "respawning", `!reset` replies in the channel,
+      // `spawn` logs the queue — and eviction, now that it is on, shrinks the
+      // pool on its own with nothing recording when, which agent, or how long it
+      // had been idle.
+      //
+      // The qualifier is load-bearing and I checked rather than assumed it:
+      // `shutdown` (:1233) releases every session and writes nothing either.
+      // That one is correct as it stands — it is teardown, every session goes,
+      // and a line apiece would be noise at the moment nobody is reading. An
+      // earlier draft of this comment said "the only release in the tree",
+      // which is a claim about the whole file and was false.
       //
       // That matters for THIS change specifically rather than as tidiness. The
       // success test for turning eviction on is "do the sentry OOMs stop", the
