@@ -18,7 +18,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -239,6 +239,17 @@ test('a real 86-line-style header, set off by a blank line, is still not an orph
   // above is safe: `armed.ts` opens with a long header followed by a blank line
   // and then imports. Pinned here so a future tightening of the header test
   // cannot quietly start flagging every module in `src/`.
+  // THE FIRST VERSION OF THIS TEST COULD NOT FAIL, and OJ found it by mutation:
+  // delete the header exclusion entirely and it stayed green. Its fixture was a
+  // header, a blank line, then `export const x = 1;` — and TypeScript ATTACHES a
+  // header to the declaration below it when nothing sits between them, so the
+  // block never reached the exclusion at all. It was passing for a reason it
+  // does not claim.
+  //
+  // A header only becomes unattached when a SECOND documented declaration
+  // follows it, which is the `types.ts` and `schedule.ts` shape. That is the
+  // only arrangement where the exclusion is the thing keeping the run green,
+  // and therefore the only one that pins it.
   const dir = repoWith({
     working: [
       '/**',
@@ -247,6 +258,7 @@ test('a real 86-line-style header, set off by a blank line, is still not an orph
       ' * Several paragraphs, then a blank line, then the code.',
       ' */',
       '',
+      '/** Doc for the constant, which takes the attachment. */',
       'export const x = 1;',
       '',
     ].join('\n'),
@@ -278,4 +290,101 @@ test('the excerpt carries the block\'s first real line, not the delimiter', () =
   const { out } = run(dir, 'HEAD');
   assert.match(out, /What this block actually says/, `got:\n${out}`);
   assert.doesNotMatch(out, /documents nothing — \/\*\*\s*$/m, 'excerpt is the bare delimiter');
+});
+
+// ── the file set, and what `git ls-files` quietly changed about it ──────────
+//
+// Round 1's finding 5 was cosmetic: a generated, gitignored file made the
+// headline count wobble between 26 and 27. The one-line fix for it — swapping
+// `readdirSync` for `git ls-files` — brought three regressions, one of them this
+// script's own named failure mode. These pin the file set itself, which nothing
+// did before.
+
+const ORPHAN_SRC = [
+  '/** Header. */',
+  '',
+  '/** Doc that lost its declaration. */',
+  '/** Doc for the type that displaced it. */',
+  'export type T = { x: number };',
+  '',
+  'export function g(): void {}',
+  '',
+].join('\n');
+
+test('a file written but not yet `git add`ed is still looked at', () => {
+  // `git ls-files` reads the INDEX. A new file that has never been added is not
+  // in it, so it dropped out of the sweep — and the summary counts what it
+  // listed, so it read as a clean pass. That is the exact shape this script
+  // exists to refuse: `ok` about a file it did not open.
+  //
+  // It is also the state a new file spends most of its life in, and the state
+  // you are in at the moment `npm run check-docs` is documented as a pre-commit
+  // check.
+  const dir = repoWith({ working: ['/** Header. */', 'export const a = 1;', ''].join('\n') });
+  writeFileSync(join(dir, 'src', 'brand-new.ts'), ORPHAN_SRC);
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.match(out, /ORPHANED\s+src\/brand-new\.ts/, `untracked file skipped — got:\n${out}`);
+  assert.equal(code, 1);
+});
+
+test('an ignored generated file is still left out', () => {
+  // The other side of the same call: finding 5's fix must survive finding 1's.
+  // `src/build-info.ts` is generated and gitignored, and the orphan half should
+  // not be parsing generated output.
+  const dir = repoWith({ working: ['/** Header. */', 'export const a = 1;', ''].join('\n') });
+  writeFileSync(join(dir, '.gitignore'), 'src/generated.ts\n');
+  writeFileSync(join(dir, 'src', 'generated.ts'), ORPHAN_SRC);
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.doesNotMatch(out, /generated\.ts/, `ignored file was scanned — got:\n${out}`);
+  assert.equal(code, 0);
+});
+
+test('a conflicted file is counted once, not once per merge stage', () => {
+  // `git ls-files` prints an unmerged path once per stage, so a file whose
+  // conflict is resolved in the editor but not yet staged was scanned three
+  // times and every finding tripled — in the count this round set out to make
+  // trustworthy.
+  const dir = mkdtempSync(join(tmpdir(), 'docs-conflict-'));
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
+  git('init', '-q', '--initial-branch=main');
+  git('config', 'user.email', 't@example.com');
+  git('config', 'user.name', 'test');
+  mkdirSync(join(dir, 'src'));
+  writeFileSync(join(dir, 'src', 'a.ts'), '/** Header. */\nexport const a = 1;\n');
+  git('add', '-A');
+  git('commit', '-qm', 'base');
+  git('checkout', '-q', '-b', 'other');
+  writeFileSync(join(dir, 'src', 'a.ts'), '/** Header. */\nexport const a = 2;\n');
+  git('commit', '-qam', 'theirs');
+  git('checkout', '-q', 'main');
+  writeFileSync(join(dir, 'src', 'a.ts'), '/** Header. */\nexport const a = 3;\n');
+  git('commit', '-qam', 'ours');
+  try {
+    git('merge', 'other');
+  } catch {
+    /* expected: this is the conflict */
+  }
+  // Resolved in the editor, deliberately not staged — the ordinary state.
+  writeFileSync(join(dir, 'src', 'a.ts'), ORPHAN_SRC);
+
+  const { out } = run(dir, 'HEAD');
+  const hits = [...out.matchAll(/ORPHANED/g)].length;
+  assert.equal(hits, 1, `one orphan in one file, reported ${hits} times:\n${out}`);
+});
+
+test('a tracked file missing from disk is a diagnostic, not a stack trace', () => {
+  // `ls-files` lists index entries whether or not the file is there, so `rm` or
+  // a `mv` without `git mv` left an entry pointing at nothing. The uncaught
+  // ENOENT exited 1 — which is this script's code for FINDINGS — and printed a
+  // stack trace, which is a worse answer than either outcome the header
+  // promises. `readdirSync` could not produce that state.
+  const dir = repoWith({ working: ['/** Header. */', 'export const a = 1;', ''].join('\n') });
+  rmSync(join(dir, 'src', 'a.ts'));
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.doesNotMatch(out, /ENOENT|at readFileSync/, `crashed instead of reporting:\n${out}`);
+  assert.match(out, /MISSING\s+src\/a\.ts/, `should name the file — got:\n${out}`);
+  assert.equal(code, 0, 'nothing was found, so this is not a findings exit');
 });

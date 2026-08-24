@@ -287,9 +287,34 @@ function orphanedBlocks(source, fileName) {
   return orphans.sort((a, b) => a.line - b.line);
 }
 
-const files = execFileSync('git', ['-C', root, 'ls-files', 'src/*.ts'], { encoding: 'utf8' })
-  .split('\n')
-  .filter(Boolean); // repo-relative already, which is what `git show` wants
+// `-c -o --exclude-standard` is cached PLUS untracked-but-not-ignored, which is
+// the set a human means by "the files here". Plain `ls-files` reads the index
+// alone, so a file written and not yet `git add`ed vanished from the sweep --
+// and the summary counts what it listed, so it read as a clean pass. That is
+// this script's own named failure mode, traded in for a cosmetic count fix.
+//
+// The `Set` because an unmerged path is printed once per STAGE, so a file whose
+// conflict is resolved in the editor and not yet staged was scanned three times
+// and every finding tripled -- in the count this round set out to make
+// trustworthy.
+//
+// `git ls-files --deduplicate` does the same job and this had both, until
+// mutation showed each alone was sufficient: removing either left the suite
+// green and only removing BOTH turned the conflict test red. Two mechanisms for
+// one property is the thing being removed elsewhere in this repository, so one
+// goes -- and the `Set` is the one that stays, because `--deduplicate` needs
+// git >= 2.31 and this does not need a version floor to collapse a list.
+const files = [
+  ...new Set(
+    execFileSync(
+      'git',
+      ['-C', root, 'ls-files', '-c', '-o', '--exclude-standard', 'src/*.ts'],
+      { encoding: 'utf8' },
+    )
+      .split('\n')
+      .filter(Boolean),
+  ),
+]; // repo-relative already, which is what `git show` wants
 
 let regressions = 0;
 let checked = 0;
@@ -297,7 +322,18 @@ let checked = 0;
 let orphans = 0;
 
 for (const file of files) {
-  const after = readFileSync(join(root, file), 'utf8');
+  // A TRACKED FILE CAN BE ABSENT FROM DISK -- `rm` or a `mv` without `git mv`
+  // leaves the index entry behind. `readdirSync` could not produce that state;
+  // `ls-files` can, and an uncaught ENOENT exits 1, which is this script's code
+  // for FINDINGS. A stack trace under a findings exit code is a worse answer
+  // than either outcome the header promises.
+  let after;
+  try {
+    after = readFileSync(join(root, file), 'utf8');
+  } catch {
+    console.log(`  MISSING    ${file}  tracked, but not on disk — skipped`);
+    continue;
+  }
 
   // THE ORPHAN CHECK RUNS ON EVERY FILE, unconditionally, and deliberately
   // BEFORE the base comparison. It needs no base ref and no `before`, so it is
