@@ -69,11 +69,33 @@
  * broke. The third of three places the same belief was written down and
  * load-bearing; the other two were in `daemon.ts` and are corrected.
  *
- * WHAT ACTUALLY MAKES THIS SAFE NOW is not this argument. `MailWaker` defers
- * `markRead` until the turn has run (#241): a settle callback travels with the
- * turn, and a turn that dies without settling leaves its mail unread for the
- * next sweep. So the no-acknowledgement design is still right — but it is right
- * because of the deferred mark, not because a dead sandbox leaves a transcript.
+ * ── AND THE TWO PATHS ARE SAFE FOR DIFFERENT REASONS ────────────────────────
+ *
+ * The first draft of this correction said the deferred mark is what makes the
+ * design safe. **That is true of the WAKE path and not of this one**, and
+ * substituting one path's guarantee for the other's is the same move as the
+ * paragraph above it — a justification covering a case it does not reach. OJ
+ * #260 round 1 caught it, in the change written to fix exactly that.
+ *
+ *   THE WAKE PATH — `MailWaker` → `renderMail`. `markRead` is deferred until
+ *   the turn has RUN (#241): a settle travels with the turn, and one that dies
+ *   without settling leaves the rows unread for the next sweep. This is what
+ *   closed #239, and it is why the sentry-OOM case is covered there.
+ *
+ *   THIS PATH — `checkMail` → `collect`, which calls `markRead` SYNCHRONOUSLY,
+ *   inside the tool call. The deferred mark never reaches it; `mail-wake.ts`
+ *   says so in as many words, that mail read this way "never reaches this
+ *   callback at all". So for a self-initiated `checkMail` the justification IS
+ *   still the transcript argument — and it holds, because here the tool RESULT
+ *   is the message, and a result that came back is in the transcript.
+ *
+ * WHAT IS LEFT ON THIS PATH, stated rather than implied: the tool runs in the
+ * host process, so `collect` commits the read before the result has crossed
+ * back into the container. A kill in that window leaves the row read, unseen,
+ * and never re-offered — `unread()` excludes it and the sweep only offers
+ * unread. That window is MILLISECONDS rather than a whole turn, which is why it
+ * is a far smaller hole than #239 and not the same bug. It is not closed by the
+ * deferred mark, and this comment should not be read as saying it is.
  *
  * NAMED RATHER THAN DELETED, deliberately. Deleting the claim would leave the
  * design looking unjustified and invite somebody to restore the acknowledgement
