@@ -470,6 +470,21 @@ test('a retry after a tool call CONTINUES; a retry after none REPLAYS (#242)', a
     const retried = String(h.pushed[1].message.content);
     assert.match(retried, /cut short by an API error/, 'a turn that acted must CONTINUE');
     assert.match(retried, /do not repeat completed work/);
+
+    // AND THE OTHER DIRECTION OF THE SYNTHETIC FLAG. `#rewake` computes it as
+    // `kind === 'mail' && !#actedSinceWake`; test 2 pins the true case, and
+    // nothing pinned this one — replacing the whole expression with `true`
+    // passed the full suite, 443 green, because this test read the content of
+    // the retried push and never its flag. A continuation is not a fresh
+    // delivery: the agent has already been woken and has already acted.
+    // `undefined`, not `false`: `PromptQueue.push` spreads the key in only when
+    // synthetic is true, so a non-synthetic message OMITS it. Asserting `false`
+    // fails here, which is the test telling me something true about the shape.
+    assert.equal(
+      h.pushed[1].isSynthetic,
+      undefined,
+      'a continuation is not synthetic — the wake it continues already happened',
+    );
   } finally {
     h.restore();
   }
