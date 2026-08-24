@@ -958,12 +958,48 @@ test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to 
   assert.match(said, /must name an INSTANCE file/);
   assert.doesNotMatch(said, /Almost certainly you want/, 'must not tell the base to extend itself');
 
-  // A file with prompt content but no mode key is a base however it is named —
-  // the suffix is a convention, not a guarantee.
+  // A file with prompt content and NO `crew` is a base however it is named — the
+  // suffix is a convention, not a guarantee.
   assert.throws(
-    () => loadAgentConfig(writeUndeclared(['prompts:', '  roleNotice: hi', 'crew: x'])),
+    () => loadAgentConfig(writeUndeclared(['prompts:', '  roleNotice: hi'])),
     /this looks like the SHARED BASE/,
   );
+
+  // AND THE `crew` HALF IS LOAD-BEARING. This fixture used to carry `crew: x` and
+  // was asserted to be the shared base — which it cannot be, since a base
+  // carrying `crew` is refused for that key. The assertion pinned a detector that
+  // over-fired on two files that are not bases, and OJ round 4 named both states.
+  //
+  // 1. An instance setting `systemPrompt.useClaudeCodeDefault` — documented, on no
+  //    refusal list, and it loads in an instance file. Delete its `extends:` line
+  //    (THE #221 SCENARIO THIS CHANGE EXISTS FOR) and it was told it is the shared
+  //    base and that adding `extends:` back "is not the fix". It is the fix.
+  // 2. A `standalone: true` config, which carries prompt content by definition.
+  //    Drop the declaration and it was told `standalone: true` is not the fix.
+  //
+  // Both carry `crew`. A base may not, and every loaded config must, so prompt
+  // content with no `crew` is the base and nothing else is.
+  for (const notABase of [
+    ['crew: x', 'systemPrompt:', '  useClaudeCodeDefault: false'],
+    ['crew: x', 'prompts:', '  roleNotice: hi'],
+    ['crew: x', 'systemPrompt:', '  append: hello'],
+  ]) {
+    assert.throws(
+      () => loadAgentConfig(writeUndeclared(notABase)),
+      /has no `extends:` and does not declare itself standalone/,
+      `${notABase.join(' ')} names a crew, so it is an instance file and must get the ordinary error`,
+    );
+    assert.doesNotThrow(
+      () => {
+        try {
+          loadAgentConfig(writeUndeclared(notABase));
+        } catch (e) {
+          if (/SHARED BASE/.test(e.message)) throw new Error('told an instance file it is the base');
+        }
+      },
+      /told an instance file it is the base/,
+    );
+  }
 
   // And an ordinary instance file with neither mode key still gets the ordinary
   // error, because it carries no prompt content.

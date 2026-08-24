@@ -1273,16 +1273,38 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     // the state where a hedge four lines down is what gets skipped. OJ round 3
     // on #228, new item 2.
     //
-    // Detected by CONTENT, not by filename: a file carrying prompt content is a
-    // base by construction, since `PROMPT_CONTENT` refuses those keys in an
-    // instance file. A `.base.yaml` suffix is a convention a third crew need not
-    // follow.
-    if ('systemPrompt' in instance || 'prompts' in instance) {
+    // Detected by CONTENT, not by filename — a `.base.yaml` suffix is a
+    // convention a third crew need not follow. But the discriminator is prompt
+    // content AND NO `crew`, and both halves are load-bearing.
+    //
+    // The first version tested prompt content alone, justified by "an instance
+    // file is refused for those keys". That is false of two files, and OJ round 4
+    // named the states:
+    //
+    //   an instance setting `systemPrompt.useClaudeCodeDefault` — a documented
+    //   knob (SETUP.md), on no refusal list, which LOADS in an instance file. Delete
+    //   its `extends:` line — THE #221 SCENARIO THIS CHANGE EXISTS FOR — and it was
+    //   told it is the shared base, told to point AGENT_CONFIG_PATH elsewhere, and
+    //   told that adding `extends:` back "is not the fix". It is exactly the fix.
+    //
+    //   a `standalone: true` config, which carries prompt content BY DEFINITION —
+    //   that is what self-contained means. Drop its declaration and it was told
+    //   `standalone: true` is not the fix, when it is the only fix.
+    //
+    // `crew` is the discriminator and it is the same by-construction argument done
+    // correctly: `BASE_FORBIDDEN` refuses `crew` in a base, and a loaded config
+    // REQUIRES it. So prompt content with no `crew` is the base and nothing else
+    // is. Both false positives above carry a `crew` line.
+    //
+    // `systemPrompt.append` rather than `systemPrompt`, so the code matches the
+    // list its own reasoning cites: `PROMPT_CONTENT` refuses `systemPrompt.append`
+    // and `prompts`, not the whole `systemPrompt` block.
+    if ((hasKey(instance, 'systemPrompt.append') || 'prompts' in instance) && !('crew' in instance)) {
       throw new Error(
         `${path}: this looks like the SHARED BASE, and AGENT_CONFIG_PATH must name an ` +
           'INSTANCE file rather than the base.\n' +
-          '  It carries prompt content, which only a base may hold — an instance file is ' +
-          'refused for exactly those keys.\n' +
+          '  It carries prompt content and names no `crew` — a base may not have one, and ' +
+          'every instance file must.\n' +
           '  Point AGENT_CONFIG_PATH at agent-config.yaml, or at whichever instance file ' +
           'this crew uses; that file names this one with `extends:`.\n' +
           'A base has no mode of its own, so adding `extends:` or `standalone: true` here ' +
