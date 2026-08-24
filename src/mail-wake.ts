@@ -71,6 +71,17 @@ import type { WakeContext } from './types.js';
  */
 const SWEEP_INTERVAL_MS = 10_000;
 
+/**
+ * How many turns one message gets before the sweep stops offering it.
+ *
+ * Three, because the failures this is bounding do not clear in one attempt and
+ * do not clear in twenty either: a dead credential, a refusing API, a container
+ * that will not start. Two would risk giving up on a genuine one-off; the point
+ * is only that the number is FINITE, since the sweep now fires on the busy flip
+ * and so re-offers with no delay at all. OJ #241 round 3 measured 26.
+ */
+const MAX_REOFFERS = 3;
+
 export type MailWakerOptions = {
   crew: string;
   registry: AgentRegistry;
@@ -139,6 +150,15 @@ export class MailWaker {
   }
 
   /** Give a turn to every agent of this crew that has mail and is not running one. */
+  /**
+   * How many turns one message gets before the sweep stops offering it. See the
+   * ceiling in `#consider`; the counter is dropped the moment a turn settles it.
+   */
+  #offers = new Map<number, number>();
+
+  /** Agents already told their mail hit the ceiling — so the line prints once. */
+  #capped = new Set<string>();
+
   sweep(): void {
     if (this.#sweeping) return;
     this.#sweeping = true;
@@ -161,6 +181,40 @@ export class MailWaker {
 
     const pending = mail.unread(agent.id);
     if (pending.length === 0) return;
+
+    // ── A CEILING ON RE-OFFERS, BECAUSE THE SWEEP IS NO LONGER ON A TIMER ────
+    //
+    // Deferring the mark means an unsettled turn leaves its mail unread and the
+    // next sweep re-offers it. That is the intended trade — a duplicate is
+    // visible, a loss is silent — but the sweep now also fires SYNCHRONOUSLY on
+    // the busy flip at the end of a turn, not only on the ten-second timer. So
+    // against an API that is refusing every call, "re-offer" has no delay in it:
+    // OJ measured 26 turns for one message, and it stops only when the API
+    // recovers.
+    //
+    // That is not the duplicate-vs-loss trade. A duplicate is one extra turn;
+    // this is a hot loop against a failing API for as long as the condition
+    // stands, and this branch introduced it — before it, the mail was consumed
+    // and the loop was one turn long.
+    //
+    // So a message gets MAX_REOFFERS turns and then stops being offered, and the
+    // line says so rather than the mail simply going quiet. It stays UNREAD, so
+    // nothing is lost and `checkMail` still returns it the moment anything else
+    // wakes the agent — which is the difference between a ceiling and a drop.
+    const overdue = pending.filter((message) => (this.#offers.get(message.id) ?? 0) >= MAX_REOFFERS);
+    if (overdue.length === pending.length) {
+      if (!this.#capped.has(agent.id)) {
+        this.#capped.add(agent.id);
+        log(
+          `${agent.id}: ${pending.length} message(s) have each been offered ${MAX_REOFFERS} times ` +
+            'without a turn that settled — not offering again. They are still UNREAD and will be ' +
+            'delivered by the next wake from any other source. Something is failing every turn: ' +
+            'check the journal above this line for the refusal.',
+        );
+      }
+      return;
+    }
+    this.#capped.delete(agent.id);
 
     if (agent.status !== 'live') {
       log(
@@ -204,6 +258,10 @@ export class MailWaker {
     // by `start` and is checked at the top of this method, so the window between
     // handoff and settle is not a window in which the same mail is offered
     // twice.
+    for (const id of pending.map((message) => message.id)) {
+      this.#offers.set(id, (this.#offers.get(id) ?? 0) + 1);
+    }
+
     let settled = false;
     const settle = (ran: boolean, why: string): void => {
       // Once. `onDone` and `onError` can both fire for one turn, and marking
@@ -212,6 +270,7 @@ export class MailWaker {
       if (settled) return;
       settled = true;
       if (ran) {
+        for (const id of ids) this.#offers.delete(id);
         mail.markRead(agent.id, ids);
         return;
       }

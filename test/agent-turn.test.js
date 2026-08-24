@@ -150,6 +150,15 @@ function drive() {
 
 const RESULT = { type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.01 };
 
+/** An API-level refusal, which arrives as an ordinary assistant message. */
+const refusal = (kind) => ({
+  type: 'assistant',
+  // The flag lives on the SDK wrapper and IS the kind — see `#handle`'s
+  // `case 'assistant'`. The detail is read out of the content blocks.
+  error: kind,
+  message: { role: 'assistant', content: [{ type: 'text', text: `API Error: ${kind}` }] },
+});
+
 // ── the defect round 2 found ─────────────────────────────────────────────────
 
 test('a successful turn settles TRUE, and settles its OWN turn (#241 round 2)', async () => {
@@ -246,6 +255,117 @@ test('!stop actually stops: interrupt settles TRUE, before the flip (#241 round 
     const flip = seen.find((s) => s.busy === false);
     assert.ok(flip, 'interrupt must publish an idle transition');
     assert.equal(flip.pending, false, 'a sweep on this transition would restart the turn just stopped');
+  } finally {
+    h.restore();
+  }
+});
+
+// ── round 3: the flip must come after everything that reads the turn ─────────
+
+test('onDone still sees the turn s error after a non-retryable refusal (#241 round 3)', async () => {
+  // Round 2 moved the settle above the flip and left `onDone` below it. `onDone`
+  // reads `#apiErrorThisTurn`, `#apiErrorKindThisTurn` and `#sentThisTurn` — the
+  // exact fields the re-entrant `#push` clears — so a sweep firing on the flip
+  // wiped them first and the four-line `mail wake REFUSED` block never printed.
+  // The Discord path lost `API REFUSED THE TURN` and `announceOutage` with it.
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(refusal('billing_error'));
+    await h.send(RESULT);
+
+    const done = h.events.find((e) => e.kind === 'done');
+    assert.ok(done, 'the turn must report');
+    assert.equal(done.apiErrorKind, 'billing_error', 'the refusal must survive to onDone');
+    assert.ok(done.apiError, 'and carry its message, which is what the journal quotes');
+  } finally {
+    h.restore();
+  }
+});
+
+test('the busy flip is the LAST thing a finished turn does (#241 round 3)', async () => {
+  // Asserted structurally rather than through one consequence, because the
+  // consequence differs per path — onDone loses a refusal, the respawn branch
+  // loses the only recovery from a dead credential. Anything observing the flip
+  // must find a turn that is finished in every sense.
+  const h = drive();
+  try {
+    let seenAtFlip = null;
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    h.session.onBusyChanged = () => {
+      if (h.session.busy === false) seenAtFlip = h.events.map((e) => e.kind);
+    };
+    await h.send(refusal('billing_error'));
+    await h.send(RESULT);
+
+    assert.ok(seenAtFlip, 'the turn must publish an idle transition');
+    assert.ok(
+      seenAtFlip.includes('done'),
+      'onDone must have already run when the flip is observed — it reads fields #push clears',
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+test('a dead credential still reaches onNeedsRespawn (#241 round 3)', async () => {
+  // The auth-failure check runs after `onDone`, so it sat behind the same wipe.
+  // Respawn is the ONLY thing that recovers a token this process will never
+  // re-read; without it the agent loops 401ing turns against a session that
+  // cannot work, with nothing in stderr saying why.
+  //
+  // The retry must be allowed to FIRE rather than re-waking: `wake` resets
+  // `#retries`, so a test that wakes again never exhausts the plan and never
+  // reaches the branch under test. There is exactly one auth retry, at 2s.
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(refusal('authentication_failed'));
+    await h.send(RESULT);
+
+    const first = h.events.find((e) => e.kind === 'done');
+    assert.equal(first.retryScheduled, true, 'the first auth failure is retried');
+    assert.equal(h.session.turnPending, true, 'and its mail is deliberately unsettled');
+
+    await new Promise((r) => setTimeout(r, 2_400));
+
+    await h.send(refusal('authentication_failed'));
+    await h.send(RESULT);
+
+    assert.ok(
+      h.events.some((e) => e.kind === 'respawn'),
+      'an exhausted auth failure must ask for a respawn',
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+test('!stop during a retry BACKOFF settles, or the agent goes deaf forever (#241 round 3)', async () => {
+  // The worst of round 3. `interrupt` returned early on `!this.busy` — and a
+  // backoff is exactly when busy is false and a settle is pending. With `isBusy`
+  // now `busy || turnPending`, that pending settle was never cleared and the
+  // waker skipped the agent FOR THE LIFE OF THE PROCESS: session never released,
+  // `idleTimeoutMinutes: 0` never evicts, mail piling up unread with no line
+  // anywhere saying so. Reachable from a Discord `!stop`.
+  const h = drive();
+  try {
+    const settles = [];
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, (ran, why) =>
+      settles.push({ ran, why }),
+    );
+    await h.send(refusal('server_error'));
+    await h.send(RESULT);
+
+    // A retryable refusal leaves the turn deliberately unsettled and the session
+    // idle for the backoff — the state the early return exists for.
+    assert.equal(h.session.busy, false, 'a backoff is idle');
+    assert.equal(h.session.turnPending, true, 'and its turn is deliberately unsettled');
+
+    await h.session.interrupt();
+
+    assert.equal(h.session.turnPending, false, 'interrupt must clear the pending turn');
+    assert.deepEqual(settles, [{ ran: true, why: 'interrupted by !stop' }]);
   } finally {
     h.restore();
   }

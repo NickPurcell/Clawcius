@@ -42,7 +42,7 @@ function board(lines = []) {
   // What `main()` in daemon.ts wires: a delivery is the fast path into a sweep.
   mail.onDelivered = (message) => waker.onDelivered(message.recipient);
 
-  return { registry, mail, waker, busy, started, add };
+  return { registry, mail, waker, busy, started, add, lines };
 }
 
 const note = (author, recipient, body = 'hello') => ({
@@ -323,3 +323,48 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
 });
 
 
+
+// ── the ceiling on re-offers ────────────────────────────────────────────────
+
+test('a message that never settles stops being offered, and the line says so (#241 round 3)', () => {
+  // Deferring the mark means an unsettled turn leaves its mail unread and the
+  // next sweep re-offers it. That trade is deliberate. What is NOT deliberate is
+  // that the sweep now also fires synchronously on the busy flip at the end of a
+  // turn, so against an API refusing every call "re-offer" has no delay in it —
+  // OJ measured 26 turns for one message, ending only when the API recovered.
+  //
+  // A duplicate is one extra turn. A hot loop against a failing API for as long
+  // as the condition stands is a different thing, and this branch introduced it:
+  // before, the mail was consumed and the loop was one turn long.
+  const { mail, waker, started, lines } = board();
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
+
+  // Every turn dies without settling — the standing-refusal case.
+  for (let i = 0; i < 10; i += 1) {
+    for (const s of started.splice(0)) s.settle(false, 'API refused: billing_error');
+    waker.sweep();
+  }
+
+  assert.equal(started.length, 0, 'the ceiling must stop the loop');
+  const capped = lines.filter((l) => /not offering again/.test(l));
+  assert.equal(capped.length, 1, 'and say so ONCE, not every sweep');
+  assert.match(capped[0], /offered 3 times/);
+
+  // STILL UNREAD — that is the difference between a ceiling and a drop. Nothing
+  // is lost, and any other wake still delivers it.
+  assert.equal(mail.unread('hamachi-engineer1').length, 1);
+});
+
+test('the re-offer counter is forgotten once a turn settles the mail (#241 round 3)', () => {
+  // Otherwise a busy agent accumulates a permanent tally and goes quiet after
+  // three ordinary messages, which would be a far worse bug than the one the
+  // ceiling fixes.
+  const { mail, waker, started } = board();
+  for (let i = 0; i < 6; i += 1) {
+    mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', `message ${i}`));
+    for (const s of started.splice(0)) s.settle(true, 'turn completed');
+    waker.sweep();
+  }
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'still listening?'));
+  assert.equal(started.length, 1, 'a settled agent never hits the ceiling');
+});
