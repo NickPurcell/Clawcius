@@ -130,7 +130,7 @@ export type DiscordHandlers = {
 /**
  * The three session events a mail wake logs and reacts to.
  *
- * THEY NO LONGER SETTLE THE MAIL. `AgentSession` does, from `#settleTurn`, at
+ * THEY NO LONGER SETTLE THE MAIL. `AgentSession` does, through `TurnSettle`, at
  * the one place a turn ends — because this object is handed to `acquire`, which
  * DROPS it for a session that already exists, so only the first wake's copy ever
  * ran. Settling from here marked the first message read and then nothing else
@@ -973,8 +973,12 @@ export async function main(): Promise<void> {
    * The events handed to a mail wake are deliberately thinner than the Discord
    * ones. There is no channel to announce an outage in and no message anybody is
    * waiting on, so a failure is a line in the journal; and a stale token drops
-   * the session without replaying, because the mail has already been marked read
-   * and handed over, and replaying it would deliver the same message twice.
+   * the session and leaves the mail UNREAD, because replaying it is the point:
+   * `onNeedsRespawn` settles the turn false, so the sweep offers the message to
+   * the session that replaces this one. (This paragraph said the opposite until
+   * #241 — that the mail was already marked read and replaying would deliver it
+   * twice. That was true when the mark happened at handoff. It is the sentence
+   * the old design left behind, and OJ round 2 caught it still standing.)
    */
   const mailWaker =
     mail && config.agent.clawsky.wakeOnMail

@@ -422,6 +422,36 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
  * queued has not ended, and guessing an answer for it would be worse than
  * waiting for the retry to produce a real one.
  */
+/**
+ * The SDK entry point, behind an assignable indirection.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ *
+ * `AgentSession`'s constructor calls `#start`, which stands up a containerised
+ * `claude`. So until this, **no test could construct one**, and everything
+ * reachable only through `wake`, `#push`, `#handle` or `#consume` had no
+ * coverage whatsoever: retry, backoff, replay-vs-continuation, API-error
+ * classification, session-id capture, the respawn path, and the turn-settle
+ * rules this file's #241 work is about.
+ *
+ * That is not a hypothetical. Five mutations of the settle logic — including
+ * two that lose mail outright — passed the full suite, 391 green every time,
+ * and the defect OJ found in #241 round 2 (the settle at the end of turn N
+ * belonging to turn N+1) is invisible to every test that does not drive a real
+ * session. Clawcius #242 has the reproduction.
+ *
+ * ── WHY HERE AND NOT A CONSTRUCTOR PARAMETER ────────────────────────────────
+ *
+ * `SessionManager.newSession` is the same shape — an assignable property with a
+ * real default — so this is the seam this file already uses, not a new idea. It
+ * is module-level rather than a constructor option for a second reason: the
+ * constructor signature is being changed on another branch, and a seam that
+ * conflicts with in-flight work is a seam nobody installs.
+ *
+ * PRODUCTION NEVER ASSIGNS THIS. A test does, and restores it.
+ */
+export const sdk = { query };
+
 export class TurnSettle {
   #pending: ((ran: boolean, why: string) => void) | null = null;
 
@@ -531,6 +561,11 @@ export class AgentSession {
 
   get busy(): boolean {
     return this.#busy;
+  }
+
+  /** Whether a turn has been handed over and has not yet ended. See `isBusy`. */
+  get turnPending(): boolean {
+    return this.#settle.pending;
   }
 
   set busy(value: boolean) {
@@ -646,7 +681,7 @@ export class AgentSession {
   }
 
   #start(resumeSessionId: string | undefined): void {
-    this.#query = query({
+    this.#query = sdk.query({
       prompt: this.#queue,
       options: this.#buildOptions(resumeSessionId),
     });
@@ -662,6 +697,15 @@ export class AgentSession {
       }
     } catch (error) {
       if (!this.#closed) {
+        // THE PATH THAT BIT, AND IT WAS SILENT. The gVisor sentry kill arrives
+        // here, asynchronously, and #239's whole point was a journal line
+        // saying the mail outlived the turn. The mail IS safe on this path —
+        // the daemon's `onError` releases the session, `release()` fires
+        // `onCountsChanged`, and the sweep re-offers it — but it was safe by
+        // the daemon's grace rather than by anything this class does, and the
+        // line never printed. Settling says so, and leaves the mail unread,
+        // which is what the sweep then finds. OJ #241 round 2.
+        this.#settle.done(false, `the turn died: ${String(error)}`);
         this.#events.onError(error instanceof Error ? error : new Error(String(error)));
       }
     }
@@ -768,8 +812,30 @@ export class AgentSession {
       }
 
       case 'result': {
-        this.busy = false;
-
+        // ── ORDER IS LOAD-BEARING: SETTLE BEFORE PUBLISHING `busy` ───────────
+        //
+        // `busy = false` is not an assignment, it is a broadcast. The setter
+        // (`:531`) calls `onBusyChanged` → `SessionManager.onCountsChanged`
+        // (`:1163`) → `mailWaker.sweep()` (`src/daemon.ts:1076`), synchronously,
+        // four plain calls deep — and that sweep is written to fire exactly
+        // here, because "a turn just ended" is when mail that arrived mid-turn
+        // comes due.
+        //
+        // So with the flip first, the sweep ran while THIS turn's mail was still
+        // unread. It re-offered it, `wake()` adopted the new turn's callback,
+        // and `adopt` settled the turn that had just SUCCEEDED as dead. The
+        // settle below then fired the NEXT turn's callback. The general form:
+        // the settle that fires at the end of turn N belongs to turn N+1.
+        //
+        // Every successful mail wake ran twice and logged "turn died before it
+        // ran" for the one that completed. Worse, the re-entrant `wake` runs
+        // `#push`, which resets `#apiErrorThisTurn` — read below — so a 529 was
+        // erased before anyone saw it and reported as a clean success, with no
+        // retry queued and nothing in the journal. That is #239 re-created by
+        // its own fix. OJ #241 round 2, verified against a real session.
+        //
+        // Settling first costs nothing: the sweep then finds a turn whose mail
+        // is already accounted for, and still does the job it exists for.
         const plan =
           this.#apiErrorKindThisTurn !== null
             ? retryPlanFor(this.#apiErrorKindThisTurn)
@@ -789,6 +855,8 @@ export class AgentSession {
         } else if (!willRetry) {
           this.#settle.done(false, `API refused: ${this.#apiErrorKindThisTurn}`);
         }
+
+        this.busy = false;
 
         this.#events.onDone({
           isError: message.is_error,
@@ -896,6 +964,15 @@ export class AgentSession {
     this.#lastContext = null;
     if (!this.#query || !this.busy) return;
     await this.#query.interrupt();
+    // SETTLED TRUE, AND BEFORE THE FLIP, for the two separate reasons the
+    // `result` handler settles first. `busy = false` broadcasts into
+    // `mailWaker.sweep()`, so an unsettled interrupt left the mail unread, the
+    // sweep re-offered it and the same turn started again — `!stop` stopped
+    // nothing. TRUE rather than FALSE because the turn RAN: a person asked for
+    // it to end, and re-delivering the message that started it is the one
+    // outcome they ruled out. #239's rule is that mail survives a turn that
+    // never ran; this turn ran and was cut short, which is not that.
+    this.#settle.done(true, 'interrupted by !stop');
     this.busy = false;
   }
 
@@ -1111,7 +1188,18 @@ export class SessionManager {
    * live `claude` process is not part of what it is to be busy.
    */
   isBusy(channelId: string): boolean {
-    return this.#sessions.get(channelId)?.busy === true;
+    const session = this.#sessions.get(channelId);
+    if (session === undefined) return false;
+    // A TURN STILL PENDING COUNTS AS BUSY, and that is the retry backoff. An
+    // API refusal with a retry queued is left unsettled on purpose — the retry
+    // re-runs the turn and its own completion decides — but the session is idle
+    // for the whole backoff, so a sweep would re-offer mail that is already
+    // spoken for and `wake()` would cancel the retry it is racing.
+    //
+    // `TurnSettle.pending` already means exactly "this turn has not ended", so
+    // this asks the question rather than tracking a second flag. It also stops
+    // the ops status file reporting a mid-backoff agent as interruptible.
+    return session.busy || session.turnPending;
   }
 
   /**

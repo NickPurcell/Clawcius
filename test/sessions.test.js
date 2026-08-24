@@ -92,6 +92,8 @@ class FakeSession {
     this.busy = false;
     this.lastActiveAt = Date.now();
     this.closed = false;
+    /** See `isBusy`: a handed-over turn that has not ended yet. */
+    this.turnPending = false;
     this.onBusyChanged = () => {};
     /** Every `wake` this session was given, with the per-turn settle. */
     this.wakes = [];
@@ -810,7 +812,7 @@ test('the role acted on is the row, not the identity the fallback would have pic
 //
 // The first version handed the per-turn `settle` callback to `acquire`. But
 // `acquire` returns an EXISTING session and drops everything else it was given
-// (`src/agent.ts:1041-1046`), and `AgentSession` stores its events once, in the
+// (`src/agent.ts:1091`), and `AgentSession` stores its events once, in the
 // constructor. So the callback reached the session only on the wake that
 // happened to CREATE it. Every mail wake after that settled nothing; the mail
 // was never marked read; the ten-second sweep re-offered it forever — a full
@@ -930,4 +932,29 @@ test('a wake carrying no settle still ends the turn before it', () => {
   assert.equal(settle.pending, false, 'a null adopt leaves nothing in flight');
   settle.done(true, 'no-op');
   assert.equal(calls.length, 1);
+});
+
+test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backoff (#241)', () => {
+  // An API refusal WITH a retry queued leaves the turn deliberately unsettled —
+  // the retry re-runs it and its own completion decides. But the session is idle
+  // for the whole backoff, so without this the ten-second sweep re-offers mail
+  // that is already spoken for and `wake()` cancels the retry it is racing.
+  // `TurnSettle.pending` already means "this turn has not ended", so `isBusy`
+  // asks it rather than tracking a second flag.
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+  manager.acquire('hamachi-engineer1', events);
+  const [session] = built;
+
+  session.busy = false;
+  session.turnPending = true;
+  assert.equal(manager.isBusy('hamachi-engineer1'), true, 'idle-but-unsettled is not idle');
+
+  session.turnPending = false;
+  assert.equal(manager.isBusy('hamachi-engineer1'), false, 'a settled idle session is free again');
 });
