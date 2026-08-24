@@ -89,6 +89,12 @@ import {
 } from './schedule.js';
 import type { AgentRegistry } from './store.js';
 
+/** The Pacific instant beside a schedule-zone one, or nothing when identical. */
+function alsoIn(at: number, timeZone: string): string {
+  const here = zonedStamp(at, DEFAULT_TIMEZONE);
+  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
+}
+
 /** PT and labelled. Same format `renderMail` uses. */
 function stamp(at: number): string {
   // PT and labelled, for the same reason as the mail header it sits beside.
@@ -153,8 +159,12 @@ export function composeReminderMail(condition: ArmedCondition, firedAt: number):
  * because its absence is a silent failure:
  *
  *   - THIS WILL HAPPEN AGAIN, and here is when, in the schedule's own timezone
- *     rather than only in UTC. "Every Monday at 9am" rendered as 16:00Z is a
- *     fact the reader has to do arithmetic on to check;
+ *     -- and, when that differs from the reader's Pacific, in Pacific too.
+ *     "Every Monday at 9am" is a fact the reader has to do arithmetic on if it
+ *     arrives in some other zone alone. It used to be paired with UTC; the pair
+ *     is now schedule-zone plus Pacific, and `alsoIn` omits the second when they
+ *     are the same string, because two identical numbers teach a reader that one
+ *     of them is noise;
  *   - IT IS LATE AND N WERE SKIPPED, when the service was down. The operator
  *     asked to be made aware of missed alerts and this is the sentence that
  *     does it. One mail, one count, never a burst — and when the count is a
@@ -185,8 +195,8 @@ export function composeScheduleMail(
     `A recurring schedule you armed on ${stamp(condition.armedAt)}: \`${spec.cron}\`` +
       `${spec.everyN > 1 ? `, every ${spec.everyN}${ordinalSuffix(spec.everyN)} occurrence` : ''}` +
       ` in ${spec.timezone}.`,
-    `This is occurrence ${fires}. It was due ${zonedStamp(condition.dueAt, spec.timezone)} ` +
-      `(${stamp(condition.dueAt)}).`,
+    `This is occurrence ${fires}. It was due ${zonedStamp(condition.dueAt, spec.timezone)}` +
+      `${alsoIn(condition.dueAt, spec.timezone)}.`,
   ];
 
   if (lateBy > LATE_AFTER_MS) {
@@ -238,7 +248,7 @@ export function composeScheduleMail(
     );
   } else {
     lines.push(
-      `Next: ${zonedStamp(plan.nextAt, spec.timezone)} (${stamp(plan.nextAt)}). This repeats ` +
+      `Next: ${zonedStamp(plan.nextAt, spec.timezone)}${alsoIn(plan.nextAt, spec.timezone)}. This repeats ` +
         `until you stop it — disarm(${condition.id}) — and listArmed() shows it with when it ` +
         'last fired and when it fires next.',
     );

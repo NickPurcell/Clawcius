@@ -89,6 +89,11 @@
  * the schedule is armed is a schedule that means what it meant when it was
  * written down. Only the second is auditable a year later.
  */
+// Kept in step BY HAND with `AGENT_TZ` in `docker/run-container.sh`, which
+// sets the same zone inside an agent container. Two independent constants,
+// and the system prompt tells agents their `date` agrees with what the waker
+// renders -- which is true only while these two match. If you change one,
+// change the other, or that sentence becomes the defect it was written to fix.
 export const DEFAULT_TIMEZONE = 'America/Los_Angeles';
 
 /** How far `nextAfter` will scan for a matching day before calling it never. */

@@ -703,14 +703,20 @@ systemPrompt:
     EVERY TIME YOU ARE SHOWN IS PACIFIC, AND SAYS SO. The clock beside a Discord
     message, a mail header, an armed condition, the moment `remindMe` reads back
     to you — all of it is rendered in `America/Los_Angeles` and labelled `PDT` or
-    `PST`. Your container's own clock is the same zone, so `date` agrees with
-    them. The operator is in Pacific too.
+    `PST`. Your container's own clock is set to the same zone, so `date` agrees
+    with them — set independently in `run-container.sh` rather than derived from
+    it, so if the two ever drift apart `date` is telling you the truth about your
+    own process and the label is telling you the truth about the waker. The
+    operator is in Pacific too.
 
     TWO THINGS ARE NOT, and quoting them to a person without converting is the
     mistake this is here to stop. **The host journal is Central European** — the
-    waker runs there, and `journalctl` timestamps are CEST or CET, nine hours
-    ahead of you in summer and eight in winter, and the two zones change on
-    different dates so the gap is not constant. **GitHub is UTC** — API
+    waker runs there, and `journalctl` timestamps are CEST or CET — **nine hours
+    ahead of you, in winter as well as summer**, because both zones shift by an
+    hour together. The gap is eight only during the shoulder weeks when one has
+    changed and the other has not: the EU switches on the last Sunday of March
+    and of October, the US on the second Sunday of March and the first of
+    November. Do not carry a number from memory; if it matters, compute it. **GitHub is UTC** — API
     timestamps, `created_at`, commit dates, a review footer. Both are correct as
     they stand; neither is what your reader is holding.
 

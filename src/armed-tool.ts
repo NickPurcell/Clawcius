@@ -274,6 +274,21 @@ function stamp(at: number): string {
 }
 
 /**
+ * The absolute instant beside a schedule-zone rendering, or nothing.
+ *
+ * The parenthetical exists so a reader can check the arithmetic on a time
+ * shown in some other zone. Now that `stamp` is Pacific and Pacific is also
+ * the default schedule zone, the pair collapsed into the same string twice --
+ * `2026-08-24 09:00 PDT (2026-08-24 09:00 PDT)`. Two identical numbers teach
+ * a reader that one of them is noise, which is how the useful one stops being
+ * read on the day the zones differ.
+ */
+function alsoIn(at: number, timeZone: string): string {
+  const here = zonedStamp(at, DEFAULT_TIMEZONE);
+  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
+}
+
+/**
  * "in 3 minutes", "2 hours ago" — the useful half of a timestamp.
  *
  * `armed-wake.ts` has a one-directional cousin of this for saying how late a
@@ -523,8 +538,10 @@ function describeRemindMe(agentId: string): string {
     '               with no conversation around it, so "finish that" will not mean anything.',
     '    inMinutes  minutes from now. Use this or `at`, not both.',
     '    at         an ISO 8601 instant WITH a zone, e.g. 2026-08-15T09:00:00Z. A bare',
-    '               local time is refused — this tool runs on the host, not in your',
-    '               container, and the two do not share a timezone.',
+    '               local time is still refused: what you are READ BACK is Pacific,',
+    '               and rendering output in a zone does not make ambiguous input safe.',
+    '               So the receipt shows a different number from the one you typed —',
+    '               09:00Z reads back as 02:00 PDT. Same instant, your zone.',
     '',
     'ONE-SHOT. It fires once and disarms, and this tool has no repeat argument — the turn that',
     'receives a reminder is a turn that holds this tool, so "again tomorrow" is a call you make',
@@ -888,7 +905,7 @@ export function buildArmedTools(
       const armed = options.store.arm(agentId, 'schedule', first.at, spec, seen);
 
       const fires = preview(fields, zone, step, first.at, PREVIEW_FIRES)
-        .map((at) => `      ${zonedStamp(at, zone)}  (${stamp(at)})`)
+        .map((at) => `      ${zonedStamp(at, zone)}${alsoIn(at, zone)}`)
         .join('\n');
 
       return ok(

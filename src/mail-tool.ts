@@ -63,7 +63,13 @@ import { FEED } from './mail.js';
 import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
 /**
- * PT and labelled.
+ * PT and labelled, to the minute.
+ *
+ * SECONDS ARE GONE and that is a real change riding along with the zone: two
+ * feed posts inside one minute now carry the same header. Accepted rather than
+ * overlooked -- ordering comes from the row, not from the rendering, and a
+ * header is read to place a message in a day. Named here so the next person
+ * finds a decision rather than an accident.
  *
  * This used to read "UTC, spelled out. The waker and the container do not
  * share a timezone." The observation was right and UTC was the wrong answer
