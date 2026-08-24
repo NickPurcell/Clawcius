@@ -71,11 +71,12 @@
  *
  * A reminder and a PR watch both end by themselves, which was the argument for
  * shipping without a way to read the table back or cancel a row — a schedule
- * does not, which is the paragraph above. It held for one condition and
- * not for two: duplicates last as long as the thing they watch and multiply
- * the mail for the whole of it. That is Clawcius #50, and it happened — two
- * watches on one pull request, armed by two agents that each had no way to see
- * the other's, delivering every event twice with no way to stop it.
+ * does not, which is what `A reminder is one-shot, and a schedule is the other
+ * thing` argues above. It held for one condition and not for two: duplicates
+ * last as long as the thing they watch and multiply the mail for the whole of
+ * it. That is Clawcius #50, and it happened — two watches on one pull request,
+ * armed by two agents that each had no way to see the other's, delivering every
+ * event twice with no way to stop it.
  *
  * So `listFor` and `spentFor` are read by a tool now, `disarmFor` withdraws a
  * row on an agent's say-so, and `findPrWatch` lets the arming tool refuse the

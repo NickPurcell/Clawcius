@@ -769,7 +769,7 @@ export async function main(): Promise<void> {
   }
 
   /**
-   * Armed conditions — `remindMe` and `watchPr`.
+   * Armed conditions — `remindMe`, `scheduleRecurring` and `watchPr`.
    *
    * ── The token check happens HERE, once, in the process that would use it ────
    *
