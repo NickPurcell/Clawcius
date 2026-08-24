@@ -274,7 +274,8 @@ export class AtCapacityError extends Error {
  * freed a slot in the ordinary course. The shipped value is now 30, so a slot
  * does free itself eventually — but "eventually" is up to thirty minutes away
  * and the message in hand is already dropped, so telling the reader to try
- * again would still be telling them to wait for something they cannot see. Naming the remedies is the useful half — and
+ * again would still be telling them to wait for something they cannot
+ * see. Naming the remedies is the useful half — and
  * `!reset` comes first because it is the only one the reader can act on
  * themselves. A restart is the operator's and raising the cap is an edit and a
  * redeploy, so a message that named only those two told the reader to wait for
@@ -1084,6 +1085,7 @@ export class SessionManager {
    * delivered to, so it is only wired when mail is.
    */
   #spawnLog: ((line: string) => void) | null;
+  #evictLog: ((line: string) => void) | null;
   #sweeper: NodeJS.Timeout;
 
   constructor(
@@ -1091,11 +1093,25 @@ export class SessionManager {
     mail: MailStore | null = null,
     armed: ArmedToolOptions | null = null,
     spawnLog: ((line: string) => void) | null = null,
+    /**
+     * Where an eviction writes its line.
+     *
+     * SEPARATE FROM `spawnLog`, and the separation is the finding. Eviction
+     * first wrote through `spawnLog`, which is prefixed `[spawn]` and is built
+     * as `mail ? … : null` — so every eviction landed in the spawn journal
+     * ("every line here names the coordinator that spawned, the agent it got,
+     * and whether the first turn actually started", which stopped being true),
+     * and with the board off it was null and eviction went silent again, which
+     * was the whole finding it was added for. Eviction is memory management and
+     * has nothing to do with the mail board. OJ #249 round 2.
+     */
+    evictLog: ((line: string) => void) | null = null,
   ) {
     this.#registry = registry;
     this.#mail = mail;
     this.#armed = armed;
     this.#spawnLog = spawnLog;
+    this.#evictLog = evictLog;
     this.#sweeper = setInterval(() => void this.evictIdle(), 60_000);
     this.#sweeper.unref();
   }
@@ -1421,11 +1437,16 @@ export class SessionManager {
   /**
    * Reclaim sessions nobody is using. Driven by the 60s sweeper.
    *
-   * PUBLIC so it can be driven directly. It was private, which meant the only
-   * way to observe an eviction was to wait a minute for the interval — so the
-   * behaviour had no test, and #242 is a whole issue about what that costs in
-   * this file. `release`, `persist` and `isBusy` are public for the same sort of
-   * reason; this is not a test-only hook bolted onto a private.
+   * PUBLIC so it can be driven directly rather than through `t.mock.timers`.
+   *
+   * NOT because it was untested — it was, by 'with a timeout set, the sweeper
+   * evicts the idle and leaves the busy', which predates this change and sits
+   * twenty-five lines above the test that replaced this comment's first draft.
+   * That draft said the behaviour "had no test", which I wrote without looking
+   * up the file I was editing. Driving the method directly is still the better
+   * shape — it is what makes the new test readable — but the reason is
+   * ergonomics, not coverage. `release`, `persist` and `isBusy` are public for
+   * the same sort of reason.
    */
   async evictIdle(): Promise<void> {
     // 0 disables eviction: sessions stay alive for the life of the process.
@@ -1448,7 +1469,7 @@ export class SessionManager {
       // file cannot say, being an overwritten snapshot of a count rather than a
       // record of events. OJ #249 round 1.
       const idleMinutes = Math.round((Date.now() - session.lastActiveAt) / 60_000);
-      this.#spawnLog?.(`evicting ${channelId} — idle ${idleMinutes} minute(s), slot freed`);
+      this.#evictLog?.(`evicting ${channelId} — idle ${idleMinutes} minute(s), slot freed`);
       // The session ID survives in SQLite, so the next mention resumes rather
       // than starting a cold conversation.
       await this.release(channelId);

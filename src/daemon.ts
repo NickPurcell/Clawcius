@@ -632,7 +632,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
       // shipped 30 an idle session is reclaimed eventually — but "eventually"
       // is up to thirty minutes, it depends on somebody else's channel going
       // quiet, and none of it is visible from here. So this still announces
-      // rather than staying silent: the messages in hand are gone eitherway. Silence here is
+      // rather than staying silent: the messages in hand are gone either way. Silence here is
       // indistinguishable from the bot being down — the same reading
       // `announceOutage` exists to prevent — and spawn is what makes it
       // reachable by a coordinator rather than only by the operator: a spawned
@@ -985,7 +985,17 @@ export async function main(): Promise<void> {
       }
     : null;
 
-  const sessions = new SessionManager(registry, mail, armedTools, spawnLog);
+  const sessions = new SessionManager(
+    registry,
+    mail,
+    armedTools,
+    spawnLog,
+    // UNCONDITIONAL, unlike `spawnLog`. Eviction is memory management; tying
+    // its observability to whether the mail board is on would leave the one
+    // deployment without a board unable to answer "did eviction fire at all",
+    // which is the first question when the OOMs do not stop.
+    (line) => process.stdout.write(`[sessions] ${line}\n`),
+  );
 
   /**
    * Mail wakes an idle agent — CLAWSKY.md phase 3.

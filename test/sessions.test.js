@@ -1006,7 +1006,7 @@ test('eviction announces itself — it was the only silent release while running
   });
   const registry = new AgentRegistry(dbPath, { crew: CREW });
   // The EVICTION sink, which is the FIFTH argument and not `spawnLog`. The
-  // first version passed it fourth — mail-null WITH a log function, a
+  // first version passed it as the fourth — mail-null WITH a log function, a
   // combination `main()` cannot construct — so it proved a line was emitted and
   // said nothing about whether it reached a journal. It did not: `spawnLog` is
   // prefixed `[spawn]` and is null whenever the mail board is off, so eviction

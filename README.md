@@ -46,7 +46,7 @@ been addressed, or on a wake it scheduled for itself.
 ceiling so continuous typing cannot defer it forever, so a burst of three lines
 arrives as one turn rather than three.
 
-**Stays warm.** One session per channel, never evicted by default, resumed from
+**Stays warm while it is working.** One session per channel, resumed from
 SQLite across restarts. Nothing obliges it to reply; silence is a normal
 outcome.
 

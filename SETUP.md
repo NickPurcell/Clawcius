@@ -737,8 +737,8 @@ that is mid-turn keeps its process until the turn drains, since `close()`
 (`src/agent.ts:714`) closes the prompt queue rather than interrupting the way
 `!stop` does. So it frees a slot faster than it frees memory when the session
 is mid-turn; on an idle one — which is most of what any pool holds, and all of
-what one at `idleTimeoutMinutes: 0` accumulates — both come back together. It costs that channel's transcript
-and only that: `clearSession` clears the session ID rather than the row, so
+what one at `idleTimeoutMinutes: 0` accumulates — both come back together. It
+costs that channel's transcript and only that: `clearSession` clears the session ID rather than the row, so
 the mailbox survives, and a turn finishing after the reset does not write its
 ID back either, because `persist` returns early once the map entry is gone
 (`src/agent.ts:1008`). Two limits on it. It reaches only channels, so a
