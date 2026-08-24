@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { MailWaker } from '../dist/mail-wake.js';
+import { SUPERSEDED } from '../dist/types.js';
 
 function board(lines = []) {
   const path = join(mkdtempSync(join(tmpdir(), 'clawsky-wake-')), 'clawcius.db');
@@ -346,12 +347,64 @@ test('a message that never settles stops being offered, and the line says so (#2
   }
 
   assert.equal(started.length, 0, 'the ceiling must stop the loop');
-  const capped = lines.filter((l) => /not offering again/.test(l));
+  const capped = lines.filter((l) => /pausing for/.test(l));
   assert.equal(capped.length, 1, 'and say so ONCE, not every sweep');
   assert.match(capped[0], /offered 3 times/);
+  assert.match(capped[0], /stay\s+UNREAD/i);
 
   // STILL UNREAD — that is the difference between a ceiling and a drop. Nothing
   // is lost, and any other wake still delivers it.
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
+
+test('a superseded turn does NOT spend one of a message s re-offers (#241 round 4)', () => {
+  // Three Discord messages interleaved with a pending mail turn is ordinary
+  // traffic in a coordinator's channel. Counting each supersede as a failed
+  // offer parked the mail and printed "something is failing every turn: check
+  // the journal for the refusal" — with three supersede lines above it and no
+  // refusal anywhere. One miscount, a false ceiling AND a false sentence.
+  const { mail, waker, started, lines } = board();
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
+
+  for (let i = 0; i < 6; i += 1) {
+    for (const s of started.splice(0)) s.settle(false, SUPERSEDED);
+    waker.sweep();
+  }
+
+  assert.equal(started.length, 1, 'ordinary Discord traffic must not park the mail');
+  assert.deepEqual(
+    lines.filter((l) => /pausing for/.test(l)),
+    [],
+    'and must not blame a refusal that never happened',
+  );
+});
+
+test('the ceiling is three offers PER WINDOW, not three ever (#241 round 4)', () => {
+  // Each failure re-sweeps synchronously through `release()`, so three offers
+  // can be spent in milliseconds. The flagship incident — the sentry OOM-killed
+  // and back seconds later — otherwise ended with the mail parked for good,
+  // which is the phase-2 behaviour this feature exists to replace.
+  const { mail, waker, started, lines } = board();
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
+
+  for (let i = 0; i < 5; i += 1) {
+    for (const s of started.splice(0)) s.settle(false, 'API refused: server_error');
+    waker.sweep();
+  }
+  assert.equal(started.length, 0, 'the hot loop is bounded');
+  assert.equal(lines.filter((l) => /pausing for/.test(l)).length, 1);
+
+  // The window passes and the blip is over.
+  const realNow = Date.now;
+  try {
+    const later = realNow() + 61_000;
+    Date.now = () => later;
+    waker.sweep();
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.equal(started.length, 1, 'a paused batch must be offered again once the window passes');
+  assert.equal(mail.unread('hamachi-engineer1').length, 1, 'and was never lost while paused');
+});

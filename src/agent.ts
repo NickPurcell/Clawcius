@@ -31,6 +31,7 @@ import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
 import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
+import { SUPERSEDED } from './types.js';
 
 /**
  * Matches a `discord send` / `discord reply` invocation in a bash command,
@@ -927,7 +928,7 @@ export class AgentSession {
     // turn never completed — nothing else would have left it. Settle it FALSE:
     // its mail was never confirmed read, so it should be offered again rather
     // than silently dropped when this callback replaces it.
-    this.#settle.adopt(onSettled, 'a new wake arrived before the previous turn settled');
+    this.#settle.adopt(onSettled, SUPERSEDED);
     this.#cancelRetry();
     this.#lastContext = context;
     this.#retries = 0;
@@ -987,32 +988,41 @@ export class AgentSession {
     this.#cancelRetry();
     this.#lastContext = null;
 
-    // SETTLED BEFORE THE EARLY RETURN, and that is the whole point of putting it
-    // here rather than below. The comment above says this method runs its first
-    // two statements before the busy check because a retry backoff is a state
-    // where the session is idle — and a backoff is EXACTLY when `busy` is false
-    // and a settle is pending. Settling below the return meant `!stop` during a
-    // backoff left the turn pending forever; with `isBusy` now
-    // `busy || turnPending`, the waker then skipped that agent FOR THE LIFE OF
-    // THE PROCESS. Nothing recovered it: the session is never released and
-    // `idleTimeoutMinutes: 0` never evicts, so mail piled up unread and
-    // undelivered with no line anywhere saying so.
+    // ── SETTLED BEFORE THE EARLY RETURN, AND THE ANSWER DIFFERS EITHER SIDE
+    //    OF IT ─────────────────────────────────────────────────────────────
     //
-    // Reachable in production — `!stop` acts on `message.channelId`, and a
-    // Discord channel's row is a mail-carrying crew member. A few seconds wide,
-    // and the consequence does not end. OJ #241 round 3.
-    this.#settle.done(true, 'interrupted by !stop');
-
-    if (!this.#query || !this.busy) return;
+    // BEFORE the return, because the state that return exists for is a retry
+    // backoff — and a backoff is exactly when `busy` is false and a settle is
+    // pending. Settling below it meant `!stop` during a backoff left the turn
+    // pending forever; with `isBusy` now `busy || turnPending`, the waker then
+    // skipped that agent FOR THE LIFE OF THE PROCESS, with mail piling up
+    // unread and no line anywhere saying so. (#241 round 3.)
+    //
+    // FALSE here and TRUE below, because the two branches are different turns:
+    //
+    //   · a BACKOFF is a turn the API REFUSED. It produced nothing and nobody
+    //     read the mail — which is this file's own rule thirty lines up, where a
+    //     refusal with no retry settles FALSE. The only difference is that a
+    //     retry was going to re-run it, and `!stop` has just cancelled that.
+    //     Settling TRUE marked the message read having never shown it to
+    //     anybody: silent loss, in the change written to end silent loss.
+    //
+    //   · a RUNNING turn below the return DID run. A person asked for it to end,
+    //     and re-delivering the message that started it is the outcome they
+    //     ruled out.
+    //
+    // `busy` already tells them apart, which is why the settle can sit either
+    // side of the check and mean different things. (#241 round 4.)
+    // `done` fires ONCE, so each branch settles inside itself. Settling FALSE
+    // above the check and TRUE below it would have the FALSE spend the callback
+    // and the TRUE quietly do nothing — a running turn settling as if it had
+    // never run, which is the opposite of both intentions.
+    if (!this.#query || !this.busy) {
+      this.#settle.done(false, 'stopped during a retry backoff — the turn never ran');
+      return;
+    }
     await this.#query.interrupt();
-    // SETTLED TRUE, AND BEFORE THE FLIP, for the two separate reasons the
-    // `result` handler settles first. `busy = false` broadcasts into
-    // `mailWaker.sweep()`, so an unsettled interrupt left the mail unread, the
-    // sweep re-offered it and the same turn started again — `!stop` stopped
-    // nothing. TRUE rather than FALSE because the turn RAN: a person asked for
-    // it to end, and re-delivering the message that started it is the one
-    // outcome they ruled out. #239's rule is that mail survives a turn that
-    // never ran; this turn ran and was cut short, which is not that.
+    this.#settle.done(true, 'interrupted by !stop');
     this.busy = false;
   }
 

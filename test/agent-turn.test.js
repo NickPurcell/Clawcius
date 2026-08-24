@@ -365,7 +365,15 @@ test('!stop during a retry BACKOFF settles, or the agent goes deaf forever (#241
     await h.session.interrupt();
 
     assert.equal(h.session.turnPending, false, 'interrupt must clear the pending turn');
-    assert.deepEqual(settles, [{ ran: true, why: 'interrupted by !stop' }]);
+
+    // FALSE, not TRUE. A backoff is a turn the API REFUSED — it produced
+    // nothing and nobody read the mail. `!stop` cancels the retry that was
+    // going to re-run it, so marking the message read would consume it having
+    // never shown it to anybody: silent loss, in the change written to end
+    // silent loss. Round 4.
+    assert.equal(settles.length, 1);
+    assert.equal(settles[0].ran, false, 'mail nobody has seen is not mail that was read');
+    assert.match(settles[0].why, /never ran/);
   } finally {
     h.restore();
   }

@@ -57,6 +57,7 @@ import { renderMail } from './mail-tool.js';
 import { FEED, type MailStore } from './mail.js';
 import type { AgentRecord, AgentRegistry } from './store.js';
 import type { WakeContext } from './types.js';
+import { SUPERSEDED } from './types.js';
 
 /**
  * The guarantee behind the fast path.
@@ -81,6 +82,21 @@ const SWEEP_INTERVAL_MS = 10_000;
  * and so re-offers with no delay at all. OJ #241 round 3 measured 26.
  */
 const MAX_REOFFERS = 3;
+
+/**
+ * How long a spent ceiling holds before the message is offered again.
+ *
+ * The attempt count alone had no time in it, and each failure re-sweeps
+ * SYNCHRONOUSLY through `release()`, so three offers could be spent in
+ * milliseconds. The flagship incident this whole change is about — the sentry
+ * OOM-killed and back seconds later — therefore ended with the mail parked
+ * indefinitely, which is the phase-2 behaviour the feature exists to replace.
+ *
+ * So the ceiling is three attempts PER WINDOW rather than three ever: it bounds
+ * the hot loop to a handful of turns a minute, and a blip recovers on its own.
+ * #241 round 4.
+ */
+const REOFFER_WINDOW_MS = 60_000;
 
 export type MailWakerOptions = {
   crew: string;
@@ -149,16 +165,27 @@ export class MailWaker {
     this.sweep();
   }
 
-  /** Give a turn to every agent of this crew that has mail and is not running one. */
   /**
    * How many turns one message gets before the sweep stops offering it. See the
    * ceiling in `#consider`; the counter is dropped the moment a turn settles it.
    */
-  #offers = new Map<number, number>();
+  #offers = new Map<string, Map<number, number>>();
+
+  #offersFor(agentId: string): Map<number, number> {
+    const existing = this.#offers.get(agentId);
+    if (existing) return existing;
+    const fresh = new Map<number, number>();
+    this.#offers.set(agentId, fresh);
+    return fresh;
+  }
 
   /** Agents already told their mail hit the ceiling — so the line prints once. */
   #capped = new Set<string>();
 
+  /** When the current re-offer window opened, per agent. See `REOFFER_WINDOW_MS`. */
+  #windowStartedAt = new Map<string, number>();
+
+  /** Give a turn to every agent of this crew that has mail and is not running one. */
   sweep(): void {
     if (this.#sweeping) return;
     this.#sweeping = true;
@@ -201,15 +228,34 @@ export class MailWaker {
     // line says so rather than the mail simply going quiet. It stays UNREAD, so
     // nothing is lost and `checkMail` still returns it the moment anything else
     // wakes the agent — which is the difference between a ceiling and a drop.
-    const overdue = pending.filter((message) => (this.#offers.get(message.id) ?? 0) >= MAX_REOFFERS);
+    const now = Date.now();
+    // The window is per agent: the messages are offered as one batch, so they
+    // are capped and released as one.
+    if (this.#windowStartedAt.has(agent.id) && now - (this.#windowStartedAt.get(agent.id) ?? 0) > REOFFER_WINDOW_MS) {
+      this.#windowStartedAt.delete(agent.id);
+      this.#capped.delete(agent.id);
+      this.#offers.delete(agent.id);
+    }
+    // Mail read by some OTHER turn — an agent calling `checkMail` itself —
+    // never reaches `settle(true)`, so its counters were never dropped and the
+    // map grew with message volume for the life of the process. `pending` is
+    // the whole truth about what is unread for this agent, so anything counted
+    // and no longer in it is finished with. That is also why the counters are
+    // keyed by agent: it makes this sweepable without asking the store which
+    // recipient a message id belonged to.
+    const offers = this.#offersFor(agent.id);
+    const stillPending = new Set(pending.map((message) => message.id));
+    for (const id of offers.keys()) if (!stillPending.has(id)) offers.delete(id);
+
+    const overdue = pending.filter((message) => (offers.get(message.id) ?? 0) >= MAX_REOFFERS);
     if (overdue.length === pending.length) {
       if (!this.#capped.has(agent.id)) {
         this.#capped.add(agent.id);
         log(
           `${agent.id}: ${pending.length} message(s) have each been offered ${MAX_REOFFERS} times ` +
-            'without a turn that settled — not offering again. They are still UNREAD and will be ' +
-            'delivered by the next wake from any other source. Something is failing every turn: ' +
-            'check the journal above this line for the refusal.',
+            `without a turn that settled — pausing for ${REOFFER_WINDOW_MS / 1000}s. They stay ` +
+            'UNREAD, any other wake still delivers them, and the sweep tries again after the ' +
+            'pause. Whatever ended those turns is in the journal above this line.',
         );
       }
       return;
@@ -258,8 +304,11 @@ export class MailWaker {
     // by `start` and is checked at the top of this method, so the window between
     // handoff and settle is not a window in which the same mail is offered
     // twice.
+    // The window opens on the FIRST offer of a batch, not on the sweep that
+    // happened to look — so the pause is measured from when the trouble started.
+    if (!this.#windowStartedAt.has(agent.id)) this.#windowStartedAt.set(agent.id, now);
     for (const id of pending.map((message) => message.id)) {
-      this.#offers.set(id, (this.#offers.get(id) ?? 0) + 1);
+      offers.set(id, (offers.get(id) ?? 0) + 1);
     }
 
     let settled = false;
@@ -269,6 +318,19 @@ export class MailWaker {
       // than either.
       if (settled) return;
       settled = true;
+      // A SUPERSEDE IS NOT A FAILED OFFER, so it does not spend one. Three
+      // Discord messages interleaved with a pending mail turn — ordinary
+      // traffic in a coordinator's channel — otherwise parked the mail and
+      // printed "something is failing every turn: check the journal for the
+      // refusal" with three supersede lines above it and no refusal anywhere.
+      // A false sentence and a false ceiling from the same miscount. #241 r4.
+      if (!ran && why.startsWith(SUPERSEDED)) {
+        for (const id of ids) {
+          const spent = offers.get(id);
+          if (spent !== undefined) offers.set(id, Math.max(0, spent - 1));
+        }
+      }
+
       if (ran) {
         // MEMORY, NOT BEHAVIOUR, and there is deliberately no test for it. The
         // map is keyed by message id, so a stale entry cannot affect a NEW
@@ -276,7 +338,7 @@ export class MailWaker {
         // agent never hits the ceiling", then mutated this line away and the
         // test still passed: it could not fail, which makes it worse than
         // nothing. Deleted, and the reason recorded here instead.
-        for (const id of ids) this.#offers.delete(id);
+        for (const id of ids) offers.delete(id);
         mail.markRead(agent.id, ids);
         return;
       }
