@@ -1328,8 +1328,11 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     root = deepMerge(base, instance, keyProvenance, basePath, path);
   }
   delete root['extends'];
-  // Both mode keys are stripped before validation, so neither reaches the config
-  // object and neither can be mistaken for a setting.
+  // Belt and braces only, and labelled as such rather than as a guard: the
+  // config object below is built key by key from `root`, so an unhandled root
+  // key cannot reach it whether or not these deletes happen. A test asserting
+  // `config.standalone === undefined` therefore passes with the delete removed,
+  // which is a test that looks like coverage and is not — found by mutating it.
   delete root['standalone'];
 
   // Refused wherever it appears, including a standalone file, because unlike

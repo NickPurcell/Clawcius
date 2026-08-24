@@ -567,10 +567,12 @@ test('a config must DECLARE its mode; silence is an error (#221)', () => {
     /standalone cannot be true in a file that also has `extends:`/,
   );
 
-  // Neither mode key survives into the config object.
-  const config = loadAgentConfig(writeConfigRaw(['standalone: true', 'crew: x']));
-  assert.equal(config.standalone, undefined);
-  assert.equal(config.extends, undefined);
+  // NO assertion here that the mode keys are absent from the resolved config.
+  // There was one, and mutating the `delete` calls away did not fail it: the
+  // config object is built key by key, so an unhandled root key cannot reach it
+  // in the first place. The assertion could not fail, which makes it worse than
+  // no assertion — it reads as coverage of a delete that is only belt and
+  // braces. Removed rather than rewritten, because there is nothing to check.
 });
 
 test('the real shipped config, minus its extends line, is refused (#221)', () => {
