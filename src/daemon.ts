@@ -191,10 +191,16 @@ export function mailWakeEvents(opts: {
       // absence read as "no turns ran" rather than "turns ran and we do not
       // log them". A handoff line with no completion line cannot tell those
       // apart, which is the whole shape of #239.
+      // `subtype` IS THE FIELD THE INCIDENT ANALYSIS RESTS ON. The grep quoted
+      // in this change's own description — `mail wake turn — 34 matches, ALL
+      // "success"` — is this field, and without it a turn that ended
+      // `error_max_turns` logs exactly what a clean one logs. That is the
+      // distinction the line exists to make, so it goes first.
       log(
-        `${agentId}: turn finished` +
+        `${agentId}: mail wake turn ${summary.subtype}` +
+          (summary.isError ? ' (isError)' : '') +
           (summary.costUsd === undefined ? '' : ` — $${summary.costUsd.toFixed(4)}`) +
-          (summary.numTurns === undefined ? '' : `, ${summary.numTurns} turn(s)`),
+          (summary.numTurns === undefined ? '' : `, ${summary.numTurns} model turn(s)`),
       );
     },
     // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that claimed

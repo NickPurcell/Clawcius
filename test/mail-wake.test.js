@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { MailWaker } from '../dist/mail-wake.js';
+import { mailWakeEvents } from '../dist/daemon.js';
 import { SUPERSEDED } from '../dist/types.js';
 
 function board(lines = []) {
@@ -362,8 +363,11 @@ test('a message that never settles stops being offered, and the line says so (#2
   );
   assert.match(capped[0], /a NEW message to this agent releases the batch/);
 
-  // STILL UNREAD — that is the difference between a ceiling and a drop. Nothing
-  // is lost, and any other wake still delivers it.
+  // STILL UNREAD — that is the difference between a ceiling and a drop.
+  // Nothing is lost, and the batch is released either by the pause expiring or
+  // by a new message arriving for this agent. (This comment said "any other
+  // wake still delivers it" until round 6 — the same false claim the assertion
+  // five lines above forbids, left behind in the commit that removed it.)
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
@@ -417,4 +421,104 @@ test('the ceiling is three offers PER WINDOW, not three ever (#241 round 4)', ()
 
   assert.equal(started.length, 1, 'a paused batch must be offered again once the window passes');
   assert.equal(mail.unread('hamachi-engineer1').length, 1, 'and was never lost while paused');
+});
+
+// ── mailWakeEvents: the wiring #239 actually lived in ───────────────────────
+//
+// Its tests were deleted in round 3, when settling moved to `AgentSession` and
+// they became assertions at the wrong layer. Nothing replaced them, while the
+// doc comment above it still said it had been "EXTRACTED SO THEY CAN BE TESTED,
+// because this wiring is exactly where #239 lived … Fixing a path and leaving it
+// untested is the shape that produced the bug." Round 6 pointed out that the
+// newest code in it — the completion line — was the unpinned part.
+
+const summary = (over = {}) => ({
+  isError: false,
+  costUsd: 0.01,
+  numTurns: 1,
+  durationMs: 10,
+  subtype: 'success',
+  sentMessage: false,
+  apiError: null,
+  apiErrorKind: null,
+  retryScheduled: false,
+  retryAttempt: 0,
+  ...over,
+});
+
+function wired() {
+  const out = { log: [], err: [], persisted: 0, released: 0 };
+  const events = mailWakeEvents({
+    persist: () => (out.persisted += 1),
+    release: () => (out.released += 1),
+    err: (line) => out.err.push(line),
+    log: (line) => out.log.push(line),
+    agentId: 'hamachi-engineer1',
+  });
+  return { events, out };
+}
+
+test('a finished mail wake logs its SUBTYPE, not just that it finished (#241 round 6)', () => {
+  // The grep this change's own description rests on is `mail wake turn — 34
+  // matches, ALL "success"`, and *success* is this field. Without it a turn that
+  // ended `error_max_turns` logs exactly what a clean one logs, which is the
+  // distinction the line exists to make.
+  const { events, out } = wired();
+  events.onDone(summary());
+  assert.equal(out.log.length, 1);
+  assert.match(out.log[0], /mail wake turn success/);
+
+  const bad = wired();
+  bad.events.onDone(summary({ subtype: 'error_max_turns', isError: true }));
+  assert.match(bad.out.log[0], /mail wake turn error_max_turns/);
+  assert.match(bad.out.log[0], /isError/);
+});
+
+test('a refusal logs the REFUSED block and NO completion line', () => {
+  // A refused turn did not finish. Logging both would be the handoff-line
+  // problem again: two lines that cannot be told apart by grep.
+  const { events, out } = wired();
+  events.onDone(summary({ apiError: 'API Error: billing_error', apiErrorKind: 'billing_error' }));
+  assert.deepEqual(out.log, [], 'a refusal has not finished a turn');
+  assert.equal(out.err.length, 1);
+  assert.match(out.err[0], /mail wake REFUSED \(billing_error\)/);
+  assert.match(out.err[0], /not retrying — mail left unread for the next sweep/);
+});
+
+test('a refusal WITH a retry queued says so, and still logs no completion', () => {
+  const { events, out } = wired();
+  events.onDone(summary({
+    apiError: 'API Error: server_error',
+    apiErrorKind: 'server_error',
+    retryScheduled: true,
+    retryAttempt: 1,
+  }));
+  assert.deepEqual(out.log, []);
+  assert.match(out.err[0], /retry 1 queued/);
+  assert.doesNotMatch(out.err[0], /left unread for the next sweep/, 'the retry re-runs it');
+});
+
+test('the refusal block does not end in a blank line', () => {
+  // `err` appends its own newline and the block used to end in one too.
+  const { events, out } = wired();
+  events.onDone(summary({ apiError: 'x', apiErrorKind: 'billing_error' }));
+  assert.doesNotMatch(out.err[0], /\n$/);
+});
+
+test('every turn persists the session id, refused or not', () => {
+  // The id is how an evicted or dropped session resumes the same transcript.
+  const a = wired();
+  a.events.onDone(summary());
+  assert.equal(a.out.persisted, 1);
+
+  const b = wired();
+  b.events.onDone(summary({ apiError: 'x', apiErrorKind: 'billing_error' }));
+  assert.equal(b.out.persisted, 1, 'a refused turn still has an id worth keeping');
+});
+
+test('a stale token releases the session and says so', () => {
+  const { events, out } = wired();
+  events.onNeedsRespawn();
+  assert.equal(out.released, 1);
+  assert.match(out.err.join('\n'), /stale token/);
 });
