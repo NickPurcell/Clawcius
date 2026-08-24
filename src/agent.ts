@@ -1463,9 +1463,7 @@ export class SessionManager {
       // had been idle.
       //
       // The qualifier is load-bearing and I checked rather than assumed it:
-      // `shutdown` releases every session and writes nothing either. (Named,
-      // not cited by line: my own insertion above moved it from :1233 to :1238
-      // in the same commit that wrote the citation, which is #251 in miniature.)
+      // `shutdown` releases every session and writes nothing either.
       // That one is correct as it stands — it is teardown, every session goes,
       // and a line apiece would be noise at the moment nobody is reading. An
       // earlier draft of this comment said "the only release in the tree",
