@@ -57,17 +57,18 @@ export function buildSystemPrompt(identity: PromptIdentity): Options['systemProm
   // time a session is constructed, including on resume, so it cannot drift out
   // of step with a session that already carries an old preamble in its history
   // -- and it survives compaction, which a first turn does not.
-  const roleNotice = render(config().agent.prompts.roleNotice, {
-    id: identity.id,
-    crew: identity.crew,
-    // A ROLE THE CREW DOES NOT DEFINE IS NAMED AS SUCH RATHER THAN PASSED OFF.
-    // The bug being fixed here is a wrong role asserted confidently, so the one
-    // thing this must not do is print an unknown string as though `<roles>`
-    // described it -- the agent would go looking and find nothing.
-    role: isAgentRole(identity.role)
-      ? identity.role
-      : `${identity.role} (not a role this crew defines — see <roles>)`,
-  });
+  //
+  // A ROLE THE CREW DOES NOT DEFINE GETS A DIFFERENT TEMPLATE, not a decorated
+  // value. Decorating produced `<sousaphonist (not a role this crew defines)>`
+  // in the clause that says which section is yours -- still telling the agent a
+  // section exists, and naming a nonsense one. Two templates means the unknown
+  // case simply has no such clause. It also keeps this file's own rule from the
+  // header: no prose the agent sees lives in code, only substitution.
+  const known = isAgentRole(identity.role);
+  const roleNotice = render(
+    known ? config().agent.prompts.roleNotice : config().agent.prompts.roleNoticeUnknown,
+    { id: identity.id, crew: identity.crew, role: identity.role },
+  );
 
   const layered = [protocol, roleNotice, config().agent.systemPrompt.append.trim()]
     .filter(Boolean)
@@ -146,7 +147,6 @@ export function buildWakeMessage(context: WakeContext): string {
 
   return render(prompts.messageWake, {
     cli,
-    roleNotice: prompts.roleNotice,
     count: String(messages.length),
     plural: messages.length === 1 ? 'message' : 'messages',
     messages: rendered,

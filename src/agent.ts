@@ -478,13 +478,21 @@ export class AgentSession {
      * the registry row and this class deliberately knows nothing about the
      * registry.
      */
-    model?: string,
+    // `string | undefined` rather than optional, so the required `identity`
+    // can follow it. `newSession` -- the only caller -- already passes both.
+    model: string | undefined,
     /**
      * Resolved by the caller for the same reason `model` is, and used once, in
      * `#buildOptions` -- so a session says who it is in the one place that
      * survives compaction and is rebuilt on resume.
+     *
+     * REQUIRED, deliberately. `newSession` is the only construction path and
+     * always passes one, so a default buys nothing -- and it would convert a
+     * future call site that forgot into a `tsc` error turned into rendered text
+     * a model reads: crew `` and an empty role are exactly the confidently-wrong
+     * identity this change exists to remove.
      */
-    identity: PromptIdentity = { id: channelId, crew: '', role: '' },
+    identity: PromptIdentity,
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;

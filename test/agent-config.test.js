@@ -1059,8 +1059,15 @@ test('an unrecognised role is named as unrecognised, not passed off as real', ()
   const out = typeof sp === 'string' ? sp : sp.append;
   // Truthful beats confident: it must not read as though <roles> describes it,
   // because the agent would go looking and find nothing.
-  assert.match(out, /not a role this crew defines/);
+  assert.match(out, /not one this crew defines/);
   assert.match(out, /sousaphonist/);
+  // THE ASSERTION THAT MATTERS, and the one the first draft lacked: no clause
+  // may tell an unrecognised role which section is "yours". The earlier version
+  // decorated {role} in place, so `<sousaphonist (not a role...)>` was named as
+  // the agent's section — and both patterns above matched the FIRST occurrence,
+  // so neither noticed.
+  assert.doesNotMatch(out, /is yours/);
+  assert.doesNotMatch(out, /<sousaphonist/);
 });
 
 test('the wake carries messages, not identity', () => {

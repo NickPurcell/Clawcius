@@ -168,7 +168,14 @@ prompts:
   # confidently is the defect this replaced.
   #
   # Set to "" to drop it entirely.
-  roleNotice: "You are `{id}` — crew `{crew}`, role `{role}`. The `<roles>` section above describes the whole crew; `<{role}>` is yours. Wakes reach only the main agent of a session: subagents you spawn are never woken this way."
+  roleNotice: "You are `{id}` — crew `{crew}`, role `{role}`. The `<roles>` section below describes the whole crew; `<{role}>` is yours. Wakes reach only the main agent of a session: subagents you spawn are never woken this way."
+
+  # Used instead of roleNotice when the row carries a role the crew does not
+  # define. A SEPARATE TEMPLATE rather than a decorated {role}, because the
+  # decorated version still rendered "`<{role}>` is yours" and named a section
+  # that cannot exist. This one has no such clause. Placeholders: {id} {crew}
+  # {role}.
+  roleNoticeUnknown: "You are `{id}` — crew `{crew}`. Your role is recorded as `{role}`, which is not one this crew defines, so `<roles>` below does not describe it. Say so if it matters. Wakes reach only the main agent of a session: subagents you spawn are never woken this way."
 
   # Wake message when Discord messages arrive. Carries the new messages and the
   # operational tail and nothing else — identity is said once, above, at session
