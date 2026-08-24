@@ -159,6 +159,25 @@ function drive() {
       await new Promise((r) => setImmediate(r));
       await new Promise((r) => setImmediate(r));
     },
+    /**
+     * Wait until `n` prompts have been pushed, or give up loudly.
+     *
+     * NOT a fixed sleep. The retried push arrives at 1999–2004ms against a
+     * 2_400ms sleep — ~400ms of slack, and the spread widens as the suite grows
+     * and `node --test` runs files concurrently. When it trips it trips
+     * `assert.equal(h.pushed.length, 2)`, which reads as a regression in the
+     * retry path rather than as a slow machine. Polling is deterministic and
+     * faster: these two tests were ~4.8s of the suite.
+     */
+    async waitForPushes(n, capMs = 8_000) {
+      const started = Date.now();
+      while (pushed.length < n) {
+        if (Date.now() - started > capMs) {
+          throw new Error(`only ${pushed.length} of ${n} prompts pushed within ${capMs}ms`);
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    },
     restore: () => {
       sdk.query = real;
     },
@@ -433,9 +452,8 @@ test('a retry after a tool call CONTINUES; a retry after none REPLAYS (#242)', a
     // starts at 5s and this test only needs the retry to fire, not which plan.
     await h.send(refusal('authentication_failed'));
     await h.send(RESULT);
-    await new Promise((r) => setTimeout(r, 2_400));
+    await h.waitForPushes(2);
 
-    assert.equal(h.pushed.length, 2, 'the retry must have run');
     const retried = String(h.pushed[1].message.content);
     assert.match(retried, /cut short by an API error/, 'a turn that acted must CONTINUE');
     assert.match(retried, /do not repeat completed work/);
@@ -453,9 +471,8 @@ test('a retry with no tool call replays the wake verbatim, and stays synthetic (
     h.session.wake({ kind: 'mail', channelId: AGENT, mail: 'look at #31', count: 1 }, () => {});
     await h.send(refusal('authentication_failed'));
     await h.send(RESULT);
-    await new Promise((r) => setTimeout(r, 2_400));
+    await h.waitForPushes(2);
 
-    assert.equal(h.pushed.length, 2);
     const retried = String(h.pushed[1].message.content);
     assert.doesNotMatch(retried, /cut short by an API error/, 'nothing ran, so nothing to continue');
     assert.equal(
@@ -493,9 +510,21 @@ test('respawn is for a dead CREDENTIAL, not for any exhausted error (#242)', asy
     await h.send(refusal('billing_error'));
     await h.send(RESULT);
 
-    assert.ok(
-      h.events.some((e) => e.kind === 'done'),
-      'the turn ended',
+    const done = h.events.find((e) => e.kind === 'done');
+    assert.ok(done, 'the turn ended');
+
+    // PIN THE PREMISE, or this test can stop testing without failing. It proves
+    // its point only because `retryPlanFor('billing_error')` returns null, so
+    // `willRetry` is false and the auth-failure `else if` is actually reached.
+    // Add `billing_error` to TRANSIENT_ERRORS one day and `willRetry` becomes
+    // true, the branch is never evaluated, and this keeps passing while no
+    // longer able to catch the mutation it was written for. The `done` event
+    // already carries the fact, so pinning it costs one line. OJ #255 round 2.
+    assert.equal(
+      done.retryScheduled,
+      false,
+      'the respawn branch is only reached when no retry was queued — if this ' +
+        'fails, this test has stopped exercising the branch it names',
     );
     assert.equal(
       h.events.some((e) => e.kind === 'respawn'),
@@ -513,16 +542,21 @@ test('the retry timer is unref d, so a backoff cannot hold the process open (#24
   // the daemon hang for up to 45 seconds on shutdown, which reads as a slow
   // deploy rather than as a bug, and no test could see it because the timer is
   // private. Captured at `setTimeout` instead, which is where it is created.
+  // PATCHED AFTER `drive()`, not before. The patch used to sit above it with
+  // `drive()` outside the `try`, so a throw in `drive()` left
+  // `globalThis.setTimeout` monkeypatched for every later test in the file. The
+  // blast radius was zero only because this test happens to be last —
+  // positional luck — and it inverts the debugging order: the test that broke
+  // things passes and its successors fail strangely.
+  const h = drive();
   const realSetTimeout = globalThis.setTimeout;
   const timers = [];
-  globalThis.setTimeout = (...args) => {
-    const t = realSetTimeout(...args);
-    timers.push(t);
-    return t;
-  };
-
-  const h = drive();
   try {
+    globalThis.setTimeout = (...args) => {
+      const t = realSetTimeout(...args);
+      timers.push(t);
+      return t;
+    };
     h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
     await h.send(refusal('authentication_failed'));
     await h.send(RESULT);
