@@ -222,3 +222,31 @@ test('a turn that dies asynchronously settles FALSE and says so (#239)', async (
     h.restore();
   }
 });
+
+test('!stop actually stops: interrupt settles TRUE, before the flip (#241 round 2)', async () => {
+  // `interrupt` set `busy = false` without settling, and that flip broadcasts
+  // into `mailWaker.sweep()` — which found the mail unread and started the same
+  // turn again. `!stop` stopped nothing.
+  //
+  // TRUE rather than FALSE because the turn RAN. #239's rule is that mail
+  // survives a turn that never ran; a turn a person cut short is not that, and
+  // re-delivering the message that started it is the one outcome they ruled out.
+  const h = drive();
+  try {
+    const settles = [];
+    const seen = [];
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, (ran, why) =>
+      settles.push({ ran, why }),
+    );
+    h.session.onBusyChanged = () => seen.push({ busy: h.session.busy, pending: h.session.turnPending });
+
+    await h.session.interrupt();
+
+    assert.deepEqual(settles, [{ ran: true, why: 'interrupted by !stop' }]);
+    const flip = seen.find((s) => s.busy === false);
+    assert.ok(flip, 'interrupt must publish an idle transition');
+    assert.equal(flip.pending, false, 'a sweep on this transition would restart the turn just stopped');
+  } finally {
+    h.restore();
+  }
+});
