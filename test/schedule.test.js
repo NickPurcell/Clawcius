@@ -1140,20 +1140,57 @@ test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async (
   );
 });
 
-test('the Pacific parenthetical is omitted when it would repeat the line', async () => {
-  // The property that went wrong, and that nothing asserted on either time: last
-  // round the collapse survived because no test read the parenthesised half; the
-  // FIX had the same gap under it until this existed.
-  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
-  const alsoIn = (at, tz) => {
-    const here = zonedStamp(at, DEFAULT_TIMEZONE);
-    return zonedStamp(at, tz) === here ? '' : ` (${here})`;
-  };
-  const at = Date.parse('2026-08-24T16:00:00Z');
+test('a schedule in the reader\'s own zone is rendered once, not twice', async () => {
+  // THIS TEST'S FIRST DRAFT TESTED A COPY OF THE FUNCTION. It pasted `alsoIn`'s
+  // three lines into the test body and asserted on those, so deleting the whole
+  // fix from `armed-tool.ts` left the suite green at 388/388. It was written to
+  // close a finding about a duplication nothing asserted on, and it had the
+  // identical defect: it asserted on something that was not the shipped code.
+  //
+  // So it drives the real tool now, and reads the string an agent would read.
+  const { registry, store } = board();
+  const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
 
-  // A schedule in the reader's own zone: one rendering, no echo.
-  assert.equal(alsoIn(at, DEFAULT_TIMEZONE), '');
-  // Any other zone: two genuinely different facts, so both are shown.
-  assert.equal(alsoIn(at, 'Europe/London'), ` (${zonedStamp(at, DEFAULT_TIMEZONE)})`);
-  assert.notEqual(alsoIn(at, 'UTC'), '');
+  // BOTH surfaces, because they use different code and I checked: undoing
+  // `alsoIn` leaves `listArmed` green, and undoing the `local` suppression
+  // leaves the receipt green. One assertion would have caught one defect.
+  const receipt = said(
+    await scheduleRecurring.handler(
+      { note: 'stand-up', cron: '0 9 * * *', timezone: 'America/Los_Angeles' },
+      {},
+    ),
+  );
+  assert.doesNotMatch(receipt, /P[DS]T\)/, 'the preview echoed each fire in the same zone');
+
+  const mine = said(await listArmed.handler({}, {}));
+
+  // The reader's own zone: one rendering. No ` (…)` echo, and no second line
+  // repeating the first and calling it `local`.
+  assert.match(mine, /fires \d{4}-\d{2}-\d{2} \d{2}:\d{2} P[DS]T/);
+  assert.doesNotMatch(mine, /P[DS]T\)/, 'the parenthetical repeated the line it annotates');
+  assert.doesNotMatch(mine, /P[DS]T local/, 'the `local` line repeated the line above it');
+
+  registry.close();
+});
+
+test('a schedule in another zone still shows both, because they are two facts', async () => {
+  const { registry, store } = board();
+  const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
+
+  const receipt = said(
+    await scheduleRecurring.handler(
+      { note: 'london stand-up', cron: '0 9 * * *', timezone: 'Europe/London' },
+      {},
+    ),
+  );
+  // The preview must still carry both: the schedule's zone and the reader's.
+  assert.match(receipt, /GMT\+1.*\(.*P[DS]T\)/, 'the preview dropped the Pacific instant');
+
+  const mine = said(await listArmed.handler({}, {}));
+
+  // Suppression must not have eaten the case it exists to preserve: the
+  // schedule's own zone and the reader's are different numbers here.
+  assert.match(mine, /local/, 'the schedule-zone line was suppressed when it carried a fact');
+  assert.match(mine, /P[DS]T/, 'the reader\'s own zone is missing');
+  registry.close();
 });
