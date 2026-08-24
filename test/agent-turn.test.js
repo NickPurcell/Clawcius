@@ -52,7 +52,16 @@ function installConfig() {
       // The prompt builders and the container spawner read these. Nothing here
       // is under test — they exist so the class can be constructed at all,
       // which is the whole reason this file could not be written before.
-      prompts: { protocol: 'protocol', mailWake: '{{mail}}', discord: '{{text}}', armed: '{{note}}' },
+      prompts: {
+        protocol: 'protocol',
+        // #234 added these two: a role the crew does not define gets a
+        // different template rather than a decorated value.
+        roleNotice: 'you are {{id}}',
+        roleNoticeUnknown: 'you are {{id}}',
+        mailWake: '{{mail}}',
+        discord: '{{text}}',
+        armed: '{{note}}',
+      },
       paths: { discordCli: '/bin/true' },
       systemPrompt: { append: '', useClaudeCodeDefault: false },
       // `githubTokenDir` is DERIVED from `stateDir` by the loader — that
@@ -119,7 +128,15 @@ function drive() {
     onNeedsRespawn: () => messages.push({ kind: 'respawn' }),
   };
 
-  const session = new AgentSession(AGENT, tempDir('ws-'), undefined, events, null, undefined);
+  // `identity` is REQUIRED as of #234 — deliberately, so a missing one fails the
+  // build rather than rendering `crew ``, role `(not a role this crew defines)`
+  // into a live model's context. Nothing here tests it; it exists so the class
+  // can be constructed.
+  const session = new AgentSession(AGENT, tempDir('ws-'), undefined, events, null, undefined, {
+    id: AGENT,
+    crew: CREW,
+    role: 'engineer',
+  });
 
   return {
     session,
