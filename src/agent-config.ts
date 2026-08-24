@@ -1267,6 +1267,29 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   // loader completely. The protection was never a guard — it was a side effect
   // of a different requirement, and deriving removed it.
   if (!('extends' in instance) && !standalone) {
+    // A BASE POINTED AT DIRECTLY gets its own message, because the generic one
+    // below tells it to extend ITSELF. `AGENT_CONFIG_PATH` naming the base is a
+    // mistake three documents already warn about, and the reader is in exactly
+    // the state where a hedge four lines down is what gets skipped. OJ round 3
+    // on #228, new item 2.
+    //
+    // Detected by CONTENT, not by filename: a file carrying prompt content is a
+    // base by construction, since `PROMPT_CONTENT` refuses those keys in an
+    // instance file. A `.base.yaml` suffix is a convention a third crew need not
+    // follow.
+    if ('systemPrompt' in instance || 'prompts' in instance) {
+      throw new Error(
+        `${path}: this looks like the SHARED BASE, and AGENT_CONFIG_PATH must name an ` +
+          'INSTANCE file rather than the base.\n' +
+          '  It carries prompt content, which only a base may hold — an instance file is ' +
+          'refused for exactly those keys.\n' +
+          '  Point AGENT_CONFIG_PATH at agent-config.yaml, or at whichever instance file ' +
+          'this crew uses; that file names this one with `extends:`.\n' +
+          'A base has no mode of its own, so adding `extends:` or `standalone: true` here ' +
+          'is not the fix — the first would be a chain and is refused.',
+      );
+    }
+
     // The two ways out are NOT symmetric and the message must not present them
     // as though they were. An operator reads this having just been refused, in a
     // hurry, and `standalone: true` is the shorter line — but taking it

@@ -939,3 +939,36 @@ test('githubTokenDir is refused inside OR equal to any other bind mount', () => 
     );
   }
 });
+
+test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to extend itself', () => {
+  // OJ round 3 on #228, new item 2. The base has neither mode key, so it took the
+  // generic error — which offers `extends: agent-config.base.yaml` as the likely
+  // fix. That is the shared base being told to name itself, read by an operator
+  // in the state where the hedge four lines down is what gets skipped.
+  //
+  // Detected by content rather than filename: a file carrying prompt content is a
+  // base by construction, since an instance file is refused for those keys.
+  let said = '';
+  try {
+    loadAgentConfig('agent-config.base.yaml');
+  } catch (e) {
+    said = e.message;
+  }
+  assert.match(said, /this looks like the SHARED BASE/);
+  assert.match(said, /must name an INSTANCE file/);
+  assert.doesNotMatch(said, /Almost certainly you want/, 'must not tell the base to extend itself');
+
+  // A file with prompt content but no mode key is a base however it is named —
+  // the suffix is a convention, not a guarantee.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['prompts:', '  roleNotice: hi', 'crew: x'])),
+    /this looks like the SHARED BASE/,
+  );
+
+  // And an ordinary instance file with neither mode key still gets the ordinary
+  // error, because it carries no prompt content.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: x'])),
+    /has no `extends:` and does not declare itself standalone/,
+  );
+});

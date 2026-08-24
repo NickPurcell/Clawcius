@@ -160,12 +160,18 @@ file full of secrets. **Most** keys in the YAML are optional and fall back to th
 defaults in `src/agent-config.ts`; the loader validates types and fails at
 startup with the offending path named, rather than at the first mention.
 
-**Two keys are required**, for two different reasons — they are not one rule:
+**Two keys are required in the file `AGENT_CONFIG_PATH` names** — the instance
+file, never the base — for two different reasons, and they are not one rule:
 
 | key | why it is required |
 |---|---|
 | `crew` | it has no default, because a default would be one crew's value handed to a crew that did not say its own. Every path and identity derives from it |
 | `extends` **or** `standalone: true` | silence used to *mean* standalone, and meant it dangerously. See below |
+
+**All three of those keys are boot errors in the base.** `crew` and `standalone`
+are refused there, and `extends` in a base is a refused chain — so the row above
+describes the instance file only, which is the distinction this section exists to
+teach and the one an operator holding three YAML files cannot infer.
 
 `container.stateDir` is **not** in that table, though it has no default either.
 It derives from `crew`, and in any file with `extends:` — which is every config
@@ -174,7 +180,9 @@ reachable only from a `standalone: true` config, which is the mode the next
 paragraph calls almost never what you want. § *Adding an instance* says **do not
 add paths** for the same reason.
 
-**A config must declare which mode it is in.** An instance file names its base —
+**An instance file must declare which mode it is in.** A base has no mode — it is
+the thing an instance points at, and the loader says so if you give it one. An
+instance file names its base —
 `extends: agent-config.base.yaml`. A deliberately self-contained config says
 `standalone: true`. A file with neither is a boot error naming both options, and
 a file claiming both is refused rather than resolved by precedence.
