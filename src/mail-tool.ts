@@ -60,10 +60,19 @@ import {
 import { z } from 'zod';
 import type { MailMessage, MailStore } from './mail.js';
 import { FEED } from './mail.js';
+import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
-/** UTC, spelled out. The waker and the container do not share a timezone. */
+/**
+ * PT and labelled.
+ *
+ * This used to read "UTC, spelled out. The waker and the container do not
+ * share a timezone." The observation was right and UTC was the wrong answer
+ * to it: an agent's own clock is PT, so a UTC header made every mail arrive in
+ * a second zone the reader had to convert from. Same fact, opposite fix.
+ */
 function stamp(at: number): string {
-  return new Date(at).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  // PT and labelled: an agent reads these beside its own clock, which is PT.
+  return zonedStamp(at, DEFAULT_TIMEZONE);
 }
 
 export function renderMail(messages: readonly MailMessage[]): string {

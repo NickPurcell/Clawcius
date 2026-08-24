@@ -15,6 +15,7 @@
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
 import type { WakeContext } from './types.js';
+import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
 /** Substitute `{name}` placeholders. Unknown names cannot survive config validation. */
 function render(template: string, vars: Record<string, string>): string {
@@ -75,8 +76,18 @@ export function buildSpawnCharter(vars: {
   return render(config().agent.prompts.spawnCharter, vars);
 }
 
+/**
+ * The clock an agent reads beside every Discord message.
+ *
+ * PINNED TO PT AND LABELLED, because the un-pinned version rendered in whatever
+ * zone the WAKER PROCESS happened to run in — and the waker runs on the host,
+ * which is `Europe/Berlin`. `container.ts` already puts `TZ` in `HOST_ONLY` so
+ * that "whatever the server happens to be set to" cannot silently win inside a
+ * container; rendering on the host walked around that wall rather than through
+ * it, and the agent had no way to tell, because the number carried no label.
+ */
 function clockOf(at: number): string {
-  return new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  return zonedStamp(at, DEFAULT_TIMEZONE, 'time');
 }
 
 /** The per-wake message handed to the agent. */

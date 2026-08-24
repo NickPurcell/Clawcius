@@ -1073,3 +1073,49 @@ test('the tool descriptions state what a schedule is and is not', () => {
   assert.match(remindMe.description, /scheduleRecurring/);
   registry.close();
 });
+
+// ── everything an agent is shown is PT, and says so ─────────────────────────
+//
+// THESE EPOCHS ARE CHOSEN, NOT ARBITRARY. The waker runs on the host, which is
+// Europe/Berlin; agent containers are America/Los_Angeles. A test that only
+// asserts "a zone label is present" passes in both, so it would not have caught
+// the defect — the old code produced a correct-looking number in a container and
+// a wrong one on the host.
+//
+// So each epoch below renders in a DIFFERENT HOUR in the two zones, and the
+// assertions pin the hour and the literal abbreviation. Weakening either one
+// makes these pass on the host, which is the thing they exist to stop.
+
+test('a rendered time is PT, in the hour PT would use — not the host process zone', async () => {
+  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+
+  // 02:30Z: 19:30 the previous day in PT, 04:30 the same day in Berlin.
+  // Different hour AND different date, so nothing accidental can align them.
+  const at = Date.parse('2026-08-24T02:30:00Z');
+
+  assert.equal(zonedStamp(at, DEFAULT_TIMEZONE, 'time'), '19:30 PDT');
+  assert.equal(zonedStamp(at, DEFAULT_TIMEZONE), '2026-08-23 19:30 PDT');
+
+  // The rendering the host would have produced, kept in the file so the contrast
+  // is here rather than in a commit message. Asserted as a DIFFERENCE rather
+  // than as a literal: the first draft asserted 'CEST' from memory and this ICU
+  // renders Europe/Berlin as 'GMT+2'. What matters is that the host's hour is
+  // not PT's, which is the whole defect; the abbreviation it happens to print is
+  // not this test's business.
+  const asHost = zonedStamp(at, 'Europe/Berlin', 'time');
+  assert.notEqual(asHost.slice(0, 5), '19:30', 'host and PT must not agree here');
+  assert.equal(asHost.slice(0, 5), '04:30');
+});
+
+test('the abbreviation follows the changeover rather than being hardcoded', async () => {
+  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  // Same wall-clock intent, six months apart. A hardcoded "PDT" passes the test
+  // above and fails this one.
+  assert.match(zonedStamp(Date.parse('2026-08-24T02:30:00Z'), DEFAULT_TIMEZONE, 'time'), /PDT$/);
+  assert.match(zonedStamp(Date.parse('2026-01-15T02:30:00Z'), DEFAULT_TIMEZONE, 'time'), /PST$/);
+});
+
+test('DEFAULT_TIMEZONE is the agents\' zone, not the process\'s', async () => {
+  const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  assert.equal(DEFAULT_TIMEZONE, 'America/Los_Angeles');
+});

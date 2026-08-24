@@ -268,9 +268,9 @@ function refuse(text: string) {
   return { content: [{ type: 'text' as const, text }], isError: true };
 }
 
-/** UTC, spelled out. Same format `renderMail` uses. */
+/** PT and labelled. Same format `renderMail` uses. */
 function stamp(at: number): string {
-  return new Date(at).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  return zonedStamp(at, DEFAULT_TIMEZONE);
 }
 
 /**
@@ -704,13 +704,13 @@ export function buildArmedTools(
 
       if (dueAt <= now) {
         return refuse(
-          `Not armed — that moment (${new Date(dueAt).toISOString()}) has already passed. ` +
+          `Not armed — that moment (${stamp(dueAt)}) has already passed. ` +
             'A reminder is for the future; if you need to act now, act now.',
         );
       }
       if (dueAt - now > MAX_AHEAD_MS) {
         return refuse(
-          `Not armed — that is more than a year away (${new Date(dueAt).toISOString()}), ` +
+          `Not armed — that is more than a year away (${stamp(dueAt)}), ` +
             'which is almost always a typo in `inMinutes`.',
         );
       }
@@ -721,7 +721,7 @@ export function buildArmedTools(
       const armed = options.store.arm(agentId, 'reminder', dueAt, { note: text });
 
       return ok(
-        `Armed reminder ${armed.id} for ${agentId}, due ${new Date(dueAt).toISOString()} ` +
+        `Armed reminder ${armed.id} for ${agentId}, due ${stamp(dueAt)} ` +
           `(in ${Math.round((dueAt - now) / 60_000)} minutes). It is on disk, so a restart ` +
           'does not lose it, and it fires late rather than never if the service is down when ' +
           'it comes due.',
@@ -834,7 +834,7 @@ export function buildArmedTools(
         if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
           const past = anchorAt < now;
           return refuse(
-            `Not armed — the anchor ${new Date(anchorAt).toISOString()} is more than a year ` +
+            `Not armed — the anchor ${stamp(anchorAt)} is more than a year ` +
               `${past ? 'in the past' : 'away'}, which is almost always a typo. ` +
               (past
                 ? 'A past anchor only chooses which occurrences are selected, and every phase ' +

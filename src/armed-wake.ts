@@ -80,12 +80,19 @@ import type {
   ScheduleSeen,
   ScheduleSpec,
 } from './armed.js';
-import { isTimezone, parseCron, planNextFire, zonedStamp } from './schedule.js';
+import {
+  DEFAULT_TIMEZONE,
+  isTimezone,
+  parseCron,
+  planNextFire,
+  zonedStamp,
+} from './schedule.js';
 import type { AgentRegistry } from './store.js';
 
-/** UTC, spelled out. Same format `renderMail` uses. */
+/** PT and labelled. Same format `renderMail` uses. */
 function stamp(at: number): string {
-  return new Date(at).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  // PT and labelled, for the same reason as the mail header it sits beside.
+  return zonedStamp(at, DEFAULT_TIMEZONE);
 }
 
 function minutes(ms: number): string {

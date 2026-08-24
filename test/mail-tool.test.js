@@ -235,8 +235,10 @@ test('rendering names the sender and distinguishes a DM from the feed', () => {
   ]);
 
   assert.match(text, /^2 messages\./);
-  assert.match(text, /\[DM\] from hamachi-coordinator · 2026-08-14 09:30:00Z/);
+  // Same instant, PT: 09:30Z is 02:30 PDT. The zone is part of the assertion
+  // because a bare number is what the defect looked like.
+  assert.match(text, /\[DM\] from hamachi-coordinator · 2026-08-14 02:30 PDT/);
   assert.match(text, /subject: the release/);
-  assert.match(text, /\[FEED\] from clawcius-poster · 2026-08-14 09:31:00Z/);
+  assert.match(text, /\[FEED\] from clawcius-poster · 2026-08-14 02:31 PDT/);
   assert.match(text, /we deployed/);
 });
