@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { AgentSession, AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
+import { AtCapacityError, SessionManager, TurnSettle, atCapacityNotice } from '../dist/agent.js';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { setConfig } from '../dist/config.js';
@@ -855,4 +855,79 @@ test('every wake carries its own settle, not just the one that built the session
   // And they are wired to the right turns, which set-size alone does not show.
   session.wakes[1].onSettled(true, '');
   assert.deepEqual(settles, [{ which: 'second', ran: true, why: '' }]);
+});
+
+// ── TurnSettle: the rules that had no coverage at all ────────────────────────
+//
+// These exist because of a mutation run, not because they looked missing. With
+// the settle logic inline in `AgentSession`, five separate mutations of it —
+// never clearing the callback, deleting the supersede, ignoring the callback
+// `wake` is handed, deleting the catch's settle, settling TRUE through an API
+// refusal — every one passed the full suite green. The logic was inside the one
+// class in agent.ts that no test can construct, so "391 pass" said nothing
+// about any of it.
+
+test('a settle fires exactly once, however many times the turn ends', () => {
+  // Belt and braces with mail-wake's own once-guard, deliberately: the two
+  // layers fail independently, and a double `markRead` is a message confirmed
+  // read twice, which is how a real one gets consumed by a turn that never saw it.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ ran, why }), 'first');
+
+  settle.done(true, 'turn completed');
+  settle.done(false, 'and again');
+  settle.done(true, 'and again');
+
+  assert.deepEqual(calls, [{ ran: true, why: 'turn completed' }]);
+});
+
+test('adopting a new turn ends the previous one FALSE (#241)', () => {
+  // A wake arriving while a turn is pending means that turn never completed —
+  // nothing else would have left it pending. Its mail was never confirmed read,
+  // so it must be offered again rather than vanishing with the callback.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ turn: 'first', ran, why }), 'first');
+  settle.adopt((ran, why) => calls.push({ turn: 'second', ran, why }), 'superseded');
+
+  assert.deepEqual(calls, [{ turn: 'first', ran: false, why: 'superseded' }]);
+
+  // And the turn that took over is the one now in flight — the defect was the
+  // NEW callback being dropped, so proving the old one fired is only half of it.
+  settle.done(true, 'done');
+  assert.deepEqual(calls[1], { turn: 'second', ran: true, why: 'done' });
+});
+
+test('adopting when nothing is in flight settles nothing', () => {
+  // The common case — one wake, one turn. `adopt` must not invent a settle for
+  // a turn that never existed.
+  let fired = 0;
+  const settle = new TurnSettle();
+  settle.adopt(() => fired++, 'nothing was in flight');
+  assert.equal(fired, 0);
+  assert.equal(settle.pending, true);
+});
+
+test('a turn left pending stays pending — a queued retry has not ended (#241)', () => {
+  // `onDone` deliberately leaves an API refusal WITH a retry queued unsettled:
+  // the retry re-runs the turn and its own completion decides. Settling either
+  // way here would be a guess, and a guess of TRUE loses the mail.
+  const settle = new TurnSettle();
+  settle.adopt(() => assert.fail('a queued retry must not settle its turn'), 'first');
+  assert.equal(settle.pending, true);
+});
+
+test('a wake carrying no settle still ends the turn before it', () => {
+  // Discord wakes pass no callback. They must not silently strand the settle of
+  // a mail turn that was still in flight — that is mail loss by another route.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ ran, why }), 'mail turn');
+  settle.adopt(null, 'a discord wake arrived');
+
+  assert.deepEqual(calls, [{ ran: false, why: 'a discord wake arrived' }]);
+  assert.equal(settle.pending, false, 'a null adopt leaves nothing in flight');
+  settle.done(true, 'no-op');
+  assert.equal(calls.length, 1);
 });

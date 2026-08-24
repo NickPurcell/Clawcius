@@ -387,6 +387,63 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+/**
+ * The settle callback for the turn in flight, and the single rule that a new
+ * turn ends the one before it.
+ *
+ * ── WHY THIS IS A CLASS AND NOT TWO LINES IN `AgentSession` ─────────────────
+ *
+ * It was two lines in `AgentSession`, and a mutation run against #241 killed
+ * that idea properly: FIVE mutations of the settle logic — never clearing the
+ * callback, dropping the supersede entirely, ignoring the callback `wake` is
+ * handed, deleting the catch's settle, settling TRUE through an API refusal —
+ * ALL FIVE passed the full suite, 391 green every time. Nothing tested any of
+ * it.
+ *
+ * Not for want of a test. `AgentSession`'s constructor stands up a
+ * containerised `claude`, so a test cannot construct one, and the settle rules
+ * were sitting inside the one class in this file that no test can instantiate.
+ * `SessionManager` has `newSession` as its seam for exactly this reason; the
+ * turn-settle rules had no equivalent, so they had no coverage.
+ *
+ * So the rules moved somewhere reachable. That is the whole motivation: a
+ * behaviour whose only home is an unconstructable class is a behaviour with no
+ * tests, however carefully it is written.
+ *
+ * ── WHAT IT GUARANTEES ──────────────────────────────────────────────────────
+ *
+ * A settle fires AT MOST ONCE per turn, and `adopt` ends the previous turn
+ * FALSE. False means "this mail was never confirmed read" — the caller leaves
+ * it unread for the next sweep rather than dropping it. A wake arriving while a
+ * turn is still pending means that turn never completed, because nothing else
+ * would have left it pending; so its mail must be offered again.
+ *
+ * Leaving a settle pending is legitimate and deliberate: a turn whose retry is
+ * queued has not ended, and guessing an answer for it would be worse than
+ * waiting for the retry to produce a real one.
+ */
+export class TurnSettle {
+  #pending: ((ran: boolean, why: string) => void) | null = null;
+
+  /** Take over for a new turn, ending whatever turn was still in flight. */
+  adopt(next: ((ran: boolean, why: string) => void) | null, why: string): void {
+    this.done(false, why);
+    this.#pending = next;
+  }
+
+  /** End the turn in flight, once. A turn with nothing pending is a no-op. */
+  done(ran: boolean, why: string): void {
+    const settle = this.#pending;
+    this.#pending = null;
+    if (settle) settle(ran, why);
+  }
+
+  /** Whether a turn is still in flight. */
+  get pending(): boolean {
+    return this.#pending !== null;
+  }
+}
+
 export class AgentSession {
   readonly channelId: string;
   readonly workspacePath: string;
@@ -415,13 +472,14 @@ export class AgentSession {
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
   #sentThisTurn = false;
   /**
-   * What to tell the caller once THIS TURN has settled — set by `wake`, cleared
-   * the moment it fires.
+   * What to tell the caller once THIS TURN has settled. The rules — fire once,
+   * and a new turn ends the previous one FALSE — are `TurnSettle`'s, which
+   * exists as a separate class because they are only testable outside this one.
    *
    * PER TURN, NOT PER SESSION, and that distinction is Clawcius #241's blocking
    * finding. The first version handed the callback to `SessionManager.acquire`,
    * which returns an EXISTING session and drops the events it was given
-   * (`:998-1003`), while `AgentSession` stores `#events` once in its
+   * (`:1090`), while `AgentSession` stores `#events` once in its
    * constructor. So only the first wake's callback ever reached `onDone`. Every
    * mail wake after that settled nothing, the mail was never marked read, and
    * the ten-second sweep re-offered it forever — a full model turn against the
@@ -431,7 +489,7 @@ export class AgentSession {
    * A turn is the lifetime this belongs to, so it lives here and travels with
    * `wake`.
    */
-  #pendingSettle: ((ran: boolean, why: string) => void) | null = null;
+  readonly #settle = new TurnSettle();
   #apiErrorThisTurn: string | null = null;
   #apiErrorKindThisTurn: string | null = null;
   /**
@@ -727,9 +785,9 @@ export class AgentSession {
         // pending on purpose: the retry re-runs this turn and its own completion
         // decides, so settling either way here would be a guess.
         if (this.#apiErrorThisTurn === null) {
-          this.#settleTurn(true, 'turn completed');
+          this.#settle.done(true, 'turn completed');
         } else if (!willRetry) {
-          this.#settleTurn(false, `API refused: ${this.#apiErrorKindThisTurn}`);
+          this.#settle.done(false, `API refused: ${this.#apiErrorKindThisTurn}`);
         }
 
         this.#events.onDone({
@@ -758,7 +816,7 @@ export class AgentSession {
           // Out of retries on an auth failure. The token this process holds is
           // dead and it will never pick up the live one, so the session itself
           // is the thing that has to go. Someone above owns the session map.
-          this.#settleTurn(false, 'stale token, session dropped');
+          this.#settle.done(false, 'stale token, session dropped');
           this.#events.onNeedsRespawn(this.#actedSinceWake);
         }
         break;
@@ -780,8 +838,7 @@ export class AgentSession {
     // turn never completed — nothing else would have left it. Settle it FALSE:
     // its mail was never confirmed read, so it should be offered again rather
     // than silently dropped when this callback replaces it.
-    this.#settleTurn(false, 'a new wake arrived before the previous turn settled');
-    this.#pendingSettle = onSettled;
+    this.#settle.adopt(onSettled, 'a new wake arrived before the previous turn settled');
     this.#cancelRetry();
     this.#lastContext = context;
     this.#retries = 0;
@@ -820,16 +877,9 @@ export class AgentSession {
       // and retry, rather than letting it surface as an unhandled rejection
       // that says nothing about which channel broke.
       this.busy = false;
-      this.#settleTurn(false, `could not start the turn: ${String(error)}`);
+      this.#settle.done(false, `could not start the turn: ${String(error)}`);
       this.#events.onError(error instanceof Error ? error : new Error(String(error)));
     }
-  }
-
-  /** Fire the pending settle once, and clear it. */
-  #settleTurn(ran: boolean, why: string): void {
-    const settle = this.#pendingSettle;
-    this.#pendingSettle = null;
-    if (settle) settle(ran, why);
   }
 
   #cancelRetry(): void {
