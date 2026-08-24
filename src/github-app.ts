@@ -149,9 +149,23 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  *
  * HOW IT ARRIVED IS DELIBERATELY NOT CLAIMED, here or in the warnings below.
  * An earlier version blamed a trailing newline in a systemd `EnvironmentFile`.
- * The limb that applies to THESE three is the simple one: systemd's
- * `EnvironmentFile=` documents leading and trailing whitespace as discarded
- * from an unquoted value, so the claim was wrong on its own terms.
+ * The limb that applies to THESE three is the simple one, and it is worth
+ * stating at exactly the width the evidence supports. systemd's
+ * `EnvironmentFile=` documents leading and trailing **space, tab and CR** as
+ * discarded from an unquoted value -- those three, named. It does NOT say
+ * "newline" there. So under the quotable part alone, a claim about a trailing
+ * NEWLINE is untouched.
+ *
+ * What refutes it is one step further and is an INFERENCE, marked as one: the
+ * document handles the newline structurally, a paragraph earlier, as the
+ * separator between assignments -- so it is never part of an unquoted value in
+ * the first place. Nobody here has read that page directly; there is no `man`
+ * or `systemctl` in an agent container.
+ *
+ * Said this way rather than as "whitespace", which is what an earlier draft of
+ * THIS comment wrote. That paraphrase proved the conclusion by widening a quote
+ * past the confidence its own author had stated -- in the change whose whole
+ * subject is not claiming more than the evidence carries.
  *
  * NOT the multi-loader limb, which belongs to `GITHUB_TOKEN` and not here.
  * These three are read only by `config.ts`, in a daemon systemd starts directly
