@@ -336,8 +336,8 @@ test('the base prompt renders to each crew, and rendering is the only difference
 
   assert.equal(
     (template.match(/\{\{Crew\}\}/g) ?? []).length,
-    3,
-    'three identity sites: <system description> twice and <style> once',
+    5,
+    'five identity sites: <system description> twice and <style> three times',
   );
 
   for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
@@ -1162,10 +1162,26 @@ test('the wake carries messages, not identity', () => {
 // for an operator and has the same defect. It is deliberately out of reach here
 // -- these tests compare the two things the loader can produce -- and is #247.
 
-/** The left column of the indented tool block -- the prose's list of tools. */
-function toolsNamedInProtocol(protocol) {
-  const section = protocol.slice(protocol.indexOf('## Waking yourself later'));
-  return new Set([...section.matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*)/gm)].map((m) => m[1]));
+/**
+ * The left column of the indented tool block -- the prose's list of tools.
+ *
+ * TAKES THE WHOLE DOCUMENT, NOT `prompts.protocol`, because the block has two
+ * addresses now and the guard has to hold at both. The compiled default still
+ * carries it under `## Waking yourself later`, which is what a `standalone:
+ * true` deployment reads; the shipped base moved it into `systemPrompt.append`
+ * under <alerts-alarms-and-wakes>, where the agents that run from the YAML
+ * read it. Anchoring on either heading rather than on the field means a future
+ * move does not silently empty the set -- which is the failure that matters
+ * here, since an empty set makes every real tool look undocumented and the
+ * assertion fires loudly rather than passing vacuously.
+ */
+function toolsNamedInPrompt(config) {
+  const doc = [config.prompts.protocol, config.systemPrompt.append].join('\n\n');
+  const at = [doc.indexOf('## Waking yourself later'), doc.indexOf('<alerts-alarms-and-wakes>')]
+    .filter((i) => i !== -1)
+    .sort((a, b) => a - b)[0];
+  assert.notEqual(at, undefined, 'neither anchor for the tool block is present');
+  return new Set([...doc.slice(at).matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*)/gm)].map((m) => m[1]));
 }
 
 test('the protocol prompt names exactly the tools that exist, in both copies', () => {
@@ -1184,16 +1200,16 @@ test('the protocol prompt names exactly the tools that exist, in both copies', (
 
   const fromDefaults = loadAgentConfig(
     writeConfigRaw(['standalone: true', 'crew: x', 'displayName: X']),
-  ).prompts;
+  );
   const fromShipped = loadAgentConfig(
     writeConfigRaw([`extends: ${BASE}`, 'crew: x', 'displayName: X']),
-  ).prompts;
+  );
 
-  for (const [label, prompts] of [
+  for (const [label, config] of [
     ['the compiled defaults', fromDefaults],
     ['the shipped base', fromShipped],
   ]) {
-    const named = toolsNamedInProtocol(prompts.protocol);
+    const named = toolsNamedInPrompt(config);
 
     const undocumented = [...real].filter((n) => !named.has(n));
     assert.deepEqual(
@@ -1241,7 +1257,29 @@ test('every prompt template is byte-identical between the defaults and the shipp
   const keys = [...new Set([...Object.keys(fromDefaults), ...Object.keys(fromShipped)])].sort();
   assert.ok(keys.length >= 7, 'expected the full prompt set, got ' + keys.join(', '));
 
-  for (const key of keys) {
+  // `protocol` IS EXEMPT, AND THE EXEMPTION IS ASSERTED RATHER THAN ASSUMED.
+  //
+  // The base no longer sets it: the text moved into `systemPrompt.append`, so
+  // the agents that run from the YAML read it there. The compiled default keeps
+  // its copy because `DEFAULTS.systemPrompt.append` is '' -- a `standalone:
+  // true` deployment has no append to have moved it into, and emptying the
+  // default to make this assertion pass again would leave such a deployment
+  // with nothing telling it that ordinary output is invisible. That is the
+  // silent-dead-Discord failure the old CAREFUL note in the base warned about,
+  // reintroduced by way of tidying a test.
+  //
+  // So the two differ on purpose, in one direction only, and that direction is
+  // pinned below. Drift in the other direction -- the base quietly growing a
+  // `protocol` again, or the default losing its copy -- fails here. What the
+  // two say about tools is covered separately, by the tool-block test above,
+  // which reads whichever address each one keeps it at.
+  assert.equal(fromShipped.protocol, '', 'the base relocated protocol into systemPrompt.append');
+  assert.ok(
+    fromDefaults.protocol.includes('## Waking yourself later'),
+    'the compiled default is the standalone fallback and must keep the protocol text',
+  );
+
+  for (const key of keys.filter((k) => k !== 'protocol')) {
     assert.equal(
       fromDefaults[key],
       fromShipped[key],

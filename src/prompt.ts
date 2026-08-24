@@ -70,9 +70,23 @@ export function buildSystemPrompt(identity: PromptIdentity): Options['systemProm
     { id: identity.id, crew: identity.crew, role: identity.role },
   );
 
-  const layered = [protocol, roleNotice, config().agent.systemPrompt.append.trim()]
-    .filter(Boolean)
-    .join('\n\n');
+  // APPEND IS RENDERED, NOT USED RAW, AND `cli` IS WHY. The "Speaking in
+  // Discord" text lives here now -- `prompts.protocol` is empty on purpose and
+  // this is the address it moved to -- so the `{cli}` in its two command lines
+  // has to resolve on this side or the agent reads a literal `{cli}` and is
+  // left with no path to run. That failure is silent: append is not checked
+  // against PROMPT_PLACEHOLDERS the way the templates in `prompts` are, so
+  // nothing fails the boot the way an unknown placeholder there would.
+  //
+  // Safe for the rest of the document because `render` substitutes only names
+  // it was given and returns any other `{name}` whole. The `{owner}`, `{repo}`
+  // and `{n}` in the GitHub URLs under <habits> are exactly that case: they are
+  // there for the agent to fill in, and they stay literal.
+  const append = render(config().agent.systemPrompt.append, {
+    cli: config().agent.paths.discordCli,
+  });
+
+  const layered = [protocol, roleNotice, append].filter(Boolean).join('\n\n');
 
   if (config().agent.systemPrompt.useClaudeCodeDefault) {
     return { type: 'preset', preset: 'claude_code', append: layered };
