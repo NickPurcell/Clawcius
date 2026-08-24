@@ -52,11 +52,29 @@
  *
  * ── No throttle, and the poll interval is not one ───────────────────────────
  *
- * Nothing here delays, drops, coalesces or rate-limits a message. One poll that
- * finds four new comments sends one mail naming all four; the next poll that
+ * Nothing here delays, coalesces or rate-limits a message, and ONE CLASS is
+ * dropped — see the exception below. One poll that finds four new comments
+ * sends one mail naming all four; the next poll that
  * finds one sends another. The re-entrancy guard is the same one `MailWaker`
  * and `WakeSpool` have — an async tick that overlapped itself would poll GitHub
  * twice for the same row and mail the same comment twice — and the poll
+ * ── THE ONE EXCEPTION, stated where the rule is (#231) ─────────────────────
+ *
+ * A comment matching `armed.github.quiet` does not wake anybody. It is a DROP,
+ * not a delay: nothing is buffered and nothing arrives later.
+ *
+ * A mail starts a TURN, at the receiving agent's own model, and the reviewer's
+ * acknowledgement carried nothing about the round it announced — 26
+ * byte-identical 151-character wakes in fourteen hours, across six pull requests
+ * and both crews. The comment still stands on the pull request for a human; only
+ * the wake is gone.
+ *
+ * Every suppression is logged with the pull request and the comment URL, and
+ * watermarks still move over suppressed comments, so a drop never becomes a
+ * replay. IF YOU ARE HERE because an agent says it never saw a comment that is
+ * plainly on the pull request, grep the operator's log for
+ * `not waking … for a quiet comment` before looking anywhere else.
+ *
  * interval is a courtesy to a third party's API, not a limit on what reaches an
  * agent.
  */
@@ -69,6 +87,7 @@ import {
   type PullRequestSource,
   type PullRequestState,
   GitHubError,
+  COMMENT_BODY_CAP,
 } from './github.js';
 import type { MailStore } from './mail.js';
 import type {
@@ -274,37 +293,57 @@ export type WatchFindings = {
   finished: boolean;
 };
 
+export type QuietComments = { author: string; keep: string; suppress: readonly string[] };
+
 /**
  * Is this comment one nobody needs waking for?
  *
- * THREE CONDITIONS, ALL REQUIRED, and `keep` beats `suppress` — because the two
- * failure directions are not symmetric. Matching too little brings the wakes
- * back, which is visible and annoying. Matching too much drops findings, which
- * is silent, and silent loss is the thing this system spent a morning on.
+ * FOUR CONDITIONS, ALL REQUIRED, and the third is the one OJ round 1 on #240
+ * found missing. `keep` beats `suppress`, because the failure directions are not
+ * symmetric: matching too little brings the wakes back, which is visible and
+ * annoying; matching too much drops findings, which is silent. Err narrow.
  *
- * `keep` exists so that widening `suppress` later cannot reach a comment that
- * carries the findings footer — the one part of a review that names the commit
- * it read. An operator tuning `suppress` in a hurry is the expected case, and
- * this is what makes that safe rather than merely discouraged.
+ * ── WHY THE LENGTH CHECK IS THE LOAD-BEARING ONE ──────────────────────────
  *
- * A malformed pattern disables ITSELF rather than the mechanism: a bad `keep`
- * would otherwise stop protecting findings, and a bad `suppress` would
- * otherwise throw inside a poll. Both are logged by the caller when they bite.
+ * `PrComment.body` IS NOT THE COMMENT. `GitHubClient.listComments` builds it as
+ * `text(row.body, MAX_EXTERNAL_CHARS * 2)` — a bare tail-truncation at 2400
+ * characters. `keep` looks for the findings FOOTER, and a footer is at the end,
+ * so it is the first thing that cap removes.
+ *
+ * So `keep` fired on short reviews and was STRUCTURALLY UNABLE to fire on long
+ * ones, and the asymmetry ran the wrong way: `suppress`'s pattern is `^`-anchored
+ * at the START, which truncation never weakens. TRUNCATION ATE THE GUARD AND
+ * LEFT THE BLADE — and only on the many-finding reviews, whose loss costs most.
+ *
+ * A body at the cap may have been cut and nothing downstream can tell. So this
+ * refuses to suppress at that length rather than guessing. An acknowledgement is
+ * 151 characters and never near it, so the check costs nothing real and removes
+ * the whole class.
+ *
+ * The sibling implementation escapes this by accident of layer:
+ * `pr-cli/pr-state.mjs` reads raw GitHub bodies and never sees a cap.
  */
-export type QuietComments = { author: string; keep: string; suppress: readonly string[] };
-
 export function isQuiet(comment: PrComment, quiet: QuietComments): boolean {
   if (!quiet.author || comment.author !== quiet.author) return false;
+  // May have been truncated, so `keep` cannot be trusted to have seen a footer.
+  if (comment.body.length >= COMMENT_BODY_CAP) return false;
   if (quiet.keep && matches(quiet.keep, comment.body)) return false;
   return quiet.suppress.some((p: string) => matches(p, comment.body));
 }
 
+/**
+ * A pattern that does not compile cannot reach here: `loadAgentConfig` compiles
+ * every one at boot and refuses to start on a bad one.
+ *
+ * This used to swallow the `SyntaxError` and return false, while the docstring
+ * claimed such patterns were "logged by the caller when they bite". They were
+ * not — the caller logs only SUCCESSFUL suppressions, so a typo in `keep`
+ * silently disabled the guard in the very edit that widened `suppress`. Refusing
+ * at boot is this codebase's house style and makes the claim true by
+ * construction rather than by a log nobody reads.
+ */
 function matches(pattern: string, body: string): boolean {
-  try {
-    return new RegExp(pattern).test(body);
-  } catch {
-    return false;
-  }
+  return new RegExp(pattern).test(body);
 }
 
 /**
@@ -573,7 +612,13 @@ export type ArmedWakerOptions = {
    *
    * Optional so every existing construction of this waker keeps compiling and
    * keeps its behaviour: absent means `isQuiet` sees an empty author and
-   * suppresses nothing. The mechanism is off unless a deployment asks for it.
+   * suppresses nothing.
+   *
+   * "Off unless a deployment asks for it" would be FALSE as a statement about
+   * the shipped system: `DEFAULTS` names the reviewer and `daemon.ts` always
+   * passes it, so the mechanism is ON out of the box. This option being absent
+   * turns it off for a caller that constructs a waker directly, which is tests
+   * and nothing else.
    */
   quiet?: QuietComments;
   log: (line: string) => void;

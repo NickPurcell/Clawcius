@@ -1516,18 +1516,114 @@ test('`keep` beats `suppress`, because the two failure directions are not symmet
   assert.equal(isQuiet(comment(both), QUIET), false);
 });
 
-test('suppression is confined to the named author, and off by default', () => {
+test('suppression is confined to the named author, and an empty author disables it', () => {
   // A human quoting the acknowledgement is not the acknowledgement.
   assert.equal(isQuiet(comment(ACK, 'NickPurcell'), QUIET), false);
 
-  // Empty author disables the whole mechanism — the safe value for a deployment
-  // that has not thought about it, and the shipped default.
+  // An empty author disables the whole mechanism. It is NOT the shipped default
+  // — this test used to say so, in its own name and in this comment, and it was
+  // wrong: `DEFAULTS` names the reviewer and `daemon.ts` always passes it, so
+  // the mechanism ships ON. A false sentence sitting directly above an assertion
+  // that appears to demonstrate it is the worst place for one.
   assert.equal(isQuiet(comment(ACK), { author: '', keep: '', suppress: ['.'] }), false);
 });
 
-test('a malformed pattern disables itself, not the mechanism', () => {
-  // A bad `suppress` must not throw inside a poll; a bad `keep` must not stop
-  // protecting findings by taking the whole predicate down with it.
-  assert.equal(isQuiet(comment(ACK), { ...QUIET, suppress: ['('] }), false);
-  assert.equal(isQuiet(comment(ACK), { ...QUIET, keep: '(' }), true);
+test('a comment long enough to have been truncated is never suppressed', () => {
+  // OJ round 1 on #240, and the load-bearing one. `PrComment.body` is
+  // `text(row.body, MAX_EXTERNAL_CHARS * 2)` — a tail-truncation at 2400 — while
+  // `keep` looks for the FOOTER, which is at the end and so is the first thing
+  // that cap removes.
+  //
+  // `keep` therefore fired on short reviews and was structurally unable to fire
+  // on long ones, while `suppress`'s `^`-anchored pattern was untouched by
+  // truncation. Truncation ate the guard and left the blade — on precisely the
+  // many-finding reviews whose loss costs most.
+  const atCap = ACK + 'x'.repeat(2400 - ACK.length);
+  assert.equal(atCap.length, 2400);
+  assert.equal(
+    isQuiet(comment(atCap), QUIET),
+    false,
+    'a body that may have been cut cannot be shown to lack a footer',
+  );
+
+  // And the real acknowledgement, 151 characters, is nowhere near the cap — so
+  // the check costs nothing real.
+  assert.ok(ACK.length < 200);
+  assert.equal(isQuiet(comment(ACK), QUIET), true);
+});
+
+test('a quiet comment does not wake, the watermark still moves, and findings still arrive', async () => {
+  // OJ round 1 on #240, finding 6: the two properties the description leaned
+  // hardest on were exercised NOWHERE. Every other test here calls `isQuiet`
+  // directly, so a later change that moved the filter from `unseenComments` onto
+  // `comments` would keep the whole suite green while re-offering every
+  // suppressed comment on every poll forever — and dropping the log loop would
+  // cost nothing at all.
+  const { registry, mail, store } = board();
+  const quiet = {
+    author: 'osmosis-jones-agent[bot]',
+    keep: '<sub>OJ · round',
+    suppress: ['^🧬 OJ is reviewing this pull request'],
+  };
+  const state = {
+    pr: openPr,
+    reviews: [],
+    comments: [
+      { id: 10, author: 'osmosis-jones-agent[bot]', body: ACK, htmlUrl: 'u/10', onDiff: false },
+    ],
+  };
+  const lines = [];
+  const github = stubGitHub(state);
+  const waker = new ArmedWaker({
+    store,
+    registry,
+    mail,
+    github,
+    tickMs: 1000,
+    quiet,
+    log: (line) => lines.push(line),
+  });
+
+  store.arm(
+    'hamachi-engineer1',
+    'pr-watch',
+    Date.now() - 1,
+    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review', 'comment', 'merge'], pollSeconds: 1 },
+    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
+  );
+
+  await waker.tick();
+
+  assert.equal(mail.unread('hamachi-engineer1').length, 0, 'the acknowledgement must not wake');
+
+  // THE WATERMARK MOVED. This is the property the change could most easily have
+  // broken: filtering the poll instead of the unseen set would suppress the wake
+  // and then re-offer the same comment forever.
+  const row = store.listFor('hamachi-engineer1')[0];
+  assert.equal(row.seen.issueCommentId, 10, 'a suppressed comment is still SEEN');
+
+  // AND THE SUPPRESSION WAS LOGGED, with the pull request. Written the same
+  // morning a delivered message vanished with no record — a fix for wake cost
+  // that drops things silently would be the same class of defect.
+  assert.ok(
+    lines.some((l) => /not waking hamachi-engineer1 for a quiet comment/.test(l) && /#44/.test(l)),
+    'every suppression is logged with the pull request',
+  );
+
+  // Findings still arrive, and the ack is not replayed alongside them.
+  state.comments.push({
+    id: 11,
+    author: 'osmosis-jones-agent[bot]',
+    body: 'Non-blocking. Two things.\n\n<sub>OJ · round 1 · head `abc1234`</sub>',
+    htmlUrl: 'u/11',
+    onDiff: false,
+  });
+  store.reschedule(store.listFor('hamachi-engineer1')[0].id, Date.now() - 1, row.seen);
+  await waker.tick();
+
+  const inbox = mail.unread('hamachi-engineer1');
+  assert.equal(inbox.length, 1, 'findings wake');
+  assert.match(inbox[0].body, /Non-blocking/);
+  assert.doesNotMatch(inbox[0].body, /OJ is reviewing this pull request/, 'the ack is not replayed');
+  registry.close();
 });

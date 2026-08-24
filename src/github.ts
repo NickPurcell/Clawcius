@@ -288,11 +288,23 @@ function encodePath(repo: string): string {
  * about a review in a mail is that it happened and roughly what it says; the
  * authoritative copy is on GitHub and every quote carries its link.
  *
- * This is not a throttle on delivery. Nothing is delayed, dropped or merged —
- * one poll still produces one mail naming every new event. It is a limit on how
+ * This is not a throttle on delivery. Nothing is delayed or merged — one poll
+ * still produces one mail naming every new event, except for the one class
+ * `armed.github.quiet` drops outright (#231, described in armed-wake.ts's
+ * header). It is a limit on how
  * much of a third party's prose we paste into an agent's context.
  */
 export const MAX_EXTERNAL_CHARS = 1200;
+
+/**
+ * The cap a comment body is delivered under — `MAX_EXTERNAL_CHARS * 2`.
+ *
+ * Exported because a body AT this length may have been cut, and nothing
+ * downstream can tell whether it was. `isQuiet` in `armed-wake.ts` refuses to
+ * suppress at this length for exactly that reason: its `keep` guard looks for a
+ * FOOTER, and a footer is the first thing a tail-truncation removes.
+ */
+export const COMMENT_BODY_CAP = MAX_EXTERNAL_CHARS * 2;
 
 /** At most this many quoted items in one mail; the rest are counted, not pasted. */
 export const MAX_EXTERNAL_ITEMS = 20;

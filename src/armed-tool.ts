@@ -115,8 +115,11 @@
  *
  * ── This is not a throttle ──────────────────────────────────────────────────
  *
- * Nothing here delays, drops or coalesces a delivery, and nothing added here
- * ever should — see the header of armed-wake.ts. What is deduplicated is the
+ * Nothing here delays or coalesces a delivery. One class of comment is DROPPED
+ * — `armed.github.quiet`, added by #231 — and that exception is described where
+ * the rule is, in the header of armed-wake.ts. Nothing else should join it
+ * without the same treatment: a logged drop, watermarks that still move, and the
+ * reason written next to the rule it breaks. What is deduplicated is the
  * armed *condition*, at the moment it is armed, in a refusal the agent reads.
  * One watch still mails every event it sees, immediately.
  */

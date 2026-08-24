@@ -1738,14 +1738,45 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
         apiBase: str(armedGithub['apiBase'], 'armed.github.apiBase', DEFAULTS.armed.github.apiBase),
         quiet: (() => {
           const q = section(armedGithub['quiet'], 'armed.github.quiet');
+          // COMPILED HERE, so a pattern that does not compile is a boot error
+          // rather than a guard that silently stopped guarding.
+          //
+          // The predicate used to swallow the SyntaxError and return false while
+          // its docstring claimed bad patterns were "logged by the caller when
+          // they bite". They were not: the caller logs only SUCCESSFUL
+          // suppressions. So a typo in `keep` — in the very edit that widens
+          // `suppress`, which is when a typo is likeliest — disabled the guard
+          // and said nothing, in the direction that drops findings.
+          //
+          // Refuse-don't-ignore is this file's rule everywhere else. OJ round 1
+          // on #240.
+          const compiled = (raw: string, at: string): string => {
+            if (raw === '') return raw;
+            try {
+              new RegExp(raw);
+            } catch (error) {
+              throw new ConfigError(
+                at,
+                `is not a valid regular expression (${
+                  error instanceof Error ? error.message : String(error)
+                }). A pattern that does not compile would silently match nothing — and for ` +
+                  '`keep` that means the guard protecting findings stops guarding, quietly.',
+              );
+            }
+            return raw;
+          };
+          const suppress = strList(
+            q['suppress'],
+            'armed.github.quiet.suppress',
+            DEFAULTS.armed.github.quiet.suppress,
+          );
           return {
             author: str(q['author'], 'armed.github.quiet.author', DEFAULTS.armed.github.quiet.author),
-            keep: str(q['keep'], 'armed.github.quiet.keep', DEFAULTS.armed.github.quiet.keep),
-            suppress: strList(
-              q['suppress'],
-              'armed.github.quiet.suppress',
-              DEFAULTS.armed.github.quiet.suppress,
+            keep: compiled(
+              str(q['keep'], 'armed.github.quiet.keep', DEFAULTS.armed.github.quiet.keep),
+              'armed.github.quiet.keep',
             ),
+            suppress: suppress.map((p, i) => compiled(p, `armed.github.quiet.suppress[${i}]`)),
           };
         })(),
       },
