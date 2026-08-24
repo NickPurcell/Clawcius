@@ -242,7 +242,7 @@ export function approvalsFor(reviews, head) {
  *
  *   under any fnmatch where `*` stops at `/`, `**` is the form that crosses it —
  *   that is the entire reason the second form exists. A blanket
- *   a blanket star-to-`[^/]*` replace rewrites BOTH, so the edit that fixes `*` breaks
+ *   star-to-`[^/]*` replace rewrites BOTH, so the edit that fixes `*` breaks
  *   `**`, and breaks it in the UNDER-matching direction: a ruleset targeting
  *   `refs/heads/**` is dropped, taking the `ruleset` line, the "of N required"
  *   and `explainMergeState`'s honest `required` with it.
@@ -298,29 +298,52 @@ export function explainMergeState(state, approvals, ruleset) {
       // tri-state was worth doing is that the third sentence is now expressible.
       //
       // The gate answers MAY I merge. It does not answer SHOULD I.
-      const unknown = approvals.filter((a) => a.coverage === 'unknown');
-      if (stale.length === 0) {
-        return unknown.length === 0
-          ? 'nothing blocking'
-          : `nothing GitHub blocks on — but whether ${unknown.length === 1 ? 'the approval covers' : `${unknown.length} approvals cover`} ` +
-            'this head is UNKNOWN (commit_id absent)';
-      }
-      // Counts `coverage === 'stale'`, so an approval whose commit is merely
-      // ABSENT is not reported as superseded — a distinction that used to need
-      // `&& a.sha` at every call site, and which two of them did not have.
+      // EVERY BUCKET, not the first non-empty one. The previous version returned
+      // on `stale` and phrased each branch as though its bucket were the whole
+      // set. Both directions were reachable and both were false:
       //
+      //   stale + current   -> "the approval is STALE", while an approval that
+      //                        DOES cover this head existed — which under
+      //                        `required: 1` is the answer to the question asked
+      //   current + unknown -> "the approval …is UNKNOWN", naming the wrong one
+      //
+      // The JSON was honest in both; only the sentence was not, which is the
+      // narrower form of this file's own header defect. OJ round 2 on #235.
+      //
+      // The gate answers MAY I merge. It does not answer SHOULD I.
+      const unknown = approvals.filter((a) => a.coverage === 'unknown');
+      const current = approvals.length - stale.length - unknown.length;
+      if (stale.length === 0 && unknown.length === 0) return 'nothing blocking';
+
       // The dismissal clause READS `dismissStaleOnPush` rather than asserting it:
       // it hardcoded "is false" and said so against a ruleset that set it true and
-      // against a read that established nothing.
+      // against a read that established nothing. Only shown when something is
+      // stale, since it is the setting that lets a stale approval keep counting.
       const dismissal =
-        ruleset?.dismissStaleOnPush === false
-          ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
-          : ruleset?.dismissStaleOnPush === true
-            ? ' — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts it'
-            : ' (whether stale reviews are dismissed could not be read)';
+        stale.length === 0
+          ? ''
+          : ruleset?.dismissStaleOnPush === false
+            ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
+            : ruleset?.dismissStaleOnPush === true
+              ? ' — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts it'
+              : ' (whether stale reviews are dismissed could not be read)';
+
+      const said = [];
+      if (stale.length > 0) {
+        said.push(
+          `${stale.length} STALE, for a commit no longer at the head`,
+        );
+      }
+      if (unknown.length > 0) {
+        said.push(`${unknown.length} with no commit_id, so coverage is UNKNOWN`);
+      }
       return (
-        `nothing GitHub blocks on — but ${stale.length === 1 ? 'the approval is' : `${stale.length} approvals are`} ` +
-        `STALE, for a commit no longer at the head. Merging now merges code no review has read${dismissal}`
+        `nothing GitHub blocks on — but of ${approvals.length} approval(s): ` +
+        `${said.join(', and ')}. ` +
+        (current > 0
+          ? `${current} DOES cover this head`
+          : 'none is known to cover this head') +
+        dismissal
       );
     case 'dirty':
       return 'merge conflicts';

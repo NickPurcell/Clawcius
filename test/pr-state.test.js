@@ -333,8 +333,33 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
 
   const said = explainMergeState('clean', stale, { required: 1 });
   assert.match(said, /STALE/);
-  assert.match(said, /merges code no review has read/);
   assert.doesNotMatch(said, /^nothing blocking$/);
+
+  // EVERY BUCKET, not the first non-empty one. Naming one bucket as though it
+  // were the whole set was false in both directions and the JSON was honest
+  // while the sentence was not (OJ round 2 on #235):
+  const mixed = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'head1234', coverage: 'current' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(mixed, /1 STALE/);
+  assert.match(mixed, /1 DOES cover this head/, 'a covering approval must be named when one exists');
+
+  const both = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: null, coverage: 'unknown' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(both, /1 STALE/);
+  assert.match(both, /1 with no commit_id/, 'the unknown one must not go unmentioned');
+  assert.match(both, /none is known to cover this head/);
 });
 
 test('ruleset ref patterns match the way GitHub writes them', () => {
@@ -365,11 +390,14 @@ test('the stale-approval warning does not assert what it has not established', (
   const OJ1 = { name: 'OJ1', required: 1, dismissStaleOnPush: false, bypass: 0 };
   const absent = explainMergeState('clean', [{ by: 'n', at: 't', sha: null, coverage: 'unknown' }], OJ1);
   assert.doesNotMatch(absent, /STALE/, 'an absent commit_id is unknown, not stale');
+  // The dismissal footnote is about a STALE approval keeping its count, so it
+  // must not appear when nothing is stale.
+  assert.doesNotMatch(absent, /dismiss_stale_reviews_on_push/);
   // …and `unknown` must not be silently rounded to `nothing blocking` either. That
   // sentence is true of GitHub and answers "does GitHub block" when the reader
   // asked "has anyone read this code" — this file's own header defect. The
   // tri-state exists so the third sentence is expressible; saying it is the point.
-  assert.match(absent, /UNKNOWN \(commit_id absent\)/);
+  assert.match(absent, /coverage is UNKNOWN/);
 
   // (b) The parenthetical hardcoded "is false" and never read the value the tool
   //     had in hand — so it said so against a ruleset that sets it TRUE, and
@@ -442,7 +470,7 @@ test('coverage is three states, because commit_id can be absent', () => {
   // "nothing blocking", which answers a different question from the one asked.
   const said = explainMergeState('clean', [unknown], { name: 'OJ1', required: 1, dismissStaleOnPush: false });
   assert.doesNotMatch(said, /STALE/);
-  assert.match(said, /UNKNOWN \(commit_id absent\)/);
+  assert.match(said, /coverage is UNKNOWN/);
 
   // An empty-string commit_id is not a sha. `== null` treated it as one and
   // printed `STALE: approved , head is …` with a hole in it; the readers this
