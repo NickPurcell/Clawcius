@@ -96,8 +96,8 @@ export type PromptTemplates = {
 /** Placeholders each template may use. Anything else is a startup error. */
 export const PROMPT_PLACEHOLDERS: Record<keyof PromptTemplates, readonly string[]> = {
   protocol: ['cli'],
-  roleNotice: [],
-  messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli', 'roleNotice'],
+  roleNotice: ['id', 'crew', 'role'],
+  messageWake: ['count', 'plural', 'messages', 'channelId', 'latestMessageId', 'cli'],
   messageLine: ['time', 'author', 'authorId', 'messageId', 'content'],
   mailWake: ['mail', 'count', 'plural'],
   spawnCharter: ['id', 'role', 'crew', 'spawnedBy', 'instructions'],
@@ -417,12 +417,11 @@ There are limits on how often and how many wakes you may schedule. A rejected
 call says which limit it hit.`,
 
   roleNotice:
-    'You are the team leader — the main agent for this channel. This wake is ' +
-    'addressed to you; subagents you spawn are never woken this way.',
+    'You are `{id}` — crew `{crew}`, role `{role}`. The `<roles>` section above ' +
+    'describes the whole crew; `<{role}>` is yours. Wakes reach only the main ' +
+    'agent of a session: subagents you spawn are never woken this way.',
 
-  messageWake: `{roleNotice}
-
-{count} new {plural}:
+  messageWake: `{count} new {plural}:
 
 {messages}
 

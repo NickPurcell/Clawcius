@@ -33,6 +33,8 @@ import { tmpdir } from 'node:os';
 import { parse, stringify } from 'yaml';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
+import { setConfig } from '../dist/config.js';
+import { buildSystemPrompt, buildWakeMessage } from '../dist/prompt.js';
 
 /**
  * Exactly the lines given, for tests about the container block itself.
@@ -1007,4 +1009,72 @@ test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to 
     () => loadAgentConfig(writeUndeclared(['crew: x'])),
     /has no `extends:` and does not declare itself standalone/,
   );
+});
+
+// ── identity at session initialization ──────────────────────────────────────
+//
+// The defect these pin: `roleNotice` was a literal telling EVERY agent it was
+// the team leader, substituted into the wake on every wake. True of the
+// coordinator, false of everyone else, and the first line they read.
+//
+// Driven through the REAL base config rather than a hand-built stub, so these
+// fail if the shipped YAML stops saying it.
+
+function withRealPrompts() {
+  // `extends: BASE` is the whole point: without it this loads DEFAULT_PROMPTS
+  // out of the compiled TypeScript and the assertions below say nothing about
+  // the file that actually ships. `loadAgentConfig` takes ONE argument -- a
+  // second one is silently ignored, which is how the first draft of these tests
+  // passed against a mutated YAML.
+  const loaded = loadAgentConfig(writeConfigRaw(['crew: x', `extends: ${BASE}`]));
+  setConfig({
+    discord: { token: 'u', guildId: 'u' },
+    github: { token: '', appId: '' },
+    storage: { dbPath: 'u' },
+    agent: loaded,
+  });
+}
+
+test('each role is told its own role, not the coordinator\'s', () => {
+  withRealPrompts();
+  const text = (identity) => {
+    const sp = buildSystemPrompt(identity);
+    return typeof sp === 'string' ? sp : sp.append;
+  };
+
+  for (const role of ['coordinator', 'engineer', 'researcher', 'poster', 'updater', 'host']) {
+    const out = text({ id: `hamachi-${role}1`, crew: 'hamachi', role });
+    assert.match(out, new RegExp('role `' + role + '`'), `${role} not named`);
+    assert.match(out, new RegExp('You are `hamachi-' + role + '1`'), `${role} id missing`);
+    // The specific regression: nobody but the coordinator is called the leader.
+    if (role !== 'coordinator') {
+      assert.doesNotMatch(out, /team leader/, `${role} was told it leads the team`);
+    }
+  }
+});
+
+test('an unrecognised role is named as unrecognised, not passed off as real', () => {
+  withRealPrompts();
+  const sp = buildSystemPrompt({ id: 'hamachi-x1', crew: 'hamachi', role: 'sousaphonist' });
+  const out = typeof sp === 'string' ? sp : sp.append;
+  // Truthful beats confident: it must not read as though <roles> describes it,
+  // because the agent would go looking and find nothing.
+  assert.match(out, /not a role this crew defines/);
+  assert.match(out, /sousaphonist/);
+});
+
+test('the wake carries messages, not identity', () => {
+  withRealPrompts();
+  const out = String(
+    buildWakeMessage({
+      kind: 'message',
+      channelId: 'C1',
+      messages: [{ at: Date.now(), author: 'nick', authorId: 'u1', messageId: 'm1', content: 'hi' }],
+    }),
+  );
+  assert.doesNotMatch(out, /team leader/);
+  assert.doesNotMatch(out, /role `/);
+  // The operational tail is per-wake data and stays.
+  assert.match(out, /channel_id: C1/);
+  assert.match(out, /latest message_id: m1/);
 });

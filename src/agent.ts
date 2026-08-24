@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { config } from './config.js';
 import { tokenFilePath } from './token-file.js';
 import { buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
+import type { PromptIdentity } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
@@ -403,6 +404,12 @@ export class AgentSession {
   #mcpServers: Record<string, McpServerConfig> | null;
   /** Per-role model override; undefined means use `model` from config. */
   #model: string | undefined;
+  /**
+   * Who this session is, for the system prompt's opening line. Resolved by the
+   * caller for the same reason `#model` is: this class deliberately knows
+   * nothing about the registry.
+   */
+  #identity: PromptIdentity;
   #consuming: Promise<void> | null = null;
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
@@ -472,12 +479,19 @@ export class AgentSession {
      * registry.
      */
     model?: string,
+    /**
+     * Resolved by the caller for the same reason `model` is, and used once, in
+     * `#buildOptions` -- so a session says who it is in the one place that
+     * survives compaction and is rebuilt on resume.
+     */
+    identity: PromptIdentity = { id: channelId, crew: '', role: '' },
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
     this.#events = events;
     this.#mcpServers = mcpServers;
     this.#model = model;
+    this.#identity = identity;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
@@ -492,7 +506,7 @@ export class AgentSession {
     const options: Options = {
       cwd: this.workspacePath,
       model: this.#model ?? config().agent.model,
-      systemPrompt: buildSystemPrompt(),
+      systemPrompt: buildSystemPrompt(this.#identity),
       // Required for the discord-cli skill to load at all. The SDK defaults to
       // isolation mode, where no filesystem settings — and therefore no skills
       // — are read. Paired with the .claude symlink created above.
@@ -971,8 +985,17 @@ export class SessionManager {
     events: AgentEvents,
     mcpServers: Record<string, McpServerConfig> | null,
     model: string | undefined,
-  ) => AgentSession = (channelId, workspacePath, resumeSessionId, events, mcpServers, model) =>
-    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model);
+    identity: PromptIdentity,
+  ) => AgentSession = (
+    channelId,
+    workspacePath,
+    resumeSessionId,
+    events,
+    mcpServers,
+    model,
+    identity,
+  ) =>
+    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model, identity);
 
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
@@ -1061,6 +1084,9 @@ export class SessionManager {
       // with no entry gets undefined and falls back to `model`, so the default
       // deployment is unchanged by this existing at all.
       config().agent.modelByRole[identity.role],
+      // Identity for the system prompt's opening line. `channelId` IS the
+      // agent id; crew and role come off the row `ensure` just wrote.
+      { id: channelId, crew: identity.crew, role: identity.role },
     );
 
     session.onBusyChanged = () => this.onCountsChanged();

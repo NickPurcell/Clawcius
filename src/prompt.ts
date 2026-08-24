@@ -14,6 +14,7 @@
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
+import { isAgentRole } from './store.js';
 import type { WakeContext } from './types.js';
 import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
@@ -38,12 +39,37 @@ function render(template: string, vars: Record<string, string>): string {
  * Order is protocol then append: the operator's instructions land last and so
  * are the most recent thing in context.
  */
-export function buildSystemPrompt(): Options['systemPrompt'] {
+/**
+ * Who the session is, as the system prompt needs to say it.
+ *
+ * Resolved by `SessionPool.acquire`, which holds the registry row, and passed
+ * in -- the same shape `model` already uses, and for the reason `AgentSession`'s
+ * own comment gives: this module knows nothing about the registry.
+ */
+export type PromptIdentity = { id: string; crew: string; role: string };
+
+export function buildSystemPrompt(identity: PromptIdentity): Options['systemPrompt'] {
   const protocol = render(config().agent.prompts.protocol, {
     cli: config().agent.paths.discordCli,
   });
 
-  const layered = [protocol, config().agent.systemPrompt.append.trim()]
+  // WHY THE SYSTEM PROMPT AND NOT A FIRST-TURN MESSAGE. This is rebuilt every
+  // time a session is constructed, including on resume, so it cannot drift out
+  // of step with a session that already carries an old preamble in its history
+  // -- and it survives compaction, which a first turn does not.
+  const roleNotice = render(config().agent.prompts.roleNotice, {
+    id: identity.id,
+    crew: identity.crew,
+    // A ROLE THE CREW DOES NOT DEFINE IS NAMED AS SUCH RATHER THAN PASSED OFF.
+    // The bug being fixed here is a wrong role asserted confidently, so the one
+    // thing this must not do is print an unknown string as though `<roles>`
+    // described it -- the agent would go looking and find nothing.
+    role: isAgentRole(identity.role)
+      ? identity.role
+      : `${identity.role} (not a role this crew defines — see <roles>)`,
+  });
+
+  const layered = [protocol, roleNotice, config().agent.systemPrompt.append.trim()]
     .filter(Boolean)
     .join('\n\n');
 
