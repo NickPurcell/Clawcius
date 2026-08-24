@@ -648,3 +648,34 @@ test('real ISO-8601 stamps compare correctly, not just t1/t2/t3', () => {
   ];
   assert.equal(whyStale({ at: '2026-09-01T00:00:00Z' }, spanning), 'spent');
 });
+
+test('a stranger whose work was AUTHORED before the approval is not "no new author"', () => {
+  // #252 round 2, item 7 — and the paragraph this pins was itself the fix for a
+  // different reassuring error. `owners` is built from `before`, and `before` is
+  // selected by AUTHOR date, so a stranger's commit authored before the approval
+  // joins `owners` however late it lands.
+  //
+  // The route needs a cherry-pick, a `git am` or a sibling branch merged in
+  // rather than an ordinary push, so this is not a bug being fixed — it is the
+  // documented cost of reading rebases correctly, pinned so that the day someone
+  // changes the split back, the comment and the test disagree loudly.
+  const commits = [
+    commit('hamachi', '2026-08-24T08:00:00Z'),
+    commit('a-stranger', '2026-08-24T09:00:00Z', '2026-08-24T12:00:00Z'),
+    commit('hamachi', '2026-08-24T12:30:00Z'),
+  ];
+  assert.equal(
+    whyStale({ at: '2026-08-24T11:00:00Z' }, commits),
+    'spent',
+    'documented limit: an author-date split cannot see a late-landing old commit',
+  );
+});
+
+test('an amend after the approval gives up rather than answering', () => {
+  // `git commit --amend` preserves the author date, so an amended commit sorts
+  // BEFORE the approval, `after` is empty, and the function declines. No wrong
+  // answer — but the round-1 code said "spent" here, so this is a case that used
+  // to be explained and now is not, and the comment says so.
+  const commits = [commit('hamachi', '2026-08-24T10:00:00Z', '2026-08-24T12:30:00Z')];
+  assert.equal(whyStale({ at: '2026-08-24T11:00:00Z' }, commits), null);
+});

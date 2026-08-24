@@ -292,11 +292,22 @@ export function whyStale(approval, commits) {
   // up before authorship was ever consulted. The paragraph was arguing for a
   // robustness the code did not have.
   //
-  // The trade, stated: a commit authored long ago and cherry-picked in after the
-  // approval now sorts as `before`. That under-reports a genuinely new push —
-  // but only when the cherry-picker is an author already on the branch, since a
-  // NEW author still lands in `owners` as absent. Rebase is common here and
-  // cherry-picking old work by an existing author is not.
+  // THE TRADE, STATED PROPERLY — and the first version of this paragraph got it
+  // wrong in the reassuring direction, which is worth leaving visible in the
+  // comment that fixed a different reassuring error.
+  //
+  // It claimed "a NEW author still lands in `owners` as absent". It does not.
+  // `owners` is built from `before`, and `before` is selected by AUTHOR date, so
+  // a stranger's commit authored before the approval joins `owners` however late
+  // it actually lands. Work authored at 09:00, landed at 12:00, approval at
+  // 11:00, owner pushes at 12:30 — this reports `spent`, on a branch a new
+  // author pushed to after the approval.
+  //
+  // The route needs a cherry-pick, a `git am`, or a sibling branch merged in
+  // rather than an ordinary push, so the exposure is small; and `git commit
+  // --amend` preserves the author date too, which is not exotic here — after an
+  // amend and a force-push this gives up rather than answering. Those are the
+  // costs of reading rebases correctly, which is the far commoner case.
   const dateOf = (c) => c.commit?.author?.date ?? c.commit?.committer?.date;
 
   const before = commits.filter((c) => {
@@ -602,6 +613,21 @@ function api(path, repo) {
  *                         fetches those separately, so the warning does not
  *                         apply here.
  */
+function apiList(path, repo) {
+  const url = `https://api.github.com/repos/${repo}${path}`;
+  const first = curlJson(url, true);
+  if (!Array.isArray(first.body)) {
+    throw new Error(
+      `GitHub said ${first.body?.status ?? '?'}: ${first.body?.message ?? 'unexpected'} (${url})`,
+    );
+  }
+  const last = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link);
+  if (!last) return first.body;
+  const sep = url.includes('?') ? '&' : '?';
+  const tail = curlJson(`${url}${sep}page=${last[1]}`, false).body;
+  return Array.isArray(tail) ? [...first.body, ...tail] : first.body;
+}
+
 /**
  * `apiList`, plus whether the middle was skipped.
  *
@@ -634,21 +660,6 @@ function apiListSayingIfTruncated(path, repo) {
     // Two pages IS the whole list; three or more means a middle was dropped.
     truncated: Number(last[1]) > 2,
   };
-}
-
-function apiList(path, repo) {
-  const url = `https://api.github.com/repos/${repo}${path}`;
-  const first = curlJson(url, true);
-  if (!Array.isArray(first.body)) {
-    throw new Error(
-      `GitHub said ${first.body?.status ?? '?'}: ${first.body?.message ?? 'unexpected'} (${url})`,
-    );
-  }
-  const last = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link);
-  if (!last) return first.body;
-  const sep = url.includes('?') ? '&' : '?';
-  const tail = curlJson(`${url}${sep}page=${last[1]}`, false).body;
-  return Array.isArray(tail) ? [...first.body, ...tail] : first.body;
 }
 
 /** Is `sha` an ancestor of `head` in the local clone? null if we cannot tell. */
@@ -775,7 +786,16 @@ export function main() {
   // `truncated` is fatal rather than cosmetic here: see
   // `apiListSayingIfTruncated`. An incomplete list yields a confident wrong
   // verdict in the reassuring direction, so it yields no verdict at all.
-  const needsCommits = bare.some((a) => a.coverage === 'stale');
+  // WIDER THAN "a surviving approval is stale", because `roundsSpent` counts
+  // over every approval ever cast rather than over the one-per-reviewer set.
+  // The narrow predicate silenced the history line on approve-A / push-B /
+  // re-approve-B — the #241 shape the line exists for — because by then the only
+  // surviving approval is `current` and nothing looked stale. The line went
+  // quiet exactly when the branch was back in the good state and a person was
+  // most likely to ask how many rounds it took.
+  const needsCommits =
+    bare.some((a) => a.coverage === 'stale') ||
+    reviews.some((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head);
   const { items: commits, truncated } = needsCommits
     ? apiListSayingIfTruncated(`/pulls/${number}/commits?per_page=100`, repo)
     : { items: [], truncated: false };
@@ -901,6 +921,16 @@ export function main() {
       // reading `staleApprovals: 1` cannot tell whether somebody moved the
       // branch under a reviewer or the author simply pushed again.
       spentApprovals,
+      // SIBLING OF `spentApprovals`, for the reason `unknownCoverageApprovals`
+      // is a sibling of `staleApprovals`: "0 stale is not the same as 0 unread".
+      // `staleApprovals: 1, spentApprovals: 0` reads naturally as "not spent, so
+      // somebody moved the branch under a reviewer" — and it is also what you
+      // get when the author did not resolve to a login, and when the commit list
+      // was truncated. Two of those three are the tool declining to answer, and
+      // reading them as the alarming one sends a consumer chasing an intruder
+      // who is not there, which is #216's actual bill. With both counts present
+      // the residue — stale minus spent minus overtaken — is honestly unknown.
+      overtakenApprovals: approvals.filter((a) => a.why === 'overtaken').length,
       // Sibling of the above, and added for the same reason: without it a scripted
       // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
       // 0 stale is not the same as 0 unread.
