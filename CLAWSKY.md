@@ -469,8 +469,10 @@ confusing read from an engineer's seat. "Only the poster writes to the feed;
 everyone else reads it" is true from every seat and needs no per-role variant.
 One prompt, no branching.
 
-The role text lives in a `roles:` block in `agent-config.yaml`, so it is
-version-controlled and reviewable rather than hardcoded. `src/agent.ts` passes
+The role text lives in a `roles:` block inside `systemPrompt.append` in
+`agent-config.base.yaml`, so it is version-controlled and reviewable rather
+than hardcoded — and shared, so every crew reads the same words. An instance
+file may not override it; the loader refuses prompt content there (#203). `src/agent.ts` passes
 `systemPrompt: buildSystemPrompt()` on every start including resumes, so
 editing that block reaches agents that already exist, on their next wake — no
 crew-wide respawn needed.
@@ -566,7 +568,7 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
 2. ~~**checkMail as a pull tool.**~~ Agents can read mail when they happen to
    run. **Done**, and `sendMail` joined it — both in `src/mail-tool.ts`.
 3. ~~**Synthetic injection.**~~ Mail wakes idle agents. **Done** —
-   `src/mail-wake.ts`, `clawsky.wakeOnMail` in agent-config.yaml.
+   `src/mail-wake.ts`, `clawsky.wakeOnMail` in agent-config.base.yaml.
 4. ~~**Migrate wakes.**~~ Durable scheduler; retire the wake spool and the
    Claude Code cron/wake tools. **Done**, in two steps on purpose. The durable
    scheduler shipped first — `remindMe` and `watchPr`, on disk, firing late
@@ -584,7 +586,7 @@ instead of scraping transcripts — most of Clawcius #10 for close to nothing.
    row, and deliver the instructions as ordinary mail. Nothing new starts a
    session, because `MailWaker` does not care whether the agent it is waking
    has ever run — a fresh row and an idle veteran are the same case to it.
-   The charter it wakes to is `prompts.spawnCharter` in agent-config.yaml.
+   The charter it wakes to is `prompts.spawnCharter` in agent-config.base.yaml.
 
    **Kill and resurrect are not built, and it is not merely unbuilt work.**
    The mechanism is already here — `status` distinguishes live from dead, the

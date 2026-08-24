@@ -145,18 +145,41 @@ the config has not changed.
 
 ## 1b. Configuration split
 
-Two files, on purpose:
+Secrets in one file, shared behaviour in one file, per-instance facts in one
+small file each:
 
 | File | Holds | Commit it? |
 |---|---|---|
-| `.env` | Discord token, guild ID, optionally an API key | **No** |
-| `agent-config.yaml` | Model, turn cap, system prompt, sessions, scheduling | **Yes** |
+| `.env`, `.env.<crew>` | Discord token, guild ID, optionally an API key | **No** |
+| `agent-config.base.yaml` | The system prompt, prompt templates, models, session limits — everything true of *every* crew | **Yes** |
+| `agent-config.yaml`, `agent-config.<crew>.yaml` | One instance's `crew`, `displayName` and Discord channels. A dozen lines | **Yes** |
 | `squid/squid.conf` | The egress allowlist — the only copy of it | **Yes** |
 
 Changing the agent's personality should be a reviewable diff, not an edit to a
 file full of secrets. Every key in the YAML is optional and falls back to the
 defaults in `src/agent-config.ts`; the loader validates types and fails at
 startup with the offending path named, rather than at the first mention.
+
+`AGENT_CONFIG_PATH` points at an **instance** file, never at the base. The
+instance file names its base with `extends:`, resolved against the instance
+file's own directory rather than the process's working directory — systemd
+hands the waker a `WorkingDirectory` it did not choose.
+
+**Two rules, and the loader refuses rather than ignores both.** An instance file
+may not carry prompt content (`systemPrompt.append`, `prompts.*`); the base file
+may not carry instance identity (`crew`, `displayName`, the channel lists, or
+any of the derived paths). The first is what "a standard system prompt for all
+the agents" means in practice — crews share the words and differ only in facts
+interpolated into them, so a sentence true of one crew and false of another gets
+rewritten to be true of the *mechanism*. The second stops a shared file handing
+its value to an instance that forgot to override it; before #203 the defaults
+did exactly that with six Clawcius literals, one of which was the `docker exec`
+target.
+
+Until #203 there was no base and the two instance files were deliberate full
+copies — 937 and 972 lines, of which 111 differed and exactly **three** were
+config values. The rest was the same prose twice, hand-synced, and #125 is the
+commit that proved it drifts.
 
 Egress is **not** configured here. The allowlist lives only in
 `squid/squid.conf`, because a second copy in the YAML was a list that had to
@@ -279,11 +302,65 @@ name is.** `docker/snapshot.sh` is parameterised on `CLAWCIUS_CONTAINER` and
 restore test, because the verifier did not look at the date on the image it was
 booting (Clawcius #87).
 
-**Everything above is instance 1 only, and the second instance's setup is not
-written down anywhere** — not here, not in `MIGRATION.md` (which only chgrps
-`.env.hamachi`, it does not create it), not in `README.md`. Recorded as a gap
-rather than papered over with a pointer to a document that does not have it —
-Clawcius #115.
+**Everything above is instance 1 only.** The config half of a second instance is
+now a dozen lines; the systemd and image half is still hand-work and is still
+not written down end to end — not in `MIGRATION.md` (which only chgrps
+`.env.hamachi`, it does not create it), not in `README.md`. Recorded as a
+remaining gap rather than papered over with a pointer to a document that does
+not have it — Clawcius #115.
+
+### Adding an instance: the config
+
+Copy `agent-config.yaml`, which is Clawcius's instance file and is the shortest
+worked example there is. Change three things:
+
+```yaml
+extends: agent-config.base.yaml
+
+crew: newcrew            # lowercase, ^[a-z][a-z0-9-]{0,31}$
+displayName: Newcrew     # optional; defaults to `crew` capitalised
+
+discord:
+  allowedChannelIds:   ['…']   # channels from THIS crew's guild
+  followUpChannelIds:  ['…']
+  alwaysOnChannelIds:  ['…']
+```
+
+That is the whole file. **Do not add paths.** Nine values derive from `crew` and
+the loader refuses them in the base file precisely so a new instance cannot
+inherit somebody else's:
+
+```
+container.name            newcrew-agent
+container.stateDir        /var/lib/newcrew
+container.execEnvDir      /var/lib/newcrew/exec-env
+container.githubTokenDir  /var/lib/newcrew/github-token
+sessions.workspaceRoot    /var/lib/newcrew/workspaces
+status.file               /var/lib/newcrew/waker-status.json
+status.instance           newcrew
+git.userName              Newcrew
+git.userEmail             newcrew@users.noreply.github.com
+```
+
+Do not add prompt content either — `systemPrompt.append` and `prompts.*` are
+refused in an instance file. The new crew's agents get the shared prompt with
+its own `displayName` at the three `{{Crew}}` sites.
+
+**Two things outside this file must agree with it, and nothing checks either.**
+`status.instance` must match a key under `instances:` in `ops/ops-config.yaml`,
+which compares exact strings. `container.stateDir` must match
+`CLAWCIUS_STATE_DIR` in the new instance's container unit — which is hand-written
+there (`systemd/hamachi-container.service:42`) and defaults to
+`/var/lib/clawcius` in `docker/run-container.sh`, so nothing derives it from
+`crew` and nothing compares the two.
+
+Deriving from `crew` means this file cannot disagree with *itself*. It does not
+reach the unit or the ops manifest, and a correct crew name here does not make
+either of those right. Check them by hand; that is the same hand-work the
+section below is about.
+
+### Adding an instance: the rest
+
 What `systemd/hamachi-container.service` requires, read off the unit itself,
 is: the image `hamachi-agent:latest` (§ *Build the images* above builds
 `clawcius-agent:latest` only — on a from-scratch deploy, tag the freshly built
@@ -291,6 +368,12 @@ image as both names), the env file
 `/home/npurcell/clawcius/.env.hamachi` with its own `CLAWCIUS_DB_PATH`, and
 `agent-config.hamachi.yaml` in the checkout. `run-container.sh` passes
 `--env-file` unconditionally, so a missing env file stops the unit.
+
+The waker unit needs `Environment=AGENT_CONFIG_PATH=` pointing at the new
+instance file — that one line is what makes two instances distinct, and without
+it the process resolves `agent-config.yaml` relative to `WorkingDirectory` and
+comes up as a second copy of instance 1: same container, same workspaces, same
+channel.
 
 Once that instance exists, its snapshot timer is two files and one enable —
 and it is worth having *before* the rest is tidy, because an instance nothing
@@ -746,7 +829,10 @@ The registry lives in the existing SQLite database. Rows from the pre-Clawsky
 channel id as their agent id, and the old table is left in place so a rollback
 to a previous `dist/` still finds its data.
 
-Configuration is the `clawsky:` block in `agent-config.yaml`. `agents:` is how
+Configuration is the `clawsky:` block in `agent-config.base.yaml` — except the
+crew name, which is the top-level `crew` in the *instance* file since #203,
+because the container name and the state directory derive from it too and it is
+no longer only the board's. `agents:` is how
 a crew gets anyone but its Discord coordinator until spawn exists; it ships
 empty.
 

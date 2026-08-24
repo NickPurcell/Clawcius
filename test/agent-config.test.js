@@ -27,7 +27,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { parse, stringify } from 'yaml';
@@ -42,10 +42,20 @@ function writeConfigRaw(lines) {
   return path;
 }
 
-/** A config with just enough in it to load, plus whatever is under test. */
+/**
+ * A config with just enough in it to load, plus whatever is under test.
+ *
+ * `crew: x` is the whole preamble since #203, and it is what the two lines it
+ * replaced used to say the long way: `container.stateDir` derives to
+ * `/var/lib/x` from it, so every path assertion below reads exactly as before.
+ * The lines callers pass still open inside `container:`.
+ */
 function writeConfig(lines) {
-  return writeConfigRaw(['container:', '  stateDir: /var/lib/x', ...lines]);
+  return writeConfigRaw(['crew: x', 'container:', ...lines]);
 }
+
+/** Absolute, because a fixture in a tmpdir cannot resolve a relative base. */
+const BASE = resolve('agent-config.base.yaml');
 
 test('a status file inside the container mount is refused, not just one inside a spool', () => {
   // Clawcius #55, as reported: one level above the directory the old check
@@ -91,17 +101,21 @@ test('the default layout loads: every trusted path is a sibling of the mount', (
   assert.equal(config.status.file, '/var/lib/x/waker-status.json');
 });
 
-test('container.stateDir is required, absolute, and has no default', () => {
-  // The three values OJ put through the loader in review of #67. Each one makes
-  // the #55 fix pass a status.file that is inside a real bind mount, so each one
-  // silently undoes the thing this key was added to do.
+test('an explicit container.stateDir must still be absolute', () => {
+  // Two of the three values OJ put through the loader in review of #67. Each
+  // makes the #55 fix pass a status.file that is inside a real bind mount, so
+  // each silently undoes the thing that key was added to do.
+  //
+  // The THIRD case — the key absent entirely — is no longer a failure and is
+  // now the normal state: it derives from `crew`. See the next test, which is
+  // where that case moved rather than where it was dropped.
 
   // Relative: resolves against the WAKER'S cwd, so isInside() compares against a
   // directory that does not exist and everything passes.
   assert.throws(
     () =>
       loadAgentConfig(
-        writeConfigRaw(['container:', '  stateDir: var/lib/x', '  execEnvDir: /var/lib/x-env']),
+        writeConfigRaw(['crew: x', 'container:', '  stateDir: var/lib/x', '  execEnvDir: /var/lib/x-env']),
       ),
     /container\.stateDir .* must be an absolute path/,
   );
@@ -109,25 +123,75 @@ test('container.stateDir is required, absolute, and has no default', () => {
   // Empty: same, and it is what a half-finished edit leaves behind.
   assert.throws(
     () =>
-      loadAgentConfig(writeConfigRaw(['container:', '  stateDir: ""', '  execEnvDir: /x-env'])),
+      loadAgentConfig(writeConfigRaw(['crew: x', 'container:', '  stateDir: ""', '  execEnvDir: /x-env'])),
     /container\.stateDir is required/,
-  );
-
-  // Absent: the one that would actually happen. The key is new; a default would
-  // be /var/lib/clawcius, so an agent-config.hamachi.yaml that simply lacks it
-  // would point Hamachi's containment check at CLAWCIUS's mount and wave
-  // Hamachi's own run/ straight through.
-  assert.throws(
-    () => loadAgentConfig(writeConfigRaw(['container:', '  execEnvDir: /var/lib/x-env'])),
-    /container\.stateDir is required and has no default/,
   );
 });
 
-test('both shipped agent configs set container.stateDir, and set it to their own', () => {
-  // The check above only bites if somebody writes the key. This is the one that
-  // says the two files in this repository are correct, and that they differ —
-  // a copy-paste that left Hamachi pointing at /var/lib/clawcius would pass
-  // every other test in this file.
+test('crew is required, has no default, and is what every instance path derives from', () => {
+  // This is where `container.stateDir is required and has no default` went.
+  // The reason it was required is intact and is now discharged one level up: a
+  // DEFAULT would be `/var/lib/clawcius`, one crew's directory handed to a crew
+  // that forgot to say its own. A DERIVATION from the instance's own name
+  // cannot name its neighbour, which is the property the literal never had.
+  assert.throws(
+    () => loadAgentConfig(writeConfigRaw(['container:', '  execEnvDir: /var/lib/x-env'])),
+    /crew is required and has no default/,
+  );
+
+  // And the nine values that come off it. Measured against both shipped configs
+  // before the split: every one already held exactly this shape, so this test
+  // asserts a convention that was being hand-maintained, not a new one.
+  const config = loadAgentConfig(writeConfigRaw(['crew: newcrew']));
+  assert.equal(config.container.name, 'newcrew-agent');
+  assert.equal(config.container.stateDir, '/var/lib/newcrew');
+  assert.equal(config.container.execEnvDir, '/var/lib/newcrew/exec-env');
+  assert.equal(config.container.githubTokenDir, '/var/lib/newcrew/github-token');
+  assert.equal(config.sessions.workspaceRoot, '/var/lib/newcrew/workspaces');
+  assert.equal(config.status.file, '/var/lib/newcrew/waker-status.json');
+  assert.equal(config.status.instance, 'newcrew');
+  assert.equal(config.git.userName, 'Newcrew');
+  assert.equal(config.git.userEmail, 'newcrew@users.noreply.github.com');
+
+  // container.name in particular, because its failure mode is the loudest and
+  // the least visible. It is the `docker exec` target (src/container.ts:323),
+  // so before #203 — when DEFAULTS held the literal `clawcius-agent` — a third
+  // crew that set everything else and forgot this one key would not have
+  // errored. It would have run its turns inside CLAWCIUS's container, with
+  // Clawcius's mounts and Clawcius's read-only credential directory.
+  assert.notEqual(config.container.name, 'clawcius-agent');
+});
+
+test('displayName defaults to the crew capitalised, and is what the prompt says', () => {
+  assert.equal(loadAgentConfig(writeConfigRaw(['crew: x'])).displayName, 'X');
+  assert.equal(
+    loadAgentConfig(writeConfigRaw(['crew: x', 'displayName: Xylophone'])).displayName,
+    'Xylophone',
+  );
+  // It reaches two places and only two: the prompt, and the commit identity.
+  const config = loadAgentConfig(
+    writeConfigRaw([
+      'crew: x',
+      'displayName: Xylophone',
+      'systemPrompt:',
+      '  append: You are {{Crew}}.',
+    ]),
+  );
+  assert.equal(config.systemPrompt.append, 'You are Xylophone.');
+  assert.equal(config.git.userName, 'Xylophone');
+  // …while `crew` stays lowercase, because it is compared as an exact string by
+  // the ops allowlist and prefixes every agent id.
+  assert.equal(config.crew, 'x');
+  assert.equal(config.git.userEmail, 'x@users.noreply.github.com');
+});
+
+test('both shipped agent configs resolve container.stateDir to their own', () => {
+  // Neither file SETS it any more — the key is refused in both layered files and
+  // derives from `crew`, which is the better assertion and is what this checks.
+  // The title used to say "set", which was the opposite of what #203 did (OJ
+  // round 1 on #207, finding 7). What it has always been for is unchanged: the
+  // two shipped files must be correct AND must differ, and a copy-paste that
+  // left Hamachi pointing at /var/lib/clawcius would pass every other test here.
   const clawcius = loadAgentConfig('agent-config.yaml');
   const hamachi = loadAgentConfig('agent-config.hamachi.yaml');
   assert.equal(clawcius.container.stateDir, '/var/lib/clawcius');
@@ -141,6 +205,14 @@ test('all three read-write mounts are checked, not just the one the spools lived
   // named agent-home as a known gap, while ops/src/config.ts checked all three
   // — two halves of one change disagreeing about the completeness of one
   // enumeration. Both files check three now.
+  //
+  // The assertion matches the CLAIM rather than the label, and that is not
+  // laxity — since #203 the `workspaces` case is caught by the
+  // `sessions.workspaceRoot` entry instead of the `<container.stateDir>/…` one,
+  // because workspaceRoot finally derives from stateDir and the two entries name
+  // the same directory. `bindMountedPaths` lists both on purpose ("an operator
+  // who moves one has not moved the mount"), so which one reports it is an
+  // ordering detail; that the path is refused as a bind mount is the property.
   for (const child of ['run', 'workspaces', 'agent-home']) {
     assert.throws(
       () =>
@@ -151,7 +223,7 @@ test('all three read-write mounts are checked, not just the one the spools lived
             `  file: /var/lib/x/${child}/waker-status.json`,
           ]),
         ),
-      /status\.file .* is inside .* bind-mounted read-write/,
+      /status\.file .* is inside .* which docker\/run-container\.sh bind-mounts/,
       `a status file under ${child}/ must be refused`,
     );
     assert.throws(
@@ -178,6 +250,408 @@ test('a near-miss prefix is not containment', () => {
     writeConfig(['  execEnvDir: /var/lib/x-ops/exec-env', 'status:', '  file: /var/lib/x-run/s.json']),
   );
   assert.equal(config.container.execEnvDir, '/var/lib/x-ops/exec-env');
+});
+
+// ── Layering: one shared base, one small file per instance (#203) ───────────
+//
+// Before this, `agent-config.yaml` and `agent-config.hamachi.yaml` were
+// deliberate full copies — 937 and 972 lines, of which 111 differed and exactly
+// THREE were config values. The rest was the same prose twice, hand-synced, and
+// #125 is the commit that proved it drifts: it changed one copy and not the
+// other, and Hamachi kept a persona the operator had asked to remove for four
+// days. #152 ported it and verified byte-identity with a `node -e` in the PR
+// description, which ran once and never again. These are that check, made a
+// thing that runs.
+
+test('the shipped instance files extend the shared base rather than copying it', () => {
+  // The whole property in one assertion. A future instance file that stopped
+  // extending would load fine and drift silently, which is the state this
+  // change exists to make unreachable.
+  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
+    const raw = parse(readFileSync(file, 'utf8'));
+    assert.equal(raw.extends, 'agent-config.base.yaml', `${file} must extend the base`);
+    assert.ok(raw.crew, `${file} must name its crew`);
+  }
+});
+
+test('the base prompt renders to each crew, and rendering is the only difference', () => {
+  // THE NO-OP PROOF, and the reason it is a test rather than a paragraph in a
+  // pull request. It says: one 24kB prompt, three `{{Crew}}` sites, and what
+  // each crew's agents read differs by the display name and nothing else.
+  //
+  // It scales to instance three without an edit — add a file to the list and
+  // the same property is asserted of it — which is what #152's one-off could
+  // never do.
+  const base = parse(readFileSync('agent-config.base.yaml', 'utf8'));
+  const template = base.systemPrompt.append;
+
+  assert.equal(
+    (template.match(/\{\{Crew\}\}/g) ?? []).length,
+    3,
+    'three identity sites: <system description> twice and <style> once',
+  );
+
+  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
+    const config = loadAgentConfig(file);
+    assert.equal(
+      config.systemPrompt.append,
+      template.split('{{Crew}}').join(config.displayName),
+      `${file}'s prompt must be the shared base with only its own name substituted`,
+    );
+    assert.doesNotMatch(config.systemPrompt.append, /\{\{/, 'nothing unsubstituted reaches an agent');
+  }
+
+  // There is deliberately NO third assertion comparing the two crews' prompts
+  // to each other, and the absence is the result rather than a gap.
+  //
+  // #152 compared them under s/Clawcius/CREW/ AND s/Hamachi/CREW/, which mapped
+  // "Hamachi and Clawcius" and "Clawcius and Hamachi" to the same string — so
+  // it could not have seen a reordering. The obvious repair, normalising out
+  // each crew's OWN name and comparing, does not work either, and fails for a
+  // reason worth writing down: `<mail>` names both crews in one sentence on
+  // purpose, so each crew's prompt legitimately contains the other's name. That
+  // assertion was written here first; this comment is what it turned into.
+  //
+  // Neither is needed. Both prompts are rendered from ONE template by the loop
+  // above, so there is no second copy for a reordering to happen in. The
+  // property #152 was reaching for is now unreachable rather than checked, which
+  // is what an include directive was always supposed to buy.
+});
+
+test('the repository name survives substitution, in every crew’s prompt', () => {
+  // The hazard that made the delimiter a design decision. `Clawcius` is this
+  // crew's identity AND the repository, indistinguishable by string match — so
+  // a substitution keyed on the literal name would rewrite Hamachi's copy to
+  // `NickPurcell/Hamachi`, a repository that does not exist, taking
+  // <issue-tracking> with it. It would not fail: it would 404 the first time
+  // some agent tried to file an issue.
+  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
+    const { append } = loadAgentConfig(file).systemPrompt;
+    assert.match(append, /Repositories: NickPurcell\/Clawcius/, `${file}: the repo is not the crew`);
+    assert.match(append, /\(Clawcius #93\)/, `${file}: issue references are not the crew`);
+    // And the single-brace URL templates are prose, left exactly alone. This is
+    // why the placeholder is `{{Crew}}`: a `{name}` validator would fail the
+    // boot on a pasted GitHub path, and a `{name}` substituter would rewrite it.
+    assert.match(append, /\/repos\/\{owner\}\/\{repo\}\/issues\/\{n\}\/labels/);
+  }
+});
+
+test('an instance file may not carry prompt content — refused, not ignored', () => {
+  // Decision 2 of #203, made enforceable. Crews share one prompt and differ only
+  // in facts interpolated into it; a crew that needs a different sentence gets a
+  // sentence rewritten to be true of the MECHANISM, which is what #197 did under
+  // duress and what this makes the rule.
+  //
+  // REFUSED rather than ignored, because ignoring it is the original defect in a
+  // smaller place: an edit that does not reach the running system. An operator
+  // who gets a boot error learns the rule at the moment they can act on it; one
+  // who gets a working instance with a silently-dropped paragraph learns nothing.
+  for (const [lines, pattern] of [
+    [['systemPrompt:', '  append: You are something else.'], /systemPrompt\.append/],
+    [['prompts:', '  roleNotice: something else'], /prompts/],
+  ]) {
+    assert.throws(
+      () => loadAgentConfig(writeConfigRaw(['crew: x', `extends: ${BASE}`, ...lines])),
+      pattern,
+    );
+    assert.throws(
+      () => loadAgentConfig(writeConfigRaw(['crew: x', `extends: ${BASE}`, ...lines])),
+      /does not belong in this file|do not belong in this file/,
+    );
+  }
+
+  // A non-prompt key in an instance file is fine — that is what instance files
+  // are for, and the refusal must be about content rather than about overriding.
+  const config = loadAgentConfig(
+    writeConfigRaw(['crew: x', `extends: ${BASE}`, 'maxTurns: 7']),
+  );
+  assert.equal(config.maxTurns, 7);
+  assert.match(config.systemPrompt.append, /You are X, a team of agents/);
+});
+
+test('the shared base may not carry instance identity — the inheritance bug, closed', () => {
+  // Not symmetry with the test above. This one prevents a demonstrated failure:
+  // a value in the SHARED file is inherited by every instance that does not
+  // override it, and before #203 `DEFAULTS` did exactly that with six Clawcius
+  // literals. `container.name` is the worst of them because it is the
+  // `docker exec` target (src/container.ts:323) — an instance inheriting it does
+  // not fail, it runs its turns inside the other crew's container.
+  const forbidden = [
+    ['container:', '  name: someone-elses-agent'],
+    ['container:', '  stateDir: /var/lib/someoneelse'],
+    ['container:', '  execEnvDir: /var/lib/someoneelse/exec-env'],
+    ['container:', '  githubTokenDir: /var/lib/someoneelse/github-token'],
+    ['sessions:', '  workspaceRoot: /var/lib/someoneelse/workspaces'],
+    ['status:', '  file: /var/lib/someoneelse/waker-status.json'],
+    ['status:', '  instance: someoneelse'],
+    ['git:', '  userName: SomeoneElse'],
+    ['git:', '  userEmail: someoneelse@users.noreply.github.com'],
+    ['discord:', "  allowedChannelIds: ['1']"],
+    ['discord:', "  followUpChannelIds: ['1']"],
+    ['discord:', "  alwaysOnChannelIds: ['1']"],
+    ['crew: someoneelse'],
+    ['displayName: SomeoneElse'],
+  ];
+  for (const lines of forbidden) {
+    const fakeBase = writeConfigRaw(['model: some-model', ...lines]);
+    const instance = writeConfigRaw(['crew: x', `extends: ${fakeBase}`]);
+    assert.throws(
+      () => loadAgentConfig(instance),
+      /does not belong in this file|do not belong in this file/,
+      `a base carrying ${lines.join(' ')} must be refused`,
+    );
+  }
+});
+
+test('clawsky.crew is refused wherever it appears, because the key moved', () => {
+  // Unlike everything else here this key MOVED to the top level, and a moved key
+  // left working under its old name is a second place to write the crew name.
+  // The one thing the derivation cannot survive is two sources for the fact it
+  // derives from, so this is refused even in a standalone file.
+  assert.throws(
+    () => loadAgentConfig(writeConfigRaw(['crew: x', 'clawsky:', '  crew: y'])),
+    /clawsky\.crew moved to the top level as `crew`/,
+  );
+});
+
+test('extends resolves against the instance file, and chains are refused', () => {
+  // Against the INSTANCE FILE's directory, not the process's cwd: systemd hands
+  // the waker a WorkingDirectory it did not choose, so a base found only when
+  // launched from the right place is a config that works in development and
+  // fails at boot.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-layer-'));
+  writeFileSync(join(dir, 'shared.yaml'), 'model: from-the-base\n');
+  writeFileSync(join(dir, 'instance.yaml'), 'crew: x\nextends: shared.yaml\n');
+  assert.equal(loadAgentConfig(join(dir, 'instance.yaml')).model, 'from-the-base');
+
+  // A missing base names the path rather than falling back to defaults, which
+  // would be a crew booting on somebody's idea of a sensible prompt.
+  writeFileSync(join(dir, 'broken.yaml'), 'crew: x\nextends: nope.yaml\n');
+  assert.throws(() => loadAgentConfig(join(dir, 'broken.yaml')), /Base config named by `extends` not found/);
+
+  // One level. A chain makes "which file is this value from" a question you
+  // answer by tracing, which is the state this change is getting out of.
+  writeFileSync(join(dir, 'middle.yaml'), 'extends: shared.yaml\nmodel: m\n');
+  writeFileSync(join(dir, 'chained.yaml'), 'crew: x\nextends: middle.yaml\n');
+  assert.throws(() => loadAgentConfig(join(dir, 'chained.yaml')), /chains are not supported/);
+
+  writeFileSync(join(dir, 'self.yaml'), 'crew: x\nextends: self.yaml\n');
+  assert.throws(() => loadAgentConfig(join(dir, 'self.yaml')), /cannot point at the file itself/);
+});
+
+test('an unknown {{placeholder}} fails the boot instead of reaching an agent', () => {
+  // The same bargain `prompts.*` templates already make, and for the same
+  // reason: a literal `{{crew}}` shipped into 24kB of prose is a sentence that
+  // reads as broken to every agent that gets it, with nothing said at boot.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfigRaw(['crew: x', 'systemPrompt:', '  append: You are {{crew}}.']),
+      ),
+    /systemPrompt\.append uses unknown placeholder \{\{crew\}\}/,
+  );
+
+  // Single braces are prose and are left entirely alone — no validation, no
+  // substitution. This is the whole reason the delimiter is doubled.
+  const config = loadAgentConfig(
+    writeConfigRaw(['crew: x', 'systemPrompt:', '  append: "POST /repos/{owner}/{repo}/issues/{n}/labels"']),
+  );
+  assert.equal(config.systemPrompt.append, 'POST /repos/{owner}/{repo}/issues/{n}/labels');
+});
+
+// ── What the mechanism CLAIMS versus what it does (OJ round 1 on #207) ──────
+//
+// Every finding in that round was of one kind: a sentence in a header, a comment
+// or an error message describing a stricter loader than the one that shipped.
+// All are closed by making the loader match the sentence rather than the other
+// way round, because in each case the sentence described what anyone would want.
+// These keep it that way.
+
+test('a derived key is refused in an instance file, not just in the base', () => {
+  // FINDING 1, the sharpest of the round: the file whose header promised this
+  // refusal was the file that accepted the key. BASE_FORBIDDEN closed the
+  // INHERITANCE path — a shared value reaching an instance that did not override
+  // it. It did not close RESTATEMENT, so this loaded:
+  //
+  //   extends: <base> / crew: third / container: { name: clawcius-agent }
+  //   => container.name "clawcius-agent", stateDir "/var/lib/third"
+  //
+  // Crew `third` docker-exec-ing into Clawcius's container, accepted silently.
+  for (const [lines, key] of [
+    [['container:', '  name: clawcius-agent'], 'container\\.name'],
+    [['container:', '  stateDir: /var/lib/clawcius'], 'container\\.stateDir'],
+    [['status:', '  file: /var/lib/clawcius/waker-status.json'], 'status\\.file'],
+    [['git:', '  userName: Clawcius'], 'git\\.userName'],
+  ]) {
+    assert.throws(
+      () => loadAgentConfig(writeConfigRaw(['crew: third', `extends: ${BASE}`, ...lines])),
+      new RegExp(`${key} does not belong in this file`),
+      `${key} restated in an instance file must be refused`,
+    );
+  }
+
+  // And the refusal must say the right thing. One rule sentence covered both
+  // kinds of forbidden key at first, so this told an operator that
+  // `container.name` was prompt content.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeConfigRaw(['crew: third', `extends: ${BASE}`, 'container:', '  name: clawcius-agent']),
+      ),
+    /derives from `crew`/,
+  );
+
+  // A STANDALONE file is deliberately unaffected: no shared file, nothing to
+  // inherit through, and the containment guards need explicit paths to bite.
+  assert.equal(
+    loadAgentConfig(writeConfig(['  execEnvDir: /var/lib/x-env'])).container.execEnvDir,
+    '/var/lib/x-env',
+  );
+});
+
+test('a bare `extends:` is an error, not a silent standalone file', () => {
+  // FINDING 2. `extends:` with no value parses to null, and null was treated as
+  // absent — so it did not mean "extends nothing is wrong", it meant "this file
+  // is standalone", and the crew booted with NO system prompt at all, on the
+  // code default model instead of the base's, silently:
+  //
+  //   systemPrompt.append 0 chars · model claude-opus-5 (base: [1m])
+  //   sessions.maxConcurrent 3 (base: 10)
+  //
+  // `extends: ""` was already refused. In YAML these are the same edit made two
+  // ways, and the safe-looking one was the one that failed silently.
+  for (const line of ['extends:', 'extends: ""']) {
+    assert.throws(
+      () => loadAgentConfig(writeConfigRaw([line, 'crew: clawcius'])),
+      /extends must be a path to the shared base config/,
+    );
+  }
+  // Absent entirely is still a legitimate standalone config.
+  assert.equal(loadAgentConfig(writeConfigRaw(['crew: x'])).crew, 'x');
+});
+
+test('an explicit null in an instance file inherits the base, not the code default', () => {
+  // FINDING 3. `deepMerge` treated an explicit null as a value replacing the
+  // base's, and every reader then treats null as absent and falls back to
+  // DEFAULTS. So `key:` with nothing after it meant neither "inherit" nor
+  // "error" but "reset to whatever src/agent-config.ts says" — a third semantic
+  // nobody chose. Commenting out a value and leaving its key is an ordinary
+  // edit; `model:` moved every agent in the crew off the 1M-context model.
+  const shipped = loadAgentConfig('agent-config.yaml');
+  const nulled = loadAgentConfig(
+    writeConfigRaw(['crew: clawcius', `extends: ${BASE}`, 'model:', 'sessions:', '  maxConcurrent:']),
+  );
+  assert.equal(nulled.model, shipped.model);
+  assert.match(nulled.model, /\[1m\]/, 'the 1M-context suffix must survive a nulled key');
+  assert.equal(nulled.sessions.maxConcurrent, shipped.sessions.maxConcurrent);
+  assert.equal(nulled.sessions.maxConcurrent, 10);
+
+  // An explicit EMPTY value is a value and still overrides — that is what
+  // `alwaysOnChannelIds: []` needs, so the fix must not swallow it.
+  assert.deepEqual(
+    loadAgentConfig(
+      writeConfigRaw(['crew: x', `extends: ${BASE}`, 'discord:', '  alwaysOnChannelIds: []']),
+    ).discord.alwaysOnChannelIds,
+    [],
+  );
+});
+
+test('an error names the file the key actually came from', () => {
+  // FINDING 4, and it is this change's own listed fix reintroduced one layer up.
+  // Every error named the instance file, but after the split almost every value
+  // lives in the base — so a bad `{{crew}}` in the SHARED prompt said "fix
+  // systemPrompt.append in agent-config.yaml", which is one of the two keys an
+  // instance file is FORBIDDEN to contain. An operator following that error
+  // writes the key, gets a second boot error telling them to move it back, and
+  // the second error names the file the first one should have.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-prov-'));
+  const shared = readFileSync('agent-config.base.yaml', 'utf8');
+  const write = (baseText, instanceLines) => {
+    writeFileSync(join(dir, 'base.yaml'), baseText);
+    writeFileSync(join(dir, 'inst.yaml'), ['extends: base.yaml', 'crew: third', ...instanceLines, ''].join('\n'));
+    return join(dir, 'inst.yaml');
+  };
+
+  for (const [mutate, key] of [
+    [(t) => t.replace('maxTurns: 0', 'maxTurns: nope'), /base\.yaml: maxTurns/],
+    [(t) => t.replace('You are {{Crew}}, a team', 'You are {{crew}}, a team'), /base\.yaml: systemPrompt\.append/],
+    [(t) => t.replace(/^  roleNotice: .*$/m, '  roleNotice: "{nope}"'), /base\.yaml: prompts\.roleNotice/],
+  ]) {
+    assert.throws(() => loadAgentConfig(write(mutate(shared), [])), key);
+  }
+
+  // Same key, different file, different name.
+  assert.throws(() => loadAgentConfig(write(shared, ['maxTurns: nope'])), /inst\.yaml: maxTurns/);
+});
+
+test('an indexed key names its own file, and so do the guards (OJ round 2)', () => {
+  // THE TAIL OF FINDING 4. `fileFor` walked up by stripping at the last `.`, so
+  // a path with an `[index]` never reached its own entry: `allowedChannelIds[0]`
+  // jumped straight past `discord.allowedChannelIds` to `discord`, and named
+  // whichever file wrote the parent mapping.
+  //
+  // For this key that is ALWAYS wrong — BASE_FORBIDDEN refuses
+  // `discord.allowedChannelIds` in the base, so it can only have come from an
+  // instance file. An error naming the base names a file the key may not be in.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-idx-'));
+  const write = (baseLines, instanceLines) => {
+    writeFileSync(join(dir, 'base.yaml'), [...baseLines, ''].join('\n'));
+    writeFileSync(join(dir, 'inst.yaml'), ['extends: base.yaml', 'crew: third', ...instanceLines, ''].join('\n'));
+    return join(dir, 'inst.yaml');
+  };
+
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(['discord:', '  followUpWindowSeconds: 300'], ['discord:', '  allowedChannelIds: [12345]']),
+      ),
+    /inst\.yaml: discord\.allowedChannelIds\[0\]/,
+  );
+
+  // Same shape one level deeper, through a list of mappings.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(
+          ['clawsky:', '  enabled: true'],
+          ['clawsky:', '  agents:', '    - id: wrongprefix', '      role: engineer'],
+        ),
+      ),
+    /inst\.yaml: clawsky\.agents\[0\]\.id/,
+  );
+
+  // The bundling check is the clean miss: BOTH keys live in the base and are
+  // refused nowhere, so naming the instance file was simply always wrong.
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        write(['discord:', '  bundleDebounceMs: 1500', '  bundleMaxWaitMs: 100'], []),
+      ),
+    /base\.yaml: discord\.bundleMaxWaitMs must be >=/,
+  );
+
+  // And the containment guards name the file holding the MOUNT, because that is
+  // the half an operator can edit — `status.file` is derived and cannot move.
+  assert.throws(
+    () => loadAgentConfig(write(['paths:', '  skillsDir: /var/lib/third'], [])),
+    /base\.yaml: status\.file .* is inside paths\.skillsDir/,
+  );
+});
+
+test('an explicit stateDir is followed by every derived path or by none', () => {
+  // FINDING 5. `githubTokenDir` re-derived from an explicit stateDir while
+  // execEnvDir, workspaceRoot and status.file kept computing from
+  // /var/lib/{crew} — so `stateDir: /srv/third` produced a workspaceRoot outside
+  // the directory run-container.sh actually mounts. Half-honoured reads as
+  // coherent, which is worse than not honoured at all.
+  const config = loadAgentConfig(
+    writeConfigRaw(['crew: third', 'container:', '  stateDir: /srv/third']),
+  );
+  assert.equal(config.container.stateDir, '/srv/third');
+  assert.equal(config.container.execEnvDir, '/srv/third/exec-env');
+  assert.equal(config.container.githubTokenDir, '/srv/third/github-token');
+  assert.equal(config.sessions.workspaceRoot, '/srv/third/workspaces');
+  assert.equal(config.status.file, '/srv/third/waker-status.json');
 });
 
 // ── modelByRole ─────────────────────────────────────────────────────────────
@@ -298,7 +772,13 @@ test('githubTokenDir is refused inside OR equal to any other bind mount', () => 
   // with a mount is the worst case, not the exempt one: `<stateDir>/workspaces`
   // is the read-write mount that is also the container's working directory,
   // which is where round 1 found the credential and why any of this exists.
+  // Built from the real Clawcius instance file, so the mounts it is checked
+  // against are the real ones. `extends` is rewritten to an absolute path
+  // because the fixture is written to a tmpdir and `extends` resolves against
+  // the instance file's own directory — which is the correct behaviour and the
+  // reason a systemd-launched waker can find its base at all.
   const base = parse(readFileSync('agent-config.yaml', 'utf8'));
+  base.extends = BASE;
   const refused = [
     '/var/lib/clawcius/workspaces', // equal to a read-write mount
     '/var/lib/clawcius/run',
@@ -308,7 +788,7 @@ test('githubTokenDir is refused inside OR equal to any other bind mount', () => 
   ];
   for (const dir of refused) {
     const y = structuredClone(base);
-    y.container.githubTokenDir = dir;
+    y.container = { ...(y.container ?? {}), githubTokenDir: dir };
     const path = join(mkdtempSync(join(tmpdir(), 'clawsky-cfg-')), 'agent-config.yaml');
     writeFileSync(path, stringify(y));
     assert.throws(
