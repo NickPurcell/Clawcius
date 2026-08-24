@@ -393,9 +393,20 @@ export type AgentConfig = {
       /**
        * Seconds between polls of one watched pull request.
        *
-       * A courtesy to a third party's API and not a limit on anything that
-       * reaches an agent: one poll produces one mail naming everything it
-       * found, however much that is. Two minutes against one repository and a
+       * A courtesy to a third party's API and not a throttle on anything that
+       * reaches an agent — with ONE exception, `quiet` above, which DROPS a
+       * matching comment rather than delaying it. One poll produces one mail
+       * naming everything it found EXCEPT those: with the shipped defaults a
+       * poll carrying the reviewer's acknowledgement and a human's comment
+       * mails one of them, not two.
+       *
+       * The exception is repeated here rather than left to `quiet`'s own block
+       * twelve lines up because an IDE hover on `pollSeconds` renders THIS doc
+       * alone — so without it, the type that adds the exception is the one
+       * place the exception is denied. Fifth of five copies of this sentence;
+       * the other four are corrected. OJ #240 round 3.
+       *
+       * Two minutes against one repository and a
        * handful of pull requests is nowhere near GitHub's 5000/hour, and a
        * shorter interval buys nothing a human review cycle can perceive.
        */

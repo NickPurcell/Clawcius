@@ -1146,7 +1146,10 @@ armed:
     # one mail naming every new review and comment it found — with ONE
     # exception: `armed.github.quiet`, which DROPS a matching comment rather
     # than delaying it. That key is overridable but is not written out in this
-    # file; its defaults and the reasoning are in `src/armed-wake.ts`'s header.
+    # file: its DEFAULTS are the `quiet` block in `src/agent-config.ts`'s
+    # `DEFAULTS`, and the REASONING is `src/armed-wake.ts`'s header. (Two
+    # places, said separately, because an earlier version of this line sent the
+    # reader to armed-wake.ts for both and the defaults are not there.)
     # With the shipped defaults a poll that finds a reviewer's acknowledgement
     # and a human's comment mails one of them, not two.
     # One repo and a handful of PRs is nowhere near 5000 requests an hour,

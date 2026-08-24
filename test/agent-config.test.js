@@ -1250,3 +1250,68 @@ test('every prompt template is byte-identical between the defaults and the shipp
     );
   }
 });
+
+// ── the boot refusal that another module's safety now rests on ──────────────
+
+test('a quiet pattern that does not compile REFUSES at boot (#240)', () => {
+  // This is not ordinary coverage. Round 2 of #240 removed the `try/catch` from
+  // `matches()` in `src/armed-wake.ts` on the strength of this refusal running,
+  // so the invariant is enforced in a DIFFERENT MODULE from the one relying on
+  // it, and nothing failed if a refactor dropped it.
+  //
+  // What it costs if it goes: an uncompilable `suppress` reaches the waker, and
+  // every tick throws before the watermark advances. The watch wedges — nothing
+  // is delivered, including the human's comment in the same poll — and the row
+  // stays armed and retries forever. Worse than the silent-match bug the
+  // refusal replaced.
+  // `suppress` is a LIST and `keep` is a SCALAR — the loader refuses the wrong
+  // shape before it ever reaches the compile check, so the fixture differs.
+  const cases = [
+    { key: 'suppress', lines: ['      suppress:', "        - '('"] },
+    { key: 'keep', lines: ["      keep: '('"] },
+  ];
+  for (const { key, lines } of cases) {
+    assert.throws(
+      () =>
+        loadAgentConfig(
+          writeConfigRaw([
+            'standalone: true',
+            'crew: x',
+            'armed:',
+            '  github:',
+            '    quiet:',
+            '      author: someone',
+            ...lines,
+          ]),
+        ),
+      (error) => {
+        assert.match(error.message, /is not a valid regular expression/);
+        assert.ok(
+          error.message.includes(`armed.github.quiet.${key}`),
+          `the message must name the key, or an operator cannot find it: ${error.message}`,
+        );
+        return true;
+      },
+      `an uncompilable ${key} pattern must not reach the waker`,
+    );
+  }
+});
+
+test('a valid quiet config still loads — or the refusal above proves nothing', () => {
+  // The control. Without it, "throws" would hold just as well if the fixture
+  // were malformed for some unrelated reason.
+  const config = loadAgentConfig(
+    writeConfigRaw([
+      'standalone: true',
+      'crew: x',
+      'armed:',
+      '  github:',
+      '    quiet:',
+      '      author: someone',
+      '      suppress:',
+      "        - '^ok'",
+    ]),
+  );
+  assert.equal(config.armed.github.quiet.author, 'someone');
+  assert.deepEqual(config.armed.github.quiet.suppress, ['^ok']);
+});
