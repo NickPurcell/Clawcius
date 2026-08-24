@@ -353,7 +353,20 @@ export function explainMergeState(state, approvals, ruleset) {
             // this tool's whole subject: the gate answers MAY I merge, not
             // SHOULD I. It belongs only here, where nothing is known to cover
             // the head; in the `N DOES cover` case the old code warned wrongly.
-            'none is known to cover this head, so merging now merges code no review has read') +
+            //
+            // AND IT SPLITS ON UNKNOWN, which is #235 round 4's finding against
+            // the restored clause. `no review has read` is a claim about the
+            // world; with an UNKNOWN approval in hand, only a claim about
+            // KNOWLEDGE is available. An approval with an absent `commit_id` may
+            // have read exactly this head — that is the entire content of
+            // UNKNOWN, and the reason three rounds went into stopping this tool
+            // collapsing it into STALE. Saying it anyway, on the line a reader
+            // acts on, would collapse it again in the last clause of the same
+            // sentence.
+            (unknown.length > 0
+              ? 'none is KNOWN to cover this head and the UNKNOWN one(s) may or may not, ' +
+                'so whether this code has been reviewed cannot be settled from here'
+              : 'none covers this head, so merging now merges code no review has read')) +
         dismissal
       );
     case 'dirty':

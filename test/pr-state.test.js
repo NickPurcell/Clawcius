@@ -359,12 +359,42 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
   );
   assert.match(both, /1 STALE/);
   assert.match(both, /1 with no commit_id/, 'the unknown one must not go unmentioned');
-  assert.match(both, /none is known to cover this head/);
   // AND THE CONSEQUENCE, which the bucket rewrite dropped along with the
   // assertion that pinned it. The all-stale case is the one that started #218
   // and the one that got merged past; a statement of fact is not what a reader
   // needs there.
-  assert.match(both, /merging now merges code no review has read/i);
+  //
+  // ROUND 4: but the consequence SPLITS ON UNKNOWN, and the first restored
+  // version did not. `no review has read` is a claim about the world, and an
+  // approval with an absent commit_id may have read exactly this head — that is
+  // the whole content of UNKNOWN and the thing this branch exists to stop the
+  // tool collapsing into STALE. With one in hand only a claim about KNOWLEDGE
+  // is available, so that is what it says.
+  assert.match(both, /none is KNOWN to cover this head/);
+  assert.match(both, /cannot be settled from here/);
+  assert.doesNotMatch(
+    both,
+    /no review has read/i,
+    'an UNKNOWN approval may have read this head; asserting otherwise is the collapse this branch removes',
+  );
+
+  // Unknown ALONE — the same claim with nothing stale to lend it cover.
+  const unknownOnly = explainMergeState(
+    'clean',
+    [{ by: 'b', at: 't', sha: null, coverage: 'unknown' }],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(unknownOnly, /1 with no commit_id/);
+  assert.doesNotMatch(unknownOnly, /no review has read/i);
+
+  // Stale ALONE is the state where the strong claim is TRUE and must survive:
+  // every approval names a commit, and none of them names this one.
+  const staleOnly = explainMergeState(
+    'clean',
+    [{ by: 'a', at: 't', sha: 'old12345', coverage: 'stale' }],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(staleOnly, /merging now merges code no review has read/i);
 
   // It must NOT appear when something does cover the head — the old code warned
   // wrongly there, which is why the clause belongs in one branch and not the
