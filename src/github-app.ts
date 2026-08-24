@@ -138,17 +138,27 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  * A character the operator cannot see, in a value the operator typed.
  *
  * THE FAILURE THESE THREE VARIABLES SHARE is not a wrong value, it is an
- * invisible one: a `\r` from a Windows paste, a space picked up by a shell
- * heredoc, a zero-width space copied out of a web page. The value looks right
- * in the file and in every journal line that echoes it, and it is wrong.
+ * invisible one: a `\r` from a Windows paste, a tab, a zero-width space copied
+ * out of a web page. The value looks right in the file and in every journal
+ * line that echoes it, and it is wrong.
+ *
+ * A PLAIN SPACE IS NOT ON THAT LIST BECAUSE IT IS NOT SHARED. It counts for the
+ * two ids and deliberately not for the key path, where spaces are legal --
+ * `INVISIBLE` below is written to exclude it, and the path's own warning says
+ * "other than a plain space" for that reason.
  *
  * HOW IT ARRIVED IS DELIBERATELY NOT CLAIMED, here or in the warnings below.
  * An earlier version blamed a trailing newline in a systemd `EnvironmentFile`.
- * The argument for dropping that -- two loaders reading one `.env`, rules never
- * compared, and a cause nobody here can attribute -- is set out once, under
- * `describeTokenShape`'s TOLERATED row, and deliberately not repeated here.
- * Two copies would be two things to keep true the day the systemd reading is
- * revisited.
+ * The limb that applies to THESE three is the simple one: systemd's
+ * `EnvironmentFile=` documents leading and trailing whitespace as discarded
+ * from an unquoted value, so the claim was wrong on its own terms.
+ *
+ * NOT the multi-loader limb, which belongs to `GITHUB_TOKEN` and not here.
+ * These three are read only by `config.ts`, in a daemon systemd starts directly
+ * rather than in a container, so there is exactly one loader and it is known.
+ * `describeTokenShape`'s TOLERATED row carries the fuller argument for the
+ * value that DOES reach a container through a second parser; it is referenced
+ * rather than restated, because two copies would be two things to keep true.
  *
  * Checked against the FAILURE MODE rather than against a format, deliberately.
  * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
