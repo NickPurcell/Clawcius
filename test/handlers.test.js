@@ -38,6 +38,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createHandlers } from '../dist/daemon.js';
+import { classifyRetry } from '../dist/agent.js';
 import { ConversationWindows } from '../dist/window.js';
 import { AtCapacityError } from '../dist/agent.js';
 
@@ -248,19 +249,56 @@ async function settle(times = 10) {
   for (let i = 0; i < times; i += 1) await Promise.resolve();
 }
 
-const authFailure = (overrides = {}) => ({
-  isError: false,
-  costUsd: 0,
-  numTurns: 1,
-  durationMs: 1200,
-  subtype: 'success',
-  sentMessage: false,
-  apiError: 'OAuth token revoked',
-  apiErrorKind: 'authentication_failed',
-  retryScheduled: false,
-  retryAttempt: 0,
-  ...overrides,
-});
+// `noRetryReason` IS PART OF THE SHAPE PRODUCTION EMITS, and leaving it out is
+// what let a real defect through 444 green tests. With `retryScheduled: false`
+// on an `authentication_failed` turn, `AgentSession` always sets a reason --
+// `credential-dead` once the one auth rung is spent. A fixture without it drove
+// `outageMessage`'s `default` branch, which is a summary shape the producer
+// cannot construct, so both auth tests below were asserting on a case that does
+// not occur while the case that does occur said the opposite thing.
+//
+// OJ #263 round 1. The messages were covered and the classifier was covered;
+// the JOIN between them was fixtured with something impossible.
+const authFailure = (overrides = {}) => {
+  const base = {
+    isError: false,
+    costUsd: 0,
+    numTurns: 1,
+    durationMs: 1200,
+    subtype: 'success',
+    sentMessage: false,
+    apiError: 'OAuth token revoked',
+    apiErrorKind: 'authentication_failed',
+    retryScheduled: false,
+    retryAttempt: 0,
+    ...overrides,
+  };
+  return {
+    ...base,
+    // DERIVED FROM THE PRODUCTION CLASSIFIER so this fixture cannot express a
+    // shape `AgentSession` never emits. Hard-coding it was worse than omitting
+    // it: a test overriding `apiErrorKind` inherited a reason belonging to a
+    // different kind, which is the same defect one level down.
+    //
+    // `retriesSpent` past every ladder because `retryScheduled: false` means the
+    // retries are done — that is what this fixture is for.
+    // `retryScheduled` IS `willRetry`, and production returns a null reason
+    // whenever it is true — so deriving one for a queued retry builds the very
+    // shape this derivation exists to rule out.
+    noRetryReason:
+      'noRetryReason' in overrides
+        ? overrides.noRetryReason
+        : base.retryScheduled
+          ? null
+          : classifyRetry({
+              errorKind: base.apiErrorKind,
+              failed: true,
+              retriesSpent: 99,
+              closed: false,
+              hasContext: true,
+            }).noRetryReason,
+  };
+};
 
 const cleanTurn = () => ({
   isError: false,
@@ -734,7 +772,18 @@ test('the same auth failure AFTER a respawn is announced', async () => {
   });
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /needs a look at the host/);
+  // A DEAD CREDENTIAL NOW GETS ITS OWN SENTENCE, more actionable than the
+  // generic host line it replaced: the action is a re-login, and somebody
+  // standing in front of the machine should not have to infer that. Asserted as
+  // the FACT — they are sent to the host, and told what to do there — rather
+  // than as the old wording.
+  assert.match(sent[0], /re-login on the host/);
+  assert.match(sent[0], /could not authenticate/);
+  assert.doesNotMatch(
+    sent[0],
+    /try again in a few minutes/i,
+    'a dead credential must never be reported as an outage to wait out',
+  );
 });
 
 test('a dead transport drops the session, or the channel fails forever', async () => {
@@ -842,7 +891,18 @@ test('a dead credential announces EXACTLY ONCE across the whole respawn cycle', 
     `the channel must hear about a dead credential once, not ${sent.length} times: ` +
       JSON.stringify(sent),
   );
-  assert.match(sent[0], /needs a look at the host/);
+  // A DEAD CREDENTIAL NOW GETS ITS OWN SENTENCE, more actionable than the
+  // generic host line it replaced: the action is a re-login, and somebody
+  // standing in front of the machine should not have to infer that. Asserted as
+  // the FACT — they are sent to the host, and told what to do there — rather
+  // than as the old wording.
+  assert.match(sent[0], /re-login on the host/);
+  assert.match(sent[0], /could not authenticate/);
+  assert.doesNotMatch(
+    sent[0],
+    /try again in a few minutes/i,
+    'a dead credential must never be reported as an outage to wait out',
+  );
   // And the second round is still in the journal, which is where the detail
   // belongs — the announcement is for the person in the channel.
   assert.match(log, /respawned session ALSO failed to authenticate/);
