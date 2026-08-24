@@ -89,7 +89,7 @@ const wakingBoard = () => {
     registry: board.registry,
     mail: board.mail,
     busy: () => false,
-    start: (agent, context) => started.push({ id: agent.id, context }),
+    start: (agent, context, settle) => started.push({ id: agent.id, context, settle }),
     log: () => {},
   });
   board.mail.onDelivered = (message) => waker.onDelivered(message.recipient);
@@ -302,7 +302,14 @@ test('an agent that has never run is woken by the mail its spawn delivered', asy
   assert.match(woken[0].context.mail, /from hamachi-coordinator/);
 
   assert.equal(registry.get('hamachi-researcher1').sessionId, '', 'nothing to resume — it is new');
-  assert.equal(mail.unread('hamachi-researcher1').length, 0, 'the turn opened with it read');
+
+  // Handed over is not read. Since #239 the charter is consumed when the turn
+  // has actually RUN — a spawn whose first turn dies before producing leaves the
+  // charter for the next sweep rather than losing it, which is the same property
+  // that lost five messages when it was absent.
+  assert.equal(mail.unread('hamachi-researcher1').length, 1, 'handed over, not yet run');
+  woken[0].settle(true, 'turn completed');
+  assert.equal(mail.unread('hamachi-researcher1').length, 0, 'the turn ran, so it is consumed');
 
   waker.sweep();
   assert.equal(

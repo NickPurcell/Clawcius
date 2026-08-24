@@ -80,8 +80,17 @@ export type MailWakerOptions = {
   /**
    * Start a turn. May throw — the session cap is real — and a throw is not
    * fatal here: nothing has been marked read, so the next sweep tries again.
+   *
+   * `settle` is how the mail gets marked read, and it is the whole of #239.
+   * Call it with `true` once the turn has actually run, `false` if the turn died
+   * without producing. Never calling it leaves the mail unread, which is the
+   * safe direction: the next sweep re-offers it.
    */
-  start: (agent: AgentRecord, context: WakeContext) => void;
+  start: (
+    agent: AgentRecord,
+    context: WakeContext,
+    settle: (ran: boolean, why: string) => void,
+  ) => void;
   log: (line: string) => void;
 };
 
@@ -169,8 +178,51 @@ export class MailWaker {
       count: pending.length,
     };
 
+    const ids = pending.map((message) => message.id);
+
+    // MARKED READ WHEN THE TURN HAS RUN, NOT WHEN IT WAS HANDED OVER. This is
+    // Clawcius #239, and the old ordering lost five messages in one second on
+    // 2026-08-24.
+    //
+    // `start` only hands the turn to a session and returns. The `catch` below is
+    // therefore SYNCHRONOUS-ONLY, and every way a turn actually dies is
+    // asynchronous and lands after it: an API refusal with no retry, a stale
+    // token, and — the one that bit — a dead transport reported through
+    // `onError`. Marking read at handoff meant all three were permanent silent
+    // loss, because `checkMail` reads UNREAD rows and the row was no longer one.
+    //
+    // The guard that was there is not wrong; it guards the narrower half of one
+    // failure mode. It is kept, and `settle` covers the rest.
+    //
+    // WHICH WAY THIS ERRS, STATED RATHER THAN INCIDENTAL: toward DUPLICATE
+    // DELIVERY. If a turn dies after the model has seen the mail but before it
+    // settles, the next sweep offers the same messages again. A duplicate is
+    // visible and annoying; a loss is silent and cost this crew an hour, seven
+    // times in four days without anyone noticing. So the trade is deliberate.
+    //
+    // Nothing re-delivers WHILE a turn is running: `busy` is set synchronously
+    // by `start` and is checked at the top of this method, so the window between
+    // handoff and settle is not a window in which the same mail is offered
+    // twice.
+    let settled = false;
+    const settle = (ran: boolean, why: string): void => {
+      // Once. `onDone` and `onError` can both fire for one turn, and marking
+      // read on the first while logging a loss on the second would be worse
+      // than either.
+      if (settled) return;
+      settled = true;
+      if (ran) {
+        mail.markRead(agent.id, ids);
+        return;
+      }
+      log(
+        `${agent.id}: turn died before it ran (${why}) — ${ids.length} message(s) left ` +
+          'unread for the next sweep',
+      );
+    };
+
     try {
-      start(agent, context);
+      start(agent, context, settle);
     } catch (error) {
       // Capacity, a dead child transport, a workspace that cannot be created.
       // Nothing is marked read, so this is a retry rather than a loss.
@@ -178,14 +230,6 @@ export class MailWaker {
       return;
     }
 
-    // After the turn has been handed over, never before. `unread` + `markRead`
-    // rather than `collect` for exactly this: if `start` throws, the mail is
-    // still unread and the next sweep tries again, whereas `collect` would have
-    // marked it read on the way past and the message would be gone.
-    mail.markRead(
-      agent.id,
-      pending.map((message) => message.id),
-    );
     log(`woke ${agent.id} with ${pending.length} message(s)`);
   }
 }

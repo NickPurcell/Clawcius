@@ -36,7 +36,7 @@ function board() {
     registry,
     mail,
     busy: (id) => busy.has(id),
-    start: (agent, context) => started.push({ id: agent.id, context }),
+    start: (agent, context, settle) => started.push({ id: agent.id, context, settle }),
     log: () => {},
   });
   // What `main()` in daemon.ts wires: a delivery is the fast path into a sweep.
@@ -52,7 +52,10 @@ const note = (author, recipient, body = 'hello') => ({
   body,
 });
 
-test('mail delivered to an idle agent starts a turn with the mail already read', () => {
+test('mail delivered to an idle agent starts a turn, and is read only once it RUNS', () => {
+  // The title used to say "with the mail already read", which was the contract
+  // until #239: marked read at handoff, before the turn had produced anything.
+  // Five messages were lost that way in one second on 2026-08-24.
   const { mail, started } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -65,8 +68,54 @@ test('mail delivered to an idle agent starts a turn with the mail already read',
 
   assert.equal(
     mail.unread('hamachi-engineer1').length,
+    1,
+    'handed over is not the same as read — nothing has run yet',
+  );
+
+  started[0].settle(true, 'turn completed');
+  assert.equal(
+    mail.unread('hamachi-engineer1').length,
     0,
-    'the turn opened with it read, so checkMail must not hand it over twice',
+    'once the turn has run, checkMail must not hand it over twice',
+  );
+});
+
+test('a turn that dies before it runs leaves the mail for the next sweep (#239)', () => {
+  // THE FIVE-MESSAGE LOSS, as a test. `start` only hands the turn to a session
+  // and returns; every way a turn actually dies is asynchronous and lands after
+  // that. The worst was `onError` — a dead transport, usually the gVisor sentry
+  // OOM-killed inside the container's memcg, which kills every agent in the same
+  // second and has done so seven times in four days.
+  const { mail, started, busy } = board();
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'the lost one'));
+  assert.equal(started.length, 1);
+
+  started[0].settle(false, 'session error: connection refused');
+
+  assert.equal(
+    mail.unread('hamachi-engineer1').length,
+    1,
+    'a turn that produced nothing must not consume the mail',
+  );
+
+  // And the next sweep re-offers it, which is the whole point.
+  busy.clear();
+  started.length = 0;
+  mail.onDelivered('hamachi-engineer1');
+  assert.equal(started.length, 1, 're-offered rather than lost');
+  assert.match(started[0].context.mail, /the lost one/);
+});
+
+test('settle is once — onDone and onError can both fire for one turn', () => {
+  const { mail, started } = board();
+  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'x'));
+
+  started[0].settle(true, 'turn completed');
+  started[0].settle(false, 'session error afterwards');
+  assert.equal(
+    mail.unread('hamachi-engineer1').length,
+    0,
+    'a late failure must not un-read mail the turn already consumed',
   );
 });
 
@@ -112,12 +161,20 @@ test('a second message delivered while the first turn is starting is not lost', 
 
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'second'));
   assert.equal(started.length, 1, 'the running turn is not interrupted');
-  assert.equal(mail.unread('hamachi-engineer1').length, 1);
+  // TWO unread now, not one: since #239 the first is not consumed until its turn
+  // has actually run. `busy` is what stops it being re-offered meanwhile, which
+  // is why deferring the mark is safe.
+  assert.equal(mail.unread('hamachi-engineer1').length, 2);
+
+  // The first turn runs and consumes only what it was handed.
+  started[0].settle(true, 'turn completed');
+  assert.equal(mail.unread('hamachi-engineer1').length, 1, 'only the second is left');
 
   busy.delete('hamachi-engineer1');
   waker.sweep();
   assert.equal(started.length, 2);
   assert.match(started[1].context.mail, /second/);
+  assert.doesNotMatch(started[1].context.mail, /first/, 'the settled one is not re-offered');
 });
 
 test('a feed post wakes every reader and not its author', () => {

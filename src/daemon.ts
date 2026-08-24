@@ -908,7 +908,7 @@ export async function main(): Promise<void> {
           registry,
           mail,
           busy: (agentId) => sessions.isBusy(agentId),
-          start: (agent, context) => {
+          start: (agent, context, settle) => {
             const session = sessions.acquire(agent.id, {
               onToolUse: (tool) => process.stdout.write(`[clawcius ${agent.id}] ${tool}\n`),
               onCliFailure: (cmd, out) =>
@@ -918,24 +918,50 @@ export async function main(): Promise<void> {
               onDone: (summary) => {
                 sessions.persist(agent.id);
                 if (summary.apiError) {
+                  // A refusal WITH a retry queued: the retry re-runs this turn,
+                  // so the mail is neither read nor lost — leave it unsettled and
+                  // let the retry's own onDone decide.
+                  //
+                  // A refusal with NO retry produced nothing, so the mail was
+                  // never read by anybody. It used to be marked read here on the
+                  // strength of "already in the transcript", which is the claim
+                  // #239 disproved: `checkMail` reads unread rows, the row was no
+                  // longer one, and the message was gone for good.
+                  if (!summary.retryScheduled) settle(false, `API refused: ${summary.apiErrorKind}`);
                   process.stderr.write(
                     `[clawcius ${agent.id}] mail wake REFUSED (${summary.apiErrorKind})\n` +
                       `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
                       (summary.retryScheduled
                         ? `  retry ${summary.retryAttempt} queued\n`
-                        : `  not retrying — the mail is already in the transcript\n`),
+                        : `  not retrying — mail left unread for the next sweep\n`),
                   );
+                } else {
+                  // The turn ran. This is the only path that marks mail read.
+                  settle(true, 'turn completed');
                 }
                 process.stdout.write(
                   `[clawcius ${agent.id}] mail wake turn ${summary.subtype} ` +
                     `$${summary.costUsd.toFixed(4)}\n`,
                 );
               },
+              // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that
+              // claimed nothing. The other two at least asserted a reason a
+              // reader could disagree with; this printed one line and released
+              // the session, so every documented failure string grepped ZERO
+              // while mail vanished. A path with no sentence attached is
+              // invisible to every technique we have for finding false ones.
+              //
+              // Its usual cause is not exotic: the gVisor sentry is OOM-killed
+              // inside the container's memcg, every agent's `docker exec` dies in
+              // the same second, and this fires once per agent with nothing to
+              // say — because there was no per-agent failure to describe.
               onError: (error) => {
+                settle(false, `session error: ${error.message}`);
                 process.stderr.write(`[clawcius ${agent.id}] ${error.message}\n`);
                 void sessions.release(agent.id);
               },
               onNeedsRespawn: () => {
+                settle(false, 'stale token, session dropped');
                 process.stderr.write(
                   `[clawcius ${agent.id}] stale token on a mail wake — dropping session\n`,
                 );
