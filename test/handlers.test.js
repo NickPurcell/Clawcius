@@ -583,8 +583,11 @@ test('a full pool is announced, with the numbers and the remedies', async () => 
 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /No session slot free — 4 of 4 are in use/);
-  // `idleTimeoutMinutes: 0` in the fixture is the shipped configuration, where a
-  // retry cannot work and "try again" is what a person would naturally do.
+  // `idleTimeoutMinutes: 0` is NOT the shipped configuration any more — 30 is,
+  // since #249 — and the test below covers the sentence a real user now gets.
+  // This one keeps 0 because 0 is still supported and its refusal is a
+  // different, stronger claim: with nothing reclaiming a slot, the pool really
+  // cannot clear on its own.
   assert.match(sent[0], /will not clear on its own/);
   // Clawcius #146: this is the sentence a user actually reads, and the whole
   // point of the fix is that it reaches them here rather than only in a doc.

@@ -715,6 +715,11 @@ accumulation over time; the cap bounds the peak. Turning eviction on does not
 make a cap of 10 safe against the limits above — it makes the pool recover
 afterwards.
 
+**The shipped value is 30 since 2026-08-24** — set against a gVisor sentry that
+had been OOM-killed seven times in four days, on an interval shape that said
+accumulation rather than burst. What follows describes 0, which is still a
+supported value and is what you get if you set it back.
+
 At `idleTimeoutMinutes: 0` the cap does both jobs badly: it still bounds the
 peak, but nothing reclaims a slot in the ordinary course, so it protects by
 locking rather than by refusing gracefully. That lockout is not an alternative
@@ -731,9 +736,9 @@ channel holding a live session frees that slot at once — though a session
 that is mid-turn keeps its process until the turn drains, since `close()`
 (`src/agent.ts:714`) closes the prompt queue rather than interrupting the way
 `!stop` does. So it frees a slot faster than it frees memory when the session
-is mid-turn; on an idle one — which is what a pool at `idleTimeoutMinutes: 0`
-mostly holds — both come back together. It costs that channel's transcript
-and only that: `clearSession` clears the session ID rather than the row, so
+is mid-turn; on an idle one — which is most of what any pool holds, and all of
+what one at `idleTimeoutMinutes: 0` accumulates — both come back together. It
+costs that channel's transcript and only that: `clearSession` clears the session ID rather than the row, so
 the mailbox survives, and a turn finishing after the reset does not write its
 ID back either, because `persist` returns early once the map entry is gone
 (`src/agent.ts:1008`). Two limits on it. It reaches only channels, so a
@@ -757,7 +762,8 @@ any of this:
   editing `run-container.sh`, which has no per-instance override for it.
 - **`sessions.idleTimeoutMinutes` is the only setting that makes the pool
   recover**, and it costs a cold start rather than continuity — the session ID
-  survives in SQLite and resumes on the next mention.
+  survives in SQLite and resumes on the next mention. **It is set to 30, not 0**,
+  so this is a lever already pulled rather than one available to pull.
 
 > Reading limits from inside a container is normally useless — without lxcfs,
 > `/proc/meminfo` shows the host's figures. **These containers run gVisor
@@ -782,11 +788,16 @@ sudo sysctl --system
 fire on every message in every channel it can see.
 
 One session per channel or thread, persistent across mentions and resumed from
-SQLite after a restart. With `sessions.idleTimeoutMinutes: 0` (the default)
-sessions are **never evicted** — the agent stays warm and skips Claude Code
-startup on every mention, at a standing cost of **at least** 400 MB RSS per live
-session and considerably more for a busy one (§ 5 has the measurements and why
-they do not reduce to one figure). Note that this also makes
+SQLite after a restart. **`sessions.idleTimeoutMinutes` ships as 30**: a session
+idle that long is reclaimed, and the next mention pays Claude Code startup and
+resumes the same transcript from SQLite. A session costs **at least** 400 MB RSS
+while it is live and considerably more when busy (§ 5 has the measurements and
+why they do not reduce to one figure), so eviction is what stops that standing
+cost accumulating across a crew that has gone quiet.
+
+At `idleTimeoutMinutes: 0` sessions are **never evicted** — the agent is always
+warm and never pays startup, and that was the shipped behaviour before
+2026-08-24. It also makes
 `sessions.maxConcurrent` a lifetime budget *as well as* a concurrency limit: it
 still bounds how many sessions are resident at once, and with nothing evicting
 it also bounds how many distinct channels can run at all, because nothing

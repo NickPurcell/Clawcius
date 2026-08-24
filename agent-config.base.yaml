@@ -924,16 +924,48 @@ sessions:
   # Costs at least ~400 MB RSS per live session, standing, whether busy or not,
   # and materially more for a busy one — see the measurements above.
   #
-  # This is what makes maxConcurrent a permanent ceiling rather than a busy
-  # moment: nothing reclaims a session on its own, so once `maxConcurrent`
-  # sessions have run, the pool stays full until the process restarts — or
-  # until someone spends a channel's transcript with `!reset`, as above.
-  # Raising the cap defers that lockout, it does not remove it.
+  # At 0 this is what made maxConcurrent a permanent ceiling rather than a busy
+  # moment: nothing reclaimed a session on its own, so once `maxConcurrent`
+  # sessions had run, the pool stayed full until the process restarted — or
+  # until someone spent a channel's transcript with `!reset`, as above.
+  # Raising the cap deferred that lockout, it did not remove it. THAT IS NO
+  # LONGER THE SHIPPED STATE — see below — and the sentences are in the past
+  # tense because they describe what 0 does, which is still what you get if you
+  # set it back to 0.
   #
   # Any positive value evicts after that many idle minutes; the session ID
   # survives in SQLite and is resumed on the next mention, so conversation
   # continuity is kept either way — the difference is startup latency and RAM.
-  idleTimeoutMinutes: 0
+  #
+  # ── WHY THIS IS NO LONGER 0 ─────────────────────────────────────────────
+  #
+  # The gVisor sentry has been OOM-killed inside the container memcg SEVEN
+  # times since 20 August. One kill takes every agent's `docker exec` in the
+  # same second, and until Clawcius #241 each one silently ate whatever mail
+  # had just been handed over — five messages in one second on 2026-08-24,
+  # with nothing anywhere recording it.
+  #
+  # The shape of the occurrences is what points here rather than at
+  # maxConcurrent: cluster sizes grow with crew size and the intervals are
+  # 2h24m / 4h44m / 7h15m — load-driven ACCUMULATION, not a burst. And the
+  # paragraph above says which lever that is: `maxConcurrent` bounds the peak,
+  # eviction is the only thing that reclaims a live session on its own.
+  #
+  # 30 minutes, because it is long enough that an agent doing work stays warm
+  # — a crew member mid-task wakes on mail every few minutes, and eviction
+  # skips anything active within the timeout — and short enough that a crew
+  # that has gone quiet stops holding ~400 MB per member against the next
+  # crew's burst. The cost of being wrong is startup latency on one mention,
+  # not a lost transcript.
+  #
+  # WHAT THIS DOES NOT FIX, stated because the paragraph above is emphatic
+  # about it: eviction cannot bound a burst. Ten channels mentioned at once
+  # put ten sessions live and none of them is idle, whatever this says. If the
+  # sentry is killed by a simultaneous burst rather than by accumulation, this
+  # number will not have moved it, and the next reader should not conclude the
+  # lever was tried and failed. #241 is what makes the mail survive it either
+  # way; this is what makes it rarer.
+  idleTimeoutMinutes: 30
   # workspaceRoot: <stateDir>/workspaces — derived, refused here.
 
 discord:

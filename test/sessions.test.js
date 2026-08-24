@@ -12,10 +12,11 @@
  *     row went missing came back as the one role that may DM the host agent.
  *   - Under the caps shipped at the time (3 and 1) a spawned agent could never
  *     take a turn, because `acquire` had no slot for it and
- *     `idleTimeoutMinutes: 0` means nothing gives a slot back on its own. Both
- *     configs went to 10 on 2026-08-20, so a spawn now succeeds until ten
- *     sessions have run; the second half of that sentence is untouched, and it
- *     is the half that makes the pool fill and stay filled.
+ *     `idleTimeoutMinutes: 0` meant nothing gave a slot back on its own. Both
+ *     configs went to 10 on 2026-08-20, so a spawn succeeds until ten sessions
+ *     have run — and #249 set `idleTimeoutMinutes` to 30, so the second half of
+ *     that sentence no longer holds either: the pool fills and then recovers,
+ *     which turns a permanent lockout into a busy moment that passes.
  *   - The at-capacity announcement, added to fix the second, was reasoned about
  *     and shipped unexercised.
  *
@@ -463,7 +464,8 @@ test('the sweeper is inert at idleTimeoutMinutes: 0, however idle a session is',
   await Promise.resolve();
 
   // 0 disables eviction: nothing here reclaims a session, so they stay alive.
-  // This is the shipped configuration, and it is why `liveCount` is a high-water
+  // The `idleTimeoutMinutes: 0` branch — not the shipped value since #249, but
+  // the one that made `liveCount` a high-water
   // mark. It is the sweeper that does nothing — `!reset` and the error paths
   // still release, they are simply not on this timer.
   assert.equal(manager.capacity.live, 2);
@@ -558,8 +560,9 @@ test('at capacity with eviction off, the notice names the remedies', () => {
   const notice = atCapacityNotice(new AtCapacityError(4, 4), 0);
   assert.match(notice, /4 of 4 are in use/);
   assert.match(notice, /not queued/);
-  // The branch is the point. On the shipped configuration a retry cannot work,
-  // and "try again" is what a person would naturally do.
+  // The branch is the point, and the branch is `0` — supported, but not the
+  // shipped value since #249. At 0 a retry genuinely cannot work; at 30 a slot
+  // does free itself, which is the other test.
   assert.match(notice, /will not clear on its own/);
   // Clawcius #146: the reader's OWN remedy, and the reason this branch exists at
   // all. A restart is the operator's and raising the cap is an edit and a
@@ -981,4 +984,57 @@ test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
 
   session.turnPending = false;
   assert.equal(manager.busyCount, 0);
+});
+
+test('eviction announces itself — it was the only silent release while running (#249)', async () => {
+  // Every other path that drops a session says so: onError writes the error,
+  // onNeedsRespawn writes "respawning", !reset replies in the channel, spawn
+  // logs the queue. Eviction did not, and now that it is ON the pool shrinks by
+  // itself with nothing recording when or which agent.
+  //
+  // Not tidiness. The success test for turning eviction on is "do the sentry
+  // OOMs stop", and the first question if they do not is whether it was
+  // accumulation or a burst — which needs to know eviction fired at all. The
+  // waker's status file cannot answer it: an overwritten count is not a record
+  // of events.
+  const lines = [];
+  const dbPath = join(tempDir('clawsky-evict-'), 'clawcius.db');
+  installConfig({
+    maxConcurrent: 4,
+    idleTimeoutMinutes: 30,
+    workspaceRoot: tempDir('clawsky-evict-ws-'),
+  });
+  const registry = new AgentRegistry(dbPath, { crew: CREW });
+  // The EVICTION sink, which is the FIFTH argument and not `spawnLog`. The
+  // first version passed it as the fourth — mail-null WITH a log function, a
+  // combination `main()` cannot construct — so it proved a line was emitted and
+  // said nothing about whether it reached a journal. It did not: `spawnLog` is
+  // prefixed `[spawn]` and is null whenever the mail board is off, so eviction
+  // was silent again on exactly the deployment the finding was about.
+  const manager = new SessionManager(registry, null, null, null, (line) => lines.push(line));
+  const built = [];
+  manager.newSession = (...args) => {
+    const session = new FakeSession(...args);
+    built.push(session);
+    return session;
+  };
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+  manager.acquire('hamachi-engineer1', events);
+
+  // Idle well past the timeout, and not busy.
+  built[0].lastActiveAt = Date.now() - 45 * 60_000;
+  await manager.evictIdle();
+
+  const evicted = lines.filter((l) => /evicting hamachi-engineer1/.test(l));
+  assert.equal(evicted.length, 1, 'an eviction must leave a record');
+  assert.match(evicted[0], /idle 45 minute\(s\)/, 'and say how long it had been idle');
+
+  // Every other manager-building test in this file tears down; this one left an
+  // interval armed and a SQLite handle open for the rest of the run.
+  await manager.shutdown();
 });
