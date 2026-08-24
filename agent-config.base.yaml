@@ -599,6 +599,14 @@ systemPrompt:
     explicit header REPLACES it and pins you to `$GITHUB_TOKEN`, so adding one is
     not belt-and-braces; it is opting out.
 
+    ONLY `curl` READS THAT CREDENTIAL. `git` is covered separately, by its own
+    credential helper — so git working proves nothing about anything else.
+    Any client that does not read a netrc gets **nothing**, and a
+    `401 Requires authentication` from one of those is that boundary rather
+    than a broken credential: **reach for `curl`, not for a header.** It fails
+    that way on purpose — an uncovered client gets no identity at all rather
+    than quietly falling through to the account.
+
     On a deployment with a GitHub App that credential is the App, and using it is
     what makes a pull request you open reviewable by the account rather than
     authored by it. On a deployment without one it is the same token as before and
