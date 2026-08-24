@@ -1143,8 +1143,10 @@ const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only
  *
  * ── Still NOT exhaustive, and this is the honest remainder ───────────────
  *
- * Two read-only mounts still do not appear here: `gws-cli` and the Google
- * service-account key. They are read-only, so nothing in a container can write
+ * Three read-only mounts still do not appear here: `gws-cli`, `pr-cli` and the
+ * Google service-account key. `pr-cli` was added by #218 and this sentence was
+ * updated with it — the count is stated so that adding a fourth without touching
+ * this paragraph is visibly wrong rather than quietly incomplete. They are read-only, so nothing in a container can write
  * them — the risk is not a forged claim but a shared secret, since a path placed
  * in one would be visible to BOTH deployments' agents.
  *

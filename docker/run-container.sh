@@ -96,6 +96,7 @@ SKILLS=/home/npurcell/clawcius/.claude
 DISCORD_CLI=/home/npurcell/clawcius/discord-cli
 GWS_CLI=/home/npurcell/clawcius/gws-cli
 BROWSER_CLI=/home/npurcell/clawcius/browser-cli
+PR_CLI=/home/npurcell/clawcius/pr-cli
 
 # BROWSE_LOG is set on the container rather than left to browse's own default,
 # and the reason is durability, not taste.
@@ -603,6 +604,7 @@ docker run -d \
   -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
   -v "$GWS_CLI:$GWS_CLI:ro" \
   -v "$BROWSER_CLI:$BROWSER_CLI:ro" \
+  -v "$PR_CLI:$PR_CLI:ro" \
   -v "$GITHUB_TOKEN_DIR:$GITHUB_TOKEN_DIR:ro" \
   -e BROWSE_LOG="$WORKSPACES/.browse/navigation.jsonl" \
   "${GWS_MOUNT[@]}" \

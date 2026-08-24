@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+/* Run the tool straight from the mount, with no install step.
+ *
+ * Same shim as `discord-cli/discord`, and for the same reason: the directory is
+ * bind-mounted read-only into every agent container, so there is nowhere to
+ * install to and nothing may be written here. The implementation is one file
+ * beside this one and imports nothing outside the node standard library.
+ *
+ * The extension lives on the module rather than on this launcher because ESM
+ * needs one to import, and the bare name is what the other CLIs here use —
+ * `discord`, `gdoc`, `browse`.
+ */
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// Call `main()` rather than relying on the module's self-run guard: launched
+// through this shim, `process.argv[1]` is this file, so that guard does not
+// fire and the tool would exit silently having done nothing.
+const { main } = await import(join(dirname(fileURLToPath(import.meta.url)), 'pr-state.mjs'));
+main();
