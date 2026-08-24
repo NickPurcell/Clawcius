@@ -356,8 +356,11 @@ instances:
     #   db:   the instance's CLAWCIUS_DB_PATH, from its env file above. A wrong
     #         path is refused at boot rather than creating a second empty
     #         database that looks exactly like a mailbox nobody writes to.
-    #   crew: the instance's clawsky.crew, from its agent-config.yaml. A wrong
-    #         crew registers the host agent where the coordinator asking is not.
+    #   crew: the instance's top-level `crew`, from its own agent-config file.
+    #         It was `clawsky.crew` until Clawcius #203; that spelling is now a
+    #         hard boot error, so a config still using it will not start and this
+    #         value cannot be copied from one. A wrong crew registers the host
+    #         agent where the coordinator asking is not.
     #
     # Leave the block out entirely and the host agent has no mailbox on this
     # instance: a coordinator DMing it is told there is no such recipient, which

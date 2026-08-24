@@ -120,7 +120,7 @@ export type RepoEntry = {
 export type BoardEntry = {
   /** The instance's `CLAWCIUS_DB_PATH`. Never created; opened or refused. */
   db: string;
-  /** The instance's `clawsky.crew`. The host agent registers as `<crew>-host`. */
+  /** The instance's top-level `crew`. The host agent registers as `<crew>-host`. */
   crew: string;
 };
 
@@ -159,7 +159,9 @@ export type InstanceEntry = {
    * because both can only be got right by matching something written
    * elsewhere. `db` must be the same file as that instance's
    * `CLAWCIUS_DB_PATH` — which lives in its env file, not here — and `crew`
-   * must be its `clawsky.crew` from `agent-config.yaml`. A wrong `db` would
+   * must be the top-level `crew` from that instance's own agent-config file
+   * (`clawsky.crew` until Clawcius #203, which moved it and refuses the old
+   * spelling). A wrong `db` would
    * open a second, empty database that looks exactly like a mailbox nobody is
    * writing to; a wrong `crew` would register the host agent into a crew whose
    * coordinator is not the one asking. Neither failure is visible from the
@@ -1183,7 +1185,8 @@ export function loadOpsConfig(configPath?: string): OpsConfig {
       if (!NAME_PATTERN.test(crew)) {
         throw new OpsConfigError(
           `${at}.board.crew`,
-          `("${crew}") must be the instance's clawsky.crew from its agent-config.yaml, ` +
+          `("${crew}") must be the instance's top-level \`crew\` from its own ` +
+            'agent-config file, ' +
             'lowercase. The host agent registers as <crew>-host and only that crew\'s ' +
             'coordinator can reach it, so a crew nobody is in is a mailbox nobody can use.',
         );
