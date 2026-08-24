@@ -138,9 +138,19 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  * A character the operator cannot see, in a value the operator typed.
  *
  * THE FAILURE THESE THREE VARIABLES SHARE is not a wrong value, it is an
- * invisible one: a `\r` from a Windows paste, a trailing newline in a systemd
- * `EnvironmentFile`, a space picked up by a shell heredoc. The value looks
- * right in the file and in every journal line that echoes it, and it is wrong.
+ * invisible one: a `\r` from a Windows paste, a space picked up by a shell
+ * heredoc, a zero-width space copied out of a web page. The value looks right
+ * in the file and in every journal line that echoes it, and it is wrong.
+ *
+ * HOW IT ARRIVED IS DELIBERATELY NOT CLAIMED, here or in the warnings below.
+ * An earlier version blamed a trailing newline in a systemd `EnvironmentFile`.
+ * That is a claim about a LOADER, and systemd's `EnvironmentFile=` documents
+ * leading and trailing space, tab and CR as discarded from an unquoted value --
+ * which is how `.env` is normally written. Docker's `--env-file` reads the SAME
+ * file for the agent containers and its rules have never been compared with
+ * systemd's, so identical bytes may not even yield identical values. None of
+ * these checks depend on knowing the route, and a cause that cannot be
+ * attributed cannot be improved -- only dropped.
  *
  * Checked against the FAILURE MODE rather than against a format, deliberately.
  * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
@@ -212,7 +222,7 @@ async function mint(
   // Operator-controlled, and it is interpolated into a path. `github.ts`
   // validates every value it interpolates (`requireRepo`, `requirePr`,
   // `encodePath`) so a bad one fails with a name instead of a puzzling status,
-  // and a trailing newline in a systemd EnvironmentFile is an ordinary typo.
+  // and an invisible character in an operator-typed value is an ordinary typo.
   // Here it matters more than style: the failure lands as a permanent disarm.
   if (!isInstallationIdValid(id)) {
     throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
@@ -653,16 +663,14 @@ export function checkAppConfig(
   if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
     faults.push(
       'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — whitespace other ' +
-        'than a plain space, a control character, or a zero-width one. A trailing ' +
-        'newline in an EnvironmentFile is the usual cause, and nothing in the value ' +
-        'itself shows it',
+        'than a plain space, a control character, or a zero-width one. Nothing in ' +
+        'the value itself shows it',
     );
   }
 
   if (!isInstallationIdValid(input.installationId)) {
     faults.push(
-      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
-        'and a trailing newline in an EnvironmentFile is the usual cause',
+      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL',
     );
   }
 

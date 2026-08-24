@@ -458,11 +458,11 @@ any of them fails:
 4. `GITHUB_APP_ID` carries no invisible character;
 5. neither does the key path.
 
-An "invisible character" is a trailing newline from an `EnvironmentFile`, a
-stray `\r` from a paste, or a zero-width space picked up by copying an
-identifier out of a web page — the last of which no editor will show you. Each
-check reports itself, so the line names the variable that actually failed rather
-than the one that failed last time.
+An "invisible character" is a stray `\r` from a Windows paste, a space picked
+up by a shell heredoc, or a zero-width space picked up by copying an identifier
+out of a web page — the last of which no editor will show you. Each check
+reports itself, so the line names the variable that actually failed rather than
+the one that failed last time.
 
 The fallback is deliberate, for the reason above: a crew that cannot reach GitHub
 is worse than one reaching it as the older identity. But it means a mistyped path
