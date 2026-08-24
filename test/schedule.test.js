@@ -517,6 +517,59 @@ test('the mail hedges the missed count when it is a floor, and does not when it 
   assert.doesNotMatch(total.body, /FLOOR AND NOT A TOTAL/);
 });
 
+// THE THIRD SUPPRESSION SITE, and the one the other two tests cannot reach.
+// `armed-wake.ts` holds its own private `alsoIn`, independent of the copy in
+// `armed-tool.ts`; both other tests drive `scheduleRecurring` and `listArmed`,
+// which are both in `armed-tool.ts`. So gutting THIS copy to `return ''` left
+// the suite green at 389/389 — verified by doing it — while the mail that wakes
+// an agent silently lost the Pacific instant it was handed.
+//
+// This is the surface where the argument is strongest: a schedule mail is what
+// an agent reads when it is WOKEN, not something it asked for and can re-read
+// with different eyes.
+//
+// Asserted in both directions, because a one-directional test passes on
+// `return ''` for exactly the case that matters. The shape, not the
+// abbreviation: `GMT[^(]*\(.*P[DS]T\)` for the reason at the London preview
+// below — London returns to `GMT` on 25 October 2026 and a pinned `GMT\+1`
+// would go red on correct code.
+test('the schedule mail carries the reader\'s instant, and drops it when it would repeat', () => {
+  const at = Date.UTC(2026, 7, 24, 16, 0); // 17:00 in London, 09:00 Pacific
+  const base = {
+    id: 5,
+    owner: 'hamachi-engineer1',
+    kind: 'schedule',
+    armedAt: 0,
+    dueAt: at,
+    active: true,
+    firedAt: null,
+    seen: { lastFiredAt: null, fires: 0, missed: 0 },
+  };
+  const opts = { nextAt: at + 86_400_000, skipped: 0, skippedExact: true, phaseReset: false };
+
+  const abroad = composeScheduleMail(
+    { ...base, spec: { note: 'n', cron: '0 17 * * *', timezone: 'Europe/London', everyN: 1, anchorAt: 0 } },
+    at,
+    opts,
+  );
+  assert.match(
+    abroad.body,
+    /GMT[^(]*\(.*P[DS]T\)/,
+    'the wake mail dropped the Pacific instant beside the schedule zone',
+  );
+
+  const home = composeScheduleMail(
+    { ...base, spec: { note: 'n', cron: '0 9 * * *', timezone: LA, everyN: 1, anchorAt: 0 } },
+    at,
+    opts,
+  );
+  assert.doesNotMatch(
+    home.body,
+    /P[DS]T \(.*P[DS]T\)/,
+    'a Pacific schedule was rendered twice in the same zone',
+  );
+});
+
 test('the hedge follows the number into listArmed, and latches once it is set', () => {
   const { registry, mail, store } = board();
   const spec = { note: 'dense', cron: '* * * * *', timezone: LA, everyN: 1, anchorAt: 0 };

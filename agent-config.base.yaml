@@ -708,8 +708,7 @@ systemPrompt:
     it, so if the two ever drift apart, `date` is the truth about your own process
     and the label is the truth about what the waker RENDERED IN — which is this
     zone, not the waker's own clock. The waker's clock is Central European; see
-    below. The
-    operator is in Pacific too.
+    below. The operator is in Pacific too.
 
     TWO THINGS ARE NOT, and quoting them to a person without converting is the
     mistake this is here to stop. **The host journal is Central European** — the
