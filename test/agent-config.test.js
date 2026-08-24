@@ -1129,6 +1129,17 @@ test('the wake carries messages, not identity', () => {
 // leaves a stale mention in ordinary prose elsewhere in the file. Saying so is
 // the point: a green run here means these two things agree, not that every
 // sentence about tools is true.
+//
+// Round 1 proved that limit on this change's own diff. `Both are rows on disk`
+// sat four paragraphs below the corrected count, said two where `ArmedKind` has
+// three, and neither assertion here could see it -- a prose sentence, not a
+// block entry, and identical in both copies. It was a count that was right when
+// there were two, which is #243's exact shape surviving one paragraph beneath
+// the fix for it. Corrected in the same commit as this comment.
+//
+// And the population is two copies, not three: `SETUP.md` carries the same prose
+// for an operator and has the same defect. It is deliberately out of reach here
+// -- these tests compare the two things the loader can produce -- and is #247.
 
 /** The left column of the indented tool block -- the prose's list of tools. */
 function toolsNamedInProtocol(protocol) {
@@ -1170,11 +1181,20 @@ test('the protocol prompt names exactly the tools that exist, in both copies', (
       `${label}: tool(s) exist that the prompt never names — ${undocumented.join(', ')}`,
     );
 
+    // "not an armed tool" rather than "does not exist", because the set being
+    // compared against is only what `buildArmedTools` returns. An agent also has
+    // `checkMail` and `sendMail` from `mail-tool.ts`, and `checkMail` is already
+    // named in this very section -- in backticks mid-sentence, where the `^ {4}`
+    // match does not see it. If someone later documents a mail tool in the
+    // indented block, this fires, and a message saying it does not exist would
+    // send the reader hunting for a tool that was never deleted.
     const invented = [...named].filter((n) => !real.has(n));
     assert.deepEqual(
       invented,
       [],
-      `${label}: the prompt names tool(s) that do not exist — ${invented.join(', ')}`,
+      `${label}: the tool block names something that is not an armed tool — ` +
+        `${invented.join(', ')}. If it is a real tool from another module, widen ` +
+        'the set this compares against rather than deleting the line.',
     );
   }
 });

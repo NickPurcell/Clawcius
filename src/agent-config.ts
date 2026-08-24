@@ -454,7 +454,7 @@ Arming a second watch on a pull request you already watch is refused, with
 the id of the one you have. Two watches mean two mails for every event until
 the pull request closes.
 
-Both are rows on disk rather than timers in a process, so they survive a
+All three are rows on disk rather than timers in a process, so they survive a
 restart, and one that came due while the service was down still fires — late,
 and saying how late. Write the note as a self-contained instruction: your
 future self reads it without the conversation that produced it.`,
