@@ -35,6 +35,7 @@ import { parse, stringify } from 'yaml';
 import { loadAgentConfig } from '../dist/agent-config.js';
 import { setConfig } from '../dist/config.js';
 import { buildSystemPrompt, buildWakeMessage } from '../dist/prompt.js';
+import { buildArmedTools } from '../dist/armed-tool.js';
 
 /**
  * Exactly the lines given, for tests about the container block itself.
@@ -1095,4 +1096,136 @@ test('the wake carries messages, not identity', () => {
   // The operational tail is per-wake data and stays.
   assert.match(out, /channel_id: C1/);
   assert.match(out, /latest message_id: m1/);
+});
+
+
+// ── the prompt against the tools that actually exist ────────────────────────
+//
+// #243: `DEFAULT_PROMPTS.protocol` told an agent that `schedule_wake`,
+// `schedule_repeating`, `list_schedules` and `cancel_schedule` arrange for it to
+// be woken. None of those four had existed anywhere in the tree since
+// `ed8acb9` (#51, 14 Aug) introduced `remindMe` and the rest of `armed-tool.ts`.
+// That commit rewrote the prose in both instance YAMLs and added the armed
+// config keys to `agent-config.ts` -- and never touched the literal, which had
+// not been edited since `b30125a` created it.
+//
+// AND THE SAME THING HAD HAPPENED AGAIN, still live when this was written.
+// `d4c2acb` (#69, 16 Aug) added `scheduleRecurring` and touched no config file
+// at all, so the shipped prose said "Two tools arm it" and never named the third
+// -- `git log --all -S'scheduleRecurring'` over the three YAMLs returns nothing
+// before this change. Every agent read that.
+//
+// Twice is a class, so this is a check rather than a correction. It is worth
+// being clear about which half catches which:
+//
+//   the parity assertion   catches a literal drifting from what ships. That is
+//                          the #243 shape exactly -- the ghost names lived in
+//                          the compiled default and nowhere else.
+//   the registry assertion catches the prose and the tool list disagreeing in
+//                          EITHER direction: a tool nobody documented, or a
+//                          documented name that is not a tool.
+//
+// Neither can catch a rename that updates both copies and the tool together but
+// leaves a stale mention in ordinary prose elsewhere in the file. Saying so is
+// the point: a green run here means these two things agree, not that every
+// sentence about tools is true.
+//
+// Round 1 proved that limit on this change's own diff. `Both are rows on disk`
+// sat four paragraphs below the corrected count, said two where `ArmedKind` has
+// three, and neither assertion here could see it -- a prose sentence, not a
+// block entry, and identical in both copies. It was a count that was right when
+// there were two, which is #243's exact shape surviving one paragraph beneath
+// the fix for it. Corrected in the same commit as this comment.
+//
+// And the population is two copies, not three: `SETUP.md` carries the same prose
+// for an operator and has the same defect. It is deliberately out of reach here
+// -- these tests compare the two things the loader can produce -- and is #247.
+
+/** The left column of the indented tool block -- the prose's list of tools. */
+function toolsNamedInProtocol(protocol) {
+  const section = protocol.slice(protocol.indexOf('## Waking yourself later'));
+  return new Set([...section.matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*)/gm)].map((m) => m[1]));
+}
+
+test('the protocol prompt names exactly the tools that exist, in both copies', () => {
+  // A dummy store is enough: `buildArmedTools` captures it in handler closures
+  // and this only reads `.name`. Using the real registry rather than a written
+  // list is the whole point -- a hand-maintained list here would be a third copy
+  // with its own lifetime, which is the defect being fixed.
+  const real = new Set(
+    buildArmedTools('hamachi-engineer1', {
+      store: {},
+      github: null,
+      defaultRepo: 'NickPurcell/Clawcius',
+      pollSeconds: 120,
+    }).map((t) => t.name),
+  );
+
+  const fromDefaults = loadAgentConfig(
+    writeConfigRaw(['standalone: true', 'crew: x', 'displayName: X']),
+  ).prompts;
+  const fromShipped = loadAgentConfig(
+    writeConfigRaw([`extends: ${BASE}`, 'crew: x', 'displayName: X']),
+  ).prompts;
+
+  for (const [label, prompts] of [
+    ['the compiled defaults', fromDefaults],
+    ['the shipped base', fromShipped],
+  ]) {
+    const named = toolsNamedInProtocol(prompts.protocol);
+
+    const undocumented = [...real].filter((n) => !named.has(n));
+    assert.deepEqual(
+      undocumented,
+      [],
+      `${label}: tool(s) exist that the prompt never names — ${undocumented.join(', ')}`,
+    );
+
+    // "not an armed tool" rather than "does not exist", because the set being
+    // compared against is only what `buildArmedTools` returns. An agent also has
+    // `checkMail` and `sendMail` from `mail-tool.ts`, and `checkMail` is already
+    // named in this very section -- in backticks mid-sentence, where the `^ {4}`
+    // match does not see it. If someone later documents a mail tool in the
+    // indented block, this fires, and a message saying it does not exist would
+    // send the reader hunting for a tool that was never deleted.
+    const invented = [...named].filter((n) => !real.has(n));
+    assert.deepEqual(
+      invented,
+      [],
+      `${label}: the tool block names something that is not an armed tool — ` +
+        `${invented.join(', ')}. If it is a real tool from another module, widen ` +
+        'the set this compares against rather than deleting the line.',
+    );
+  }
+});
+
+test('every prompt template is byte-identical between the defaults and the shipped base', () => {
+  // Six of the seven already agreed when this was written; `protocol` was the
+  // one that did not, at 1249 characters against 2557 -- a whole older version
+  // rather than a drifted sentence. So the invariant was real and observed and
+  // enforced by nothing, which is the state that ends here.
+  //
+  // The duplication itself is deliberate and stays: `DEFAULT_PROMPTS` is what a
+  // `standalone: true` config gets, and such a config has explicitly opted out
+  // of the base file. Having the default READ the base would contradict that and
+  // would break a deployment that ships without the YAML. So the fix is to make
+  // the two provably equal, not to remove one.
+  const fromDefaults = loadAgentConfig(
+    writeConfigRaw(['standalone: true', 'crew: x', 'displayName: X']),
+  ).prompts;
+  const fromShipped = loadAgentConfig(
+    writeConfigRaw([`extends: ${BASE}`, 'crew: x', 'displayName: X']),
+  ).prompts;
+
+  const keys = [...new Set([...Object.keys(fromDefaults), ...Object.keys(fromShipped)])].sort();
+  assert.ok(keys.length >= 7, 'expected the full prompt set, got ' + keys.join(', '));
+
+  for (const key of keys) {
+    assert.equal(
+      fromDefaults[key],
+      fromShipped[key],
+      `prompts.${key} differs between DEFAULT_PROMPTS and agent-config.base.yaml — ` +
+        'update both, or the fallback ships text that no live agent has ever read',
+    );
+  }
 });
