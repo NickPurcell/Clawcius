@@ -599,6 +599,57 @@ systemPrompt:
     explicit header REPLACES it and pins you to `$GITHUB_TOKEN`, so adding one is
     not belt-and-braces; it is opting out.
 
+    ONLY `curl` READS THAT CREDENTIAL, and "only" is exact. `git` is covered
+    separately by its own credential helper, so git working proves nothing
+    about anything else. Nothing else is covered at all: the credential sits in
+    a netrc that only `$CURL_HOME/.curlrc` points at, so even a netrc-aware
+    client — Python's `requests`, say — looks at `~/.netrc`, finds nothing, and
+    gets nothing. A `401 Requires authentication` from one of those is that
+    boundary rather than a broken credential, and the repair is
+    **`curl`, not an `Authorization` header.**
+
+    AND THE HOST IS THE OTHER HALF OF THE SAME BOUNDARY. The netrc carries one
+    `machine api.github.com` line and no other, so **curl** against
+    `uploads.github.com`, `github.com` or `raw.githubusercontent.com` carries no
+    credential, and neither does a redirect that leaves the host. Being on the
+    right client is not enough to conclude the credential is broken. There is no
+    repair for this one: those hosts are not covered and no shape of curl makes
+    them so.
+
+    AND DO NOT LET THE STATUS TELL YOU WHICH PROBLEM YOU HAVE. A call that
+    carried no credential has no single symptom — 401, 404 and 403 all arrive
+    from it, and a write answers differently from a read of the same thing. A
+    403 is worse than ambiguous: here it has at least three producers, and one
+    of them means the OPPOSITE. The anonymous rate limit is one. Squid refusing
+    a port or a private address is another — `<host>` above already says a 403
+    does not say which. And a credential that WAS sent and lacks the permission
+    is the third.
+
+    AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
+    deployment has one, so reaching for it in a non-curl client is not a
+    workaround — it IS the silent fall-through to the account, which is the
+    one repair this paragraph exists to prevent.
+
+    Do not read the status — establish whether anything went out, with
+    `curl -s https://api.github.com/rate_limit`: a `core.limit` of **60** means
+    no credential was sent, and anything above it means one was. Do not test for
+    a particular number — 5000 is a floor and an installation's limit grows past
+    it.
+
+    THAT ANSWERS FOR `api.github.com` AND NOTHING ELSE, because the netrc matches
+    per host, and the host axis above is about exactly that. For any
+    other host you already have the answer: nothing was sent, and nothing will
+    be.
+
+    **AND NEVER TRACE A CALL THAT CARRIES THE CREDENTIAL.** `-v`, `--trace` and
+    `--trace-ascii` all print the `Authorization` header, which IS the
+    credential — base64 of `x-access-token:<token>`, recoverable with one
+    command. That is any request the netrc matches, not just this check, and it
+    is the request that just failed which you are most likely to want to trace.
+    Nothing downstream redacts it: it goes into whatever captured the turn and
+    stays there. Use `-i` if you need to see headers — it shows the response and
+    never the request.
+
     On a deployment with a GitHub App that credential is the App, and using it is
     what makes a pull request you open reviewable by the account rather than
     authored by it. On a deployment without one it is the same token as before and
