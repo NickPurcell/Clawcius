@@ -44,7 +44,7 @@ export type PromptTemplates = {
   protocol: string;
   /**
    * Said ONCE, at session initialization, in the system prompt. It used to
-   * ride along on every wake via `{roleNotice}` in the wake templates; that
+   * ride along via `{roleNotice}` in `messageWake` -- that one template, and
    * placeholder is now rejected there, so re-adding it is a boot error.
    *
    * The system prompt DOES now say which role is reading — that is what this
@@ -53,6 +53,12 @@ export type PromptTemplates = {
    * identity is not per-wake data. Set it empty to drop the line entirely.
    */
   roleNotice: string;
+  /**
+   * Used instead of `roleNotice` when the row carries a role outside
+   * `AgentRole`. A separate template rather than a decorated `{role}`, because
+   * decorating still rendered "`<{role}>` is yours" and named a section that
+   * cannot exist.
+   */
   roleNoticeUnknown: string;
   /** Wake message for incoming Discord messages. */
   messageWake: string;
@@ -430,8 +436,8 @@ call says which limit it hit.`,
 
   roleNoticeUnknown:
     'You are `{id}` — crew `{crew}`. Your role is recorded as `{role}`, which is ' +
-    'not one this crew defines, so `<roles>` below does not describe it. Say so ' +
-    'if it matters. Wakes reach only the main agent of a session: subagents you ' +
+    'not one this crew defines, so `<roles>` below does not describe it. Tell ' +
+    'your coordinator if it matters. Wakes reach only the main agent of a session: subagents you ' +
     'spawn are never woken this way.',
 
   messageWake: `{count} new {plural}:

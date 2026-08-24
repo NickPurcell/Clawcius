@@ -473,8 +473,10 @@ The one thing that does differ per agent is a single sentence saying who the
 agent is: `prompts.roleNotice`, rendered into the system prompt at session
 initialization with the agent's id, crew and role. It states identity and points
 at `<roles>`; it does not restate any role's duties, which is what the rule above
-is protecting. Before that, every agent was told it was the team leader — true of
-the coordinator, false of everyone else, and read first on every wake.
+is protecting. Before that there was no such sentence: a spawned agent's only
+identity text was its `spawnCharter` mail, which is history in a transcript and
+does not survive compaction. The literal that existed reached Discord-channel
+sessions alone, where it happened to be true.
 
 The role text lives in a `roles:` block inside `systemPrompt.append` in
 `agent-config.base.yaml`, so it is version-controlled and reviewable rather

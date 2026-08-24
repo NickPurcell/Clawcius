@@ -1013,9 +1013,12 @@ test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to 
 
 // ── identity at session initialization ──────────────────────────────────────
 //
-// The defect these pin: `roleNotice` was a literal telling EVERY agent it was
-// the team leader, substituted into the wake on every wake. True of the
-// coordinator, false of everyone else, and the first line they read.
+// What these pin: every role now gets a durable statement of its OWN role.
+//
+// Not "the literal was read by everyone" — it was not. It lived only in
+// `messageWake`, which renders for a Discord-channel wake alone, and those
+// sessions are coordinators. Spawned agents are woken by mail and had no role
+// statement at all; that absence is the gap, and it is the larger one.
 //
 // Driven through the REAL base config rather than a hand-built stub, so these
 // fail if the shipped YAML stops saying it.
@@ -1073,10 +1076,18 @@ test('an unrecognised role is named as unrecognised, not passed off as real', ()
 test('the wake carries messages, not identity', () => {
   withRealPrompts();
   const out = String(
+    // The REAL shape: `types.ts:12` says `kind: 'messages'` and `authorTag`.
+    // The first draft said 'message' and `author`, and reached the right branch
+    // anyway because `buildWakeMessage` returns early on 'mail' and lets
+    // everything else fall through — so it rendered `undefined: hi` and nothing
+    // asserted on the author. A fixture that only resembles the type stops
+    // exercising the right path the moment that branch becomes positive.
     buildWakeMessage({
-      kind: 'message',
+      kind: 'messages',
       channelId: 'C1',
-      messages: [{ at: Date.now(), author: 'nick', authorId: 'u1', messageId: 'm1', content: 'hi' }],
+      messages: [
+        { at: Date.now(), authorTag: 'nick', authorId: 'u1', messageId: 'm1', content: 'hi' },
+      ],
     }),
   );
   assert.doesNotMatch(out, /team leader/);
