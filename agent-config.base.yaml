@@ -1143,8 +1143,13 @@ armed:
     repo: NickPurcell/Clawcius
     # Seconds between polls of one watched pull request. A courtesy to GitHub's
     # API, and NOT a throttle on anything reaching an agent: one poll produces
-    # one mail naming every new review and comment it found, however many that
-    # is. One repo and a handful of PRs is nowhere near 5000 requests an hour,
+    # one mail naming every new review and comment it found — with ONE
+    # exception: `armed.github.quiet`, which DROPS a matching comment rather
+    # than delaying it. That key is overridable but is not written out in this
+    # file; its defaults and the reasoning are in `src/armed-wake.ts`'s header.
+    # With the shipped defaults a poll that finds a reviewer's acknowledgement
+    # and a human's comment mails one of them, not two.
+    # One repo and a handful of PRs is nowhere near 5000 requests an hour,
     # and a shorter interval buys nothing a human review cycle can perceive.
     pollSeconds: 120
     apiBase: https://api.github.com

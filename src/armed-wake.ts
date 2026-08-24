@@ -54,10 +54,12 @@
  *
  * Nothing here delays, coalesces or rate-limits a message, and ONE CLASS is
  * dropped — see the exception below. One poll that finds four new comments
- * sends one mail naming all four; the next poll that
- * finds one sends another. The re-entrancy guard is the same one `MailWaker`
- * and `WakeSpool` have — an async tick that overlapped itself would poll GitHub
- * twice for the same row and mail the same comment twice — and the poll
+ * sends one mail naming all four; the next poll that finds one sends another.
+ * The re-entrancy guard is the same one `MailWaker` and `WakeSpool` have — an
+ * async tick that overlapped itself would poll GitHub twice for the same row and
+ * mail the same comment twice — and the poll interval is a courtesy to a third
+ * party's API, not a limit on what reaches an agent.
+ *
  * ── THE ONE EXCEPTION, stated where the rule is (#231) ─────────────────────
  *
  * A comment matching `armed.github.quiet` does not wake anybody. It is a DROP,
@@ -74,9 +76,6 @@
  * replay. IF YOU ARE HERE because an agent says it never saw a comment that is
  * plainly on the pull request, grep the operator's log for
  * `not waking … for a quiet comment` before looking anywhere else.
- *
- * interval is a courtesy to a third party's API, not a limit on what reaches an
- * agent.
  */
 
 import {
