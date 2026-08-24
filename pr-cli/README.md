@@ -15,7 +15,7 @@ NickPurcell/Clawcius#240  head d94561f5
   review round                   FINISHED  since 2026-08-24T10:41:41Z
   review saw this code?          PARTLY — reviewed an ancestor; commits since it are unreviewed
                                  round 1 read c1d6f540
-  can it merge?                  clean — nothing GitHub blocks on — but of 1 approval(s): 1 STALE, for a commit no longer at the head. none is known to cover this head, so merging now merges code no review has read (dismiss_stale_reviews_on_push is false, so GitHub still counts it)
+  can it merge?                  clean — nothing GitHub blocks on — but of 1 approval(s): 1 STALE, for a commit no longer at the head. None covers this head, so merging now merges code no review has read (dismiss_stale_reviews_on_push is false, so GitHub still counts it)
                                  (mergeable: true — only says git can combine the trees; not the question)
   approval                       osmosis-jones-agent[bot] at 2026-08-24T10:41:41Z — STALE: approved c1d6f540, head is d94561f5
                                  dismiss_stale_reviews_on_push is FALSE — GitHub still counts the stale one

@@ -297,7 +297,6 @@ export function explainMergeState(state, approvals, ruleset) {
       // code" — which is this file's own header defect, and the reason the
       // tri-state was worth doing is that the third sentence is now expressible.
       //
-      // The gate answers MAY I merge. It does not answer SHOULD I.
       // EVERY BUCKET, not the first non-empty one. The previous version returned
       // on `stale` and phrased each branch as though its bucket were the whole
       // set. Both directions were reachable and both were false:
@@ -325,13 +324,19 @@ export function explainMergeState(state, approvals, ruleset) {
       // it hardcoded "is false" and said so against a ruleset that set it true and
       // against a read that established nothing. Only shown when something is
       // stale, since it is the setting that lets a stale approval keep counting.
+      // `it` / `them` follows the count for the same reason the footnote's does:
+      // the headline three words earlier says `2 STALE`, and a singular pronoun
+      // under it reads as though one of the two were the relevant one. OJ named
+      // the footnote at :791; this is the same sentence defect at a site it did
+      // not name, and fixing one and not the other is how the next round finds it.
+      const them = stale.length === 1 ? 'it' : 'them';
       const dismissal =
         stale.length === 0
           ? ''
           : ruleset?.dismissStaleOnPush === false
-            ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
+            ? ` (dismiss_stale_reviews_on_push is false, so GitHub still counts ${them})`
             : ruleset?.dismissStaleOnPush === true
-              ? ' — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts it'
+              ? ` — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts ${them}`
               : ' (whether stale reviews are dismissed could not be read)';
 
       const said = [];
@@ -364,9 +369,9 @@ export function explainMergeState(state, approvals, ruleset) {
             // acts on, would collapse it again in the last clause of the same
             // sentence.
             (unknown.length > 0
-              ? 'none is KNOWN to cover this head and the UNKNOWN one(s) may or may not, ' +
+              ? 'None is KNOWN to cover this head and the UNKNOWN one(s) may or may not, ' +
                 'so whether this code has been reviewed cannot be settled from here'
-              : 'none covers this head, so merging now merges code no review has read')) +
+              : 'None covers this head, so merging now merges code no review has read')) +
         dismissal
       );
     case 'dirty':
@@ -787,8 +792,18 @@ export function main() {
         }`,
       );
     }
-    if (approvals.some((a) => a.coverage === 'stale') && ruleset?.dismissStaleOnPush === false) {
-      say('', 'dismiss_stale_reviews_on_push is FALSE — GitHub still counts the stale one');
+    const staleCount = approvals.filter((a) => a.coverage === 'stale').length;
+    if (staleCount > 0 && ruleset?.dismissStaleOnPush === false) {
+      // COUNTED, not "the stale one". The headline four lines above says
+      // `2 STALE` for the same input, and a singular footnote under it reads as
+      // though one of the two were somehow the relevant one. It survived two
+      // rounds because the README sample happens to have exactly one approval.
+      say(
+        '',
+        `dismiss_stale_reviews_on_push is FALSE — GitHub still counts ${
+          staleCount === 1 ? 'the stale one' : `all ${staleCount} stale ones`
+        }`,
+      );
     }
   }
 

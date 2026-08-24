@@ -370,7 +370,7 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
   // the whole content of UNKNOWN and the thing this branch exists to stop the
   // tool collapsing into STALE. With one in hand only a claim about KNOWLEDGE
   // is available, so that is what it says.
-  assert.match(both, /none is KNOWN to cover this head/);
+  assert.match(both, /None is KNOWN to cover this head/);
   assert.match(both, /cannot be settled from here/);
   assert.doesNotMatch(
     both,
@@ -395,6 +395,22 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
     { required: 1, dismissStaleOnPush: false },
   );
   assert.match(staleOnly, /merging now merges code no review has read/i);
+  assert.match(staleOnly, /still counts it\)/, 'one stale approval is "it"');
+
+  // PLURAL, pinned. The headline says `2 STALE` three words earlier, and a
+  // singular pronoun under it reads as though one of the two were the relevant
+  // one. Round 4 named the same defect in the footnote; it was in this sentence
+  // too, and an unpinned fix is one somebody drops again.
+  const twoStale = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old11111', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'old22222', coverage: 'stale' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(twoStale, /2 STALE/);
+  assert.match(twoStale, /still counts them\)/, 'two stale approvals are "them"');
 
   // It must NOT appear when something does cover the head — the old code warned
   // wrongly there, which is why the clause belongs in one branch and not the
