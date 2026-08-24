@@ -29,6 +29,15 @@ function render(template: string, vars: Record<string, string>): string {
 }
 
 /**
+ * Who the session is, as the system prompt needs to say it.
+ *
+ * Resolved by `SessionPool.acquire`, which holds the registry row, and passed
+ * in -- the same shape `model` already uses, and for the reason `AgentSession`'s
+ * own comment gives: this module knows nothing about the registry.
+ */
+export type PromptIdentity = { id: string; crew: string; role: string };
+
+/**
  * Assemble the SDK `systemPrompt`.
  *
  * `useClaudeCodeDefault: true` keeps Claude Code's own prompt as the base and
@@ -39,15 +48,6 @@ function render(template: string, vars: Record<string, string>): string {
  * Order is protocol then append: the operator's instructions land last and so
  * are the most recent thing in context.
  */
-/**
- * Who the session is, as the system prompt needs to say it.
- *
- * Resolved by `SessionPool.acquire`, which holds the registry row, and passed
- * in -- the same shape `model` already uses, and for the reason `AgentSession`'s
- * own comment gives: this module knows nothing about the registry.
- */
-export type PromptIdentity = { id: string; crew: string; role: string };
-
 export function buildSystemPrompt(identity: PromptIdentity): Options['systemPrompt'] {
   const protocol = render(config().agent.prompts.protocol, {
     cli: config().agent.paths.discordCli,
