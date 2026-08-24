@@ -355,16 +355,3 @@ test('a message that never settles stops being offered, and the line says so (#2
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
-test('the re-offer counter is forgotten once a turn settles the mail (#241 round 3)', () => {
-  // Otherwise a busy agent accumulates a permanent tally and goes quiet after
-  // three ordinary messages, which would be a far worse bug than the one the
-  // ceiling fixes.
-  const { mail, waker, started } = board();
-  for (let i = 0; i < 6; i += 1) {
-    mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', `message ${i}`));
-    for (const s of started.splice(0)) s.settle(true, 'turn completed');
-    waker.sweep();
-  }
-  mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'still listening?'));
-  assert.equal(started.length, 1, 'a settled agent never hits the ceiling');
-});

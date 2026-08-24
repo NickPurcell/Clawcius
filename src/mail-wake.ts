@@ -270,6 +270,12 @@ export class MailWaker {
       if (settled) return;
       settled = true;
       if (ran) {
+        // MEMORY, NOT BEHAVIOUR, and there is deliberately no test for it. The
+        // map is keyed by message id, so a stale entry cannot affect a NEW
+        // message — it can only accumulate. I wrote a test asserting "a settled
+        // agent never hits the ceiling", then mutated this line away and the
+        // test still passed: it could not fail, which makes it worse than
+        // nothing. Deleted, and the reason recorded here instead.
         for (const id of ids) this.#offers.delete(id);
         mail.markRead(agent.id, ids);
         return;

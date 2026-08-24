@@ -958,3 +958,27 @@ test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backof
   session.turnPending = false;
   assert.equal(manager.isBusy('hamachi-engineer1'), false, 'a settled idle session is free again');
 });
+
+test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
+  // Two definitions of busy in one class is how the ops status file came to
+  // publish a mid-backoff agent as idle while the waker was correctly skipping
+  // it. A comment of mine claimed this line already fixed the status file; it
+  // did not, because the file reads `busyCount`, which counted `busy` alone.
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+  manager.acquire('hamachi-engineer1', events);
+  const [session] = built;
+
+  session.busy = false;
+  session.turnPending = true;
+  assert.equal(manager.isBusy('hamachi-engineer1'), true);
+  assert.equal(manager.busyCount, 1, 'the status file must not publish a mid-backoff agent as idle');
+
+  session.turnPending = false;
+  assert.equal(manager.busyCount, 0);
+});
