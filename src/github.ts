@@ -235,7 +235,7 @@ export class GitHubClient implements PullRequestSource {
       id: num(row['id']),
       author: login(row['user']),
       state: text(row['state'], 40) || 'COMMENTED',
-      body: text(row['body'], MAX_EXTERNAL_CHARS * 2),
+      body: text(row['body'], COMMENT_BODY_CAP),
       htmlUrl: text(row['html_url'], 300),
     }));
   }
@@ -262,7 +262,7 @@ export class GitHubClient implements PullRequestSource {
       rows.map((row) => ({
         id: num(row['id']),
         author: login(row['user']),
-        body: text(row['body'], MAX_EXTERNAL_CHARS * 2),
+        body: text(row['body'], COMMENT_BODY_CAP),
         htmlUrl: text(row['html_url'], 300),
         onDiff,
       }));
@@ -297,12 +297,19 @@ function encodePath(repo: string): string {
 export const MAX_EXTERNAL_CHARS = 1200;
 
 /**
- * The cap a comment body is delivered under — `MAX_EXTERNAL_CHARS * 2`.
+ * The cap a comment body is delivered under.
  *
  * Exported because a body AT this length may have been cut, and nothing
  * downstream can tell whether it was. `isQuiet` in `armed-wake.ts` refuses to
  * suppress at this length for exactly that reason: its `keep` guard looks for a
  * FOOTER, and a footer is the first thing a tail-truncation removes.
+ *
+ * USED BY THE TRUNCATION ITSELF, not merely equal to it. Both fetch sites wrote
+ * `MAX_EXTERNAL_CHARS * 2` literally while this constant said the same thing
+ * elsewhere — two copies of one number, and the guard downstream is only correct
+ * while they agree. Nothing enforced that, and a mutation halving this constant
+ * changed no behaviour and passed the whole suite, because the truncation was
+ * not reading it. Now it is: change this and the cut moves with it.
  */
 export const COMMENT_BODY_CAP = MAX_EXTERNAL_CHARS * 2;
 

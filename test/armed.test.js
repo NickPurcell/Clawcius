@@ -48,7 +48,12 @@ import {
 } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
-import { quoteExternal, MAX_EXTERNAL_CHARS, GitHubError } from '../dist/github.js';
+import {
+  quoteExternal,
+  MAX_EXTERNAL_CHARS,
+  COMMENT_BODY_CAP,
+  GitHubError,
+} from '../dist/github.js';
 
 /** A board on disk, so a second process can be simulated by a second store. */
 function board() {
@@ -1626,4 +1631,34 @@ test('a quiet comment does not wake, the watermark still moves, and findings sti
   assert.match(inbox[0].body, /Non-blocking/);
   assert.doesNotMatch(inbox[0].body, /OJ is reviewing this pull request/, 'the ack is not replayed');
   registry.close();
+});
+
+test('the truncation and the guard read ONE constant, so they cannot drift (#240)', () => {
+  // `isQuiet` refuses to suppress a body AT the cap, because a body that long
+  // may have been cut and `keep` looks for a FOOTER — the first thing a
+  // tail-truncation removes. That guard is only correct while the number it
+  // checks is the number the fetch actually cut at.
+  //
+  // It was two copies: `COMMENT_BODY_CAP` here, and `MAX_EXTERNAL_CHARS * 2`
+  // written literally at both fetch sites. Nothing enforced their agreement, and
+  // a mutation HALVING the constant changed no behaviour and passed the entire
+  // suite — because the truncation was not reading it. Found by mutation, not by
+  // reading. The fetch reads the constant now, so this test pins the guard
+  // rather than the arithmetic.
+  const author = 'osmosis-jones-agent[bot]';
+  const quiet = { author, suppress: ['^🧬 OJ is reviewing'], keep: ['<sub>OJ ·'] };
+
+  const atCap = comment('🧬 OJ is reviewing this pull request. ' + 'x'.repeat(COMMENT_BODY_CAP));
+  assert.ok(atCap.body.length >= COMMENT_BODY_CAP);
+  assert.equal(
+    isQuiet(atCap, quiet),
+    false,
+    'a body at the delivery cap may have lost its footer, so it is never suppressed',
+  );
+
+  // And below the cap the same text IS suppressed — otherwise the assertion
+  // above would hold for a reason that has nothing to do with the cap.
+  const shortAck = comment('🧬 OJ is reviewing this pull request. I will post findings here.');
+  assert.ok(shortAck.body.length < COMMENT_BODY_CAP);
+  assert.equal(isQuiet(shortAck, quiet), true);
 });
