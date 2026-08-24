@@ -111,14 +111,19 @@ export function retryPlanFor(errorKind: string): RetryPlan | null {
  * ternary, reachable only by constructing an `AgentSession`; a mutation making
  * it answer `not-retryable` for everything passed the whole suite.
  *
- * The three answers want opposite things from the reader:
+ * The four answers want opposite things from the reader:
  *
- *   not-retryable  a standing condition. `retryPlanFor` has no plan for it, so
- *                  a retry reproduces the same answer. Go and look.
- *   exhausted      a transient kind that used every rung of its ladder. Wait.
- *   abandoned      rungs were LEFT, and the session was closed or its stored
- *                  context cleared out from under the retry. Nothing is broken
- *                  and nothing is coming; send it again.
+ *   not-retryable   a standing condition. `retryPlanFor` has no plan for it, so
+ *                   a retry reproduces the same answer. Go and look.
+ *   exhausted       a TRANSIENT kind that used every rung of its ladder. Wait.
+ *   credential-dead the AUTH ladder is spent. Not a transient that ran out of
+ *                   time — the token is dead, and waiting never fixes it. The
+ *                   host needs a re-login. Branching on `delay === undefined`
+ *                   alone put this in `exhausted` and told a human to wait for
+ *                   an outage that was not happening; that was #263 round 1.
+ *   abandoned       rungs were LEFT, and the session was closed or its stored
+ *                   context cleared out from under the retry. Nothing is broken
+ *                   and nothing is coming; send it again.
  *
  * `abandoned` is the one that had no name before. Two of the nine refusals in
  * the 2026-08-24 05:45–06:10Z window took that exit, and both were reported as

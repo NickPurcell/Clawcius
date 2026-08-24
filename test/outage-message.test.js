@@ -296,3 +296,41 @@ test('a very long apiError is cut at a word boundary, not mid-word', () => {
   assert.doesNotMatch(text, /diagnosti…/, 'must not stop mid-word');
   assert.match(text, /did not reach me/, 'the rest of the message survives');
 });
+
+test('the abandoned branch characterises no error kind, because it cannot', () => {
+  // OJ #263 round 2. `authentication_failed` is not in `TRANSIENT_ERRORS` but it
+  // HAS a plan, so an auth failure racing a `!reset` takes the abandoned exit —
+  // and the branch was calling it "a temporary API error" and "transient".
+  // Both false for a revoked token: the round-1 finding, one branch over.
+  //
+  // The fix is not a fifth branch. The characterisation was carrying no weight:
+  // the reader acts on "the session was cleared" and "send it again", and both
+  // are true whatever the kind was. A sentence that does not need to name the
+  // kind cannot be wrong about it.
+  for (const kind of ['server_error', 'authentication_failed', 'rate_limit']) {
+    const text = outageMessage({ apiErrorKind: kind, apiError: 'x', noRetryReason: 'abandoned' });
+    assert.doesNotMatch(text, /temporary/i, `${kind}: claims the error was temporary`);
+    assert.doesNotMatch(text, /transient/i, `${kind}: claims the error was transient`);
+    assert.match(text, /session was cleared/, `${kind}: lost what actually happened`);
+    assert.match(text, /Send it again\./, `${kind}: lost the action`);
+
+    const journal = noRetryJournalReason({ noRetryReason: 'abandoned' });
+    assert.doesNotMatch(journal, /transient/i, 'the journal made the same claim');
+    assert.match(journal, /retries left/);
+  }
+});
+
+test('an auth failure racing a !reset really does reach the abandoned exit', () => {
+  // The reachability the finding rests on, pinned rather than asserted in prose:
+  // the auth rung is unspent, so `delay` is defined, and only `closed` makes
+  // `willRetry` false.
+  const { willRetry, noRetryReason } = classifyRetry({
+    errorKind: 'authentication_failed',
+    failed: true,
+    retriesSpent: 0,
+    closed: true,
+    hasContext: true,
+  });
+  assert.equal(willRetry, false);
+  assert.equal(noRetryReason, 'abandoned', 'a plan existed and a rung was left');
+});

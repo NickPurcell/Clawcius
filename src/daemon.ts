@@ -250,7 +250,7 @@ export function noRetryJournalReason(summary: TurnSummary): string {
     case 'exhausted':
       return 'transient, but every retry was spent';
     case 'abandoned':
-      return 'transient with retries left — the session was closed or cleared under it';
+      return 'retries left — the session was closed or cleared under it';
     case 'credential-dead':
       return 'the auth retry was spent — the credential itself is dead';
     default:
@@ -280,7 +280,7 @@ export function noRetryJournalReason(summary: TurnSummary): string {
  *      and they want opposite actions from the reader: one means wait, the
  *      other means go and fix something.
  *
- * `summary.noRetryReason` now says which of three states this is, decided in
+ * `summary.noRetryReason` now says which of FOUR states this is, decided in
  * `AgentSession` where `#closed` and `#lastContext` are visible. The host
  * sentence survives — in the one branch where it is true. It was never a wrong
  * sentence, only a wrong unconditional one.
@@ -311,9 +311,15 @@ export function outageMessage(summary: TurnSummary): string {
       // process died. Saying "outage" here would be a false alarm, and saying
       // "needs a look at the host" would send them after a fault that is not
       // there.
+      //
+      // AND IT NAMES NO KIND. It used to say "a temporary API error", which is
+      // false for a revoked token — `authentication_failed` is not transient but
+      // it HAS a plan, so an auth failure racing a `!reset` takes this exit. The
+      // characterisation was carrying no weight either: the reader acts on "the
+      // session was cleared" and "send it again", both true whatever the kind.
       return (
-        `⚠️ That turn hit a temporary API error and I was retrying it, but the ` +
-        `session was cleared before the retry ran.\n${heard} Send it again.`
+        `⚠️ That turn hit an API error and I was retrying it, but the session ` +
+        `was cleared before the retry ran.\n${heard} Send it again.`
       );
     case 'credential-dead':
       // The auth ladder is spent and a respawn has already failed, so this is

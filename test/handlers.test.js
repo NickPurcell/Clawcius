@@ -282,16 +282,21 @@ const authFailure = (overrides = {}) => {
     //
     // `retriesSpent` past every ladder because `retryScheduled: false` means the
     // retries are done — that is what this fixture is for.
+    // `retryScheduled` IS `willRetry`, and production returns a null reason
+    // whenever it is true — so deriving one for a queued retry builds the very
+    // shape this derivation exists to rule out.
     noRetryReason:
       'noRetryReason' in overrides
         ? overrides.noRetryReason
-        : classifyRetry({
-            errorKind: base.apiErrorKind,
-            failed: true,
-            retriesSpent: 99,
-            closed: false,
-            hasContext: true,
-          }).noRetryReason,
+        : base.retryScheduled
+          ? null
+          : classifyRetry({
+              errorKind: base.apiErrorKind,
+              failed: true,
+              retriesSpent: 99,
+              closed: false,
+              hasContext: true,
+            }).noRetryReason,
   };
 };
 
