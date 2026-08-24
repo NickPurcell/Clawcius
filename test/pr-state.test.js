@@ -649,7 +649,12 @@ test('real ISO-8601 stamps compare correctly, not just t1/t2/t3', () => {
   assert.equal(whyStale({ at: '2026-09-01T00:00:00Z' }, spanning), 'spent');
 });
 
-test('a stranger whose work was AUTHORED before the approval is not "no new author"', () => {
+test('an author-date split cannot see a stranger s late-landing old commit', () => {
+  // TITLE NAMES THE LIMIT, NOT THE WORLD. It read "a stranger … is not 'no new
+  // author'" while asserting `spent` — which is the tool printing exactly `SPENT:
+  // no new author has pushed since`. So `node --test` printed a green line
+  // stating the opposite of what the test pins. A passing test whose title is
+  // false is worse than no test: the title is what anyone skims.
   // #252 round 2, item 7 — and the paragraph this pins was itself the fix for a
   // different reassuring error. `owners` is built from `before`, and `before` is
   // selected by AUTHOR date, so a stranger's commit authored before the approval

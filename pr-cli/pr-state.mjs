@@ -614,18 +614,11 @@ function api(path, repo) {
  *                         apply here.
  */
 function apiList(path, repo) {
-  const url = `https://api.github.com/repos/${repo}${path}`;
-  const first = curlJson(url, true);
-  if (!Array.isArray(first.body)) {
-    throw new Error(
-      `GitHub said ${first.body?.status ?? '?'}: ${first.body?.message ?? 'unexpected'} (${url})`,
-    );
-  }
-  const last = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link);
-  if (!last) return first.body;
-  const sep = url.includes('?') ? '&' : '?';
-  const tail = curlJson(`${url}${sep}page=${last[1]}`, false).body;
-  return Array.isArray(tail) ? [...first.body, ...tail] : first.body;
+  // ONE IMPLEMENTATION. These were line-for-line duplicates differing only in
+  // the return shape — same URL construction, same guard, same error string,
+  // same `rel="last"` regex — so the next fix to any of that could land in one
+  // copy and miss the other.
+  return apiListSayingIfTruncated(path, repo).items;
 }
 
 /**
@@ -786,15 +779,30 @@ export function main() {
   // `truncated` is fatal rather than cosmetic here: see
   // `apiListSayingIfTruncated`. An incomplete list yields a confident wrong
   // verdict in the reassuring direction, so it yields no verdict at all.
-  // WIDER THAN "a surviving approval is stale", because `roundsSpent` counts
-  // over every approval ever cast rather than over the one-per-reviewer set.
-  // The narrow predicate silenced the history line on approve-A / push-B /
-  // re-approve-B — the #241 shape the line exists for — because by then the only
-  // surviving approval is `current` and nothing looked stale. The line went
-  // quiet exactly when the branch was back in the good state and a person was
-  // most likely to ask how many rounds it took.
+  // WHAT THIS ASKS, IN ONE CONDITION EITHER SIDE, because it has been wrong in
+  // both directions and each mistake had a different shape.
+  //
+  // TOO NARROW first: `bare.some((a) => a.coverage === 'stale')`. `roundsSpent`
+  // counts over every approval ever cast rather than over the one-per-reviewer
+  // set, so on approve-A / push-B / re-approve-B — the #241 shape the history
+  // line exists for — the only surviving approval is `current`, nothing looked
+  // stale, no commits were fetched, and the line went quiet exactly when the
+  // branch was back in the good state and a person was most likely to ask how
+  // many rounds it took.
+  //
+  // THEN TOO WIDE: replacing it with the reviews-wide test alone fetched for a
+  // reader that cannot exist. Both consumers sit inside the else-branch of
+  // `approvals.length === 0`, so on approve-A / push-B / then-request-changes
+  // nothing displays the answer — one or two HTTP round trips spent on a pull
+  // request with an outstanding change request, which is not a rare state.
+  //
+  // So: something must survive to display it, AND some approval must be off the
+  // head. The old first disjunct is gone rather than kept alongside — a stale
+  // entry in `bare` IS an approved review with a truthy `commit_id` off the
+  // head, so it was a strict subset of the second test and could never decide
+  // the answer, while reading as though it could.
   const needsCommits =
-    bare.some((a) => a.coverage === 'stale') ||
+    bare.length > 0 &&
     reviews.some((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head);
   const { items: commits, truncated } = needsCommits
     ? apiListSayingIfTruncated(`/pulls/${number}/commits?per_page=100`, repo)
@@ -931,9 +939,12 @@ export function main() {
       // who is not there, which is #216's actual bill. With both counts present
       // the residue — stale minus spent minus overtaken — is honestly unknown.
       overtakenApprovals: approvals.filter((a) => a.why === 'overtaken').length,
-      // Sibling of the above, and added for the same reason: without it a scripted
-      // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
-      // 0 stale is not the same as 0 unread.
+      // Sibling of `staleApprovals` — NAMED, not "the above", because two fields
+      // have since been inserted between them and "the above" now points at
+      // `overtakenApprovals`, whose own comment cites this one as its precedent.
+      // A relative reference in a list that grows is a claim that decays on its
+      // own. Without this field a scripted consumer reading `staleApprovals: 0`
+      // gets the unannotated adjacent field — 0 stale is not the same as 0 unread.
       unknownCoverageApprovals: approvals.filter((a) => a.coverage === 'unknown').length,
     },
     approvals,
