@@ -608,6 +608,13 @@ systemPrompt:
     boundary rather than a broken credential, and the repair is
     **`curl`, not an `Authorization` header.**
 
+    AND THE HOST IS THE OTHER HALF OF THE SAME BOUNDARY. The netrc carries one
+    `machine api.github.com` line and no other, so `uploads.github.com`,
+    `github.com` and `raw.githubusercontent.com` get nothing — and neither does
+    a redirect that leaves the host. That is the same 401 from the same cause,
+    reached with curl, so being on the right client is not enough to conclude
+    the credential is broken.
+
     AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
     deployment has one, so reaching for it in a non-curl client is not a
     workaround — it IS the silent fall-through to the account, which is the
