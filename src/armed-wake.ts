@@ -275,6 +275,39 @@ export type WatchFindings = {
 };
 
 /**
+ * Is this comment one nobody needs waking for?
+ *
+ * THREE CONDITIONS, ALL REQUIRED, and `keep` beats `suppress` — because the two
+ * failure directions are not symmetric. Matching too little brings the wakes
+ * back, which is visible and annoying. Matching too much drops findings, which
+ * is silent, and silent loss is the thing this system spent a morning on.
+ *
+ * `keep` exists so that widening `suppress` later cannot reach a comment that
+ * carries the findings footer — the one part of a review that names the commit
+ * it read. An operator tuning `suppress` in a hurry is the expected case, and
+ * this is what makes that safe rather than merely discouraged.
+ *
+ * A malformed pattern disables ITSELF rather than the mechanism: a bad `keep`
+ * would otherwise stop protecting findings, and a bad `suppress` would
+ * otherwise throw inside a poll. Both are logged by the caller when they bite.
+ */
+export type QuietComments = { author: string; keep: string; suppress: readonly string[] };
+
+export function isQuiet(comment: PrComment, quiet: QuietComments): boolean {
+  if (!quiet.author || comment.author !== quiet.author) return false;
+  if (quiet.keep && matches(quiet.keep, comment.body)) return false;
+  return quiet.suppress.some((p: string) => matches(p, comment.body));
+}
+
+function matches(pattern: string, body: string): boolean {
+  try {
+    return new RegExp(pattern).test(body);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * What a PR watch says when it has something to report.
  *
  * EVERY WORD THAT CAME FROM GITHUB IS INSIDE A QUOTE, including the pull
@@ -535,6 +568,14 @@ export type ArmedWakerOptions = {
   /** null when no GitHub token reached this process. Watches refuse at arm time. */
   github: PullRequestSource | null;
   tickMs: number;
+  /**
+   * Comments that are not a reason to wake anybody — `armed.github.quiet`.
+   *
+   * Optional so every existing construction of this waker keeps compiling and
+   * keeps its behaviour: absent means `isQuiet` sees an empty author and
+   * suppresses nothing. The mechanism is off unless a deployment asks for it.
+   */
+  quiet?: QuietComments;
   log: (line: string) => void;
 };
 
@@ -884,11 +925,33 @@ export class ArmedWaker {
     const wants = (event: string): boolean => spec.on.includes(event as never);
 
     const newReviews = wants('review') ? reviews.filter((r) => r.id > seen.reviewId) : [];
-    const newComments = wants('comment')
+    const unseenComments = wants('comment')
       ? comments.filter((c) =>
           c.onDiff ? c.id > seen.reviewCommentId : c.id > seen.issueCommentId,
         )
       : [];
+
+    // A comment that is not a reason to wake anybody. See `armed.github.quiet`.
+    //
+    // WATERMARKS STILL MOVE OVER THESE — the filter is applied here and not to
+    // `comments`, so a suppressed comment is still SEEN and is never re-offered
+    // on the next poll. Suppressing a wake must not turn into replaying it.
+    const quiet = this.#options.quiet ?? { author: '', keep: '', suppress: [] };
+    const quieted = unseenComments.filter((c) => isQuiet(c, quiet));
+    const newComments = unseenComments.filter((c) => !quieted.includes(c));
+
+    // EVERY SUPPRESSION IS LOGGED, WITH THE PULL REQUEST. This is the condition
+    // the change was accepted under and it is not decoration: this mechanism was
+    // written the same morning a delivered message vanished with no record
+    // (#239), and a fix for wake cost that drops things silently would be the
+    // same class of defect as the thing it was written beside. A suppression
+    // that is counted is a tuning problem; one that is not is a mystery.
+    for (const c of quieted) {
+      this.#options.log(
+        `watch ${spec.repo}#${spec.pr}: not waking ${condition.owner} for a quiet comment ` +
+          `by ${c.author} (${c.htmlUrl})`,
+      );
+    }
     const finished = pr.state !== 'open' || pr.merged;
 
     // Watermarks move over EVERYTHING seen, including events the agent did not

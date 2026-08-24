@@ -341,6 +341,48 @@ export type AgentConfig = {
     tickSeconds: number;
     github: {
       /**
+       * Comments that are not a reason to wake anybody.
+       *
+       * A `watchPr` mail starts a TURN, at the receiving agent's own model. So a
+       * comment carrying nothing an agent can act on costs a full turn per
+       * watcher per round — measured on 2026-08-23/24: 26 byte-identical
+       * 151-character acknowledgements in fourteen hours, across six pull
+       * requests and both crews (#231).
+       *
+       * IN CONFIG RATHER THAN IN CODE, deliberately. The reviewer's format
+       * changed under us on the morning this was written — `verdictMode:
+       * comment` vanished from its footer and it began posting approvals — and a
+       * pattern here is an operator edit measured in seconds, while one compiled
+       * into a string is a build and a deploy.
+       *
+       * THE TWO FAILURE DIRECTIONS ARE NOT SYMMETRIC, which is the whole reason
+       * this is a conjunction rather than one pattern:
+       *
+       *   suppress matches too little  -> the wakes come back. Visible, and
+       *                                   merely annoying.
+       *   suppress matches too much    -> findings are dropped. SILENT, and the
+       *                                   thing this system spent a morning on.
+       *
+       * So err narrow: all three conditions must hold, and `keep` wins over
+       * `suppress` whenever both match.
+       */
+      quiet: {
+        /**
+         * Only comments by this author are ever suppressed. Empty disables the
+         * whole mechanism, which is the safe value for a deployment that has not
+         * thought about it.
+         */
+        author: string;
+        /**
+         * A comment matching this is NEVER suppressed, whatever else it matches.
+         * It is the findings footer: the one part of a review that names the
+         * commit it read, and the thing an agent must not be denied.
+         */
+        keep: string;
+        /** Comments matching any of these, and neither of the above, do not wake. */
+        suppress: string[];
+      };
+      /**
        * `owner/name` used when a `watchPr` call omits `repo`.
        *
        * Empty is legal and means every call must name one — which is the right
@@ -619,6 +661,22 @@ const DEFAULTS: Defaults = {
     enabled: true,
     tickSeconds: 15,
     github: {
+      // ACTIVE BY DEFAULT, and overridable from YAML without a build — which is
+      // the property the "in config, not in code" requirement was actually about.
+      // An operator who wants it off writes `author: ''` in agent-config.base.yaml
+      // and restarts; nobody needs a deploy to correct a pattern.
+      //
+      // Shipping it inert would have removed no cost until a second pull request
+      // landed in a file another engineer holds, so the wakes would have gone on
+      // being paid in the meantime for no reason.
+      //
+      // An empty `author` still disables the whole mechanism, which is what a
+      // deployment with a different reviewer gets by editing one line.
+      quiet: {
+        author: 'osmosis-jones-agent[bot]',
+        keep: '<sub>OJ · round',
+        suppress: ['^🧬 OJ is reviewing this pull request'],
+      },
       repo: '',
       pollSeconds: 120,
       apiBase: 'https://api.github.com',
@@ -1678,6 +1736,18 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
           86_400,
         ),
         apiBase: str(armedGithub['apiBase'], 'armed.github.apiBase', DEFAULTS.armed.github.apiBase),
+        quiet: (() => {
+          const q = section(armedGithub['quiet'], 'armed.github.quiet');
+          return {
+            author: str(q['author'], 'armed.github.quiet.author', DEFAULTS.armed.github.quiet.author),
+            keep: str(q['keep'], 'armed.github.quiet.keep', DEFAULTS.armed.github.quiet.keep),
+            suppress: strList(
+              q['suppress'],
+              'armed.github.quiet.suppress',
+              DEFAULTS.armed.github.quiet.suppress,
+            ),
+          };
+        })(),
       },
     },
     status: {

@@ -44,6 +44,7 @@ import {
   classifyPollFailure,
   MAX_CONSECUTIVE_POLL_FAILURES,
   GONE_404_POLLS,
+  isQuiet,
 } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
@@ -1467,4 +1468,66 @@ test('the overall bound reports unreachable even when the last failure was a 404
   assert.doesNotMatch(told.body, /not there/, 'two 404s among five polls is not a gone target');
   assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   registry.close();
+});
+
+
+// ── #231: a comment that is not a reason to wake anybody ────────────────────
+//
+// A watchPr mail starts a TURN, at the receiving agent's own model. Measured on
+// 2026-08-23/24: 26 byte-identical 151-character acknowledgements in fourteen
+// hours, across six pull requests and both crews. Each one a full turn spent on
+// a message that says nothing about the round it announces.
+
+const ACK =
+  '🧬 OJ is reviewing this pull request. I will post findings here when the sweep ' +
+  'finishes — if nothing appears within the hour, something broke on my end.';
+const QUIET = {
+  author: 'osmosis-jones-agent[bot]',
+  keep: '<sub>OJ · round',
+  suppress: ['^🧬 OJ is reviewing this pull request'],
+};
+const comment = (body, author = 'osmosis-jones-agent[bot]') => ({
+  id: 1,
+  author,
+  body,
+  htmlUrl: 'https://example.invalid/c/1',
+  onDiff: false,
+});
+
+test('the acknowledgement is suppressed and findings never are', () => {
+  assert.equal(isQuiet(comment(ACK), QUIET), true);
+
+  // The findings comment on #218 round 1 opens with prose, not with `##` — a
+  // positional marker has no discriminating power here, which is why the
+  // conjunction keys on the footer instead.
+  const findings =
+    'Non-blocking. The 11 tests pass here, and three claims check out.\n\n' +
+    '## 1. Something\n\n<sub>OJ · round 1 · head `8884594c`</sub>';
+  assert.equal(isQuiet(comment(findings), QUIET), false);
+});
+
+test('`keep` beats `suppress`, because the two failure directions are not symmetric', () => {
+  // Matching too LITTLE brings the wakes back: visible, and merely annoying.
+  // Matching too MUCH drops findings: silent, and the thing this system spent a
+  // morning on. So a comment carrying the footer is never suppressed, whatever
+  // else it matches — which is what makes widening `suppress` later safe rather
+  // than merely discouraged.
+  const both = ACK + '\n\n<sub>OJ · round 3 · head `deadbeef`</sub>';
+  assert.equal(isQuiet(comment(both), QUIET), false);
+});
+
+test('suppression is confined to the named author, and off by default', () => {
+  // A human quoting the acknowledgement is not the acknowledgement.
+  assert.equal(isQuiet(comment(ACK, 'NickPurcell'), QUIET), false);
+
+  // Empty author disables the whole mechanism — the safe value for a deployment
+  // that has not thought about it, and the shipped default.
+  assert.equal(isQuiet(comment(ACK), { author: '', keep: '', suppress: ['.'] }), false);
+});
+
+test('a malformed pattern disables itself, not the mechanism', () => {
+  // A bad `suppress` must not throw inside a poll; a bad `keep` must not stop
+  // protecting findings by taking the whole predicate down with it.
+  assert.equal(isQuiet(comment(ACK), { ...QUIET, suppress: ['('] }), false);
+  assert.equal(isQuiet(comment(ACK), { ...QUIET, keep: '(' }), true);
 });

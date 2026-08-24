@@ -1073,6 +1073,7 @@ export async function main(): Promise<void> {
           mail,
           github,
           tickMs: config.agent.armed.tickSeconds * 1000,
+          quiet: config.agent.armed.github.quiet,
           log: (line) => process.stdout.write(`[armed] ${line}\n`),
         })
       : null;
