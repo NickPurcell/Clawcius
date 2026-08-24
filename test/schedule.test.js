@@ -1119,3 +1119,23 @@ test('DEFAULT_TIMEZONE is the agents\' zone, not the process\'s', async () => {
   const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
   assert.equal(DEFAULT_TIMEZONE, 'America/Los_Angeles');
 });
+
+test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async () => {
+  // The system prompt tells every agent that `date` in its container agrees with
+  // what the waker renders. That is true only while these two independent
+  // constants match — one in TypeScript, one in a shell script — and nothing
+  // derived either from the other. A sentence asserting a stricter mechanism
+  // than the one that shipped is the defect this whole change is about, so the
+  // honest comment beside each is now a guarantee instead.
+  const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  const { readFileSync } = await import('node:fs');
+  const sh = readFileSync('docker/run-container.sh', 'utf8');
+  const m = sh.match(/AGENT_TZ="\$\{AGENT_TZ:-([^}"]+)\}"/);
+  assert.ok(m, 'AGENT_TZ default not found in run-container.sh — has it moved?');
+  assert.equal(
+    m[1],
+    DEFAULT_TIMEZONE,
+    'run-container.sh and schedule.ts disagree about the agent timezone; the ' +
+      'system prompt claims they agree',
+  );
+});

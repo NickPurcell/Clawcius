@@ -94,6 +94,8 @@
 // and the system prompt tells agents their `date` agrees with what the waker
 // renders -- which is true only while these two match. If you change one,
 // change the other, or that sentence becomes the defect it was written to fix.
+// `test/schedule.test.js` asserts they are equal, so this is a guarantee
+// rather than a hope -- it reads the default straight out of the shell script.
 export const DEFAULT_TIMEZONE = 'America/Los_Angeles';
 
 /** How far `nextAfter` will scan for a matching day before calling it never. */
