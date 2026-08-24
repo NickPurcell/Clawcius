@@ -63,7 +63,7 @@
  * Five messages were lost that way in one second on 2026-08-24, with nothing
  * anywhere recording it — Clawcius #239. Seven such kills in four days.
  *
- * This paragraph is the reason it took a fortnight to notice. It NAMES the
+ * This paragraph is the reason it took ten days to notice. It NAMES the
  * scenario — "a turn dies between receiving mail and acting on it" — and
  * dismisses it on one clause, and that clause is false in exactly the case that
  * broke. The third of three places the same belief was written down and
