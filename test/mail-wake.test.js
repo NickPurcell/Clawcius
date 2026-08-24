@@ -17,7 +17,7 @@ import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { MailWaker } from '../dist/mail-wake.js';
 
-function board() {
+function board(lines = []) {
   const path = join(mkdtempSync(join(tmpdir(), 'clawsky-wake-')), 'clawcius.db');
   const registry = new AgentRegistry(path, { crew: 'hamachi' });
   const mail = new MailStore(registry);
@@ -37,7 +37,7 @@ function board() {
     mail,
     busy: (id) => busy.has(id),
     start: (agent, context, settle) => started.push({ id: agent.id, context, settle }),
-    log: () => {},
+    log: (line) => lines.push(line),
   });
   // What `main()` in daemon.ts wires: a delivery is the fast path into a sweep.
   mail.onDelivered = (message) => waker.onDelivered(message.recipient);
@@ -107,15 +107,28 @@ test('a turn that dies before it runs leaves the mail for the next sweep (#239)'
 });
 
 test('settle is once — onDone and onError can both fire for one turn', () => {
-  const { mail, started } = board();
+  // THIS TEST COULD NOT FAIL until 2026-08-24, and a mutation run found it:
+  // removing the `if (settled) return` guard changed nothing it asserted. It
+  // checked `unread === 0` after settle(true) then settle(false) — but
+  // settle(false) only LOGS, it never un-marks, so the count was 0 either way.
+  //
+  // The fourth assertion of mine this day that asserted something unreachable.
+  // The observable difference is the LOG, so that is what this asserts now.
+  const lines = [];
+  const { mail, started } = board(lines);
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'x'));
 
   started[0].settle(true, 'turn completed');
   started[0].settle(false, 'session error afterwards');
+
   assert.equal(
     mail.unread('hamachi-engineer1').length,
     0,
     'a late failure must not un-read mail the turn already consumed',
+  );
+  assert.ok(
+    !lines.some((l) => /turn died before it ran/.test(l)),
+    'a turn that RAN must not also be reported as having died — one settle, one outcome',
   );
 });
 
