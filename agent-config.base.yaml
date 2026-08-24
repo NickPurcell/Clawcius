@@ -114,9 +114,10 @@ prompts:
     ## Waking yourself later
 
     Nothing you hold survives your turn ending, so anything that should happen
-    later has to be armed before you stop. These arm it, and each delivers as
-    mail — the same inbox `checkMail` reads, so a condition coming true wakes
-    you exactly as a colleague's message does.
+    later has to be armed before you stop. `remindMe`, `scheduleRecurring` and
+    `watchPr` arm it, and each delivers as mail — the same inbox `checkMail`
+    reads, so a condition coming true wakes you exactly as a colleague's
+    message does.
 
         remindMe   a note to your future self at a time you choose. One shot: it
                    fires once and disarms. To be reminded again, arm it again in
@@ -145,10 +146,11 @@ prompts:
     the id of the one you have. Two watches mean two mails for every event until
     the pull request closes.
 
-    Each is a row on disk rather than a timer in a process, so they survive a
-    restart, and one that came due while the service was down still fires — late,
-    and saying how late. Write the note as a self-contained instruction: your
-    future self reads it without the conversation that produced it.
+    Each of those three is a row on disk rather than a timer in a process, so
+    they survive a restart, and one that came due while the service was down
+    still fires — late, and saying how late. Write the note as a self-contained
+    instruction: your future self reads it without the conversation that
+    produced it.
 
   # SAID ONCE, AT SESSION INITIALIZATION, IN THE SYSTEM PROMPT — not on every
   # wake. Placeholders: {id} {crew} {role}, resolved from the agent's registry
@@ -1074,11 +1076,12 @@ clawsky:
   # no one writes to is a mailbox nothing reads.
   agents: []
 
-# ── Armed conditions: remindMe and watchPr ────────────────────────────────
-# One mechanism, two faces. An agent arms something that will be true later —
-# a moment, or a change to a pull request — and when it comes true the waker
-# delivers mail. Mail already wakes an idle agent, so nothing new starts a
-# turn: a reminder arriving and a colleague's DM arriving are the same event.
+# ── Armed conditions: remindMe, scheduleRecurring and watchPr ─────────────
+# One mechanism wearing three faces. An agent arms something that will be true
+# later — a moment, a repeating calendar schedule, or a change to a pull
+# request — and when it comes true the waker delivers mail. Mail already wakes
+# an idle agent, so nothing new starts a turn: a reminder arriving and a
+# colleague's DM arriving are the same event.
 #
 # Durable, because the alternative is worthless. A condition is a row in the
 # same SQLite file as the registry and the mailbox, so it survives a deploy,
