@@ -47,8 +47,38 @@
  *
  * Reading marks read. There is no acknowledgement step, because the only thing
  * a separate acknowledgement buys is the case where a turn dies between
- * receiving mail and acting on it — and mail already survives that badly: the
- * transcript holds the message, so the agent's next turn can still see it.
+ * receiving mail and acting on it — and in the ORDINARY form of that, mail
+ * survives anyway: the model has already read the message, so the transcript
+ * holds it and the agent's next turn can still see it.
+ *
+ * ── THE EXCEPTION, WHICH IS WHERE THIS ARGUMENT WAS LOAD-BEARING AND WRONG ──
+ *
+ * That holds when the turn dies AFTER the model has seen the mail. It does not
+ * hold when the death PRECEDES the turn — and that is not a corner case. The
+ * gVisor sentry is OOM-killed inside the container memcg, every agent's
+ * `docker exec` dies in the same second, and the wake was handed to a session
+ * that no longer exists. THERE IS NO TRANSCRIPT HOLDING THE MESSAGE, because
+ * nothing ever ran to put it there.
+ *
+ * Five messages were lost that way in one second on 2026-08-24, with nothing
+ * anywhere recording it — Clawcius #239. Seven such kills in four days.
+ *
+ * This paragraph is the reason it took a fortnight to notice. It NAMES the
+ * scenario — "a turn dies between receiving mail and acting on it" — and
+ * dismisses it on one clause, and that clause is false in exactly the case that
+ * broke. The third of three places the same belief was written down and
+ * load-bearing; the other two were in `daemon.ts` and are corrected.
+ *
+ * WHAT ACTUALLY MAKES THIS SAFE NOW is not this argument. `MailWaker` defers
+ * `markRead` until the turn has run (#241): a settle callback travels with the
+ * turn, and a turn that dies without settling leaves its mail unread for the
+ * next sweep. So the no-acknowledgement design is still right — but it is right
+ * because of the deferred mark, not because a dead sandbox leaves a transcript.
+ *
+ * NAMED RATHER THAN DELETED, deliberately. Deleting the claim would leave the
+ * design looking unjustified and invite somebody to restore the acknowledgement
+ * step; deleting only the false clause would widen what remains to cover the
+ * case it gets wrong. Naming the exception does neither.
  */
 
 import {
