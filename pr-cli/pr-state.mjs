@@ -225,6 +225,111 @@ export function approvalsFor(reviews, head) {
 }
 
 /**
+ * WHY a stale approval went stale: the author's own pushes, or somebody else's.
+ *
+ * ── THE QUESTION THIS ANSWERS ───────────────────────────────────────────────
+ *
+ * `STALE` says an approval is for a commit that is no longer the head. It does
+ * NOT say who moved the head, and those are different situations with opposite
+ * responses:
+ *
+ *   SPENT      you pushed after your own approval landed. Nothing is wrong;
+ *              you have simply consumed it, and the fix is to ask for another
+ *              round. This is the overwhelmingly common case here and it is
+ *              currently indistinguishable from the alarming one.
+ *   OVERTAKEN  somebody ELSE moved the branch under a reviewer. Their approval
+ *              is attached to code they read and somebody else has replaced —
+ *              worth looking at before asking for a re-review, because the
+ *              question is what changed and by whom, not "please look again".
+ *
+ * ── WHY NOT CALL THE SECOND ONE `VOID` ──────────────────────────────────────
+ *
+ * Because `VOID` already means something else in this file — `classifyReviewedSha`
+ * returns it for a ROUND whose commit is not in the head's history at all,
+ * usually a force-push or rebase. Two meanings for one word in one tool is the
+ * exact defect this file exists to prevent: a term that answers a question
+ * adjacent to the one being asked. `#216` is four agents doing that with five
+ * fields, and it would be an odd thing for this file to reproduce internally.
+ *
+ * ── WHAT IT USES, AND THE TRAP IT WALKED INTO FIRST ─────────────────────────
+ *
+ * The commits either side of the approval's timestamp, and who AUTHORED them.
+ * GitHub's REST API does not report who PUSHED a commit on the pull-request
+ * endpoints, so authorship is the available proxy — and a good one, because a
+ * rebase preserves the original author, which is the case that matters.
+ *
+ * `spent` is "no author appeared who was not already writing this branch".
+ *
+ * THE FIRST VERSION COMPARED AGAINST `pr.user.login` AND WAS WRONG ON EVERY
+ * PULL REQUEST THIS CREW OPENS. It printed `OVERTAKEN: somebody else pushed`
+ * for a commit I had just pushed myself. The reason is fact 2 in this file's
+ * own header, thirty lines from the top:
+ *
+ *   > Commits are authored by the user `hamachi`; the pull request is opened
+ *   > by `hamachi-bot[bot]`, the App.
+ *
+ * Two identities on one pull request, documented here, in the file I was
+ * editing — and I still compared the PR author to the commit authors and got a
+ * confident, plausible, false answer. That is #216 happening inside the tool
+ * written to stop #216, which is worth leaving in the comment rather than
+ * quietly fixing: the field answered "did the App push this" while the question
+ * was "did whoever owns this branch push this".
+ *
+ * ── WHERE IT GIVES UP ───────────────────────────────────────────────────────
+ *
+ * `null` when it cannot tell: no commits after the approval, no commits before
+ * it to establish who owns the branch, or an author GitHub did not resolve to a
+ * login. A caller prints nothing rather than guessing, for the same reason
+ * `coverage` has an `unknown` bucket — an absent datum is not a negative one.
+ */
+export function whyStale(approval, commits) {
+  if (!approval?.at) return null;
+  // AUTHOR date, not committer date, and this is the whole of finding 3. The
+  // comment below argues that authorship is a good proxy BECAUSE a rebase
+  // preserves it — and the split was being made on the committer date, which a
+  // rebase rewrites on every commit it touches. So after a rebase every commit
+  // sorted after the approval, `before` came back empty, and the function gave
+  // up before authorship was ever consulted. The paragraph was arguing for a
+  // robustness the code did not have.
+  //
+  // THE TRADE, STATED PROPERLY — and the first version of this paragraph got it
+  // wrong in the reassuring direction, which is worth leaving visible in the
+  // comment that fixed a different reassuring error.
+  //
+  // It claimed "a NEW author still lands in `owners` as absent". It does not.
+  // `owners` is built from `before`, and `before` is selected by AUTHOR date, so
+  // a stranger's commit authored before the approval joins `owners` however late
+  // it actually lands. Work authored at 09:00, landed at 12:00, approval at
+  // 11:00, owner pushes at 12:30 — this reports `spent`, on a branch a new
+  // author pushed to after the approval.
+  //
+  // The route needs a cherry-pick, a `git am`, or a sibling branch merged in
+  // rather than an ordinary push, so the exposure is small; and `git commit
+  // --amend` preserves the author date too, which is not exotic here — after an
+  // amend and a force-push this gives up rather than answering. Those are the
+  // costs of reading rebases correctly, which is the far commoner case.
+  const dateOf = (c) => c.commit?.author?.date ?? c.commit?.committer?.date;
+
+  const before = commits.filter((c) => {
+    const at = dateOf(c);
+    return at !== undefined && at <= approval.at;
+  });
+  const after = commits.filter((c) => {
+    const at = dateOf(c);
+    return at !== undefined && at > approval.at;
+  });
+  if (after.length === 0 || before.length === 0) return null;
+
+  const login = (c) => c.author?.login;
+  if ([...before, ...after].some((c) => !login(c))) return null;
+
+  // Who was already writing this branch when the approval landed. Anyone else
+  // turning up afterwards is the case worth flagging.
+  const owners = new Set(before.map(login));
+  return after.every((c) => owners.has(login(c))) ? 'spent' : 'overtaken';
+}
+
+/**
  * Does a ruleset ref pattern match this branch?
  *
  * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
@@ -509,6 +614,29 @@ function api(path, repo) {
  *                         apply here.
  */
 function apiList(path, repo) {
+  // ONE IMPLEMENTATION. These were line-for-line duplicates differing only in
+  // the return shape — same URL construction, same guard, same error string,
+  // same `rel="last"` regex — so the next fix to any of that could land in one
+  // copy and miss the other.
+  return apiListSayingIfTruncated(path, repo).items;
+}
+
+/**
+ * `apiList`, plus whether the middle was skipped.
+ *
+ * `apiList` fetches page 1 and the LAST page and deliberately drops what is
+ * between them; its doc comment enumerates the callers that is safe for, and
+ * why. `whyStale` is not one of them and cannot be added to the list: it splits
+ * the commits either side of a timestamp, so page 1 (oldest) and the last page
+ * (newest) both come back populated and it returns a VERDICT drawn from an
+ * incomplete set rather than declining to answer.
+ *
+ * Measured by OJ on a 210-commit branch with a third party's commit on the
+ * skipped page: the full list says `overtaken`, page-1-plus-last says `spent`.
+ * The alarming answer becoming the calm one is the wrong direction to be wrong
+ * in, so this reports the truncation and the caller gives up instead.
+ */
+function apiListSayingIfTruncated(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
   const first = curlJson(url, true);
   if (!Array.isArray(first.body)) {
@@ -517,10 +645,14 @@ function apiList(path, repo) {
     );
   }
   const last = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link);
-  if (!last) return first.body;
+  if (!last) return { items: first.body, truncated: false };
   const sep = url.includes('?') ? '&' : '?';
   const tail = curlJson(`${url}${sep}page=${last[1]}`, false).body;
-  return Array.isArray(tail) ? [...first.body, ...tail] : first.body;
+  return {
+    items: Array.isArray(tail) ? [...first.body, ...tail] : first.body,
+    // Two pages IS the whole list; three or more means a middle was dropped.
+    truncated: Number(last[1]) > 2,
+  };
 }
 
 /** Is `sha` an ancestor of `head` in the local clone? null if we cannot tell. */
@@ -637,7 +769,69 @@ export function main() {
   // Computed ONCE. Both the JSON and the text path called this, so `git` was
   // spawned twice for one answer.
   const verdict = latest ? classifyReviewedSha(latest.sha, head, isAncestor) : 'NONE';
-  const approvals = approvalsFor(reviews, head);
+  const bare = approvalsFor(reviews, head);
+
+  // FETCHED ONLY IF SOMETHING NEEDS IT. `whyStale` is asked about stale
+  // approvals and a fresh pull request has none, so an unconditional read added
+  // one or two HTTP round trips to every invocation for an answer nobody wanted.
+  // This file makes the same point about `git` at the `merge-base` call.
+  //
+  // `truncated` is fatal rather than cosmetic here: see
+  // `apiListSayingIfTruncated`. An incomplete list yields a confident wrong
+  // verdict in the reassuring direction, so it yields no verdict at all.
+  // WHAT THIS ASKS, IN ONE CONDITION EITHER SIDE, because it has been wrong in
+  // both directions and each mistake had a different shape.
+  //
+  // TOO NARROW first: `bare.some((a) => a.coverage === 'stale')`. `roundsSpent`
+  // counts over every approval ever cast rather than over the one-per-reviewer
+  // set, so on approve-A / push-B / re-approve-B — the #241 shape the history
+  // line exists for — the only surviving approval is `current`, nothing looked
+  // stale, no commits were fetched, and the line went quiet exactly when the
+  // branch was back in the good state and a person was most likely to ask how
+  // many rounds it took.
+  //
+  // THEN TOO WIDE: replacing it with the reviews-wide test alone fetched for a
+  // reader that cannot exist. Both consumers sit inside the else-branch of
+  // `approvals.length === 0`, so on approve-A / push-B / then-request-changes
+  // nothing displays the answer — one or two HTTP round trips spent on a pull
+  // request with an outstanding change request, which is not a rare state.
+  //
+  // So: something must survive to display it, AND some approval must be off the
+  // head. The old first disjunct is gone rather than kept alongside — a stale
+  // entry in `bare` IS an approved review with a truthy `commit_id` off the
+  // head, so it was a strict subset of the second test and could never decide
+  // the answer, while reading as though it could.
+  const needsCommits =
+    bare.length > 0 &&
+    reviews.some((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head);
+  const { items: commits, truncated } = needsCommits
+    ? apiListSayingIfTruncated(`/pulls/${number}/commits?per_page=100`, repo)
+    : { items: [], truncated: false };
+  const why0 = (a) => (truncated ? null : whyStale(a, commits));
+
+  const approvals = bare.map((a) => (a.coverage === 'stale' ? { ...a, why: why0(a) } : a));
+
+  // TWO COUNTS, TWO POPULATIONS, AND THEY ARE NOT THE SAME QUESTION.
+  //
+  // `spentApprovals` sits in the `merge` block beside `staleApprovals` as a
+  // decomposition of it, so it MUST count the same set: `approvalsFor`'s
+  // one-per-reviewer latest-review list. Counting raw `reviews` instead
+  // reported `spentApprovals: 1` on a branch with zero live approvals and an
+  // outstanding change request — overstating in the direction of "this was
+  // fine, just ask again", which is verbatim the miscount `approvalsFor`'s own
+  // comment says #218 round 1 finding 4 fixed. It also produced `2` beside a
+  // `staleApprovals: 1`, which is 2 of 1.
+  //
+  // `roundsSpent` is the other question — "how many times has this branch been
+  // round the loop" — and it genuinely wants every approval ever cast, so it is
+  // computed over `reviews` and stays on the text path where that is what is
+  // being said.
+  const spentApprovals = approvals.filter((a) => a.why === 'spent').length;
+  const roundsSpent = truncated
+    ? 0
+    : reviews
+        .filter((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head)
+        .filter((r) => whyStale({ at: r.submitted_at }, commits) === 'spent').length;
 
   let ruleset = null;
   try {
@@ -731,9 +925,26 @@ export function main() {
       mergeable_state: pr.mergeable_state,
       why,
       staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
-      // Sibling of the above, and added for the same reason: without it a scripted
-      // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
-      // 0 stale is not the same as 0 unread.
+      // Sibling of `staleApprovals` for the same reason it is here: a consumer
+      // reading `staleApprovals: 1` cannot tell whether somebody moved the
+      // branch under a reviewer or the author simply pushed again.
+      spentApprovals,
+      // SIBLING OF `spentApprovals`, for the reason `unknownCoverageApprovals`
+      // is a sibling of `staleApprovals`: "0 stale is not the same as 0 unread".
+      // `staleApprovals: 1, spentApprovals: 0` reads naturally as "not spent, so
+      // somebody moved the branch under a reviewer" — and it is also what you
+      // get when the author did not resolve to a login, and when the commit list
+      // was truncated. Two of those three are the tool declining to answer, and
+      // reading them as the alarming one sends a consumer chasing an intruder
+      // who is not there, which is #216's actual bill. With both counts present
+      // the residue — stale minus spent minus overtaken — is honestly unknown.
+      overtakenApprovals: approvals.filter((a) => a.why === 'overtaken').length,
+      // Sibling of `staleApprovals` — NAMED, not "the above", because two fields
+      // have since been inserted between them and "the above" now points at
+      // `overtakenApprovals`, whose own comment cites this one as its precedent.
+      // A relative reference in a list that grows is a claim that decays on its
+      // own. Without this field a scripted consumer reading `staleApprovals: 0`
+      // gets the unannotated adjacent field — 0 stale is not the same as 0 unread.
       unknownCoverageApprovals: approvals.filter((a) => a.coverage === 'unknown').length,
     },
     approvals,
@@ -780,6 +991,17 @@ export function main() {
   if (approvals.length === 0) {
     say('approvals', `none${ruleset?.required ? ` of ${ruleset.required} required` : ''}`);
   } else {
+    // THE ROUND COUNT, before the per-approval lines. A branch that has been
+    // approved four times and pushed four times looks identical, line by line,
+    // to one that has been approved once — every line says STALE and none of
+    // them says how often this has happened. #241 spent five.
+    const everApproved = reviews.filter((r) => r.state === 'APPROVED').length;
+    if (roundsSpent > 0) {
+      say(
+        'approval history',
+        `${everApproved} approval(s) so far; ${roundsSpent} with no new author since`,
+      );
+    }
     for (const a of approvals) {
       say(
         'approval',
@@ -787,7 +1009,21 @@ export function main() {
           a.coverage === 'unknown'
             ? `commit_id absent, so whether it covers ${head.slice(0, 8)} is unknown`
             : a.coverage === 'stale'
-              ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}`
+              ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}` +
+                // WHY it went stale, when that is knowable. "You spent it" and
+                // "somebody else moved the branch under them" want opposite
+                // responses and read identically without this.
+                // "SPENT by your own pushes" claimed more than the function
+                // computes. `spent` is "no author appeared who was not already
+                // writing this branch" — on a branch two people had touched
+                // before the approval, a push by the second reads back as
+                // yours, which is the false-reassurance direction. This says
+                // what it knows.
+                (a.why === 'spent'
+                  ? ' — SPENT: no new author has pushed since'
+                  : a.why === 'overtaken'
+                    ? ' — OVERTAKEN: an author who was not on this branch has pushed since'
+                    : '')
               : 'for this exact head'
         }`,
       );

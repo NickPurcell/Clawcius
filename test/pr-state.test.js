@@ -25,6 +25,7 @@ import {
   roundState,
   explainMergeState,
   refPatternMatches,
+  whyStale,
 } from '../pr-cli/pr-state.mjs';
 
 const OJ = { login: 'osmosis-jones-agent[bot]' };
@@ -549,4 +550,137 @@ test('coverage is three states, because commit_id can be absent', () => {
     'head1234',
   );
   assert.equal(empty.coverage, 'unknown');
+});
+
+// ── why a stale approval went stale ─────────────────────────────────────────
+
+// AUTHOR date, because that is what `whyStale` splits on and what a rebase
+// preserves. `committed` is supplied separately where a test needs the two to
+// disagree, which is exactly the rebase case.
+const commit = (login, date, committed = date) => ({
+  author: { login },
+  commit: { author: { date }, committer: { date: committed } },
+});
+
+test('an approval the author spent by their own pushes is SPENT, not overtaken', () => {
+  // The common case by far, and currently indistinguishable from the alarming
+  // one: every line says STALE and none says who moved the head. #241 spent
+  // five approvals this way in one morning.
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'spent');
+});
+
+test('somebody ELSE pushing under a reviewer is OVERTAKEN', () => {
+  // Opposite response: the question is what changed and by whom, not "please
+  // look again".
+  const commits = [commit('hamachi', 't1'), commit('someone-else', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'overtaken');
+});
+
+test('the PR author is NOT the commit author here, and comparing them was wrong', () => {
+  // THE TRAP, pinned. The first version compared the commit authors against
+  // `pr.user.login` and reported OVERTAKEN for a commit I had just pushed
+  // myself — on every pull request this crew opens.
+  //
+  // Fact 2 of this file's header: commits are authored by the user `hamachi`,
+  // the pull request is opened by `hamachi-bot[bot]`, the App. Two identities
+  // on one PR, documented in the file being edited, and the comparison still
+  // went to the wrong pair. So `whyStale` takes NO author argument — there is
+  // no way to hand it the wrong one.
+  assert.equal(whyStale.length, 2, 'whyStale(approval, commits) — no author parameter to get wrong');
+
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'spent', 'the App never authors; only the user does');
+});
+
+test('whyStale gives up rather than guessing', () => {
+  // Same reason `coverage` has an `unknown` bucket: an absent datum is not a
+  // negative one, and a caller must print nothing rather than a plausible lie.
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't9' }, commits), null, 'nothing pushed after the approval');
+  assert.equal(whyStale({ at: 't0' }, commits), null, 'nothing before it to say who owns the branch');
+  assert.equal(whyStale(null, commits), null);
+  assert.equal(
+    whyStale({ at: 't2' }, [commit('hamachi', 't1'), { author: null, commit: { committer: { date: 't3' } } }]),
+    null,
+    'an author GitHub did not resolve to a login',
+  );
+});
+
+test('a rebase after the approval still gets an answer (#252 round 1)', () => {
+  // THE CASE THE COMMENT SINGLED OUT AND THE CODE GAVE UP ON. The rationale
+  // said authorship is a good proxy BECAUSE a rebase preserves it — while the
+  // split was made on the COMMITTER date, which a rebase rewrites on every
+  // commit. So `before` came back empty and the function returned null before
+  // authorship was ever consulted: a paragraph arguing for robustness the code
+  // did not have.
+  const rebasedAt = '2026-08-24T12:22:00Z';
+  const commits = [
+    // Authored before the approval, re-committed by the rebase after it.
+    commit('hamachi', '2026-08-24T11:00:00Z', rebasedAt),
+    commit('hamachi', '2026-08-24T12:40:00Z', '2026-08-24T12:40:00Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T12:30:00Z' }, commits), 'spent');
+
+  const withStranger = [
+    commit('hamachi', '2026-08-24T11:00:00Z', rebasedAt),
+    commit('someone-else', '2026-08-24T12:40:00Z', '2026-08-24T12:40:00Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T12:30:00Z' }, withStranger), 'overtaken');
+});
+
+test('real ISO-8601 stamps compare correctly, not just t1/t2/t3', () => {
+  // Round 1: every existing case used 't1'/'t2'/'t3', so the tests pinned the
+  // ordering of three short strings and never that GitHub's actual format
+  // compares correctly under `<=` and `>`. It does — Z-suffixed UTC is fixed
+  // width and lexicographically ordered — but that was the one assumption the
+  // suite did not touch.
+  const commits = [
+    commit('hamachi', '2026-08-24T09:13:38Z'),
+    commit('hamachi', '2026-08-24T12:43:11Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T11:08:24Z' }, commits), 'spent');
+
+  // Across a month and a year boundary, where a naive comparison would slip.
+  const spanning = [
+    commit('hamachi', '2026-08-31T23:59:59Z'),
+    commit('hamachi', '2026-09-01T00:00:01Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-09-01T00:00:00Z' }, spanning), 'spent');
+});
+
+test("an author-date split cannot see a stranger's late-landing old commit", () => {
+  // TITLE NAMES THE LIMIT, NOT THE WORLD. It read "a stranger … is not 'no new
+  // author'" while asserting `spent` — which is the tool printing exactly `SPENT:
+  // no new author has pushed since`. So `node --test` printed a green line
+  // stating the opposite of what the test pins. A passing test whose title is
+  // false is worse than no test: the title is what anyone skims.
+  // #252 round 2, item 7 — and the paragraph this pins was itself the fix for a
+  // different reassuring error. `owners` is built from `before`, and `before` is
+  // selected by AUTHOR date, so a stranger's commit authored before the approval
+  // joins `owners` however late it lands.
+  //
+  // The route needs a cherry-pick, a `git am` or a sibling branch merged in
+  // rather than an ordinary push, so this is not a bug being fixed — it is the
+  // documented cost of reading rebases correctly, pinned so that the day someone
+  // changes the split back, the comment and the test disagree loudly.
+  const commits = [
+    commit('hamachi', '2026-08-24T08:00:00Z'),
+    commit('a-stranger', '2026-08-24T09:00:00Z', '2026-08-24T12:00:00Z'),
+    commit('hamachi', '2026-08-24T12:30:00Z'),
+  ];
+  assert.equal(
+    whyStale({ at: '2026-08-24T11:00:00Z' }, commits),
+    'spent',
+    'documented limit: an author-date split cannot see a late-landing old commit',
+  );
+});
+
+test('an amend after the approval gives up rather than answering', () => {
+  // `git commit --amend` preserves the author date, so an amended commit sorts
+  // BEFORE the approval, `after` is empty, and the function declines. No wrong
+  // answer — but the round-1 code said "spent" here, so this is a case that used
+  // to be explained and now is not, and the comment says so.
+  const commits = [commit('hamachi', '2026-08-24T10:00:00Z', '2026-08-24T12:30:00Z')];
+  assert.equal(whyStale({ at: '2026-08-24T11:00:00Z' }, commits), null);
 });
