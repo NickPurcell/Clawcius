@@ -203,9 +203,9 @@ test('a malformed expires_at falls back to an hour instead of minting every call
 });
 
 test('an installation id that is not digits is refused before it reaches a URL', async () => {
-  // Operator-controlled and interpolated into a path. A trailing newline in a
-  // systemd EnvironmentFile is an ordinary typo, and `github.ts` validates
-  // every value it interpolates so a bad one fails with a name.
+  // Operator-controlled and interpolated into a path. An invisible character in
+  // an operator-typed value is an ordinary typo, and `github.ts` validates every
+  // value it interpolates so a bad one fails with a name.
   for (const bad of ['42\n', ' 42', '42/../../meta', 'abc']) {
     const provider = appTokenProvider({
       appId: '1', privateKeyPath: pemOnDisk(), installationId: bad,

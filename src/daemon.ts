@@ -725,9 +725,9 @@ export async function main(): Promise<void> {
     if (app) {
       // Checked at BOOT because it costs no network, no token and no PEM, so
       // there is no reason for it to wait until first use — and first use is
-      // inside `ArmedWaker`'s try, where the catch deletes the row. A trailing
-      // newline in an EnvironmentFile is an ordinary typo; discovering it at
-      // boot is a log line, discovering it at first poll is a permanent sweep.
+      // inside `ArmedWaker`'s try, where the catch deletes the row. An invisible
+      // character in an operator-typed value is an ordinary typo; discovering it
+      // at boot is a log line, discovering it at first poll is a permanent sweep.
       //
       // The checks themselves live in `github-app.ts` as a pure function. They
       // were four lines here, and those four lines were wrong in three
