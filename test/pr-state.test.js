@@ -25,6 +25,7 @@ import {
   roundState,
   explainMergeState,
   refPatternMatches,
+  whyStale,
 } from '../pr-cli/pr-state.mjs';
 
 const OJ = { login: 'osmosis-jones-agent[bot]' };
@@ -549,4 +550,53 @@ test('coverage is three states, because commit_id can be absent', () => {
     'head1234',
   );
   assert.equal(empty.coverage, 'unknown');
+});
+
+// ── why a stale approval went stale ─────────────────────────────────────────
+
+const commit = (login, date) => ({ author: { login }, commit: { committer: { date } } });
+
+test('an approval the author spent by their own pushes is SPENT, not overtaken', () => {
+  // The common case by far, and currently indistinguishable from the alarming
+  // one: every line says STALE and none says who moved the head. #241 spent
+  // five approvals this way in one morning.
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'spent');
+});
+
+test('somebody ELSE pushing under a reviewer is OVERTAKEN', () => {
+  // Opposite response: the question is what changed and by whom, not "please
+  // look again".
+  const commits = [commit('hamachi', 't1'), commit('someone-else', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'overtaken');
+});
+
+test('the PR author is NOT the commit author here, and comparing them was wrong', () => {
+  // THE TRAP, pinned. The first version compared the commit authors against
+  // `pr.user.login` and reported OVERTAKEN for a commit I had just pushed
+  // myself — on every pull request this crew opens.
+  //
+  // Fact 2 of this file's header: commits are authored by the user `hamachi`,
+  // the pull request is opened by `hamachi-bot[bot]`, the App. Two identities
+  // on one PR, documented in the file being edited, and the comparison still
+  // went to the wrong pair. So `whyStale` takes NO author argument — there is
+  // no way to hand it the wrong one.
+  assert.equal(whyStale.length, 2, 'whyStale(approval, commits) — no author parameter to get wrong');
+
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't2' }, commits), 'spent', 'the App never authors; only the user does');
+});
+
+test('whyStale gives up rather than guessing', () => {
+  // Same reason `coverage` has an `unknown` bucket: an absent datum is not a
+  // negative one, and a caller must print nothing rather than a plausible lie.
+  const commits = [commit('hamachi', 't1'), commit('hamachi', 't3')];
+  assert.equal(whyStale({ at: 't9' }, commits), null, 'nothing pushed after the approval');
+  assert.equal(whyStale({ at: 't0' }, commits), null, 'nothing before it to say who owns the branch');
+  assert.equal(whyStale(null, commits), null);
+  assert.equal(
+    whyStale({ at: 't2' }, [commit('hamachi', 't1'), { author: null, commit: { committer: { date: 't3' } } }]),
+    null,
+    'an author GitHub did not resolve to a login',
+  );
 });

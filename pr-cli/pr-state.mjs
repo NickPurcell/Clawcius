@@ -225,6 +225,87 @@ export function approvalsFor(reviews, head) {
 }
 
 /**
+ * WHY a stale approval went stale: the author's own pushes, or somebody else's.
+ *
+ * ── THE QUESTION THIS ANSWERS ───────────────────────────────────────────────
+ *
+ * `STALE` says an approval is for a commit that is no longer the head. It does
+ * NOT say who moved the head, and those are different situations with opposite
+ * responses:
+ *
+ *   SPENT      you pushed after your own approval landed. Nothing is wrong;
+ *              you have simply consumed it, and the fix is to ask for another
+ *              round. This is the overwhelmingly common case here and it is
+ *              currently indistinguishable from the alarming one.
+ *   OVERTAKEN  somebody ELSE moved the branch under a reviewer. Their approval
+ *              is attached to code they read and somebody else has replaced —
+ *              worth looking at before asking for a re-review, because the
+ *              question is what changed and by whom, not "please look again".
+ *
+ * ── WHY NOT CALL THE SECOND ONE `VOID` ──────────────────────────────────────
+ *
+ * Because `VOID` already means something else in this file — `classifyReviewedSha`
+ * returns it for a ROUND whose commit is not in the head's history at all,
+ * usually a force-push or rebase. Two meanings for one word in one tool is the
+ * exact defect this file exists to prevent: a term that answers a question
+ * adjacent to the one being asked. `#216` is four agents doing that with five
+ * fields, and it would be an odd thing for this file to reproduce internally.
+ *
+ * ── WHAT IT USES, AND THE TRAP IT WALKED INTO FIRST ─────────────────────────
+ *
+ * The commits either side of the approval's timestamp, and who AUTHORED them.
+ * GitHub's REST API does not report who PUSHED a commit on the pull-request
+ * endpoints, so authorship is the available proxy — and a good one, because a
+ * rebase preserves the original author, which is the case that matters.
+ *
+ * `spent` is "no author appeared who was not already writing this branch".
+ *
+ * THE FIRST VERSION COMPARED AGAINST `pr.user.login` AND WAS WRONG ON EVERY
+ * PULL REQUEST THIS CREW OPENS. It printed `OVERTAKEN: somebody else pushed`
+ * for a commit I had just pushed myself. The reason is fact 2 in this file's
+ * own header, thirty lines from the top:
+ *
+ *   > Commits are authored by the user `hamachi`; the pull request is opened
+ *   > by `hamachi-bot[bot]`, the App.
+ *
+ * Two identities on one pull request, documented here, in the file I was
+ * editing — and I still compared the PR author to the commit authors and got a
+ * confident, plausible, false answer. That is #216 happening inside the tool
+ * written to stop #216, which is worth leaving in the comment rather than
+ * quietly fixing: the field answered "did the App push this" while the question
+ * was "did whoever owns this branch push this".
+ *
+ * ── WHERE IT GIVES UP ───────────────────────────────────────────────────────
+ *
+ * `null` when it cannot tell: no commits after the approval, no commits before
+ * it to establish who owns the branch, or an author GitHub did not resolve to a
+ * login. A caller prints nothing rather than guessing, for the same reason
+ * `coverage` has an `unknown` bucket — an absent datum is not a negative one.
+ */
+export function whyStale(approval, commits) {
+  if (!approval?.at) return null;
+  const dateOf = (c) => c.commit?.committer?.date ?? c.commit?.author?.date;
+
+  const before = commits.filter((c) => {
+    const at = dateOf(c);
+    return at !== undefined && at <= approval.at;
+  });
+  const after = commits.filter((c) => {
+    const at = dateOf(c);
+    return at !== undefined && at > approval.at;
+  });
+  if (after.length === 0 || before.length === 0) return null;
+
+  const login = (c) => c.author?.login;
+  if ([...before, ...after].some((c) => !login(c))) return null;
+
+  // Who was already writing this branch when the approval landed. Anyone else
+  // turning up afterwards is the case worth flagging.
+  const owners = new Set(before.map(login));
+  return after.every((c) => owners.has(login(c))) ? 'spent' : 'overtaken';
+}
+
+/**
  * Does a ruleset ref pattern match this branch?
  *
  * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
@@ -612,6 +693,10 @@ export function main() {
   const comments = apiList(`/issues/${number}/comments?per_page=100`, repo);
   const timeline = apiList(`/issues/${number}/timeline?per_page=100`, repo);
   const reviews = apiList(`/pulls/${number}/reviews?per_page=100`, repo);
+  // For `whyStale` only. Capped at 250 by GitHub on this endpoint, which is far
+  // above anything here; a branch past that would under-report and the caller
+  // gets `null` rather than a guess, which is the right failure.
+  const commits = apiList(`/pulls/${number}/commits?per_page=100`, repo);
 
   // STRUCTURAL, not "a comment by OJ exists": findings carry the footer, the
   // acknowledgement does not. That distinction is the whole point — the ack is
@@ -637,7 +722,17 @@ export function main() {
   // Computed ONCE. Both the JSON and the text path called this, so `git` was
   // spawned twice for one answer.
   const verdict = latest ? classifyReviewedSha(latest.sha, head, isAncestor) : 'NONE';
-  const approvals = approvalsFor(reviews, head);
+  const approvals = approvalsFor(reviews, head).map((a) =>
+    a.coverage === 'stale' ? { ...a, why: whyStale(a, commits) } : a,
+  );
+
+  // "This is the 4th approval; 3 were spent by your own pushes" — the count a
+  // person actually wants when a branch has been round the loop several times.
+  // Every approval this pull request has ever had, not just the surviving one
+  // per reviewer, because the question is how many rounds have been consumed.
+  const spentApprovals = reviews
+    .filter((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head)
+    .filter((r) => whyStale({ at: r.submitted_at }, commits) === 'spent').length;
 
   let ruleset = null;
   try {
@@ -731,6 +826,10 @@ export function main() {
       mergeable_state: pr.mergeable_state,
       why,
       staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
+      // Sibling of `staleApprovals` for the same reason it is here: a consumer
+      // reading `staleApprovals: 1` cannot tell whether somebody moved the
+      // branch under a reviewer or the author simply pushed again.
+      spentApprovals,
       // Sibling of the above, and added for the same reason: without it a scripted
       // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
       // 0 stale is not the same as 0 unread.
@@ -780,6 +879,17 @@ export function main() {
   if (approvals.length === 0) {
     say('approvals', `none${ruleset?.required ? ` of ${ruleset.required} required` : ''}`);
   } else {
+    // THE ROUND COUNT, before the per-approval lines. A branch that has been
+    // approved four times and pushed four times looks identical, line by line,
+    // to one that has been approved once — every line says STALE and none of
+    // them says how often this has happened. #241 spent five.
+    const everApproved = reviews.filter((r) => r.state === 'APPROVED').length;
+    if (spentApprovals > 0) {
+      say(
+        'approval history',
+        `${everApproved} approval(s) so far; ${spentApprovals} spent by your own pushes since`,
+      );
+    }
     for (const a of approvals) {
       say(
         'approval',
@@ -787,7 +897,15 @@ export function main() {
           a.coverage === 'unknown'
             ? `commit_id absent, so whether it covers ${head.slice(0, 8)} is unknown`
             : a.coverage === 'stale'
-              ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}`
+              ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}` +
+                // WHY it went stale, when that is knowable. "You spent it" and
+                // "somebody else moved the branch under them" want opposite
+                // responses and read identically without this.
+                (a.why === 'spent'
+                  ? ' — SPENT by your own pushes since'
+                  : a.why === 'overtaken'
+                    ? ' — OVERTAKEN: somebody else pushed after they approved'
+                    : '')
               : 'for this exact head'
         }`,
       );
