@@ -44,8 +44,8 @@ export type PromptTemplates = {
   protocol: string;
   /**
    * Said ONCE, at session initialization, in the system prompt. It used to
-   * ride along via `{roleNotice}` in `messageWake` -- that one template, and
-   * placeholder is now rejected there, so re-adding it is a boot error.
+   * ride along via `{roleNotice}` in `messageWake` -- that one template -- and
+   * that placeholder is now rejected there, so re-adding it is a boot error.
    *
    * The system prompt DOES now say which role is reading — that is what this
    * template is. It used to say the opposite, in this comment, while the string
@@ -423,9 +423,9 @@ intermediate work.
 ## Waking yourself later
 
 Nothing you hold survives your turn ending, so anything that should happen
-later has to be armed before you stop. Three tools arm it, and all three
-deliver as mail — the same inbox \`checkMail\` reads, so a condition coming
-true wakes you exactly as a colleague's message does.
+later has to be armed before you stop. These arm it, and each delivers as
+mail — the same inbox \`checkMail\` reads, so a condition coming true wakes
+you exactly as a colleague's message does.
 
     remindMe   a note to your future self at a time you choose. One shot: it
                fires once and disarms. To be reminded again, arm it again in
@@ -454,7 +454,7 @@ Arming a second watch on a pull request you already watch is refused, with
 the id of the one you have. Two watches mean two mails for every event until
 the pull request closes.
 
-All three are rows on disk rather than timers in a process, so they survive a
+Each is a row on disk rather than a timer in a process, so they survive a
 restart, and one that came due while the service was down still fires — late,
 and saying how late. Write the note as a self-contained instruction: your
 future self reads it without the conversation that produced it.`,

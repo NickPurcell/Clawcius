@@ -205,12 +205,13 @@ There used to be two directory-as-a-queue spools, one pair per instance inside
 the container's own bind mount:
 
 - `<stateDir>/run/wake` — the agent dropped a JSON file naming a channel and a
-  prompt, to ask its own waker to start a turn. Replaced by `remindMe` and
-  `watchPr`, armed conditions in the waker (`src/armed.ts`, `src/armed-tool.ts`,
-  `src/armed-wake.ts`) that are built per session and closed over that session's
-  agent id, so "an agent may only schedule itself" is the absence of an argument
-  rather than the rejection of one. The file it replaced named the channel, and
-  nothing validated that name (Clawcius #39);
+  prompt, to ask its own waker to start a turn. Replaced by the arming tools —
+  `remindMe`, `scheduleRecurring` and `watchPr` — armed conditions in the waker
+  (`src/armed.ts`, `src/armed-tool.ts`, `src/armed-wake.ts`, `src/schedule.ts`)
+  that are built per session and closed over that session's agent id, so "an
+  agent may only schedule itself" is the absence of an argument rather than the
+  rejection of one. The file it replaced named the channel, and nothing
+  validated that name (Clawcius #39);
 - `<stateDir>/run/ops` — the agent dropped a JSON request that this daemon
   parsed against a verb list and executed. Replaced by the DM above, which had
   already been in production for two days when the spool was removed.
