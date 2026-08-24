@@ -239,3 +239,72 @@ test('a turn that could not be started leaves the mail unread', () => {
     'collect would have marked it read on the way past; unread + markRead does not',
   );
 });
+
+test('settle called synchronously, from inside start(), leaves the mail unread (#239)', () => {
+  // THE UNTESTED NEIGHBOUR OF THE BUG. `AgentSession.#push` has a synchronous
+  // catch — "the child transport can be dead — a failed spawn, or a process that
+  // exited" — which routes straight to `onError`. So the daemon can settle
+  // BEFORE `start` returns, re-entrantly, while `#consider` is still executing
+  // the call that produced it.
+  //
+  // This is NOT the path that bit on 2026-08-24: there the queue push succeeded
+  // and the exec died asynchronously, which is why the journal shows the exit and
+  // the wake in the same second with a retry two seconds later. It is the
+  // ordering nobody thinks to write, which is why it is worth writing.
+  const registry = new AgentRegistry(join(mkdtempSync(join(tmpdir(), 'sync-settle-')), 'c.db'), {
+    crew: 'hamachi',
+  });
+  registry.ensure('hamachi-coordinator', {
+    crew: 'hamachi',
+    role: 'coordinator',
+    workspacePath: '/tmp/c',
+    spawnedBy: null,
+  });
+  registry.ensure('hamachi-engineer1', {
+    crew: 'hamachi',
+    role: 'engineer',
+    workspacePath: '/tmp/e',
+    spawnedBy: null,
+  });
+  const mail = new MailStore(registry);
+
+  const lines = [];
+  let settleCalls = 0;
+  const waker = new MailWaker({
+    crew: 'hamachi',
+    registry,
+    mail,
+    busy: () => false,
+    // The synchronous failure: settle runs before start returns.
+    start: (_agent, _context, settle) => {
+      settleCalls += 1;
+      settle(false, 'session error: child transport is dead');
+    },
+    log: (line) => lines.push(line),
+  });
+  mail.onDelivered = (message) => waker.onDelivered(message.recipient);
+
+  mail.deliver({
+    author: 'hamachi-coordinator',
+    recipient: 'hamachi-engineer1',
+    subject: 's',
+    body: 'must survive',
+  });
+
+  assert.equal(
+    mail.unread('hamachi-engineer1').length,
+    1,
+    'a turn that died inside start() must not consume the mail',
+  );
+  assert.equal(settleCalls, 1);
+
+  // And the log must not claim a wake that did not happen. Without the guard it
+  // read "turn died before it ran … left unread" and then "woke X with 1
+  // message(s)" — announcing a wake, in the path built to stop silent failure.
+  assert.ok(lines.some((l) => /turn died before it ran/.test(l)));
+  assert.ok(
+    !lines.some((l) => /^woke hamachi-engineer1/.test(l)),
+    'no wake happened, so none may be announced',
+  );
+  registry.close();
+});

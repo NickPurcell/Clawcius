@@ -230,6 +230,17 @@ export class MailWaker {
       return;
     }
 
+    // `settle` CAN HAVE RUN ALREADY, from inside the call above. `AgentSession`'s
+    // `#push` has a synchronous catch — "the child transport can be dead — a
+    // failed spawn, or a process that exited" — which routes straight to
+    // `onError`, so the daemon settles before `start` returns.
+    //
+    // Without this the log reads backwards and claims something untrue: "turn
+    // died before it ran … left unread", immediately followed by "woke X with 5
+    // message(s)". No turn was woken. Announcing a wake that did not happen, in
+    // the path built to stop things failing silently, would be the same defect
+    // one line lower.
+    if (settled) return;
     log(`woke ${agent.id} with ${pending.length} message(s)`);
   }
 }
