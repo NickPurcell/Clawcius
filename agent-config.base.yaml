@@ -609,11 +609,20 @@ systemPrompt:
     **`curl`, not an `Authorization` header.**
 
     AND THE HOST IS THE OTHER HALF OF THE SAME BOUNDARY. The netrc carries one
-    `machine api.github.com` line and no other, so `uploads.github.com`,
-    `github.com` and `raw.githubusercontent.com` get nothing — and neither does
-    a redirect that leaves the host. That is the same 401 from the same cause,
-    reached with curl, so being on the right client is not enough to conclude
-    the credential is broken.
+    `machine api.github.com` line and no other, so **curl** against
+    `uploads.github.com`, `github.com` or `raw.githubusercontent.com` carries no
+    credential, and neither does a redirect that leaves the host. Being on the
+    right client is not enough to conclude the credential is broken. There is no
+    repair for this one: those hosts are not covered and no shape of curl makes
+    them so.
+
+    AND THE SYMPTOM IS NOT ALWAYS A 401. Only an API host answers that. The
+    other two serve whatever is public and answer **404** for what is not, and
+    even on `api.github.com` a read you cannot see is a 404 where a write is a
+    401. So a 404 on a resource you know exists is this same boundary and not a
+    wrong URL — `armed-wake.ts` already records it as "the same class of event
+    as the 401". It is the more misleading of the two, because it sends you to
+    the path instead of to the credential.
 
     AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
     deployment has one, so reaching for it in a non-curl client is not a
