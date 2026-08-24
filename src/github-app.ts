@@ -144,13 +144,11 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  *
  * HOW IT ARRIVED IS DELIBERATELY NOT CLAIMED, here or in the warnings below.
  * An earlier version blamed a trailing newline in a systemd `EnvironmentFile`.
- * That is a claim about a LOADER, and systemd's `EnvironmentFile=` documents
- * leading and trailing space, tab and CR as discarded from an unquoted value --
- * which is how `.env` is normally written. Docker's `--env-file` reads the SAME
- * file for the agent containers and its rules have never been compared with
- * systemd's, so identical bytes may not even yield identical values. None of
- * these checks depend on knowing the route, and a cause that cannot be
- * attributed cannot be improved -- only dropped.
+ * The argument for dropping that -- two loaders reading one `.env`, rules never
+ * compared, and a cause nobody here can attribute -- is set out once, under
+ * `describeTokenShape`'s TOLERATED row, and deliberately not repeated here.
+ * Two copies would be two things to keep true the day the systemd reading is
+ * revisited.
  *
  * Checked against the FAILURE MODE rather than against a format, deliberately.
  * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
@@ -670,7 +668,8 @@ export function checkAppConfig(
 
   if (!isInstallationIdValid(input.installationId)) {
     faults.push(
-      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL',
+      'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
+        'and the character that is not a digit need not be visible in the value',
     );
   }
 
