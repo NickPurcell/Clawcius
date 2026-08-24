@@ -616,20 +616,28 @@ systemPrompt:
     repair for this one: those hosts are not covered and no shape of curl makes
     them so.
 
-    AND DO NOT LET THE STATUS TELL YOU WHICH PROBLEM YOU HAVE. An uncredentialed
-    call has no single symptom. A write to `api.github.com` answers 401. A read
-    of something the credential cannot see answers **404** — which reads as a
-    wrong URL and sends you to the path. An exhausted anonymous rate limit
-    answers **403** with a body naming an IP address and no credential at all,
-    and its obvious repair — wait, retry — never works, because anonymous is 60
-    an hour forever. `uploads.github.com` 401s; `github.com` and
-    `raw.githubusercontent.com` serve what is public and 404 what is not.
+    AND DO NOT LET THE STATUS TELL YOU WHICH PROBLEM YOU HAVE. A call that
+    carried no credential has no single symptom — 401, 404 and 403 all arrive
+    from it, and a write answers differently from a read of the same thing. A
+    403 is worse than ambiguous: here it has at least three producers, and one
+    of them means the OPPOSITE. The anonymous rate limit is one. Squid refusing
+    a port or a private address is another — `<host>` above already says a 403
+    does not say which. And a credential that WAS sent and lacks the permission
+    is the third.
 
-    Three statuses, one fact: nothing was sent. So check that first, and check
-    it with `curl -s https://api.github.com/rate_limit` — a `core.limit` of
-    **5000** means a credential went out, **60** means none did. **Do NOT use
-    `curl -v` for this.** It prints the `Authorization` header, and that is the
-    credential itself, into whatever captured the output.
+    So do not read the status. Establish whether anything went out, with
+    `curl -s https://api.github.com/rate_limit`: a `core.limit` of **60** means
+    no credential was sent, and anything above it means one was. Do not test for
+    a particular number — 5000 is a floor and an installation's limit grows past
+    it.
+
+    THAT ANSWERS FOR `api.github.com` AND NOTHING ELSE, because the netrc matches
+    per host, and the host is the axis the paragraph above is about. For any
+    other host you already have the answer: nothing was sent, and nothing will
+    be.
+
+    **Do NOT use `curl -v` for this.** It prints the `Authorization` header, and
+    that is the credential itself, into whatever captured the output.
 
     AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
     deployment has one, so reaching for it in a non-curl client is not a
