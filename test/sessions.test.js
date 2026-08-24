@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
+import { AgentSession, AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { setConfig } from '../dist/config.js';
@@ -93,6 +93,12 @@ class FakeSession {
     this.lastActiveAt = Date.now();
     this.closed = false;
     this.onBusyChanged = () => {};
+    /** Every `wake` this session was given, with the per-turn settle. */
+    this.wakes = [];
+  }
+
+  wake(context, onSettled = null) {
+    this.wakes.push({ context, onSettled });
   }
 
   async close() {
@@ -795,4 +801,58 @@ test('the role acted on is the row, not the identity the fallback would have pic
   manager.acquire('hamachi-engineer2', events);
   assert.equal(toolNames(built[0].mcpServers).includes('spawn'), false);
   await manager.shutdown();
+});
+
+// ── The settle travels with the TURN, not with the session ──────────────────
+//
+// #241 round 1, BLOCKING, and it is worth writing down what the shape of the
+// mistake was rather than only the fix.
+//
+// The first version handed the per-turn `settle` callback to `acquire`. But
+// `acquire` returns an EXISTING session and drops everything else it was given
+// (`src/agent.ts:1041-1046`), and `AgentSession` stores its events once, in the
+// constructor. So the callback reached the session only on the wake that
+// happened to CREATE it. Every mail wake after that settled nothing; the mail
+// was never marked read; the ten-second sweep re-offered it forever — a full
+// model turn against the same message every ten seconds, for the life of the
+// process, on the SUCCESS path. Strictly worse than the rare asynchronous loss
+// it was written to fix.
+//
+// The lifetime the callback belongs to is a TURN, and `wake()` is where a turn
+// begins, so that is where it is passed. This test is at the acquire/wake seam
+// because that seam is where it broke: a test of `AgentSession` alone, or of
+// `mailWakeEvents` alone, would have passed against the broken wiring.
+
+test('every wake carries its own settle, not just the one that built the session (#241)', () => {
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  const settles = [];
+  for (const which of ['first', 'second', 'third']) {
+    const settle = (ran, why) => settles.push({ which, ran, why });
+    manager
+      .acquire('hamachi-engineer1', events)
+      .wake({ kind: 'mail', channelId: 'hamachi-engineer1', count: 1 }, settle);
+  }
+
+  assert.equal(built.length, 1, 'all three wakes went to one session — that is the premise');
+  const [session] = built;
+  assert.equal(session.wakes.length, 3);
+
+  // The claim: three distinct callbacks arrived, one per turn. Under the old
+  // wiring the 2nd and 3rd were dropped by `acquire` and this is where it shows.
+  for (const [i, w] of session.wakes.entries()) {
+    assert.equal(typeof w.onSettled, 'function', `wake ${i + 1} arrived with no settle`);
+  }
+  const distinct = new Set(session.wakes.map((w) => w.onSettled));
+  assert.equal(distinct.size, 3, 'each turn must settle its OWN mail, not an earlier turn s');
+
+  // And they are wired to the right turns, which set-size alone does not show.
+  session.wakes[1].onSettled(true, '');
+  assert.deepEqual(settles, [{ which: 'second', ran: true, why: '' }]);
 });

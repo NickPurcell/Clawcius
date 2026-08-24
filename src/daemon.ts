@@ -128,7 +128,16 @@ export type DiscordHandlers = {
 };
 
 /**
- * The three session events that decide whether a mail wake consumed its mail.
+ * The three session events a mail wake logs and reacts to.
+ *
+ * THEY NO LONGER SETTLE THE MAIL. `AgentSession` does, from `#settleTurn`, at
+ * the one place a turn ends — because this object is handed to `acquire`, which
+ * DROPS it for a session that already exists, so only the first wake's copy ever
+ * ran. Settling from here marked the first message read and then nothing else
+ * ever again, and the sweep re-offered the same mail every ten seconds for the
+ * life of the process. Clawcius #241, round 1, blocking.
+ *
+ * A turn is the lifetime the settle belongs to, so it travels with `wake()`.
  *
  * EXTRACTED SO THEY CAN BE TESTED, because this wiring is exactly where #239
  * lived: `onError` did not settle, five messages were marked read for a turn
@@ -140,7 +149,6 @@ export type DiscordHandlers = {
  * Fixing a path and leaving it untested is the shape that produced the bug.
  */
 export function mailWakeEvents(opts: {
-  settle: (ran: boolean, why: string) => void;
   persist: () => void;
   release: () => void;
   err: (line: string) => void;
@@ -149,7 +157,7 @@ export function mailWakeEvents(opts: {
   onError: (error: Error) => void;
   onNeedsRespawn: () => void;
 } {
-  const { settle, persist, release, err } = opts;
+  const { persist, release, err } = opts;
   return {
     onDone: (summary) => {
       persist();
@@ -163,7 +171,6 @@ export function mailWakeEvents(opts: {
         // "already in the transcript", which is the claim #239 disproved:
         // `checkMail` reads unread rows, the row was no longer one, and the
         // message was gone for good.
-        if (!summary.retryScheduled) settle(false, `API refused: ${summary.apiErrorKind}`);
         err(
           `mail wake REFUSED (${summary.apiErrorKind})\n` +
             `  ${String(summary.apiError).replace(/\s+/g, ' ').slice(0, 300)}\n` +
@@ -173,8 +180,6 @@ export function mailWakeEvents(opts: {
         );
         return;
       }
-      // The turn ran. This is the only path that marks mail read.
-      settle(true, 'turn completed');
     },
     // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that claimed
     // nothing. The other two at least asserted a reason a reader could disagree
@@ -187,12 +192,10 @@ export function mailWakeEvents(opts: {
     // and this fires once per agent with nothing to say — because there was no
     // per-agent failure to describe.
     onError: (error) => {
-      settle(false, `session error: ${error.message}`);
       err(error.message);
       release();
     },
     onNeedsRespawn: () => {
-      settle(false, 'stale token, session dropped');
       err('stale token on a mail wake — dropping session');
       release();
     },
@@ -988,13 +991,12 @@ export async function main(): Promise<void> {
                   `[clawcius ${agent.id}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`,
                 ),
               ...mailWakeEvents({
-                settle,
                 persist: () => sessions.persist(agent.id),
                 release: () => void sessions.release(agent.id),
                 err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
               }),
             });
-            session.wake(context);
+            session.wake(context, settle);
           },
           log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
         })

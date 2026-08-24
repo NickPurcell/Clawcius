@@ -414,6 +414,24 @@ export class AgentSession {
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
   #sentThisTurn = false;
+  /**
+   * What to tell the caller once THIS TURN has settled — set by `wake`, cleared
+   * the moment it fires.
+   *
+   * PER TURN, NOT PER SESSION, and that distinction is Clawcius #241's blocking
+   * finding. The first version handed the callback to `SessionManager.acquire`,
+   * which returns an EXISTING session and drops the events it was given
+   * (`:998-1003`), while `AgentSession` stores `#events` once in its
+   * constructor. So only the first wake's callback ever reached `onDone`. Every
+   * mail wake after that settled nothing, the mail was never marked read, and
+   * the ten-second sweep re-offered it forever — a full model turn against the
+   * same message every ten seconds, on the SUCCESS path, which is the common
+   * one. That is worse than the loss it was fixing.
+   *
+   * A turn is the lifetime this belongs to, so it lives here and travels with
+   * `wake`.
+   */
+  #pendingSettle: ((ran: boolean, why: string) => void) | null = null;
   #apiErrorThisTurn: string | null = null;
   #apiErrorKindThisTurn: string | null = null;
   /**
@@ -704,6 +722,16 @@ export class AgentSession {
         const willRetry =
           delay !== undefined && !this.#closed && this.#lastContext !== null;
 
+        // SETTLED HERE, at the one place a turn ends, rather than in three
+        // callbacks the caller wires. A refusal WITH a retry queued is left
+        // pending on purpose: the retry re-runs this turn and its own completion
+        // decides, so settling either way here would be a guess.
+        if (this.#apiErrorThisTurn === null) {
+          this.#settleTurn(true, 'turn completed');
+        } else if (!willRetry) {
+          this.#settleTurn(false, `API refused: ${this.#apiErrorKindThisTurn}`);
+        }
+
         this.#events.onDone({
           isError: message.is_error,
           costUsd: message.total_cost_usd,
@@ -730,6 +758,7 @@ export class AgentSession {
           // Out of retries on an auth failure. The token this process holds is
           // dead and it will never pick up the live one, so the session itself
           // is the thing that has to go. Someone above owns the session map.
+          this.#settleTurn(false, 'stale token, session dropped');
           this.#events.onNeedsRespawn(this.#actedSinceWake);
         }
         break;
@@ -746,7 +775,13 @@ export class AgentSession {
    * Cancels any retry still pending from the previous wake: fresh input makes
    * a replay of the old one both stale and confusing.
    */
-  wake(context: WakeContext): void {
+  wake(context: WakeContext, onSettled: ((ran: boolean, why: string) => void) | null = null): void {
+    // A wake arriving while a previous turn's settle is still pending means that
+    // turn never completed — nothing else would have left it. Settle it FALSE:
+    // its mail was never confirmed read, so it should be offered again rather
+    // than silently dropped when this callback replaces it.
+    this.#settleTurn(false, 'a new wake arrived before the previous turn settled');
+    this.#pendingSettle = onSettled;
     this.#cancelRetry();
     this.#lastContext = context;
     this.#retries = 0;
@@ -785,8 +820,16 @@ export class AgentSession {
       // and retry, rather than letting it surface as an unhandled rejection
       // that says nothing about which channel broke.
       this.busy = false;
+      this.#settleTurn(false, `could not start the turn: ${String(error)}`);
       this.#events.onError(error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  /** Fire the pending settle once, and clear it. */
+  #settleTurn(ran: boolean, why: string): void {
+    const settle = this.#pendingSettle;
+    this.#pendingSettle = null;
+    if (settle) settle(ran, why);
   }
 
   #cancelRetry(): void {
