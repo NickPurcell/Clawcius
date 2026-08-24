@@ -167,6 +167,15 @@ function drive() {
 
 const RESULT = { type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.01 };
 
+/** An assistant turn that called a tool — the thing a retry must not replay. */
+const toolUse = (command = 'echo hi') => ({
+  type: 'assistant',
+  message: {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command } }],
+  },
+});
+
 /** An API-level refusal, which arrives as an ordinary assistant message. */
 const refusal = (kind) => ({
   type: 'assistant',
@@ -392,6 +401,137 @@ test('!stop during a retry BACKOFF settles, or the agent goes deaf forever (#241
     assert.equal(settles[0].ran, false, 'mail nobody has seen is not mail that was read');
     assert.match(settles[0].why, /never ran/);
   } finally {
+    h.restore();
+  }
+});
+
+// ── #242: the behaviours a green suite said nothing about ───────────────────
+//
+// Measured, not assumed. Every mutation below passed the full suite before
+// these tests existed — six for six, 429 green each time:
+//
+//   replay-vs-continuation inverted          # pass 429 # fail 0
+//   a replayed mail wake marked NON-synthetic # pass 429 # fail 0
+//   #actedSinceWake never set                 # pass 429 # fail 0
+//   the session id from `init` dropped        # pass 429 # fail 0
+//   the retry timer no longer unref'd         # pass 429 # fail 0
+//   respawn fires for ANY error kind          # pass 429 # fail 0
+//
+// #241 installed the `sdk` seam so a real session can be driven. This is what
+// that seam was for: the seam is not the fix, the coverage is.
+
+test('a retry after a tool call CONTINUES; a retry after none REPLAYS (#242)', async () => {
+  // The distinction is the whole reason `#actedSinceWake` exists. A verbatim
+  // replay of a turn that already ran tools would double their effects — files
+  // rewritten, a Discord message posted twice — which the continuation prompt
+  // says outright: "their effects are real".
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(toolUse());
+    // `authentication_failed`, whose single backoff is 2s — the transient plan
+    // starts at 5s and this test only needs the retry to fire, not which plan.
+    await h.send(refusal('authentication_failed'));
+    await h.send(RESULT);
+    await new Promise((r) => setTimeout(r, 2_400));
+
+    assert.equal(h.pushed.length, 2, 'the retry must have run');
+    const retried = String(h.pushed[1].message.content);
+    assert.match(retried, /cut short by an API error/, 'a turn that acted must CONTINUE');
+    assert.match(retried, /do not repeat completed work/);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a retry with no tool call replays the wake verbatim, and stays synthetic (#242)', async () => {
+  // Two claims in one place because they are one decision: `#rewake` picks the
+  // text AND the synthetic flag from the same field, and `synthetic` is how a
+  // mail wake tells the model nobody typed it.
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, mail: 'look at #31', count: 1 }, () => {});
+    await h.send(refusal('authentication_failed'));
+    await h.send(RESULT);
+    await new Promise((r) => setTimeout(r, 2_400));
+
+    assert.equal(h.pushed.length, 2);
+    const retried = String(h.pushed[1].message.content);
+    assert.doesNotMatch(retried, /cut short by an API error/, 'nothing ran, so nothing to continue');
+    assert.equal(
+      retried,
+      String(h.pushed[0].message.content),
+      'a turn that did nothing is replayed verbatim',
+    );
+    assert.equal(h.pushed[1].isSynthetic, true, 'a replayed mail wake is still nobody typing');
+  } finally {
+    h.restore();
+  }
+});
+
+test('the session id is taken from the SDK init message (#242)', async () => {
+  // Until `init` arrives the id is a placeholder. Dropping the capture means
+  // every resume starts a cold conversation — silently, since a cold session
+  // answers perfectly well and only the transcript is missing.
+  const h = drive();
+  try {
+    assert.match(h.session.sessionId, /^pending-/, 'a placeholder until the SDK says otherwise');
+    await h.send({ type: 'system', subtype: 'init', session_id: 'real-session-abc' });
+    assert.equal(h.session.sessionId, 'real-session-abc');
+  } finally {
+    h.restore();
+  }
+});
+
+test('respawn is for a dead CREDENTIAL, not for any exhausted error (#242)', async () => {
+  // `onNeedsRespawn` drops the session out of the pool. Firing it for an
+  // ordinary refusal would throw away a working session — and the transcript
+  // with it — every time the API said no.
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(refusal('billing_error'));
+    await h.send(RESULT);
+
+    assert.ok(
+      h.events.some((e) => e.kind === 'done'),
+      'the turn ended',
+    );
+    assert.equal(
+      h.events.some((e) => e.kind === 'respawn'),
+      false,
+      'a billing error is not a dead credential',
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+test('the retry timer is unref d, so a backoff cannot hold the process open (#242)', async () => {
+  // "Never hold the process open for a retry: a shutdown mid-backoff should
+  // exit, not linger." A missing `unref()` does not fail anything — it makes
+  // the daemon hang for up to 45 seconds on shutdown, which reads as a slow
+  // deploy rather than as a bug, and no test could see it because the timer is
+  // private. Captured at `setTimeout` instead, which is where it is created.
+  const realSetTimeout = globalThis.setTimeout;
+  const timers = [];
+  globalThis.setTimeout = (...args) => {
+    const t = realSetTimeout(...args);
+    timers.push(t);
+    return t;
+  };
+
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(refusal('authentication_failed'));
+    await h.send(RESULT);
+
+    const retryTimer = timers.find((t) => typeof t.hasRef === 'function' && !t.hasRef());
+    assert.ok(retryTimer, 'the retry backoff must not keep the event loop alive');
+  } finally {
+    h.session.close?.();
+    globalThis.setTimeout = realSetTimeout;
     h.restore();
   }
 });
