@@ -34,11 +34,20 @@ import { parse, stringify } from 'yaml';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
 
-/** Exactly the lines given, for tests about the container block itself. */
+/**
+ * Exactly the lines given, for tests about the container block itself.
+ *
+ * `standalone: true` is prepended unless the caller supplies `extends:`, because
+ * since #221 a config must DECLARE which mode it is in rather than have it
+ * inferred from silence. Almost every fixture here is standalone, and this is
+ * the one place that has to say so — the two helpers were the whole cost of that
+ * change on the test side, which is why it was worth doing.
+ */
 function writeConfigRaw(lines) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-'));
   const path = join(dir, 'agent-config.yaml');
-  writeFileSync(path, [...lines, ''].join('\n'));
+  const declared = lines.some((l) => l.startsWith('extends:') || l.startsWith('standalone:'));
+  writeFileSync(path, [...(declared ? [] : ['standalone: true']), ...lines, ''].join('\n'));
   return path;
 }
 
@@ -52,6 +61,22 @@ function writeConfigRaw(lines) {
  */
 function writeConfig(lines) {
   return writeConfigRaw(['crew: x', 'container:', ...lines]);
+}
+
+/**
+ * Exactly the lines given and NOTHING prepended — for the tests that assert an
+ * undeclared mode is refused.
+ *
+ * It exists because `writeConfigRaw` adds `standalone: true`, which is correct
+ * for every other fixture and silently defeats these two: the first version of
+ * this test passed the undeclared case through the helper and got a declared
+ * file back, so it asserted a throw that could not happen.
+ */
+function writeUndeclared(lines) {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-undeclared-'));
+  const path = join(dir, 'agent-config.yaml');
+  writeFileSync(path, [...lines, ''].join('\n'));
+  return path;
 }
 
 /** Absolute, because a fixture in a tmpdir cannot resolve a relative base. */
@@ -506,6 +531,62 @@ test('a derived key is refused in an instance file, not just in the base', () =>
   assert.equal(
     loadAgentConfig(writeConfig(['  execEnvDir: /var/lib/x-env'])).container.execEnvDir,
     '/var/lib/x-env',
+  );
+});
+
+test('a config must DECLARE its mode; silence is an error (#221)', () => {
+  // #207 closed the spelling that looks like a mistake and left open the one
+  // that looks like a deletion:
+  //
+  //   extends:                     refused since #207
+  //   extends: ""                  refused since #207
+  //   <the line deleted entirely>  LOADED SILENTLY  <- this test
+  //
+  // Measured on merged main before the fix: deleting that one line from the
+  // shipped agent-config.yaml gave a 0-character system prompt, `claude-opus-5`
+  // instead of `claude-opus-5[1m]`, and maxConcurrent 3 instead of 10.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /has no `extends:` and does not declare itself standalone/,
+  );
+  // The error names BOTH ways out, because an operator who hits it has no way to
+  // know which one they meant to write.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /`extends: agent-config\.base\.yaml`[\s\S]*`standalone: true`/,
+  );
+
+  // Declaring standalone is the opt-in, and it still works.
+  assert.equal(loadAgentConfig(writeConfigRaw(['standalone: true', 'crew: x'])).crew, 'x');
+
+  // Claiming both modes says nothing about which is meant, so it is refused
+  // rather than resolved by precedence — a precedence rule here would be a
+  // silent choice, which is the whole thing this key exists to stop.
+  assert.throws(
+    () => loadAgentConfig(writeConfigRaw(['standalone: true', `extends: ${BASE}`, 'crew: x'])),
+    /standalone cannot be true in a file that also has `extends:`/,
+  );
+
+  // Neither mode key survives into the config object.
+  const config = loadAgentConfig(writeConfigRaw(['standalone: true', 'crew: x']));
+  assert.equal(config.standalone, undefined);
+  assert.equal(config.extends, undefined);
+});
+
+test('the real shipped config, minus its extends line, is refused (#221)', () => {
+  // THE REPRODUCTION FROM THE ISSUE, against the file that actually ships rather
+  // than a fixture — because the fixture is what I would have got right.
+  const real = readFileSync('agent-config.yaml', 'utf8');
+  assert.match(real, /^extends: /m, 'precondition: the shipped file uses extends');
+
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-221-'));
+  const path = join(dir, 'agent-config.yaml');
+  writeFileSync(path, real.split('\n').filter((l) => !l.startsWith('extends:')).join('\n'));
+
+  assert.throws(
+    () => loadAgentConfig(path),
+    /has no `extends:` and does not declare itself standalone/,
+    'deleting one line must not silently produce a crew with no system prompt',
   );
 });
 

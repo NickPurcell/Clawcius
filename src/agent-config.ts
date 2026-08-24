@@ -1233,11 +1233,48 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   // already refused with a good message, but in YAML those are the same edit
   // made two ways and the silent one was the safe-looking one.
   // OJ round 1 on #207, finding 2.
+  const standalone = bool(instance['standalone'], 'standalone', false);
+
+  // THE MODE IS DECLARED, NEVER INFERRED. Silence used to MEAN standalone, and
+  // #207 closed only the spelling that looks like a mistake:
+  //
+  //   extends:                    refused since #207 — looks like a mistake
+  //   extends: ""                 refused since #207
+  //   <the line deleted entirely>  LOADED SILENTLY — looks like a deletion
+  //
+  // That third row is #221. Delete one line from a shipped instance file and the
+  // crew starts with a 0-character system prompt, `claude-opus-5` instead of
+  // `claude-opus-5[1m]`, and `maxConcurrent: 3` instead of 10 — measured, on
+  // merged `main`. Instance files are now twelve lines and hand-edited, and
+  // `extends:` is the one line in them that reads like boilerplate.
+  //
+  // Nothing upstream catches it any more, and that is this change's own doing:
+  // `container.stateDir` was required-with-no-default and would have thrown, but
+  // #203 derived it from `crew`, so a file containing `crew:` satisfies the
+  // loader completely. The protection was never a guard — it was a side effect
+  // of a different requirement, and deriving removed it.
+  if (!('extends' in instance) && !standalone) {
+    throw new Error(
+      `${path}: has no \`extends:\` and does not declare itself standalone.\n` +
+        '  An instance file must name its base — `extends: agent-config.base.yaml`.\n' +
+        '  A deliberately self-contained config must say so — `standalone: true`.\n' +
+        'Without a base this crew would start with no system prompt at all, which is ' +
+        'why silence is an error here rather than a default.',
+    );
+  }
+  if ('extends' in instance && standalone) {
+    throw new ConfigError(
+      'standalone',
+      'cannot be true in a file that also has `extends:` — those are the two modes, ' +
+        'and a file claiming both says nothing about which one it means',
+    );
+  }
+
   if (!('extends' in instance)) {
-    // Standalone: one file, no layering, and therefore nothing the two lists
-    // protect against — they exist to stop one instance inheriting another's
-    // identity through a SHARED file, and there is no shared file here. Both
-    // shipped configs use `extends`, and a test asserts it.
+    // Standalone, and now DECLARED. Nothing the refusal lists protect against
+    // applies: they exist to stop one instance inheriting another's identity
+    // through a SHARED file, and there is no shared file here. Both shipped
+    // configs use `extends`, and a test asserts it.
     root = instance;
   } else {
     if (typeof extendsRaw !== 'string' || extendsRaw.trim() === '') {
@@ -1291,6 +1328,9 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     root = deepMerge(base, instance, keyProvenance, basePath, path);
   }
   delete root['extends'];
+  // Both mode keys are stripped before validation, so neither reaches the config
+  // object and neither can be mistaken for a setting.
+  delete root['standalone'];
 
   // Refused wherever it appears, including a standalone file, because unlike
   // everything else here this key MOVED. Left working under its old name it
