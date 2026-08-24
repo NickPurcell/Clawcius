@@ -649,7 +649,7 @@ test('real ISO-8601 stamps compare correctly, not just t1/t2/t3', () => {
   assert.equal(whyStale({ at: '2026-09-01T00:00:00Z' }, spanning), 'spent');
 });
 
-test('an author-date split cannot see a stranger s late-landing old commit', () => {
+test("an author-date split cannot see a stranger's late-landing old commit", () => {
   // TITLE NAMES THE LIMIT, NOT THE WORLD. It read "a stranger … is not 'no new
   // author'" while asserting `spent` — which is the tool printing exactly `SPENT:
   // no new author has pushed since`. So `node --test` printed a green line
