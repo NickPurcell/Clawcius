@@ -554,7 +554,13 @@ test('coverage is three states, because commit_id can be absent', () => {
 
 // ── why a stale approval went stale ─────────────────────────────────────────
 
-const commit = (login, date) => ({ author: { login }, commit: { committer: { date } } });
+// AUTHOR date, because that is what `whyStale` splits on and what a rebase
+// preserves. `committed` is supplied separately where a test needs the two to
+// disagree, which is exactly the rebase case.
+const commit = (login, date, committed = date) => ({
+  author: { login },
+  commit: { author: { date }, committer: { date: committed } },
+});
 
 test('an approval the author spent by their own pushes is SPENT, not overtaken', () => {
   // The common case by far, and currently indistinguishable from the alarming
@@ -599,4 +605,46 @@ test('whyStale gives up rather than guessing', () => {
     null,
     'an author GitHub did not resolve to a login',
   );
+});
+
+test('a rebase after the approval still gets an answer (#252 round 1)', () => {
+  // THE CASE THE COMMENT SINGLED OUT AND THE CODE GAVE UP ON. The rationale
+  // said authorship is a good proxy BECAUSE a rebase preserves it — while the
+  // split was made on the COMMITTER date, which a rebase rewrites on every
+  // commit. So `before` came back empty and the function returned null before
+  // authorship was ever consulted: a paragraph arguing for robustness the code
+  // did not have.
+  const rebasedAt = '2026-08-24T12:22:00Z';
+  const commits = [
+    // Authored before the approval, re-committed by the rebase after it.
+    commit('hamachi', '2026-08-24T11:00:00Z', rebasedAt),
+    commit('hamachi', '2026-08-24T12:40:00Z', '2026-08-24T12:40:00Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T12:30:00Z' }, commits), 'spent');
+
+  const withStranger = [
+    commit('hamachi', '2026-08-24T11:00:00Z', rebasedAt),
+    commit('someone-else', '2026-08-24T12:40:00Z', '2026-08-24T12:40:00Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T12:30:00Z' }, withStranger), 'overtaken');
+});
+
+test('real ISO-8601 stamps compare correctly, not just t1/t2/t3', () => {
+  // Round 1: every existing case used 't1'/'t2'/'t3', so the tests pinned the
+  // ordering of three short strings and never that GitHub's actual format
+  // compares correctly under `<=` and `>`. It does — Z-suffixed UTC is fixed
+  // width and lexicographically ordered — but that was the one assumption the
+  // suite did not touch.
+  const commits = [
+    commit('hamachi', '2026-08-24T09:13:38Z'),
+    commit('hamachi', '2026-08-24T12:43:11Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-08-24T11:08:24Z' }, commits), 'spent');
+
+  // Across a month and a year boundary, where a naive comparison would slip.
+  const spanning = [
+    commit('hamachi', '2026-08-31T23:59:59Z'),
+    commit('hamachi', '2026-09-01T00:00:01Z'),
+  ];
+  assert.equal(whyStale({ at: '2026-09-01T00:00:00Z' }, spanning), 'spent');
 });

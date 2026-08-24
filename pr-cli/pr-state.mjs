@@ -284,7 +284,20 @@ export function approvalsFor(reviews, head) {
  */
 export function whyStale(approval, commits) {
   if (!approval?.at) return null;
-  const dateOf = (c) => c.commit?.committer?.date ?? c.commit?.author?.date;
+  // AUTHOR date, not committer date, and this is the whole of finding 3. The
+  // comment below argues that authorship is a good proxy BECAUSE a rebase
+  // preserves it — and the split was being made on the committer date, which a
+  // rebase rewrites on every commit it touches. So after a rebase every commit
+  // sorted after the approval, `before` came back empty, and the function gave
+  // up before authorship was ever consulted. The paragraph was arguing for a
+  // robustness the code did not have.
+  //
+  // The trade, stated: a commit authored long ago and cherry-picked in after the
+  // approval now sorts as `before`. That under-reports a genuinely new push —
+  // but only when the cherry-picker is an author already on the branch, since a
+  // NEW author still lands in `owners` as absent. Rebase is common here and
+  // cherry-picking old work by an existing author is not.
+  const dateOf = (c) => c.commit?.author?.date ?? c.commit?.committer?.date;
 
   const before = commits.filter((c) => {
     const at = dateOf(c);
@@ -589,6 +602,40 @@ function api(path, repo) {
  *                         fetches those separately, so the warning does not
  *                         apply here.
  */
+/**
+ * `apiList`, plus whether the middle was skipped.
+ *
+ * `apiList` fetches page 1 and the LAST page and deliberately drops what is
+ * between them; its doc comment enumerates the callers that is safe for, and
+ * why. `whyStale` is not one of them and cannot be added to the list: it splits
+ * the commits either side of a timestamp, so page 1 (oldest) and the last page
+ * (newest) both come back populated and it returns a VERDICT drawn from an
+ * incomplete set rather than declining to answer.
+ *
+ * Measured by OJ on a 210-commit branch with a third party's commit on the
+ * skipped page: the full list says `overtaken`, page-1-plus-last says `spent`.
+ * The alarming answer becoming the calm one is the wrong direction to be wrong
+ * in, so this reports the truncation and the caller gives up instead.
+ */
+function apiListSayingIfTruncated(path, repo) {
+  const url = `https://api.github.com/repos/${repo}${path}`;
+  const first = curlJson(url, true);
+  if (!Array.isArray(first.body)) {
+    throw new Error(
+      `GitHub said ${first.body?.status ?? '?'}: ${first.body?.message ?? 'unexpected'} (${url})`,
+    );
+  }
+  const last = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link);
+  if (!last) return { items: first.body, truncated: false };
+  const sep = url.includes('?') ? '&' : '?';
+  const tail = curlJson(`${url}${sep}page=${last[1]}`, false).body;
+  return {
+    items: Array.isArray(tail) ? [...first.body, ...tail] : first.body,
+    // Two pages IS the whole list; three or more means a middle was dropped.
+    truncated: Number(last[1]) > 2,
+  };
+}
+
 function apiList(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
   const first = curlJson(url, true);
@@ -693,10 +740,6 @@ export function main() {
   const comments = apiList(`/issues/${number}/comments?per_page=100`, repo);
   const timeline = apiList(`/issues/${number}/timeline?per_page=100`, repo);
   const reviews = apiList(`/pulls/${number}/reviews?per_page=100`, repo);
-  // For `whyStale` only. Capped at 250 by GitHub on this endpoint, which is far
-  // above anything here; a branch past that would under-report and the caller
-  // gets `null` rather than a guess, which is the right failure.
-  const commits = apiList(`/pulls/${number}/commits?per_page=100`, repo);
 
   // STRUCTURAL, not "a comment by OJ exists": findings carry the footer, the
   // acknowledgement does not. That distinction is the whole point — the ack is
@@ -722,17 +765,45 @@ export function main() {
   // Computed ONCE. Both the JSON and the text path called this, so `git` was
   // spawned twice for one answer.
   const verdict = latest ? classifyReviewedSha(latest.sha, head, isAncestor) : 'NONE';
-  const approvals = approvalsFor(reviews, head).map((a) =>
-    a.coverage === 'stale' ? { ...a, why: whyStale(a, commits) } : a,
-  );
+  const bare = approvalsFor(reviews, head);
 
-  // "This is the 4th approval; 3 were spent by your own pushes" — the count a
-  // person actually wants when a branch has been round the loop several times.
-  // Every approval this pull request has ever had, not just the surviving one
-  // per reviewer, because the question is how many rounds have been consumed.
-  const spentApprovals = reviews
-    .filter((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head)
-    .filter((r) => whyStale({ at: r.submitted_at }, commits) === 'spent').length;
+  // FETCHED ONLY IF SOMETHING NEEDS IT. `whyStale` is asked about stale
+  // approvals and a fresh pull request has none, so an unconditional read added
+  // one or two HTTP round trips to every invocation for an answer nobody wanted.
+  // This file makes the same point about `git` at the `merge-base` call.
+  //
+  // `truncated` is fatal rather than cosmetic here: see
+  // `apiListSayingIfTruncated`. An incomplete list yields a confident wrong
+  // verdict in the reassuring direction, so it yields no verdict at all.
+  const needsCommits = bare.some((a) => a.coverage === 'stale');
+  const { items: commits, truncated } = needsCommits
+    ? apiListSayingIfTruncated(`/pulls/${number}/commits?per_page=100`, repo)
+    : { items: [], truncated: false };
+  const why0 = (a) => (truncated ? null : whyStale(a, commits));
+
+  const approvals = bare.map((a) => (a.coverage === 'stale' ? { ...a, why: why0(a) } : a));
+
+  // TWO COUNTS, TWO POPULATIONS, AND THEY ARE NOT THE SAME QUESTION.
+  //
+  // `spentApprovals` sits in the `merge` block beside `staleApprovals` as a
+  // decomposition of it, so it MUST count the same set: `approvalsFor`'s
+  // one-per-reviewer latest-review list. Counting raw `reviews` instead
+  // reported `spentApprovals: 1` on a branch with zero live approvals and an
+  // outstanding change request — overstating in the direction of "this was
+  // fine, just ask again", which is verbatim the miscount `approvalsFor`'s own
+  // comment says #218 round 1 finding 4 fixed. It also produced `2` beside a
+  // `staleApprovals: 1`, which is 2 of 1.
+  //
+  // `roundsSpent` is the other question — "how many times has this branch been
+  // round the loop" — and it genuinely wants every approval ever cast, so it is
+  // computed over `reviews` and stays on the text path where that is what is
+  // being said.
+  const spentApprovals = approvals.filter((a) => a.why === 'spent').length;
+  const roundsSpent = truncated
+    ? 0
+    : reviews
+        .filter((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head)
+        .filter((r) => whyStale({ at: r.submitted_at }, commits) === 'spent').length;
 
   let ruleset = null;
   try {
@@ -884,10 +955,10 @@ export function main() {
     // to one that has been approved once — every line says STALE and none of
     // them says how often this has happened. #241 spent five.
     const everApproved = reviews.filter((r) => r.state === 'APPROVED').length;
-    if (spentApprovals > 0) {
+    if (roundsSpent > 0) {
       say(
         'approval history',
-        `${everApproved} approval(s) so far; ${spentApprovals} spent by your own pushes since`,
+        `${everApproved} approval(s) so far; ${roundsSpent} with no new author since`,
       );
     }
     for (const a of approvals) {
@@ -901,10 +972,16 @@ export function main() {
                 // WHY it went stale, when that is knowable. "You spent it" and
                 // "somebody else moved the branch under them" want opposite
                 // responses and read identically without this.
+                // "SPENT by your own pushes" claimed more than the function
+                // computes. `spent` is "no author appeared who was not already
+                // writing this branch" — on a branch two people had touched
+                // before the approval, a push by the second reads back as
+                // yours, which is the false-reassurance direction. This says
+                // what it knows.
                 (a.why === 'spent'
-                  ? ' — SPENT by your own pushes since'
+                  ? ' — SPENT: no new author has pushed since'
                   : a.why === 'overtaken'
-                    ? ' — OVERTAKEN: somebody else pushed after they approved'
+                    ? ' — OVERTAKEN: an author who was not on this branch has pushed since'
                     : '')
               : 'for this exact head'
         }`,
