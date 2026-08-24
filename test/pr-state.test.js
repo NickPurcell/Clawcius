@@ -363,11 +363,13 @@ test('the stale-approval warning does not assert what it has not established', (
   //     commit is merely ABSENT as being for a superseded one — while the printed
   //     approval line said "commit_id absent … unknown" on the same screen.
   const OJ1 = { name: 'OJ1', required: 1, dismissStaleOnPush: false, bypass: 0 };
-  assert.equal(
-    explainMergeState('clean', [{ by: 'n', at: 't', sha: null, coverage: 'unknown' }], OJ1),
-    'nothing blocking',
-    'an absent commit_id is unknown, not stale',
-  );
+  const absent = explainMergeState('clean', [{ by: 'n', at: 't', sha: null, coverage: 'unknown' }], OJ1);
+  assert.doesNotMatch(absent, /STALE/, 'an absent commit_id is unknown, not stale');
+  // …and `unknown` must not be silently rounded to `nothing blocking` either. That
+  // sentence is true of GitHub and answers "does GitHub block" when the reader
+  // asked "has anyone read this code" — this file's own header defect. The
+  // tri-state exists so the third sentence is expressible; saying it is the point.
+  assert.match(absent, /UNKNOWN \(commit_id absent\)/);
 
   // (b) The parenthetical hardcoded "is false" and never read the value the tool
   //     had in hand — so it said so against a ruleset that sets it TRUE, and
@@ -436,9 +438,18 @@ test('coverage is three states, because commit_id can be absent', () => {
   // The boolean is gone, so a reader cannot accidentally get the old semantics.
   assert.equal('stale' in unknown, false);
 
-  // And the headline must not call an absent commit superseded.
-  assert.equal(
-    explainMergeState('clean', [unknown], { name: 'OJ1', required: 1, dismissStaleOnPush: false }),
-    'nothing blocking',
+  // The headline must not call an absent commit superseded — nor round it to
+  // "nothing blocking", which answers a different question from the one asked.
+  const said = explainMergeState('clean', [unknown], { name: 'OJ1', required: 1, dismissStaleOnPush: false });
+  assert.doesNotMatch(said, /STALE/);
+  assert.match(said, /UNKNOWN \(commit_id absent\)/);
+
+  // An empty-string commit_id is not a sha. `== null` treated it as one and
+  // printed `STALE: approved , head is …` with a hole in it; the readers this
+  // replaced used falsy tests, so `""` belonged in the unknown bucket.
+  const [empty] = approvalsFor(
+    [{ state: 'APPROVED', user: { login: 'n' }, submitted_at: 't', commit_id: '' }],
+    'head1234',
   );
+  assert.equal(empty.coverage, 'unknown');
 });

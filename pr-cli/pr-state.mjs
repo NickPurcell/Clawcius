@@ -214,7 +214,13 @@ export function approvalsFor(reviews, head) {
       // are different questions, which is this tool's entire subject. It answers
       // the second now, and `unknown` is a value rather than something each
       // caller reconstructs from a second field.
-      coverage: r.commit_id == null ? 'unknown' : r.commit_id === head ? 'current' : 'stale',
+      // `!r.commit_id`, not `== null`: an empty string is not a sha, and treating
+      // it as one classified it 'stale' and printed `STALE: approved , head is …`
+      // with a hole in it. The readers this replaced used falsy tests, so `""`
+      // landed in the unknown bucket; narrowing to `== null` silently moved it.
+      // No evidence GitHub returns `""` here — it returns a sha or null — so this
+      // is a bucket restored rather than a bug fixed.
+      coverage: !r.commit_id ? 'unknown' : r.commit_id === head ? 'current' : 'stale',
     }));
 }
 
@@ -227,10 +233,23 @@ export function approvalsFor(reviews, head) {
  *
  * `*` is translated to `.*`, which CROSSES `/` — so `refs/heads/*` also matches
  * `refs/heads/a/b`. Whether GitHub's fnmatch does the same for `ref_name` is not
- * something I can check offline, and it only differs on a base ref containing a
- * slash. Recorded rather than guessed at: if it turns out GitHub stops at the
- * separator, this is one character (`[^/]*`) and a test. OJ round 4 on #218
- * raised it as an open question and I am leaving it as one.
+ * checkable offline and only differs on a base ref containing a slash, so it is
+ * left as an open question (#238) rather than guessed at.
+ *
+ * WHAT IS NOT OPEN is the size of the fix, and an earlier version of this comment
+ * got it wrong in a way that would have caused the damage. It said "one character
+ * (`[^/]*`) and a test". It is not:
+ *
+ *   under any fnmatch where `*` stops at `/`, `**` is the form that crosses it —
+ *   that is the entire reason the second form exists. A blanket
+ *   a blanket star-to-`[^/]*` replace rewrites BOTH, so the edit that fixes `*` breaks
+ *   `**`, and breaks it in the UNDER-matching direction: a ruleset targeting
+ *   `refs/heads/**` is dropped, taking the `ruleset` line, the "of N required"
+ *   and `explainMergeState`'s honest `required` with it.
+ *
+ * Today `**` works by accident, because `.*.*` and `.*` are the same language.
+ * So: handle `**` before `*` (and `?` is the same class), and test both — do not
+ * make the one-character edit and a passing test for `*` alone.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -273,7 +292,19 @@ export function explainMergeState(state, approvals, ruleset) {
       // is no longer here". Observed on #228: green check, approval for
       // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
       // this function's own finding-1 defect a third time.
-      if (stale.length === 0) return 'nothing blocking';
+      // UNKNOWN reaches this line too. `nothing blocking` is true of GitHub and
+      // answers "does GitHub block" when the reader asked "has anyone read this
+      // code" — which is this file's own header defect, and the reason the
+      // tri-state was worth doing is that the third sentence is now expressible.
+      //
+      // The gate answers MAY I merge. It does not answer SHOULD I.
+      const unknown = approvals.filter((a) => a.coverage === 'unknown');
+      if (stale.length === 0) {
+        return unknown.length === 0
+          ? 'nothing blocking'
+          : `nothing GitHub blocks on — but whether ${unknown.length === 1 ? 'the approval covers' : `${unknown.length} approvals cover`} ` +
+            'this head is UNKNOWN (commit_id absent)';
+      }
       // Counts `coverage === 'stale'`, so an approval whose commit is merely
       // ABSENT is not reported as superseded — a distinction that used to need
       // `&& a.sha` at every call site, and which two of them did not have.
@@ -648,6 +679,10 @@ export function main() {
       mergeable_state: pr.mergeable_state,
       why,
       staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
+      // Sibling of the above, and added for the same reason: without it a scripted
+      // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
+      // 0 stale is not the same as 0 unread.
+      unknownCoverageApprovals: approvals.filter((a) => a.coverage === 'unknown').length,
     },
     approvals,
     ruleset,
