@@ -9,15 +9,16 @@ fields that resemble them.
 ```
 
 ```
-NickPurcell/Clawcius#235  head 6eb53973
+NickPurcell/Clawcius#240  head d94561f5
 
   merged?                        no
-  review round                   FINISHED  since 2026-08-24T10:00:35Z
-  review saw this code?          YES — reviewed this exact commit
-                                 round 2 read 6eb53973
-  can it merge?                  clean — nothing blocking
+  review round                   FINISHED  since 2026-08-24T10:41:41Z
+  review saw this code?          PARTLY — reviewed an ancestor; commits since it are unreviewed
+                                 round 1 read c1d6f540
+  can it merge?                  clean — nothing GitHub blocks on — but of 1 approval(s): 1 STALE, for a commit no longer at the head. none is known to cover this head, so merging now merges code no review has read (dismiss_stale_reviews_on_push is false, so GitHub still counts it)
                                  (mergeable: true — only says git can combine the trees; not the question)
-  approval                       osmosis-jones-agent[bot] at 2026-08-24T10:00:35Z — for this exact head
+  approval                       osmosis-jones-agent[bot] at 2026-08-24T10:41:41Z — STALE: approved c1d6f540, head is d94561f5
+                                 dismiss_stale_reviews_on_push is FALSE — GitHub still counts the stale one
   ruleset                        OJ1: 1 approval(s), 0 bypass actor(s)
 ```
 

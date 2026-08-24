@@ -360,6 +360,29 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
   assert.match(both, /1 STALE/);
   assert.match(both, /1 with no commit_id/, 'the unknown one must not go unmentioned');
   assert.match(both, /none is known to cover this head/);
+  // AND THE CONSEQUENCE, which the bucket rewrite dropped along with the
+  // assertion that pinned it. The all-stale case is the one that started #218
+  // and the one that got merged past; a statement of fact is not what a reader
+  // needs there.
+  assert.match(both, /merging now merges code no review has read/i);
+
+  // It must NOT appear when something does cover the head — the old code warned
+  // wrongly there, which is why the clause belongs in one branch and not the
+  // sentence.
+  assert.doesNotMatch(mixed, /merges code no review has read/i);
+
+  // `current` is COUNTED, not inferred by subtraction: an unrecognised coverage
+  // value must not be reported as covering the head, since that is the one claim
+  // a reader acts on by merging.
+  const odd = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'x', coverage: undefined },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.doesNotMatch(odd, /DOES cover this head/);
 });
 
 test('ruleset ref patterns match the way GitHub writes them', () => {

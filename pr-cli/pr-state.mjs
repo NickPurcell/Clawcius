@@ -312,7 +312,13 @@ export function explainMergeState(state, approvals, ruleset) {
       //
       // The gate answers MAY I merge. It does not answer SHOULD I.
       const unknown = approvals.filter((a) => a.coverage === 'unknown');
-      const current = approvals.length - stale.length - unknown.length;
+      // COUNTED, not inferred by subtraction. `current` produces "N DOES cover
+      // this head" — the one assertion in this message a reader acts on by
+      // merging — and deriving it from the absence of the other two meant any
+      // coverage value that was neither counted as covering. Only reachable
+      // through a hand-built caller today, but it is the strongest claim here
+      // and it should not rest on a subtraction.
+      const current = approvals.filter((a) => a.coverage === 'current').length;
       if (stale.length === 0 && unknown.length === 0) return 'nothing blocking';
 
       // The dismissal clause READS `dismissStaleOnPush` rather than asserting it:
@@ -342,7 +348,12 @@ export function explainMergeState(state, approvals, ruleset) {
         `${said.join(', and ')}. ` +
         (current > 0
           ? `${current} DOES cover this head`
-          : 'none is known to cover this head') +
+          : // THE CONSEQUENCE, not just the fact. This clause was dropped in the
+            // bucket rewrite along with the assertion that pinned it — and it is
+            // this tool's whole subject: the gate answers MAY I merge, not
+            // SHOULD I. It belongs only here, where nothing is known to cover
+            // the head; in the `N DOES cover` case the old code warned wrongly.
+            'none is known to cover this head, so merging now merges code no review has read') +
         dismissal
       );
     case 'dirty':
