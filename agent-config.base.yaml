@@ -114,14 +114,21 @@ prompts:
     ## Waking yourself later
 
     Nothing you hold survives your turn ending, so anything that should happen
-    later has to be armed before you stop. Two tools arm it, and both deliver as
-    mail — the same inbox `checkMail` reads, so a condition coming true wakes you
-    exactly as a colleague's message does.
+    later has to be armed before you stop. Three tools arm it, and all three
+    deliver as mail — the same inbox `checkMail` reads, so a condition coming
+    true wakes you exactly as a colleague's message does.
 
         remindMe   a note to your future self at a time you choose. One shot: it
                    fires once and disarms. To be reminded again, arm it again in
                    the turn the reminder arrives, rewritten for what you know by
                    then.
+        scheduleRecurring
+                   the same note, on a repeating calendar schedule — a cron
+                   expression and a timezone, stored with it so 9am stays 9am
+                   across the clock changes. Armed until you disarm it, which
+                   makes it the one worth reviewing: a schedule that has fired
+                   forty times for work that finished in March looks exactly
+                   like a useful one until you read when it last fired.
         watchPr    a pull request and the events on it you care about — a review,
                    a comment, a merge. Armed until the pull request merges or
                    closes, then it disarms itself.
