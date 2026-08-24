@@ -630,14 +630,14 @@ systemPrompt:
     workaround — it IS the silent fall-through to the account, which is the
     one repair this paragraph exists to prevent.
 
-    So do not read the status. Establish whether anything went out, with
+    Do not read the status — establish whether anything went out, with
     `curl -s https://api.github.com/rate_limit`: a `core.limit` of **60** means
     no credential was sent, and anything above it means one was. Do not test for
     a particular number — 5000 is a floor and an installation's limit grows past
     it.
 
     THAT ANSWERS FOR `api.github.com` AND NOTHING ELSE, because the netrc matches
-    per host, and the host is the axis the paragraph above is about. For any
+    per host, and the host axis above is about exactly that. For any
     other host you already have the answer: nothing was sent, and nothing will
     be.
 
