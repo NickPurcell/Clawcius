@@ -31,6 +31,7 @@ import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
 import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
 import type { TurnSummary, WakeContext } from './types.js';
+import { SUPERSEDED } from './types.js';
 
 /**
  * Matches a `discord send` / `discord reply` invocation in a bash command,
@@ -387,6 +388,93 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+/**
+ * The SDK entry point, behind an assignable indirection.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ *
+ * `AgentSession`'s constructor calls `#start`, which stands up a containerised
+ * `claude`. So until this, **no test could construct one**, and everything
+ * reachable only through `wake`, `#push`, `#handle` or `#consume` had no
+ * coverage whatsoever: retry, backoff, replay-vs-continuation, API-error
+ * classification, session-id capture, the respawn path, and the turn-settle
+ * rules this file's #241 work is about.
+ *
+ * That is not a hypothetical. Five mutations of the settle logic — including
+ * two that lose mail outright — passed the full suite, 391 green every time,
+ * and the defect OJ found in #241 round 2 (the settle at the end of turn N
+ * belonging to turn N+1) is invisible to every test that does not drive a real
+ * session. Clawcius #242 has the reproduction.
+ *
+ * ── WHY HERE AND NOT A CONSTRUCTOR PARAMETER ────────────────────────────────
+ *
+ * `SessionManager.newSession` is the same shape — an assignable property with a
+ * real default — so this is the seam this file already uses, not a new idea. It
+ * is module-level rather than a constructor option for a second reason: the
+ * constructor signature is being changed on another branch, and a seam that
+ * conflicts with in-flight work is a seam nobody installs.
+ *
+ * PRODUCTION NEVER ASSIGNS THIS. A test does, and restores it.
+ */
+export const sdk = { query };
+
+/**
+ * The settle callback for the turn in flight, and the single rule that a new
+ * turn ends the one before it.
+ *
+ * ── WHY THIS IS A CLASS AND NOT TWO LINES IN `AgentSession` ─────────────────
+ *
+ * It was two lines in `AgentSession`, and a mutation run against #241 killed
+ * that idea properly: FIVE mutations of the settle logic — never clearing the
+ * callback, dropping the supersede entirely, ignoring the callback `wake` is
+ * handed, deleting the catch's settle, settling TRUE through an API refusal —
+ * ALL FIVE passed the full suite, 391 green every time. Nothing tested any of
+ * it.
+ *
+ * Not for want of a test. `AgentSession`'s constructor stands up a
+ * containerised `claude`, so a test cannot construct one, and the settle rules
+ * were sitting inside the one class in this file that no test can instantiate.
+ * `SessionManager` has `newSession` as its seam for exactly this reason; the
+ * turn-settle rules had no equivalent, so they had no coverage.
+ *
+ * So the rules moved somewhere reachable. That is the whole motivation: a
+ * behaviour whose only home is an unconstructable class is a behaviour with no
+ * tests, however carefully it is written.
+ *
+ * ── WHAT IT GUARANTEES ──────────────────────────────────────────────────────
+ *
+ * A settle fires AT MOST ONCE per turn, and `adopt` ends the previous turn
+ * FALSE. False means "this mail was never confirmed read" — the caller leaves
+ * it unread for the next sweep rather than dropping it. A wake arriving while a
+ * turn is still pending means that turn never completed, because nothing else
+ * would have left it pending; so its mail must be offered again.
+ *
+ * Leaving a settle pending is legitimate and deliberate: a turn whose retry is
+ * queued has not ended, and guessing an answer for it would be worse than
+ * waiting for the retry to produce a real one.
+ */
+export class TurnSettle {
+  #pending: ((ran: boolean, why: string) => void) | null = null;
+
+  /** Take over for a new turn, ending whatever turn was still in flight. */
+  adopt(next: ((ran: boolean, why: string) => void) | null, why: string): void {
+    this.done(false, why);
+    this.#pending = next;
+  }
+
+  /** End the turn in flight, once. A turn with nothing pending is a no-op. */
+  done(ran: boolean, why: string): void {
+    const settle = this.#pending;
+    this.#pending = null;
+    if (settle) settle(ran, why);
+  }
+
+  /** Whether a turn is still in flight. */
+  get pending(): boolean {
+    return this.#pending !== null;
+  }
+}
+
 export class AgentSession {
   readonly channelId: string;
   readonly workspacePath: string;
@@ -414,6 +502,25 @@ export class AgentSession {
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
   #sentThisTurn = false;
+  /**
+   * What to tell the caller once THIS TURN has settled. The rules — fire once,
+   * and a new turn ends the previous one FALSE — are `TurnSettle`'s, which
+   * exists as a separate class because they are only testable outside this one.
+   *
+   * PER TURN, NOT PER SESSION, and that distinction is Clawcius #241's blocking
+   * finding. The first version handed the callback to `SessionManager.acquire`,
+   * which returns an EXISTING session and drops the events it was given
+   * (`:1090`), while `AgentSession` stores `#events` once in its
+   * constructor. So only the first wake's callback ever reached `onDone`. Every
+   * mail wake after that settled nothing, the mail was never marked read, and
+   * the ten-second sweep re-offered it forever — a full model turn against the
+   * same message every ten seconds, on the SUCCESS path, which is the common
+   * one. That is worse than the loss it was fixing.
+   *
+   * A turn is the lifetime this belongs to, so it lives here and travels with
+   * `wake`.
+   */
+  readonly #settle = new TurnSettle();
   #apiErrorThisTurn: string | null = null;
   #apiErrorKindThisTurn: string | null = null;
   /**
@@ -455,6 +562,11 @@ export class AgentSession {
 
   get busy(): boolean {
     return this.#busy;
+  }
+
+  /** Whether a turn has been handed over and has not yet ended. See `isBusy`. */
+  get turnPending(): boolean {
+    return this.#settle.pending;
   }
 
   set busy(value: boolean) {
@@ -570,7 +682,7 @@ export class AgentSession {
   }
 
   #start(resumeSessionId: string | undefined): void {
-    this.#query = query({
+    this.#query = sdk.query({
       prompt: this.#queue,
       options: this.#buildOptions(resumeSessionId),
     });
@@ -586,6 +698,15 @@ export class AgentSession {
       }
     } catch (error) {
       if (!this.#closed) {
+        // THE PATH THAT BIT, AND IT WAS SILENT. The gVisor sentry kill arrives
+        // here, asynchronously, and #239's whole point was a journal line
+        // saying the mail outlived the turn. The mail IS safe on this path —
+        // the daemon's `onError` releases the session, `release()` fires
+        // `onCountsChanged`, and the sweep re-offers it — but it was safe by
+        // the daemon's grace rather than by anything this class does, and the
+        // line never printed. Settling says so, and leaves the mail unread,
+        // which is what the sweep then finds. OJ #241 round 2.
+        this.#settle.done(false, `the turn died: ${String(error)}`);
         this.#events.onError(error instanceof Error ? error : new Error(String(error)));
       }
     }
@@ -692,8 +813,30 @@ export class AgentSession {
       }
 
       case 'result': {
-        this.busy = false;
-
+        // ── ORDER IS LOAD-BEARING: SETTLE BEFORE PUBLISHING `busy` ───────────
+        //
+        // `busy = false` is not an assignment, it is a broadcast. The setter
+        // (`:531`) calls `onBusyChanged` → `SessionManager.onCountsChanged`
+        // (`:1163`) → `mailWaker.sweep()` (`src/daemon.ts:1076`), synchronously,
+        // four plain calls deep — and that sweep is written to fire exactly
+        // here, because "a turn just ended" is when mail that arrived mid-turn
+        // comes due.
+        //
+        // So with the flip first, the sweep ran while THIS turn's mail was still
+        // unread. It re-offered it, `wake()` adopted the new turn's callback,
+        // and `adopt` settled the turn that had just SUCCEEDED as dead. The
+        // settle below then fired the NEXT turn's callback. The general form:
+        // the settle that fires at the end of turn N belongs to turn N+1.
+        //
+        // Every successful mail wake ran twice and logged "turn died before it
+        // ran" for the one that completed. Worse, the re-entrant `wake` runs
+        // `#push`, which resets `#apiErrorThisTurn` — read below — so a 529 was
+        // erased before anyone saw it and reported as a clean success, with no
+        // retry queued and nothing in the journal. That is #239 re-created by
+        // its own fix. OJ #241 round 2, verified against a real session.
+        //
+        // Settling first costs nothing: the sweep then finds a turn whose mail
+        // is already accounted for, and still does the job it exists for.
         const plan =
           this.#apiErrorKindThisTurn !== null
             ? retryPlanFor(this.#apiErrorKindThisTurn)
@@ -703,6 +846,16 @@ export class AgentSession {
         // context has nothing to re-send.
         const willRetry =
           delay !== undefined && !this.#closed && this.#lastContext !== null;
+
+        // SETTLED HERE, at the one place a turn ends, rather than in three
+        // callbacks the caller wires. A refusal WITH a retry queued is left
+        // pending on purpose: the retry re-runs this turn and its own completion
+        // decides, so settling either way here would be a guess.
+        if (this.#apiErrorThisTurn === null) {
+          this.#settle.done(true, 'turn completed');
+        } else if (!willRetry) {
+          this.#settle.done(false, `API refused: ${this.#apiErrorKindThisTurn}`);
+        }
 
         this.#events.onDone({
           isError: message.is_error,
@@ -730,8 +883,32 @@ export class AgentSession {
           // Out of retries on an auth failure. The token this process holds is
           // dead and it will never pick up the live one, so the session itself
           // is the thing that has to go. Someone above owns the session map.
+          this.#settle.done(false, 'stale token, session dropped');
           this.#events.onNeedsRespawn(this.#actedSinceWake);
         }
+
+        // ── AND THE FLIP COMES LAST, FOR THE SAME REASON THE SETTLE CAME
+        //    BEFORE IT ────────────────────────────────────────────────────────
+        //
+        // Round 2 moved the settle above the flip and left its two neighbours
+        // below it, which fixed one symptom of one defect. `onDone` and the
+        // respawn branch read `#apiErrorThisTurn`, `#apiErrorKindThisTurn` and
+        // `#sentThisTurn` — the exact fields `#push` clears — so a sweep
+        // re-entering on the flip wiped them before they were read:
+        //
+        //   · the four-line `mail wake REFUSED` block never printed, and the
+        //     Discord path lost `API REFUSED THE TURN` and `announceOutage`
+        //     with it;
+        //   · `onNeedsRespawn` never fired, because the auth-failure check runs
+        //     after the wipe — so the one thing that recovers a dead token was
+        //     skipped and the agent looped 401ing turns against a session that
+        //     cannot work, with nothing in stderr saying why.
+        //
+        // NOTHING BELOW THIS LINE NEEDS THE FLIP TO HAVE HAPPENED, so putting it
+        // at the end means a sweep observes a turn that is finished in every
+        // sense. Snapshotting the fields before the flip would also work and
+        // leaves the next reader to rediscover all of this. OJ #241 round 3.
+        this.busy = false;
         break;
       }
 
@@ -746,7 +923,12 @@ export class AgentSession {
    * Cancels any retry still pending from the previous wake: fresh input makes
    * a replay of the old one both stale and confusing.
    */
-  wake(context: WakeContext): void {
+  wake(context: WakeContext, onSettled: ((ran: boolean, why: string) => void) | null = null): void {
+    // A wake arriving while a previous turn's settle is still pending means that
+    // turn never completed — nothing else would have left it. Settle it FALSE:
+    // its mail was never confirmed read, so it should be offered again rather
+    // than silently dropped when this callback replaces it.
+    this.#settle.adopt(onSettled, SUPERSEDED);
     this.#cancelRetry();
     this.#lastContext = context;
     this.#retries = 0;
@@ -784,6 +966,10 @@ export class AgentSession {
       // exited. Route it through onError so the caller can drop the session
       // and retry, rather than letting it surface as an unhandled rejection
       // that says nothing about which channel broke.
+      // Settle first, flip second — see the `result` case. The flip broadcasts
+      // into the sweep, and a turn that has not been accounted for is one the
+      // sweep will re-offer.
+      this.#settle.done(false, `could not start the turn: ${String(error)}`);
       this.busy = false;
       this.#events.onError(error instanceof Error ? error : new Error(String(error)));
     }
@@ -801,8 +987,49 @@ export class AgentSession {
     // it worked while a queued retry fired seconds later.
     this.#cancelRetry();
     this.#lastContext = null;
-    if (!this.#query || !this.busy) return;
+
+    // ── SETTLED BEFORE THE EARLY RETURN, AND THE ANSWER DIFFERS EITHER SIDE
+    //    OF IT ─────────────────────────────────────────────────────────────
+    //
+    // BEFORE the return, because the state that return exists for is a retry
+    // backoff — and a backoff is exactly when `busy` is false and a settle is
+    // pending. Settling below it meant `!stop` during a backoff left the turn
+    // pending forever; with `isBusy` now `busy || turnPending`, the waker then
+    // skipped that agent FOR THE LIFE OF THE PROCESS, with mail piling up
+    // unread and no line anywhere saying so. (#241 round 3.)
+    //
+    // FALSE here and TRUE below, because the two branches are different turns:
+    //
+    //   · a BACKOFF is a turn the API REFUSED. It produced nothing and nobody
+    //     read the mail — which is this file's own rule thirty lines up, where a
+    //     refusal with no retry settles FALSE. The only difference is that a
+    //     retry was going to re-run it, and `!stop` has just cancelled that.
+    //     Settling TRUE marked the message read having never shown it to
+    //     anybody: silent loss, in the change written to end silent loss.
+    //
+    //   · a RUNNING turn below the return DID run. A person asked for it to end,
+    //     and re-delivering the message that started it is the outcome they
+    //     ruled out.
+    //
+    // `busy` already tells them apart, which is why the settle can sit either
+    // side of the check and mean different things. (#241 round 4.)
+    // `done` fires ONCE, so each branch settles inside itself. Settling FALSE
+    // above the check and TRUE below it would have the FALSE spend the callback
+    // and the TRUE quietly do nothing — a running turn settling as if it had
+    // never run, which is the opposite of both intentions.
+    if (!this.#query || !this.busy) {
+      // AND THE AGENT WILL START AGAIN, WITHIN TEN SECONDS. Left unread is the
+      // right answer — the alternative is consuming mail nobody has seen — but
+      // it means the sweep re-offers the same message and a person who typed
+      // `!stop` watches the agent come straight back. That is the trade, not a
+      // bug: `!stop` ends the TURN, and it is not a way to discard mail. There
+      // is no way to stop the delivery of a message that has not been read
+      // without losing it, which is the whole subject of this change.
+      this.#settle.done(false, 'stopped during a retry backoff — the turn never ran');
+      return;
+    }
     await this.#query.interrupt();
+    this.#settle.done(true, 'interrupted by !stop');
     this.busy = false;
   }
 
@@ -955,7 +1182,12 @@ export class SessionManager {
    */
   get busyCount(): number {
     let busy = 0;
-    for (const session of this.#sessions.values()) if (session.busy) busy += 1;
+    // The SAME predicate as `isBusy` — see there. A mid-backoff agent is not
+    // interruptible and the waker already skips it; publishing it as idle in the
+    // ops status file was the two definitions disagreeing.
+    for (const session of this.#sessions.values()) {
+      if (session.busy || session.turnPending) busy += 1;
+    }
     return busy;
   }
 
@@ -1018,7 +1250,24 @@ export class SessionManager {
    * live `claude` process is not part of what it is to be busy.
    */
   isBusy(channelId: string): boolean {
-    return this.#sessions.get(channelId)?.busy === true;
+    const session = this.#sessions.get(channelId);
+    if (session === undefined) return false;
+    // A TURN STILL PENDING COUNTS AS BUSY, and that is the retry backoff. An
+    // API refusal with a retry queued is left unsettled on purpose — the retry
+    // re-runs the turn and its own completion decides — but the session is idle
+    // for the whole backoff, so a sweep would re-offer mail that is already
+    // spoken for and `wake()` would cancel the retry it is racing.
+    //
+    // `TurnSettle.pending` already means exactly "this turn has not ended", so
+    // this asks the question rather than tracking a second flag.
+    //
+    // `busyCount` reads the same predicate, deliberately: two definitions of
+    // busy in one class is how the ops status file came to publish a
+    // mid-backoff agent as idle while the waker was correctly skipping it. An
+    // earlier version of this comment claimed the status file was already
+    // fixed by this line. It was not — the file reads `busyCount`, which
+    // counted `session.busy` alone. OJ #241 round 3.
+    return session.busy || session.turnPending;
   }
 
   /**

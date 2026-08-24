@@ -1,6 +1,20 @@
 /** Shared shapes between the Discord layer, the scheduler, and the agent. */
 
 /**
+ * The opening of the `why` a superseded turn settles with.
+ *
+ * A CONSTANT BECAUSE TWO MODULES AGREE ON IT. `AgentSession` writes this reason
+ * when a new wake replaces a turn still in flight; `MailWaker` matches it to
+ * tell a supersede apart from a failure, because a supersede must not spend one
+ * of a message's re-offers. Matching the prose inline in both places is a
+ * coupling that breaks the moment somebody improves the wording — and it breaks
+ * SILENTLY, into a false ceiling and a journal line blaming a refusal that never
+ * happened. That is the defect this constant exists to make impossible, not a
+ * hypothetical: it is #241 round 4.
+ */
+export const SUPERSEDED = 'a new wake arrived before the previous turn settled';
+
+/**
  * Why the agent is being woken.
  *
  * The distinction matters to the agent, not just to us: a mention has a message

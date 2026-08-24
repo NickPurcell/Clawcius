@@ -57,6 +57,7 @@ import { renderMail } from './mail-tool.js';
 import { FEED, type MailStore } from './mail.js';
 import type { AgentRecord, AgentRegistry } from './store.js';
 import type { WakeContext } from './types.js';
+import { SUPERSEDED } from './types.js';
 
 /**
  * The guarantee behind the fast path.
@@ -71,6 +72,32 @@ import type { WakeContext } from './types.js';
  */
 const SWEEP_INTERVAL_MS = 10_000;
 
+/**
+ * How many turns one message gets before the sweep stops offering it.
+ *
+ * Three, because the failures this is bounding do not clear in one attempt and
+ * do not clear in twenty either: a dead credential, a refusing API, a container
+ * that will not start. Two would risk giving up on a genuine one-off; the point
+ * is only that the number is FINITE, since the sweep now fires on the busy flip
+ * and so re-offers with no delay at all. OJ #241 round 3 measured 26.
+ */
+const MAX_REOFFERS = 3;
+
+/**
+ * How long a spent ceiling holds before the message is offered again.
+ *
+ * The attempt count alone had no time in it, and each failure re-sweeps
+ * SYNCHRONOUSLY through `release()`, so three offers could be spent in
+ * milliseconds. The flagship incident this whole change is about — the sentry
+ * OOM-killed and back seconds later — therefore ended with the mail parked
+ * indefinitely, which is the phase-2 behaviour the feature exists to replace.
+ *
+ * So the ceiling is three attempts PER WINDOW rather than three ever: it bounds
+ * the hot loop to a handful of turns a minute, and a blip recovers on its own.
+ * #241 round 4.
+ */
+const REOFFER_WINDOW_MS = 60_000;
+
 export type MailWakerOptions = {
   crew: string;
   registry: AgentRegistry;
@@ -80,8 +107,17 @@ export type MailWakerOptions = {
   /**
    * Start a turn. May throw — the session cap is real — and a throw is not
    * fatal here: nothing has been marked read, so the next sweep tries again.
+   *
+   * `settle` is how the mail gets marked read, and it is the whole of #239.
+   * Call it with `true` once the turn has actually run, `false` if the turn died
+   * without producing. Never calling it leaves the mail unread, which is the
+   * safe direction: the next sweep re-offers it.
    */
-  start: (agent: AgentRecord, context: WakeContext) => void;
+  start: (
+    agent: AgentRecord,
+    context: WakeContext,
+    settle: (ran: boolean, why: string) => void,
+  ) => void;
   log: (line: string) => void;
 };
 
@@ -129,6 +165,26 @@ export class MailWaker {
     this.sweep();
   }
 
+  /**
+   * How many turns one message gets before the sweep stops offering it. See the
+   * ceiling in `#consider`; the counter is dropped the moment a turn settles it.
+   */
+  #offers = new Map<string, Map<number, number>>();
+
+  #offersFor(agentId: string): Map<number, number> {
+    const existing = this.#offers.get(agentId);
+    if (existing) return existing;
+    const fresh = new Map<number, number>();
+    this.#offers.set(agentId, fresh);
+    return fresh;
+  }
+
+  /** Agents already told their mail hit the ceiling — so the line prints once. */
+  #capped = new Set<string>();
+
+  /** When the current re-offer window opened, per agent. See `REOFFER_WINDOW_MS`. */
+  #windowStartedAt = new Map<string, number>();
+
   /** Give a turn to every agent of this crew that has mail and is not running one. */
   sweep(): void {
     if (this.#sweeping) return;
@@ -153,6 +209,71 @@ export class MailWaker {
     const pending = mail.unread(agent.id);
     if (pending.length === 0) return;
 
+    // ── A CEILING ON RE-OFFERS, BECAUSE THE SWEEP IS NO LONGER ON A TIMER ────
+    //
+    // Deferring the mark means an unsettled turn leaves its mail unread and the
+    // next sweep re-offers it. That is the intended trade — a duplicate is
+    // visible, a loss is silent — but the sweep now also fires SYNCHRONOUSLY on
+    // the busy flip at the end of a turn, not only on the ten-second timer. So
+    // against an API that is refusing every call, "re-offer" has no delay in it:
+    // OJ measured 26 turns for one message, and it stops only when the API
+    // recovers.
+    //
+    // That is not the duplicate-vs-loss trade. A duplicate is one extra turn;
+    // this is a hot loop against a failing API for as long as the condition
+    // stands, and this branch introduced it — before it, the mail was consumed
+    // and the loop was one turn long.
+    //
+    // So a message gets MAX_REOFFERS turns and then stops being offered, and the
+    // line says so rather than the mail simply going quiet. It stays UNREAD, so
+    // nothing is lost — which is the difference between a ceiling and a drop.
+    //
+    // BE PRECISE ABOUT WHAT "NOT LOST" BUYS, because the line is written to be
+    // read during an incident. Only two things put mail into a turn:
+    // `renderMail` below, which is the wake this pause has just stopped, and
+    // `checkMail` in mail-tool.ts, which the agent has to CHOOSE to call. So a
+    // discord or scheduled wake does not deliver the paused batch — it only
+    // gives the agent an opportunity to poll. What does release it without
+    // anyone doing anything is a NEW message for the same agent, because the
+    // cap requires every pending message to be overdue and a new one is not.
+    // An earlier version of this promised a delivery that does not happen on
+    // its own. OJ #241 round 5.
+    const now = Date.now();
+    // The window is per agent: the messages are offered as one batch, so they
+    // are capped and released as one.
+    if (this.#windowStartedAt.has(agent.id) && now - (this.#windowStartedAt.get(agent.id) ?? 0) > REOFFER_WINDOW_MS) {
+      this.#windowStartedAt.delete(agent.id);
+      this.#capped.delete(agent.id);
+      this.#offers.delete(agent.id);
+    }
+    // Mail read by some OTHER turn — an agent calling `checkMail` itself —
+    // never reaches `settle(true)`, so its counters were never dropped and the
+    // map grew with message volume for the life of the process. `pending` is
+    // the whole truth about what is unread for this agent, so anything counted
+    // and no longer in it is finished with. That is also why the counters are
+    // keyed by agent: it makes this sweepable without asking the store which
+    // recipient a message id belonged to.
+    const offers = this.#offersFor(agent.id);
+    const stillPending = new Set(pending.map((message) => message.id));
+    for (const id of offers.keys()) if (!stillPending.has(id)) offers.delete(id);
+
+    const overdue = pending.filter((message) => (offers.get(message.id) ?? 0) >= MAX_REOFFERS);
+    if (overdue.length === pending.length) {
+      if (!this.#capped.has(agent.id)) {
+        this.#capped.add(agent.id);
+        log(
+          `${agent.id}: ${pending.length} message(s) have each been offered ${MAX_REOFFERS} times ` +
+            `without a turn that settled — pausing for ${REOFFER_WINDOW_MS / 1000}s. They stay ` +
+            'UNREAD. The sweep tries again after the pause, and a NEW message to this agent ' +
+            'releases the batch immediately; a discord or scheduled wake does not deliver them, ' +
+            'it only gives the agent a chance to call checkMail. Whatever ended those turns is ' +
+            'in the journal above this line.',
+        );
+      }
+      return;
+    }
+    this.#capped.delete(agent.id);
+
     if (agent.status !== 'live') {
       log(
         `${agent.id} is dead and has ${pending.length} unread message(s) — not waking it. ` +
@@ -169,8 +290,83 @@ export class MailWaker {
       count: pending.length,
     };
 
+    const ids = pending.map((message) => message.id);
+
+    // MARKED READ WHEN THE TURN HAS RUN, NOT WHEN IT WAS HANDED OVER. This is
+    // Clawcius #239, and the old ordering lost five messages in one second on
+    // 2026-08-24.
+    //
+    // `start` only hands the turn to a session and returns. The `catch` below is
+    // therefore SYNCHRONOUS-ONLY, and every way a turn actually dies is
+    // asynchronous and lands after it: an API refusal with no retry, a stale
+    // token, and — the one that bit — a dead transport reported through
+    // `onError`. Marking read at handoff meant all three were permanent silent
+    // loss, because `checkMail` reads UNREAD rows and the row was no longer one.
+    //
+    // The guard that was there is not wrong; it guards the narrower half of one
+    // failure mode. It is kept, and `settle` covers the rest.
+    //
+    // WHICH WAY THIS ERRS, STATED RATHER THAN INCIDENTAL: toward DUPLICATE
+    // DELIVERY. If a turn dies after the model has seen the mail but before it
+    // settles, the next sweep offers the same messages again. A duplicate is
+    // visible and annoying; a loss is silent and cost this crew an hour, seven
+    // times in four days without anyone noticing. So the trade is deliberate.
+    //
+    // Nothing re-delivers WHILE a turn is running: `busy` is set synchronously
+    // by `start` and is checked at the top of this method, so the window between
+    // handoff and settle is not a window in which the same mail is offered
+    // twice.
+    // The window opens on the FIRST offer of a batch, not on the sweep that
+    // happened to look — so the pause is measured from when the trouble started.
+    if (!this.#windowStartedAt.has(agent.id)) this.#windowStartedAt.set(agent.id, now);
+    for (const id of pending.map((message) => message.id)) {
+      offers.set(id, (offers.get(id) ?? 0) + 1);
+    }
+
+    let settled = false;
+    const settle = (ran: boolean, why: string): void => {
+      // Once. `onDone` and `onError` can both fire for one turn, and marking
+      // read on the first while logging a loss on the second would be worse
+      // than either.
+      if (settled) return;
+      settled = true;
+      // A SUPERSEDE IS NOT A FAILED OFFER, so it does not spend one. Three
+      // Discord messages interleaved with a pending mail turn — ordinary
+      // traffic in a coordinator's channel — otherwise parked the mail and
+      // printed "something is failing every turn: check the journal for the
+      // refusal" with three supersede lines above it and no refusal anywhere.
+      // A false sentence and a false ceiling from the same miscount. #241 r4.
+      if (!ran && why.startsWith(SUPERSEDED)) {
+        for (const id of ids) {
+          const spent = offers.get(id);
+          if (spent !== undefined) offers.set(id, Math.max(0, spent - 1));
+        }
+      }
+
+      if (ran) {
+        // MEMORY, NOT BEHAVIOUR, and there is deliberately no test for it. The
+        // map is keyed by message id, so a stale entry cannot affect a NEW
+        // message. I wrote a test asserting "a settled agent never hits the
+        // ceiling", then mutated this line away and the test still passed: it
+        // could not fail, which makes it worse than nothing. Deleted, and the
+        // reason recorded here instead.
+        //
+        // This is now the SECOND line keeping the map bounded, not the only
+        // one — the sweep against `pending` above catches mail read through
+        // `checkMail`, which never reaches this callback at all. This one is
+        // the cheap path for the common case.
+        for (const id of ids) offers.delete(id);
+        mail.markRead(agent.id, ids);
+        return;
+      }
+      log(
+        `${agent.id}: turn died before it ran (${why}) — ${ids.length} message(s) left ` +
+          'unread for the next sweep',
+      );
+    };
+
     try {
-      start(agent, context);
+      start(agent, context, settle);
     } catch (error) {
       // Capacity, a dead child transport, a workspace that cannot be created.
       // Nothing is marked read, so this is a retry rather than a loss.
@@ -178,14 +374,17 @@ export class MailWaker {
       return;
     }
 
-    // After the turn has been handed over, never before. `unread` + `markRead`
-    // rather than `collect` for exactly this: if `start` throws, the mail is
-    // still unread and the next sweep tries again, whereas `collect` would have
-    // marked it read on the way past and the message would be gone.
-    mail.markRead(
-      agent.id,
-      pending.map((message) => message.id),
-    );
+    // `settle` CAN HAVE RUN ALREADY, from inside the call above. `AgentSession`'s
+    // `#push` has a synchronous catch — "the child transport can be dead — a
+    // failed spawn, or a process that exited" — which routes straight to
+    // `onError`, so the daemon settles before `start` returns.
+    //
+    // Without this the log reads backwards and claims something untrue: "turn
+    // died before it ran … left unread", immediately followed by "woke X with 5
+    // message(s)". No turn was woken. Announcing a wake that did not happen, in
+    // the path built to stop things failing silently, would be the same defect
+    // one line lower.
+    if (settled) return;
     log(`woke ${agent.id} with ${pending.length} message(s)`);
   }
 }

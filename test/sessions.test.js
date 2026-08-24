@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { AtCapacityError, SessionManager, atCapacityNotice } from '../dist/agent.js';
+import { AtCapacityError, SessionManager, TurnSettle, atCapacityNotice } from '../dist/agent.js';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { setConfig } from '../dist/config.js';
@@ -92,7 +92,15 @@ class FakeSession {
     this.busy = false;
     this.lastActiveAt = Date.now();
     this.closed = false;
+    /** See `isBusy`: a handed-over turn that has not ended yet. */
+    this.turnPending = false;
     this.onBusyChanged = () => {};
+    /** Every `wake` this session was given, with the per-turn settle. */
+    this.wakes = [];
+  }
+
+  wake(context, onSettled = null) {
+    this.wakes.push({ context, onSettled });
   }
 
   async close() {
@@ -795,4 +803,182 @@ test('the role acted on is the row, not the identity the fallback would have pic
   manager.acquire('hamachi-engineer2', events);
   assert.equal(toolNames(built[0].mcpServers).includes('spawn'), false);
   await manager.shutdown();
+});
+
+// ── The settle travels with the TURN, not with the session ──────────────────
+//
+// #241 round 1, BLOCKING, and it is worth writing down what the shape of the
+// mistake was rather than only the fix.
+//
+// The first version handed the per-turn `settle` callback to `acquire`. But
+// `acquire` returns an EXISTING session and drops everything else it was given
+// (`src/agent.ts:1091`), and `AgentSession` stores its events once, in the
+// constructor. So the callback reached the session only on the wake that
+// happened to CREATE it. Every mail wake after that settled nothing; the mail
+// was never marked read; the ten-second sweep re-offered it forever — a full
+// model turn against the same message every ten seconds, for the life of the
+// process, on the SUCCESS path. Strictly worse than the rare asynchronous loss
+// it was written to fix.
+//
+// The lifetime the callback belongs to is a TURN, and `wake()` is where a turn
+// begins, so that is where it is passed. This test is at the acquire/wake seam
+// because that seam is where it broke: a test of `AgentSession` alone, or of
+// `mailWakeEvents` alone, would have passed against the broken wiring.
+
+test('every wake carries its own settle, not just the one that built the session (#241)', () => {
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+
+  const settles = [];
+  for (const which of ['first', 'second', 'third']) {
+    const settle = (ran, why) => settles.push({ which, ran, why });
+    manager
+      .acquire('hamachi-engineer1', events)
+      .wake({ kind: 'mail', channelId: 'hamachi-engineer1', count: 1 }, settle);
+  }
+
+  assert.equal(built.length, 1, 'all three wakes went to one session — that is the premise');
+  const [session] = built;
+  assert.equal(session.wakes.length, 3);
+
+  // The claim: three distinct callbacks arrived, one per turn. Under the old
+  // wiring the 2nd and 3rd were dropped by `acquire` and this is where it shows.
+  for (const [i, w] of session.wakes.entries()) {
+    assert.equal(typeof w.onSettled, 'function', `wake ${i + 1} arrived with no settle`);
+  }
+  const distinct = new Set(session.wakes.map((w) => w.onSettled));
+  assert.equal(distinct.size, 3, 'each turn must settle its OWN mail, not an earlier turn s');
+
+  // And they are wired to the right turns, which set-size alone does not show.
+  session.wakes[1].onSettled(true, '');
+  assert.deepEqual(settles, [{ which: 'second', ran: true, why: '' }]);
+});
+
+// ── TurnSettle: the rules that had no coverage at all ────────────────────────
+//
+// These exist because of a mutation run, not because they looked missing. With
+// the settle logic inline in `AgentSession`, five separate mutations of it —
+// never clearing the callback, deleting the supersede, ignoring the callback
+// `wake` is handed, deleting the catch's settle, settling TRUE through an API
+// refusal — every one passed the full suite green. The logic was inside the one
+// class in agent.ts that no test can construct, so "391 pass" said nothing
+// about any of it.
+
+test('a settle fires exactly once, however many times the turn ends', () => {
+  // Belt and braces with mail-wake's own once-guard, deliberately: the two
+  // layers fail independently, and a double `markRead` is a message confirmed
+  // read twice, which is how a real one gets consumed by a turn that never saw it.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ ran, why }), 'first');
+
+  settle.done(true, 'turn completed');
+  settle.done(false, 'and again');
+  settle.done(true, 'and again');
+
+  assert.deepEqual(calls, [{ ran: true, why: 'turn completed' }]);
+});
+
+test('adopting a new turn ends the previous one FALSE (#241)', () => {
+  // A wake arriving while a turn is pending means that turn never completed —
+  // nothing else would have left it pending. Its mail was never confirmed read,
+  // so it must be offered again rather than vanishing with the callback.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ turn: 'first', ran, why }), 'first');
+  settle.adopt((ran, why) => calls.push({ turn: 'second', ran, why }), 'superseded');
+
+  assert.deepEqual(calls, [{ turn: 'first', ran: false, why: 'superseded' }]);
+
+  // And the turn that took over is the one now in flight — the defect was the
+  // NEW callback being dropped, so proving the old one fired is only half of it.
+  settle.done(true, 'done');
+  assert.deepEqual(calls[1], { turn: 'second', ran: true, why: 'done' });
+});
+
+test('adopting when nothing is in flight settles nothing', () => {
+  // The common case — one wake, one turn. `adopt` must not invent a settle for
+  // a turn that never existed.
+  let fired = 0;
+  const settle = new TurnSettle();
+  settle.adopt(() => fired++, 'nothing was in flight');
+  assert.equal(fired, 0);
+  assert.equal(settle.pending, true);
+});
+
+test('a turn left pending stays pending — a queued retry has not ended (#241)', () => {
+  // `onDone` deliberately leaves an API refusal WITH a retry queued unsettled:
+  // the retry re-runs the turn and its own completion decides. Settling either
+  // way here would be a guess, and a guess of TRUE loses the mail.
+  const settle = new TurnSettle();
+  settle.adopt(() => assert.fail('a queued retry must not settle its turn'), 'first');
+  assert.equal(settle.pending, true);
+});
+
+test('a wake carrying no settle still ends the turn before it', () => {
+  // Discord wakes pass no callback. They must not silently strand the settle of
+  // a mail turn that was still in flight — that is mail loss by another route.
+  const calls = [];
+  const settle = new TurnSettle();
+  settle.adopt((ran, why) => calls.push({ ran, why }), 'mail turn');
+  settle.adopt(null, 'a discord wake arrived');
+
+  assert.deepEqual(calls, [{ ran: false, why: 'a discord wake arrived' }]);
+  assert.equal(settle.pending, false, 'a null adopt leaves nothing in flight');
+  settle.done(true, 'no-op');
+  assert.equal(calls.length, 1);
+});
+
+test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backoff (#241)', () => {
+  // An API refusal WITH a retry queued leaves the turn deliberately unsettled —
+  // the retry re-runs it and its own completion decides. But the session is idle
+  // for the whole backoff, so without this the ten-second sweep re-offers mail
+  // that is already spoken for and `wake()` cancels the retry it is racing.
+  // `TurnSettle.pending` already means "this turn has not ended", so `isBusy`
+  // asks it rather than tracking a second flag.
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+  manager.acquire('hamachi-engineer1', events);
+  const [session] = built;
+
+  session.busy = false;
+  session.turnPending = true;
+  assert.equal(manager.isBusy('hamachi-engineer1'), true, 'idle-but-unsettled is not idle');
+
+  session.turnPending = false;
+  assert.equal(manager.isBusy('hamachi-engineer1'), false, 'a settled idle session is free again');
+});
+
+test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
+  // Two definitions of busy in one class is how the ops status file came to
+  // publish a mid-backoff agent as idle while the waker was correctly skipping
+  // it. A comment of mine claimed this line already fixed the status file; it
+  // did not, because the file reads `busyCount`, which counted `busy` alone.
+  const { manager, registry, built } = pool();
+  registry.ensure('hamachi-engineer1', {
+    crew: CREW,
+    role: 'engineer',
+    workspacePath: '/tmp/engineer1',
+    spawnedBy: 'hamachi-coordinator',
+  });
+  manager.acquire('hamachi-engineer1', events);
+  const [session] = built;
+
+  session.busy = false;
+  session.turnPending = true;
+  assert.equal(manager.isBusy('hamachi-engineer1'), true);
+  assert.equal(manager.busyCount, 1, 'the status file must not publish a mid-backoff agent as idle');
+
+  session.turnPending = false;
+  assert.equal(manager.busyCount, 0);
 });

@@ -127,6 +127,103 @@ export type DiscordHandlers = {
   stripMention: (message: Message) => string;
 };
 
+/**
+ * The three session events a mail wake logs and reacts to.
+ *
+ * THEY NO LONGER SETTLE THE MAIL. `AgentSession` does, through `TurnSettle`, at
+ * the one place a turn ends — because this object is handed to `acquire`, which
+ * DROPS it for a session that already exists, so only the first wake's copy ever
+ * ran. Settling from here marked the first message read and then nothing else
+ * ever again, and the sweep re-offered the same mail every ten seconds for the
+ * life of the process. Clawcius #241, round 1, blocking.
+ *
+ * A turn is the lifetime the settle belongs to, so it travels with `wake()`.
+ *
+ * EXTRACTED SO THEY CAN BE TESTED, because this wiring is exactly where #239
+ * lived: `onError` did not settle, five messages were marked read for a turn
+ * that never ran, and nothing recorded it. A mutation run confirmed the gap was
+ * still open after the fix — removing `settle` from either `onError` or
+ * `onDone` failed no test, because every test drove `MailWaker` with a stub
+ * `start` and never reached the daemon's callbacks.
+ *
+ * Fixing a path and leaving it untested is the shape that produced the bug.
+ */
+export function mailWakeEvents(opts: {
+  persist: () => void;
+  release: () => void;
+  err: (line: string) => void;
+  /** The mail-wake journal, for the completion line. Same sink as `woke X with N`. */
+  log: (line: string) => void;
+  agentId: string;
+}): {
+  onDone: (summary: TurnSummary) => void;
+  onError: (error: Error) => void;
+  onNeedsRespawn: () => void;
+} {
+  const { persist, release, err, log, agentId } = opts;
+  return {
+    onDone: (summary) => {
+      persist();
+      if (summary.apiError) {
+        // A refusal WITH a retry queued: the retry re-runs this turn, so the
+        // mail is neither read nor lost — leave it unsettled and let the
+        // retry's own onDone decide.
+        //
+        // A refusal with NO retry produced nothing, so the mail was never read
+        // by anybody. It used to be marked read here on the strength of
+        // "already in the transcript", which is the claim #239 disproved:
+        // `checkMail` reads unread rows, the row was no longer one, and the
+        // message was gone for good.
+        err(
+          `mail wake REFUSED (${summary.apiErrorKind})\n` +
+            `  ${String(summary.apiError).replace(/\s+/g, ' ').slice(0, 300)}\n` +
+            (summary.retryScheduled
+              ? `  retry ${summary.retryAttempt} queued`
+              : '  not retrying — mail left unread for the next sweep'),
+        );
+        return;
+      }
+
+      // THE COMPLETION LINE, outstanding since round 1 and grepped for by this
+      // change's own incident analysis. A successful mail wake logged `woke X
+      // with N message(s)` at handoff and then NOTHING — so `mail wake turn`
+      // returned zero matches while five messages were being eaten, and the
+      // absence read as "no turns ran" rather than "turns ran and we do not
+      // log them". A handoff line with no completion line cannot tell those
+      // apart, which is the whole shape of #239.
+      // `subtype` IS THE FIELD THE INCIDENT ANALYSIS RESTS ON. The grep quoted
+      // in this change's own description — `mail wake turn — 34 matches, ALL
+      // "success"` — is this field, and without it a turn that ended
+      // `error_max_turns` logs exactly what a clean one logs. That is the
+      // distinction the line exists to make, so it goes first.
+      log(
+        `${agentId}: mail wake turn ${summary.subtype}` +
+          (summary.isError ? ' (isError)' : '') +
+          (summary.costUsd === undefined ? '' : ` — $${summary.costUsd.toFixed(4)}`) +
+          (summary.numTurns === undefined ? '' : `, ${summary.numTurns} model turn(s)`),
+      );
+    },
+    // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that claimed
+    // nothing. The other two at least asserted a reason a reader could disagree
+    // with; this printed one line and released the session, so every documented
+    // failure string grepped ZERO while mail vanished. A path with no sentence
+    // attached is invisible to every technique we have for finding false ones.
+    //
+    // Its usual cause is not exotic: the gVisor sentry is OOM-killed inside the
+    // container's memcg, every agent's `docker exec` dies in the same second,
+    // and this fires once per agent with nothing to say — because there was no
+    // per-agent failure to describe.
+    onError: (error) => {
+      err(error.message);
+      release();
+    },
+    onNeedsRespawn: () => {
+      err('stale token on a mail wake — dropping session');
+      release();
+    },
+  };
+}
+
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   const { config, client, sessions, registry, mail, mailWaker } = deps;
   const { armedStore, github, windows, alwaysOnChannels } = deps;
@@ -898,8 +995,12 @@ export async function main(): Promise<void> {
    * The events handed to a mail wake are deliberately thinner than the Discord
    * ones. There is no channel to announce an outage in and no message anybody is
    * waiting on, so a failure is a line in the journal; and a stale token drops
-   * the session without replaying, because the mail has already been marked read
-   * and handed over, and replaying it would deliver the same message twice.
+   * the session and leaves the mail UNREAD, because replaying it is the point:
+   * `onNeedsRespawn` settles the turn false, so the sweep offers the message to
+   * the session that replaces this one. (This paragraph said the opposite until
+   * #241 — that the mail was already marked read and replaying would deliver it
+   * twice. That was true when the mark happened at handoff. It is the sentence
+   * the old design left behind, and OJ round 2 caught it still standing.)
    */
   const mailWaker =
     mail && config.agent.clawsky.wakeOnMail
@@ -908,41 +1009,22 @@ export async function main(): Promise<void> {
           registry,
           mail,
           busy: (agentId) => sessions.isBusy(agentId),
-          start: (agent, context) => {
+          start: (agent, context, settle) => {
             const session = sessions.acquire(agent.id, {
               onToolUse: (tool) => process.stdout.write(`[clawcius ${agent.id}] ${tool}\n`),
               onCliFailure: (cmd, out) =>
                 process.stderr.write(
                   `[clawcius ${agent.id}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`,
                 ),
-              onDone: (summary) => {
-                sessions.persist(agent.id);
-                if (summary.apiError) {
-                  process.stderr.write(
-                    `[clawcius ${agent.id}] mail wake REFUSED (${summary.apiErrorKind})\n` +
-                      `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
-                      (summary.retryScheduled
-                        ? `  retry ${summary.retryAttempt} queued\n`
-                        : `  not retrying — the mail is already in the transcript\n`),
-                  );
-                }
-                process.stdout.write(
-                  `[clawcius ${agent.id}] mail wake turn ${summary.subtype} ` +
-                    `$${summary.costUsd.toFixed(4)}\n`,
-                );
-              },
-              onError: (error) => {
-                process.stderr.write(`[clawcius ${agent.id}] ${error.message}\n`);
-                void sessions.release(agent.id);
-              },
-              onNeedsRespawn: () => {
-                process.stderr.write(
-                  `[clawcius ${agent.id}] stale token on a mail wake — dropping session\n`,
-                );
-                void sessions.release(agent.id);
-              },
+              ...mailWakeEvents({
+                persist: () => sessions.persist(agent.id),
+                release: () => void sessions.release(agent.id),
+                err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
+                log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
+                agentId: agent.id,
+              }),
             });
-            session.wake(context);
+            session.wake(context, settle);
           },
           log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
         })
