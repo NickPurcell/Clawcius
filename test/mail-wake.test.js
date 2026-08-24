@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { MailWaker } from '../dist/mail-wake.js';
+import { mailWakeEvents } from '../dist/daemon.js';
 
 function board(lines = []) {
   const path = join(mkdtempSync(join(tmpdir(), 'clawsky-wake-')), 'clawcius.db');
@@ -320,4 +321,61 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
     'no wake happened, so none may be announced',
   );
   registry.close();
+});
+
+
+// ── The daemon wiring, which is where #239 actually lived ──────────────────
+//
+// Every test above drives `MailWaker` with a stub `start` and never reaches the
+// daemon's session callbacks. A mutation run proved the gap was still open after
+// the fix: deleting `settle` from `onError` or from `onDone` failed NOTHING.
+// The bug was in this wiring; leaving it untested is the shape that produced it.
+
+const events = () => {
+  const calls = [];
+  const ev = mailWakeEvents({
+    settle: (ran, why) => calls.push({ ran, why }),
+    persist: () => {},
+    release: () => {},
+    err: () => {},
+  });
+  return { ev, calls };
+};
+
+test('onError settles false — the path that ate five messages', () => {
+  const { ev, calls } = events();
+  ev.onError(new Error('connecting to control server at PID 1281359: connection refused'));
+  assert.deepEqual(calls.map((c) => c.ran), [false]);
+  assert.match(calls[0].why, /connection refused/);
+});
+
+test('onNeedsRespawn settles false', () => {
+  const { ev, calls } = events();
+  ev.onNeedsRespawn();
+  assert.deepEqual(calls.map((c) => c.ran), [false]);
+});
+
+test('onDone settles true only when the turn actually produced', () => {
+  const ran = events();
+  ran.ev.onDone({ subtype: 'success', costUsd: 0, apiError: null });
+  assert.deepEqual(ran.calls.map((c) => c.ran), [true]);
+
+  // Refused with no retry: nothing was produced, so the mail was never read.
+  const refused = events();
+  refused.ev.onDone({ subtype: 'success', costUsd: 0, apiError: '529', apiErrorKind: 'server_error' });
+  assert.deepEqual(refused.calls.map((c) => c.ran), [false]);
+
+  // Refused WITH a retry queued: the retry re-runs the turn, so this must not
+  // settle at all — settling false here would manufacture a duplicate for
+  // nothing, and settling true would lose the mail if the retry also failed.
+  const retrying = events();
+  retrying.ev.onDone({
+    subtype: 'success',
+    costUsd: 0,
+    apiError: '529',
+    apiErrorKind: 'server_error',
+    retryScheduled: true,
+    retryAttempt: 1,
+  });
+  assert.deepEqual(retrying.calls, [], 'a queued retry decides later, via its own onDone');
 });

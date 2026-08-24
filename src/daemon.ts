@@ -127,6 +127,78 @@ export type DiscordHandlers = {
   stripMention: (message: Message) => string;
 };
 
+/**
+ * The three session events that decide whether a mail wake consumed its mail.
+ *
+ * EXTRACTED SO THEY CAN BE TESTED, because this wiring is exactly where #239
+ * lived: `onError` did not settle, five messages were marked read for a turn
+ * that never ran, and nothing recorded it. A mutation run confirmed the gap was
+ * still open after the fix — removing `settle` from either `onError` or
+ * `onDone` failed no test, because every test drove `MailWaker` with a stub
+ * `start` and never reached the daemon's callbacks.
+ *
+ * Fixing a path and leaving it untested is the shape that produced the bug.
+ */
+export function mailWakeEvents(opts: {
+  settle: (ran: boolean, why: string) => void;
+  persist: () => void;
+  release: () => void;
+  err: (line: string) => void;
+}): {
+  onDone: (summary: TurnSummary) => void;
+  onError: (error: Error) => void;
+  onNeedsRespawn: () => void;
+} {
+  const { settle, persist, release, err } = opts;
+  return {
+    onDone: (summary) => {
+      persist();
+      if (summary.apiError) {
+        // A refusal WITH a retry queued: the retry re-runs this turn, so the
+        // mail is neither read nor lost — leave it unsettled and let the
+        // retry's own onDone decide.
+        //
+        // A refusal with NO retry produced nothing, so the mail was never read
+        // by anybody. It used to be marked read here on the strength of
+        // "already in the transcript", which is the claim #239 disproved:
+        // `checkMail` reads unread rows, the row was no longer one, and the
+        // message was gone for good.
+        if (!summary.retryScheduled) settle(false, `API refused: ${summary.apiErrorKind}`);
+        err(
+          `mail wake REFUSED (${summary.apiErrorKind})\n` +
+            `  ${String(summary.apiError).replace(/\s+/g, ' ').slice(0, 300)}\n` +
+            (summary.retryScheduled
+              ? `  retry ${summary.retryAttempt} queued\n`
+              : `  not retrying — mail left unread for the next sweep\n`),
+        );
+        return;
+      }
+      // The turn ran. This is the only path that marks mail read.
+      settle(true, 'turn completed');
+    },
+    // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that claimed
+    // nothing. The other two at least asserted a reason a reader could disagree
+    // with; this printed one line and released the session, so every documented
+    // failure string grepped ZERO while mail vanished. A path with no sentence
+    // attached is invisible to every technique we have for finding false ones.
+    //
+    // Its usual cause is not exotic: the gVisor sentry is OOM-killed inside the
+    // container's memcg, every agent's `docker exec` dies in the same second,
+    // and this fires once per agent with nothing to say — because there was no
+    // per-agent failure to describe.
+    onError: (error) => {
+      settle(false, `session error: ${error.message}`);
+      err(error.message);
+      release();
+    },
+    onNeedsRespawn: () => {
+      settle(false, 'stale token, session dropped');
+      err('stale token on a mail wake — dropping session');
+      release();
+    },
+  };
+}
+
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   const { config, client, sessions, registry, mail, mailWaker } = deps;
   const { armedStore, github, windows, alwaysOnChannels } = deps;
@@ -915,58 +987,12 @@ export async function main(): Promise<void> {
                 process.stderr.write(
                   `[clawcius ${agent.id}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`,
                 ),
-              onDone: (summary) => {
-                sessions.persist(agent.id);
-                if (summary.apiError) {
-                  // A refusal WITH a retry queued: the retry re-runs this turn,
-                  // so the mail is neither read nor lost — leave it unsettled and
-                  // let the retry's own onDone decide.
-                  //
-                  // A refusal with NO retry produced nothing, so the mail was
-                  // never read by anybody. It used to be marked read here on the
-                  // strength of "already in the transcript", which is the claim
-                  // #239 disproved: `checkMail` reads unread rows, the row was no
-                  // longer one, and the message was gone for good.
-                  if (!summary.retryScheduled) settle(false, `API refused: ${summary.apiErrorKind}`);
-                  process.stderr.write(
-                    `[clawcius ${agent.id}] mail wake REFUSED (${summary.apiErrorKind})\n` +
-                      `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
-                      (summary.retryScheduled
-                        ? `  retry ${summary.retryAttempt} queued\n`
-                        : `  not retrying — mail left unread for the next sweep\n`),
-                  );
-                } else {
-                  // The turn ran. This is the only path that marks mail read.
-                  settle(true, 'turn completed');
-                }
-                process.stdout.write(
-                  `[clawcius ${agent.id}] mail wake turn ${summary.subtype} ` +
-                    `$${summary.costUsd.toFixed(4)}\n`,
-                );
-              },
-              // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that
-              // claimed nothing. The other two at least asserted a reason a
-              // reader could disagree with; this printed one line and released
-              // the session, so every documented failure string grepped ZERO
-              // while mail vanished. A path with no sentence attached is
-              // invisible to every technique we have for finding false ones.
-              //
-              // Its usual cause is not exotic: the gVisor sentry is OOM-killed
-              // inside the container's memcg, every agent's `docker exec` dies in
-              // the same second, and this fires once per agent with nothing to
-              // say — because there was no per-agent failure to describe.
-              onError: (error) => {
-                settle(false, `session error: ${error.message}`);
-                process.stderr.write(`[clawcius ${agent.id}] ${error.message}\n`);
-                void sessions.release(agent.id);
-              },
-              onNeedsRespawn: () => {
-                settle(false, 'stale token, session dropped');
-                process.stderr.write(
-                  `[clawcius ${agent.id}] stale token on a mail wake — dropping session\n`,
-                );
-                void sessions.release(agent.id);
-              },
+              ...mailWakeEvents({
+                settle,
+                persist: () => sessions.persist(agent.id),
+                release: () => void sessions.release(agent.id),
+                err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
+              }),
             });
             session.wake(context);
           },
