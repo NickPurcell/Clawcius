@@ -925,6 +925,13 @@ const DERIVED_KEYS: ReadonlyArray<[string, string]> = [
  * where the class needed deriving. This list is the rest of that fix.
  */
 const BASE_FORBIDDEN: ReadonlyArray<[string, string]> = [
+  // `extends` in a base is already a hard error (chains are refused) while
+  // `standalone` was silently IGNORED there — the asymmetry #221 exists to close,
+  // one file over, and created by #221 itself when it added only one of the two
+  // mode keys to the loader. An operator told "a self-contained config must say
+  // so — `standalone: true`" is not told WHICH file says so, and the wrong guess
+  // was the silent one. OJ round 1 on #228, note 1.
+  ['standalone', 'declares the mode of ONE file, and a base is not a mode'],
   ['crew', 'names one instance'],
   ['displayName', 'names one instance'],
   ['discord.allowedChannelIds', 'each crew lives in its own guild'],
@@ -1254,12 +1261,24 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   // loader completely. The protection was never a guard — it was a side effect
   // of a different requirement, and deriving removed it.
   if (!('extends' in instance) && !standalone) {
+    // The two ways out are NOT symmetric and the message must not present them
+    // as though they were. An operator reads this having just been refused, in a
+    // hurry, and `standalone: true` is the shorter line — but taking it
+    // reproduces #221 exactly: a crew with a 0-character prompt on the wrong
+    // model, now blessed by the message that offered it. OJ round 1 on #228,
+    // note 2. The declaration guards the SPELLING; nothing here guards the HARM,
+    // which is #230.
     throw new Error(
       `${path}: has no \`extends:\` and does not declare itself standalone.\n` +
-        '  An instance file must name its base — `extends: agent-config.base.yaml`.\n' +
-        '  A deliberately self-contained config must say so — `standalone: true`.\n' +
-        'Without a base this crew would start with no system prompt at all, which is ' +
-        'why silence is an error here rather than a default.',
+        '\n  Almost certainly you want:  extends: agent-config.base.yaml\n' +
+        '    Every crew that ships extends the base. It carries the system prompt, the\n' +
+        '    prompt templates, the model and the session limits — around 90% of what a\n' +
+        '    crew runs on. If this file is an instance config, this is the line.\n' +
+        '\n  Only if this file really is the whole config:  standalone: true\n' +
+        '    There is no such config in this repository. A crew with no base starts\n' +
+        '    with NO SYSTEM PROMPT AT ALL, on the code default model — which is the\n' +
+        '    exact failure this error exists to stop, so do not take this option to\n' +
+        '    make the error go away.',
     );
   }
   if ('extends' in instance && standalone) {

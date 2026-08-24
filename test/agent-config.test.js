@@ -549,11 +549,21 @@ test('a config must DECLARE its mode; silence is an error (#221)', () => {
     () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
     /has no `extends:` and does not declare itself standalone/,
   );
-  // The error names BOTH ways out, because an operator who hits it has no way to
-  // know which one they meant to write.
+  // The error names both ways out — but NOT as equals. An operator reads it
+  // having just been refused, in a hurry, and `standalone: true` is the shorter
+  // line; taking it reproduces #221 exactly, blessed by the message that offered
+  // it. So the message must rank them and say what the second one costs.
   assert.throws(
     () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
-    /`extends: agent-config\.base\.yaml`[\s\S]*`standalone: true`/,
+    /Almost certainly you want:\s+extends: agent-config\.base\.yaml/,
+  );
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /Only if this file really is the whole config:\s+standalone: true/,
+  );
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /NO SYSTEM PROMPT AT ALL[\s\S]*do not take this option to\n\s+make the error go away/,
   );
 
   // Declaring standalone is the opt-in, and it still works.
@@ -575,20 +585,41 @@ test('a config must DECLARE its mode; silence is an error (#221)', () => {
   // braces. Removed rather than rewritten, because there is nothing to check.
 });
 
-test('the real shipped config, minus its extends line, is refused (#221)', () => {
-  // THE REPRODUCTION FROM THE ISSUE, against the file that actually ships rather
-  // than a fixture — because the fixture is what I would have got right.
-  const real = readFileSync('agent-config.yaml', 'utf8');
-  assert.match(real, /^extends: /m, 'precondition: the shipped file uses extends');
+test('every shipped config, minus its extends line, is refused (#221)', () => {
+  // THE REPRODUCTION FROM THE ISSUE, against the files that actually ship rather
+  // than a fixture — because a fixture is what I would have got right.
+  //
+  // BOTH files, not just Clawcius's. The first version hardcoded
+  // `agent-config.yaml` while carrying a PR description claiming both were
+  // refused; Hamachi's has the byte-identical warning, is edited by the same
+  // operator on the same host, and was not a thing that ran (OJ round 1 on #228,
+  // note 3). The list is the same one the render test uses, so a third crew is
+  // covered by adding a filename in one place.
+  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
+    const real = readFileSync(file, 'utf8');
+    assert.match(real, /^extends: /m, `precondition: ${file} uses extends`);
 
-  const dir = mkdtempSync(join(tmpdir(), 'agent-config-221-'));
-  const path = join(dir, 'agent-config.yaml');
-  writeFileSync(path, real.split('\n').filter((l) => !l.startsWith('extends:')).join('\n'));
+    const dir = mkdtempSync(join(tmpdir(), 'agent-config-221-'));
+    const path = join(dir, 'agent-config.yaml');
+    writeFileSync(path, real.split('\n').filter((l) => !l.startsWith('extends:')).join('\n'));
 
+    assert.throws(
+      () => loadAgentConfig(path),
+      /has no `extends:` and does not declare itself standalone/,
+      `${file}: deleting one line must not silently produce a crew with no system prompt`,
+    );
+  }
+});
+
+test('a base file may not claim a mode either (#228 note 1)', () => {
+  // `extends` in a base was already refused; `standalone` was silently ignored,
+  // which is the same silence one file over.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-basemode-'));
+  writeFileSync(join(dir, 'base.yaml'), 'standalone: true\nmodel: from-the-base\n');
+  writeFileSync(join(dir, 'inst.yaml'), 'extends: base.yaml\ncrew: x\n');
   assert.throws(
-    () => loadAgentConfig(path),
-    /has no `extends:` and does not declare itself standalone/,
-    'deleting one line must not silently produce a crew with no system prompt',
+    () => loadAgentConfig(join(dir, 'inst.yaml')),
+    /standalone does not belong in this file/,
   );
 });
 

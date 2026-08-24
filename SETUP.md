@@ -156,9 +156,29 @@ small file each:
 | `squid/squid.conf` | The egress allowlist — the only copy of it | **Yes** |
 
 Changing the agent's personality should be a reviewable diff, not an edit to a
-file full of secrets. Every key in the YAML is optional and falls back to the
+file full of secrets. **Most** keys in the YAML are optional and fall back to the
 defaults in `src/agent-config.ts`; the loader validates types and fails at
 startup with the offending path named, rather than at the first mention.
+
+**Three keys are not optional**, and each has no default for the same reason: a
+default would be one crew's value handed to a crew that did not say its own.
+
+| key | in | why it has no default |
+|---|---|---|
+| `crew` | every config | every path and identity derives from it |
+| `extends` **or** `standalone: true` | every config | see below |
+| `container.stateDir` | only if you override the derived one | it must be absolute |
+
+**A config must declare which mode it is in.** An instance file names its base —
+`extends: agent-config.base.yaml`. A deliberately self-contained config says
+`standalone: true`. A file with neither is a boot error naming both options, and
+a file claiming both is refused rather than resolved by precedence.
+
+That is #221: silence used to *mean* standalone, so deleting the one line that
+looks like boilerplate from a twelve-line instance file started that crew with no
+system prompt at all, on the wrong model, silently. **`standalone: true` is
+almost never what you want here** — it means "this file is the whole config",
+and every crew that ships extends the base.
 
 `AGENT_CONFIG_PATH` points at an **instance** file, never at the base. The
 instance file names its base with `extends:`, resolved against the instance
@@ -315,7 +335,10 @@ Copy `agent-config.yaml`, which is Clawcius's instance file and is the shortest
 worked example there is. Change three things:
 
 ```yaml
-extends: agent-config.base.yaml
+extends: agent-config.base.yaml   # REQUIRED — see § Configuration split.
+                                  # Not boilerplate: without it the crew starts
+                                  # with no system prompt. Deleting it is now a
+                                  # boot error rather than a silent one.
 
 crew: newcrew            # lowercase, ^[a-z][a-z0-9-]{0,31}$
 displayName: Newcrew     # optional; defaults to `crew` capitalised
