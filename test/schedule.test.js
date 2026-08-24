@@ -1184,7 +1184,18 @@ test('a schedule in another zone still shows both, because they are two facts', 
     ),
   );
   // The preview must still carry both: the schedule's zone and the reader's.
-  assert.match(receipt, /GMT\+1.*\(.*P[DS]T\)/, 'the preview dropped the Pacific instant');
+  //
+  // NOT `/GMT\+1/`. The first draft pinned London's summer abbreviation, and the
+  // schedule is armed at the current time — so it would have gone red on
+  // 25 October 2026, on correct code, when London returns to `GMT`. A test that
+  // fails on a date rather than on a defect, inside the pull request about
+  // times that are wrong for half the year.
+  //
+  // I had used `P[DS]T` for Pacific in the same line, which is the same problem
+  // solved. The awareness did not generalise from one zone to the other, so this
+  // asserts the PROPERTY — a schedule-zone rendering, then a parenthetical
+  // carrying the reader's — rather than either abbreviation.
+  assert.match(receipt, /GMT[^(]*\(.*P[DS]T\)/, 'the preview dropped the Pacific instant');
 
   const mine = said(await listArmed.handler({}, {}));
 
