@@ -138,9 +138,41 @@ export function isInstallationIdValid(id: string | undefined): boolean {
  * A character the operator cannot see, in a value the operator typed.
  *
  * THE FAILURE THESE THREE VARIABLES SHARE is not a wrong value, it is an
- * invisible one: a `\r` from a Windows paste, a trailing newline in a systemd
- * `EnvironmentFile`, a space picked up by a shell heredoc. The value looks
- * right in the file and in every journal line that echoes it, and it is wrong.
+ * invisible one: a `\r` from a Windows paste, a tab, a zero-width space copied
+ * out of a web page. The value looks right in the file and in every journal
+ * line that echoes it, and it is wrong.
+ *
+ * A PLAIN SPACE IS NOT ON THAT LIST BECAUSE IT IS NOT SHARED. It counts for the
+ * two ids and deliberately not for the key path, where spaces are legal --
+ * `INVISIBLE` below is written to exclude it, and the path's own warning says
+ * "other than a plain space" for that reason.
+ *
+ * HOW IT ARRIVED IS DELIBERATELY NOT CLAIMED, here or in the warnings below.
+ * An earlier version blamed a trailing newline in a systemd `EnvironmentFile`.
+ * The limb that applies to THESE three is the simple one, and it is worth
+ * stating at exactly the width the evidence supports. systemd's
+ * `EnvironmentFile=` documents leading and trailing **space, tab and CR** as
+ * discarded from an unquoted value -- those three, named. It does NOT say
+ * "newline" there. So under the quotable part alone, a claim about a trailing
+ * NEWLINE is untouched.
+ *
+ * What refutes it is one step further and is an INFERENCE, marked as one: the
+ * document handles the newline structurally, a paragraph earlier, as the
+ * separator between assignments -- so it is never part of an unquoted value in
+ * the first place. Nobody here has read that page directly; there is no `man`
+ * or `systemctl` in an agent container.
+ *
+ * Said this way rather than as "whitespace", which is what an earlier draft of
+ * THIS comment wrote. That paraphrase proved the conclusion by widening a quote
+ * past the confidence its own author had stated -- in the change whose whole
+ * subject is not claiming more than the evidence carries.
+ *
+ * NOT the multi-loader limb, which belongs to `GITHUB_TOKEN` and not here.
+ * These three are read only by `config.ts`, in a daemon systemd starts directly
+ * rather than in a container, so there is exactly one loader and it is known.
+ * `describeTokenShape`'s TOLERATED row carries the fuller argument for the
+ * value that DOES reach a container through a second parser; it is referenced
+ * rather than restated, because two copies would be two things to keep true.
  *
  * Checked against the FAILURE MODE rather than against a format, deliberately.
  * `iss` accepts either the numeric App ID or a client ID (`Iv23li…`, and older
@@ -212,7 +244,7 @@ async function mint(
   // Operator-controlled, and it is interpolated into a path. `github.ts`
   // validates every value it interpolates (`requireRepo`, `requirePr`,
   // `encodePath`) so a bad one fails with a name instead of a puzzling status,
-  // and a trailing newline in a systemd EnvironmentFile is an ordinary typo.
+  // and an invisible character in an operator-typed value is an ordinary typo.
   // Here it matters more than style: the failure lands as a permanent disarm.
   if (!isInstallationIdValid(id)) {
     throw new Error('GITHUB_APP_INSTALLATION_ID must be digits only');
@@ -653,16 +685,15 @@ export function checkAppConfig(
   if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
     faults.push(
       'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — whitespace other ' +
-        'than a plain space, a control character, or a zero-width one. A trailing ' +
-        'newline in an EnvironmentFile is the usual cause, and nothing in the value ' +
-        'itself shows it',
+        'than a plain space, a control character, or a zero-width one. Nothing in ' +
+        'the value itself shows it',
     );
   }
 
   if (!isInstallationIdValid(input.installationId)) {
     faults.push(
       'GITHUB_APP_INSTALLATION_ID must be digits only — it is interpolated into a URL, ' +
-        'and a trailing newline in an EnvironmentFile is the usual cause',
+        'and the character that is not a digit need not be visible in the value',
     );
   }
 
