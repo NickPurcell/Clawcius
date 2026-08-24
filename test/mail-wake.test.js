@@ -350,7 +350,17 @@ test('a message that never settles stops being offered, and the line says so (#2
   const capped = lines.filter((l) => /pausing for/.test(l));
   assert.equal(capped.length, 1, 'and say so ONCE, not every sweep');
   assert.match(capped[0], /offered 3 times/);
-  assert.match(capped[0], /stay\s+UNREAD/i);
+  assert.match(capped[0], /stay UNREAD/i);
+  // The line is written to be read during an incident, so it must not promise a
+  // delivery that does not happen. Only `renderMail` (the wake this pause just
+  // stopped) and `checkMail` (which the agent chooses to call) put mail into a
+  // turn — a discord or scheduled wake does neither. Round 5.
+  assert.doesNotMatch(
+    capped[0],
+    /any other wake still delivers/i,
+    'a discord or scheduled wake does not deliver paused mail; it only allows a poll',
+  );
+  assert.match(capped[0], /a NEW message to this agent releases the batch/);
 
   // STILL UNREAD — that is the difference between a ceiling and a drop. Nothing
   // is lost, and any other wake still delivers it.

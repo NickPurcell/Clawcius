@@ -152,12 +152,15 @@ export function mailWakeEvents(opts: {
   persist: () => void;
   release: () => void;
   err: (line: string) => void;
+  /** The mail-wake journal, for the completion line. Same sink as `woke X with N`. */
+  log: (line: string) => void;
+  agentId: string;
 }): {
   onDone: (summary: TurnSummary) => void;
   onError: (error: Error) => void;
   onNeedsRespawn: () => void;
 } {
-  const { persist, release, err } = opts;
+  const { persist, release, err, log, agentId } = opts;
   return {
     onDone: (summary) => {
       persist();
@@ -175,11 +178,24 @@ export function mailWakeEvents(opts: {
           `mail wake REFUSED (${summary.apiErrorKind})\n` +
             `  ${String(summary.apiError).replace(/\s+/g, ' ').slice(0, 300)}\n` +
             (summary.retryScheduled
-              ? `  retry ${summary.retryAttempt} queued\n`
-              : `  not retrying — mail left unread for the next sweep\n`),
+              ? `  retry ${summary.retryAttempt} queued`
+              : '  not retrying — mail left unread for the next sweep'),
         );
         return;
       }
+
+      // THE COMPLETION LINE, outstanding since round 1 and grepped for by this
+      // change's own incident analysis. A successful mail wake logged `woke X
+      // with N message(s)` at handoff and then NOTHING — so `mail wake turn`
+      // returned zero matches while five messages were being eaten, and the
+      // absence read as "no turns ran" rather than "turns ran and we do not
+      // log them". A handoff line with no completion line cannot tell those
+      // apart, which is the whole shape of #239.
+      log(
+        `${agentId}: turn finished` +
+          (summary.costUsd === undefined ? '' : ` — $${summary.costUsd.toFixed(4)}`) +
+          (summary.numTurns === undefined ? '' : `, ${summary.numTurns} turn(s)`),
+      );
     },
     // THE PATH THAT ATE FIVE MESSAGES ON 2026-08-24, and the one that claimed
     // nothing. The other two at least asserted a reason a reader could disagree
@@ -998,6 +1014,8 @@ export async function main(): Promise<void> {
                 persist: () => sessions.persist(agent.id),
                 release: () => void sessions.release(agent.id),
                 err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
+                log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
+                agentId: agent.id,
               }),
             });
             session.wake(context, settle);

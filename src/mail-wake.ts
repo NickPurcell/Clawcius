@@ -226,8 +226,18 @@ export class MailWaker {
     //
     // So a message gets MAX_REOFFERS turns and then stops being offered, and the
     // line says so rather than the mail simply going quiet. It stays UNREAD, so
-    // nothing is lost and `checkMail` still returns it the moment anything else
-    // wakes the agent — which is the difference between a ceiling and a drop.
+    // nothing is lost — which is the difference between a ceiling and a drop.
+    //
+    // BE PRECISE ABOUT WHAT "NOT LOST" BUYS, because the line is written to be
+    // read during an incident. Only two things put mail into a turn:
+    // `renderMail` below, which is the wake this pause has just stopped, and
+    // `checkMail` in mail-tool.ts, which the agent has to CHOOSE to call. So a
+    // discord or scheduled wake does not deliver the paused batch — it only
+    // gives the agent an opportunity to poll. What does release it without
+    // anyone doing anything is a NEW message for the same agent, because the
+    // cap requires every pending message to be overdue and a new one is not.
+    // An earlier version of this promised a delivery that does not happen on
+    // its own. OJ #241 round 5.
     const now = Date.now();
     // The window is per agent: the messages are offered as one batch, so they
     // are capped and released as one.
@@ -254,8 +264,10 @@ export class MailWaker {
         log(
           `${agent.id}: ${pending.length} message(s) have each been offered ${MAX_REOFFERS} times ` +
             `without a turn that settled — pausing for ${REOFFER_WINDOW_MS / 1000}s. They stay ` +
-            'UNREAD, any other wake still delivers them, and the sweep tries again after the ' +
-            'pause. Whatever ended those turns is in the journal above this line.',
+            'UNREAD. The sweep tries again after the pause, and a NEW message to this agent ' +
+            'releases the batch immediately; a discord or scheduled wake does not deliver them, ' +
+            'it only gives the agent a chance to call checkMail. Whatever ended those turns is ' +
+            'in the journal above this line.',
         );
       }
       return;
@@ -334,10 +346,15 @@ export class MailWaker {
       if (ran) {
         // MEMORY, NOT BEHAVIOUR, and there is deliberately no test for it. The
         // map is keyed by message id, so a stale entry cannot affect a NEW
-        // message — it can only accumulate. I wrote a test asserting "a settled
-        // agent never hits the ceiling", then mutated this line away and the
-        // test still passed: it could not fail, which makes it worse than
-        // nothing. Deleted, and the reason recorded here instead.
+        // message. I wrote a test asserting "a settled agent never hits the
+        // ceiling", then mutated this line away and the test still passed: it
+        // could not fail, which makes it worse than nothing. Deleted, and the
+        // reason recorded here instead.
+        //
+        // This is now the SECOND line keeping the map bounded, not the only
+        // one — the sweep against `pending` above catches mail read through
+        // `checkMail`, which never reaches this callback at all. This one is
+        // the cheap path for the common case.
         for (const id of ids) offers.delete(id);
         mail.markRead(agent.id, ids);
         return;

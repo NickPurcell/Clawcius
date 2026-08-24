@@ -1018,6 +1018,13 @@ export class AgentSession {
     // and the TRUE quietly do nothing — a running turn settling as if it had
     // never run, which is the opposite of both intentions.
     if (!this.#query || !this.busy) {
+      // AND THE AGENT WILL START AGAIN, WITHIN TEN SECONDS. Left unread is the
+      // right answer — the alternative is consuming mail nobody has seen — but
+      // it means the sweep re-offers the same message and a person who typed
+      // `!stop` watches the agent come straight back. That is the trade, not a
+      // bug: `!stop` ends the TURN, and it is not a way to discard mail. There
+      // is no way to stop the delivery of a message that has not been read
+      // without losing it, which is the whole subject of this change.
       this.#settle.done(false, 'stopped during a retry backoff — the turn never ran');
       return;
     }
