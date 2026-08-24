@@ -416,9 +416,18 @@ test('the shared base may not carry instance identity — the inheritance bug, c
     ['discord:', "  alwaysOnChannelIds: ['1']"],
     ['crew: someoneelse'],
     ['displayName: SomeoneElse'],
+    // `standalone` is deliberately NOT in this list. It is refused in a base
+    // too, but beside the chain check rather than here, because this list's one
+    // shared rule sentence is false of a mode key — see BASE_FORBIDDEN's note.
   ];
   for (const lines of forbidden) {
-    const fakeBase = writeConfigRaw(['model: some-model', ...lines]);
+    // `writeUndeclared`, not `writeConfigRaw`: the helper prepends
+    // `standalone: true` to anything without a mode key, which is right for an
+    // instance fixture and WRONG for a base — a base may not declare a mode at
+    // all, so the fixture would trip that refusal before reaching this one. The
+    // same helper defeated the #221 test the same way; it is a good default with
+    // exactly one exception, and a base file is it.
+    const fakeBase = writeUndeclared(['model: some-model', ...lines]);
     const instance = writeConfigRaw(['crew: x', `extends: ${fakeBase}`]);
     assert.throws(
       () => loadAgentConfig(instance),
@@ -617,10 +626,28 @@ test('a base file may not claim a mode either (#228 note 1)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-basemode-'));
   writeFileSync(join(dir, 'base.yaml'), 'standalone: true\nmodel: from-the-base\n');
   writeFileSync(join(dir, 'inst.yaml'), 'extends: base.yaml\ncrew: x\n');
-  assert.throws(
-    () => loadAgentConfig(join(dir, 'inst.yaml')),
-    /standalone does not belong in this file/,
-  );
+
+  assert.throws(() => loadAgentConfig(join(dir, 'inst.yaml')), /has `standalone:`/);
+
+  // AND THE MESSAGE MUST BE TRUE OF A MODE KEY. Putting it in BASE_FORBIDDEN
+  // attached that list's shared rule sentence, which says the value is INHERITED
+  // by instances that do not override it, that it is another crew's identity,
+  // and that the fix is to move it to the instance file or let it derive from
+  // `crew`. All three are false here: it is read from the instance only, it is
+  // not an identity, moving it there is the both-modes refusal, and a mode key
+  // derives from nothing. OJ round 2 on #228.
+  const said = (() => {
+    try {
+      loadAgentConfig(join(dir, 'inst.yaml'));
+      return '';
+    } catch (e) {
+      return e.message;
+    }
+  })();
+  assert.doesNotMatch(said, /inherited/i);
+  assert.doesNotMatch(said, /other crew's identity/i);
+  assert.doesNotMatch(said, /derive from `crew`/);
+  assert.match(said, /Delete the line/);
 });
 
 test('a bare `extends:` is an error, not a silent standalone file', () => {

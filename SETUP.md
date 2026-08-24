@@ -160,14 +160,19 @@ file full of secrets. **Most** keys in the YAML are optional and fall back to th
 defaults in `src/agent-config.ts`; the loader validates types and fails at
 startup with the offending path named, rather than at the first mention.
 
-**Three keys are not optional**, and each has no default for the same reason: a
-default would be one crew's value handed to a crew that did not say its own.
+**Two keys are required**, for two different reasons — they are not one rule:
 
-| key | in | why it has no default |
-|---|---|---|
-| `crew` | every config | every path and identity derives from it |
-| `extends` **or** `standalone: true` | every config | see below |
-| `container.stateDir` | only if you override the derived one | it must be absolute |
+| key | why it is required |
+|---|---|
+| `crew` | it has no default, because a default would be one crew's value handed to a crew that did not say its own. Every path and identity derives from it |
+| `extends` **or** `standalone: true` | silence used to *mean* standalone, and meant it dangerously. See below |
+
+`container.stateDir` is **not** in that table, though it has no default either.
+It derives from `crew`, and in any file with `extends:` — which is every config
+this repository ships or recommends — setting it is a hard boot error. It is
+reachable only from a `standalone: true` config, which is the mode the next
+paragraph calls almost never what you want. § *Adding an instance* says **do not
+add paths** for the same reason.
 
 **A config must declare which mode it is in.** An instance file names its base —
 `extends: agent-config.base.yaml`. A deliberately self-contained config says

@@ -925,13 +925,19 @@ const DERIVED_KEYS: ReadonlyArray<[string, string]> = [
  * where the class needed deriving. This list is the rest of that fix.
  */
 const BASE_FORBIDDEN: ReadonlyArray<[string, string]> = [
-  // `extends` in a base is already a hard error (chains are refused) while
-  // `standalone` was silently IGNORED there — the asymmetry #221 exists to close,
-  // one file over, and created by #221 itself when it added only one of the two
-  // mode keys to the loader. An operator told "a self-contained config must say
-  // so — `standalone: true`" is not told WHICH file says so, and the wrong guess
-  // was the silent one. OJ round 1 on #228, note 1.
-  ['standalone', 'declares the mode of ONE file, and a base is not a mode'],
+  // `standalone` is NOT here, though it is refused in a base. It lives beside the
+  // chain check instead, because `refuseKeys` appends one shared rule sentence to
+  // every entry in this list and that sentence is false of a mode key: a base's
+  // `standalone` is never INHERITED (it is read from the instance only), it has
+  // nothing to do with another crew's identity, and its advice — "put it in the
+  // instance file, or let it derive from `crew`" — is either the both-modes
+  // refusal or, if the operator clears `extends:` to escape that, the exact #221
+  // harm the sibling error spends eight lines warning against. A mode key cannot
+  // derive from anything.
+  //
+  // This file already learned this once, at the two `refuseKeys` calls below:
+  // one rule sentence cannot be true of two kinds of entry. The list had two
+  // kinds and #228 briefly gave it a third. OJ round 2 on #228, new item 1.
   ['crew', 'names one instance'],
   ['displayName', 'names one instance'],
   ['discord.allowedChannelIds', 'each crew lives in its own guild'],
@@ -1309,6 +1315,16 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       throw new ConfigError('extends', `cannot point at the file itself (${basePath})`);
     }
     const base = readYaml(basePath, 'Base config named by `extends`');
+    // Both mode keys, refused in one place, because they are one decision: a base
+    // is not a file that has a mode, it is the thing a mode points at.
+    if ('standalone' in base) {
+      throw new Error(
+        `${basePath}: has \`standalone:\`, which declares the MODE of one instance file ` +
+          'and is meaningless in a shared base. A base is not standalone or extending — it ' +
+          'is the thing an instance extends. Delete the line; it is read only from the ' +
+          'instance file and was silently ignored here before #228.',
+      );
+    }
     if (base['extends'] !== undefined) {
       // One level, deliberately. A chain would make "which file is this value
       // from" a question you answer by tracing, which is the state this whole
