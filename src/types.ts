@@ -87,29 +87,30 @@ export type TurnSummary = {
    * Why no retry was queued, when the API refused the turn and nothing is
    * coming. Null when the turn succeeded or when a retry IS queued.
    *
-   * THREE STATES, AND THEY WANT OPPOSITE THINGS FROM A HUMAN. Before this
+   * FOUR STATES, AND THEY WANT OPPOSITE THINGS FROM A HUMAN. Before this
    * existed the caller had one bit — `retryScheduled` — and said the same
    * sentence for all of them: "retries are exhausted or would not help, so this
    * needs a look at the host". That covers every case and therefore tells the
    * reader none of them, and for a 529 it is false twice: the fault is
    * Anthropic's, and waiting is exactly what helps.
    *
-   *   not-retryable  a standing condition — `billing_error`, `invalid_request`.
-   *                  A retry reproduces the same answer. THIS is the one that
-   *                  genuinely needs a look at the host.
-   *   exhausted      a transient kind that used every rung of its ladder. The
-   *                  fault is upstream and time is the fix.
-   *   abandoned      rungs were left, but the session was closed or its stored
-   *                  context cleared out from under the retry — `!reset`,
-   *                  `!stop`, or `onError` dropping a session whose child
-   *                  process died. NOT an outage, and not the user's fault to
-   *                  diagnose: something on this side threw the message away.
+   *   not-retryable    a standing condition — `billing_error`,
+   *                    `invalid_request`. A retry reproduces the same answer.
+   *                    THIS is the one that genuinely needs a look at the host.
+   *   exhausted        a TRANSIENT kind that used every rung of its ladder. The
+   *                    fault is upstream and time is the fix.
    *   credential-dead  the AUTH ladder is spent. Distinct from `exhausted`,
-   *                  which is a transient that ran out of time — this one is
-   *                  the token being dead, and no amount of waiting fixes it.
-   *                  `AUTH_RETRY_DELAYS_MS` has one rung precisely because "if
-   *                  that fails the credential is genuinely dead and hammering
-   *                  it is pointless".
+   *                    which is a transient that ran out of time — this one is
+   *                    the token being dead, and no amount of waiting fixes it.
+   *                    `AUTH_RETRY_DELAYS_MS` has one rung precisely because
+   *                    "if that fails the credential is genuinely dead and
+   *                    hammering it is pointless".
+   *   abandoned        rungs were left, but the session was closed or its
+   *                    stored context cleared out from under the retry —
+   *                    `!reset`, `!stop`, or `onError` dropping a session whose
+   *                    child process died. NOT an outage, and not the user's
+   *                    fault to diagnose: something on this side threw the
+   *                    message away.
    *
    * Computed where the distinction is legible — beside the `willRetry`
    * expression that makes it — rather than re-derived by a caller from
