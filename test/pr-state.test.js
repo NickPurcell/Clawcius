@@ -24,6 +24,7 @@ import {
   approvalsFor,
   roundState,
   explainMergeState,
+  refPatternMatches,
 } from '../pr-cli/pr-state.mjs';
 
 const OJ = { login: 'osmosis-jones-agent[bot]' };
@@ -295,15 +296,60 @@ test('`blocked` is only blamed on approvals when approvals are actually short', 
     /NOT the approval count \(2 of 1\)/,
   );
 
-  // An unreadable ruleset must not become a claim about approvals either.
-  assert.match(
-    explainMergeState('blocked', [], { name: '(unreadable)', required: null }),
-    /NOT the approval count\. Look at the rest/,
-  );
+  // ROUND 2, FINDING 1 — and this assertion is the reason it survived. Its
+  // comment said "an unreadable ruleset must not become a claim about approvals"
+  // while the assertion demanded exactly that claim: `NOT the approval count`.
+  // The instinct was right and the test held the opposite in place, which is why
+  // it needed inverting rather than extending.
+  //
+  // With the count unknown the honest answer is that it is unknown. Saying it is
+  // NOT the approval count is round 1's finding with the sign flipped, and worse
+  // — that one pointed at a condition that was met, this one points away from
+  // the condition that is usually the whole answer.
+  for (const unknown of [{ name: '(unreadable)', required: null }, undefined, null]) {
+    const said = explainMergeState('blocked', [], unknown);
+    assert.match(said, /could not be read/);
+    assert.match(said, /UNKNOWN/);
+    assert.doesNotMatch(said, /NOT the approval count/);
+  }
 
   // The other states say what they mean rather than echoing the field.
   assert.equal(explainMergeState('clean', [], ruleset), 'nothing blocking');
   assert.equal(explainMergeState('dirty', [], ruleset), 'merge conflicts');
   assert.match(explainMergeState('unstable', [], ruleset), /required check/);
   assert.equal(explainMergeState('weird-new-state', [], ruleset), 'weird-new-state');
+});
+
+test('a stale approval is named on the "can it merge" line, not only beside the approval', () => {
+  // Observed live on #228: GitHub reported `clean` while the only approval was
+  // for a commit no longer at the head, because dismiss_stale_reviews_on_push is
+  // false. "nothing blocking" is GitHub's truth and the wrong thing to tell a
+  // reader deciding whether to press merge — which is this function's own
+  // finding-1 defect a third time, so it says both.
+  const fresh = [{ by: 'oj', at: 't', sha: 'head1234', stale: false }];
+  const stale = [{ by: 'oj', at: 't', sha: 'old12345', stale: true }];
+
+  assert.equal(explainMergeState('clean', fresh, { required: 1 }), 'nothing blocking');
+
+  const said = explainMergeState('clean', stale, { required: 1 });
+  assert.match(said, /STALE/);
+  assert.match(said, /merges code no review has read/);
+  assert.doesNotMatch(said, /^nothing blocking$/);
+});
+
+test('ruleset ref patterns match the way GitHub writes them', () => {
+  // ROUND 2, FINDING 2. `refs/heads/*` is one of the commonest ways to target a
+  // ruleset and the literal comparison missed it — which dropped the ruleset,
+  // which made `required` null, which landed in finding 1's wrong sentence.
+  // Three silent degradations from one unmatched pattern.
+  assert.equal(refPatternMatches('refs/heads/*', 'main'), true);
+  assert.equal(refPatternMatches('refs/heads/main', 'main'), true);
+  assert.equal(refPatternMatches('main', 'main'), true);
+  assert.equal(refPatternMatches('refs/heads/feature/*', 'feature/x'), true);
+  assert.equal(refPatternMatches('refs/heads/rel-?', 'rel-1'), true);
+  assert.equal(refPatternMatches('refs/heads/other', 'main'), false);
+  assert.equal(refPatternMatches('refs/heads/feat*', 'main'), false);
+  // A pattern with regex metacharacters must be treated as a glob, not a regex.
+  assert.equal(refPatternMatches('refs/heads/a.b', 'aXb'), false);
+  assert.equal(refPatternMatches('refs/heads/a.b', 'a.b'), true);
 });

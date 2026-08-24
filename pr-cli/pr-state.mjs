@@ -110,6 +110,14 @@ export const FOOTER = /<sub>OJ\s*·\s*round\s*(\d+)\s*·\s*head\s*`([0-9a-f]+)`/
  * gets reported for a round that has barely started — the dangerous direction,
  * because it invites acting on findings that do not exist yet.
  */
+export function parseFindings(comments) {
+  return comments
+    .filter((c) => c.user?.login === OJ_BOT)
+    .map((c) => ({ at: c.created_at, m: FOOTER.exec(c.body ?? ''), url: c.html_url }))
+    .filter((c) => c.m)
+    .map((c) => ({ at: c.at, round: Number(c.m[1]), sha: c.m[2], url: c.url }));
+}
+
 /**
  * OJ declining a round, which unlabels exactly like a pickup and posts no
  * footer — so without this it falls through to RUNNING and stays there forever.
@@ -121,8 +129,17 @@ export const FOOTER = /<sub>OJ\s*·\s*round\s*(\d+)\s*·\s*head\s*`([0-9a-f]+)`/
  * An agent reads "picked up, running" and waits for findings that were declined
  * an hour ago. That is Clawcius#88's eight-hour wait with a tool vouching for
  * it, which is worse than the wait without one. OJ round 1, finding 3.
+ *
+ * Searched over comments AND review bodies, for the same reason `parseFindings`
+ * is: if finding 5's premise holds for findings it holds for refusals.
  */
-const DECLINED = /^OJ is not reviewing this:\s*(.*)/;
+// NOT anchored hard at `^`. OJ's other system comment — the acknowledgement —
+// opens with an emoji, and `<habits>` describes it without mentioning that. If a
+// refusal ever carries a prefix the same way, a hard anchor never matches and the
+// round reads RUNNING forever, which is the exact bug the DECLINED state was
+// added to fix. The cost of being wrong is that failure; the cost of the
+// hardening is four characters. Round 2, finding 5.
+const DECLINED = /^\W*OJ is not reviewing this:\s*(.*)/;
 
 export function parseDeclines(comments) {
   return comments
@@ -130,14 +147,6 @@ export function parseDeclines(comments) {
     .map((c) => ({ at: c.created_at, m: DECLINED.exec((c.body ?? '').trim()) }))
     .filter((c) => c.m)
     .map((c) => ({ at: c.at, reason: c.m[1].trim() }));
-}
-
-export function parseFindings(comments) {
-  return comments
-    .filter((c) => c.user?.login === OJ_BOT)
-    .map((c) => ({ at: c.created_at, m: FOOTER.exec(c.body ?? ''), url: c.html_url }))
-    .filter((c) => c.m)
-    .map((c) => ({ at: c.at, round: Number(c.m[1]), sha: c.m[2], url: c.url }));
 }
 
 /**
@@ -192,6 +201,22 @@ export function approvalsFor(reviews, head) {
 }
 
 /**
+ * Does a ruleset ref pattern match this branch?
+ *
+ * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
+ * FULL ref, so `refs/heads/*` is the ordinary way to say "every branch" and a
+ * literal comparison misses it entirely.
+ */
+export function refPatternMatches(pattern, branch) {
+  if (!pattern || !branch) return false;
+  const full = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
+  const rx = new RegExp(
+    `^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`,
+  );
+  return rx.test(full) || rx.test(branch);
+}
+
+/**
  * Why a pull request cannot merge, in words, from `mergeable_state`.
  *
  * FINDING 1 OF OJ ROUND 1, and the sharpest thing said about this tool. The
@@ -214,9 +239,20 @@ export function approvalsFor(reviews, head) {
  */
 export function explainMergeState(state, approvals, ruleset) {
   const required = ruleset?.required;
+  const stale = approvals.filter((a) => a.stale);
   switch (state) {
     case 'clean':
-      return 'nothing blocking';
+      // GitHub's own verdict, plus the thing GitHub does not count as blocking.
+      // `dismiss_stale_reviews_on_push` is false on OJ1, so an approval survives
+      // the branch moving under it and `clean` can mean "approved, for code that
+      // is no longer here". Observed on #228: green check, approval for
+      // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
+      // this function's own finding-1 defect a third time.
+      return stale.length === 0
+        ? 'nothing blocking'
+        : `nothing GitHub blocks on — but ${stale.length === 1 ? 'the approval is' : `${stale.length} approvals are`} ` +
+          'STALE, for a commit no longer at the head. Merging now merges code no ' +
+          'review has read (dismiss_stale_reviews_on_push is false)';
     case 'dirty':
       return 'merge conflicts';
     case 'behind':
@@ -226,14 +262,33 @@ export function explainMergeState(state, approvals, ruleset) {
     case 'draft':
       return 'it is a draft';
     case 'blocked':
-      if (required != null && approvals.length < required) {
+      // THREE branches, not two, and the third is round 2's finding 1. With
+      // `required` unknown the two-branch version fell through to "it is NOT the
+      // approval count" — asserting the negative from an absence. Zero approvals
+      // on a PR needing one, which is the commonest blocked state here, reported
+      // as definitely not about approvals: round 1's finding with the sign
+      // flipped, and worse, because that one pointed at a condition that was met
+      // while this one points away from the condition that is the whole answer.
+      //
+      // `required` is unknown whenever the `/rulesets` read throws, no active
+      // ruleset governs this base ref, or the repo uses classic branch
+      // protection and has no rulesets at all — none exotic, and the README
+      // offers a cross-repo example where the last is possible.
+      if (required == null) {
+        return (
+          'branch protection — and the required approval count could not be read, so ' +
+          `whether ${approvals.length} approval(s) is enough is UNKNOWN. It may be the ` +
+          'approval count, or a required check, CODEOWNERS, or ' +
+          'require_extra_approval_for_unattributed_changes'
+        );
+      }
+      if (approvals.length < required) {
         return `branch protection — needs ${required} approval(s), has ${approvals.length}`;
       }
       return (
-        'branch protection, and it is NOT the approval count' +
-        (required != null ? ` (${approvals.length} of ${required})` : '') +
-        '. Look at the rest of the ruleset: a required check, CODEOWNERS, or ' +
-        'require_extra_approval_for_unattributed_changes'
+        `branch protection, and it is NOT the approval count (${approvals.length} of ` +
+        `${required}). Look at the rest of the ruleset: a required check, CODEOWNERS, ` +
+        'or require_extra_approval_for_unattributed_changes'
       );
     default:
       return state ?? 'unknown';
@@ -261,6 +316,12 @@ export function explainMergeState(state, approvals, ruleset) {
  * curl for the single value rather than reconstructing it from a transcript. No
  * boundary to find, no second stream, no temp file — which keeps the property
  * that this tool writes nothing anywhere, since it runs from a read-only mount.
+ *
+ * ON AN OLDER CURL IT DEGRADES SILENTLY, and that is worth knowing rather than
+ * guarding: the literal `%header{link}` is emitted, the regex misses, and
+ * pagination reverts to page 1 — which is the defect this whole function exists
+ * to fix. Only reachable if the tool ever runs outside this image, so it is a
+ * line here rather than a version check that would run on every call.
  */
 const SENTINEL = '\n@@pr-state-link@@';
 
@@ -305,10 +366,26 @@ function api(path, repo) {
  * that page") and `src/github.ts` `#getAll` already implements it. This took the
  * first half of a two-part rule the repository states in two places.
  *
- * Middle pages are deliberately not fetched: every question here is about the
- * newest events or the full set of reviews, and reviews do not reach 200 on a
- * pull request a person is looking at. Where that assumption could bite —
- * `parseFindings` counting rounds — it is stated at the call site.
+ * Middle pages are deliberately not fetched, and here is the whole of that
+ * assumption rather than a promise that it is written down somewhere else — an
+ * earlier version of this paragraph pointed at a statement "at the call site"
+ * that did not exist:
+ *
+ *   comments and reviews  every question is about the newest, or about the full
+ *                         set of reviews, which does not reach 200 on a pull
+ *                         request a person is looking at.
+ *
+ *   the TIMELINE          the diluted one. Label events are a few per round
+ *                         among commits, comment refs and cross-references, so
+ *                         past ~200 events the current round's
+ *                         `labeled`/`unlabeled` can sit in a skipped middle page
+ *                         while the last page is full of something else, and
+ *                         `roundState` falls back to an ancient round silently.
+ *                         If that ever bites, `/issues/{n}/events` carries the
+ *                         labellings undiluted — `<habits>` warns against it
+ *                         because it omits comments, and this script already
+ *                         fetches those separately, so the warning does not
+ *                         apply here.
  */
 function apiList(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
@@ -428,54 +505,71 @@ export function main() {
   // OJ raised this as a question rather than a defect — its posting path is not
   // in this repository and neither of us can check it. Covering both is cheaper
   // than being right about which.
-  const findings = parseFindings([
+  const carriers = [
     ...comments,
     ...reviews.map((r) => ({ user: r.user, created_at: r.submitted_at, body: r.body, html_url: r.html_url })),
-  ]).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  ];
+  const findings = parseFindings(carriers).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 
-  const round = roundState(timeline, findings, parseDeclines(comments));
-  const latestForVerdict = findings[findings.length - 1] ?? null;
+  const latest = findings[findings.length - 1] ?? null;
+  const round = roundState(timeline, findings, parseDeclines(carriers));
   // Computed ONCE. Both the JSON and the text path called this, so `git` was
   // spawned twice for one answer.
-  const verdict = latestForVerdict
-    ? classifyReviewedSha(latestForVerdict.sha, head, isAncestor)
-    : 'NONE';
-  const latest = findings[findings.length - 1] ?? null;
-
+  const verdict = latest ? classifyReviewedSha(latest.sha, head, isAncestor) : 'NONE';
   const approvals = approvalsFor(reviews, head);
 
   let ruleset = null;
   try {
-    // The ruleset must GOVERN THIS PULL REQUEST. Taking the first active one
-    // named a ruleset that might not apply to this base branch — the same
-    // adjacent-answer shape as finding 1, one line below it. `~DEFAULT_BRANCH`
-    // and `~ALL` are GitHub's aliases and are checked by name because the API
-    // does not expand them.
+    // EVERY governing ruleset, and the strictest requirement among them.
+    //
+    // Round 2's finding 2, and it became load-bearing because finding 1's fix
+    // depends on `required` being non-null to stay honest. Three defects in the
+    // first version, each silent:
+    //
+    //   `refs/heads/*` matched nothing. `ref_name.include` holds fnmatch
+    //   patterns, not just literals and the two aliases, and a wildcard is one
+    //   of the commonest ways to target a ruleset. An unmatched pattern dropped
+    //   the ruleset, which lost the `ruleset` line, lost "of N required" beside
+    //   the approvals, and landed in finding 1's wrong sentence.
+    //
+    //   `exclude` was not read, so `include: ['~ALL']` with
+    //   `exclude: ['refs/heads/main']` was reported as governing main.
+    //
+    //   `.find()` took the first match while GitHub applies ALL of them and the
+    //   effective requirement is the strictest.
     const list = api(`/rulesets?includes_parents=true`, repo);
     const base = pr.base?.ref;
     const governs = (r) => {
-      const include = r.conditions?.ref_name?.include;
+      const cond = r.conditions?.ref_name;
+      const hit = (p) =>
+        p === '~ALL' ||
+        (p === '~DEFAULT_BRANCH' && base === pr.base?.repo?.default_branch) ||
+        refPatternMatches(p, base);
+      if ((cond?.exclude ?? []).some(hit)) return false;
+      const include = cond?.include;
       if (!include || include.length === 0) return true;
-      return include.some(
-        (p) =>
-          p === '~ALL' ||
-          (p === '~DEFAULT_BRANCH' && base === pr.base?.repo?.default_branch) ||
-          p === `refs/heads/${base}` ||
-          p === base,
-      );
+      return include.some(hit);
     };
-    const active = Array.isArray(list)
-      ? list.filter((r) => r.enforcement === 'active').find(governs)
-      : null;
-    if (active) {
-      const full = api(`/rulesets/${active.id}`, repo);
+    const governing = Array.isArray(list)
+      ? list.filter((r) => r.enforcement === 'active').filter(governs)
+      : [];
+    for (const summary of governing) {
+      const full = api(`/rulesets/${summary.id}`, repo);
       const rule = (full.rules ?? []).find((r) => r.type === 'pull_request');
-      ruleset = {
+      if (!rule) continue;
+      const here = {
         name: full.name,
-        required: rule?.parameters?.required_approving_review_count ?? 0,
-        dismissStaleOnPush: rule?.parameters?.dismiss_stale_reviews_on_push ?? false,
+        required: rule.parameters?.required_approving_review_count ?? 0,
+        dismissStaleOnPush: rule.parameters?.dismiss_stale_reviews_on_push ?? false,
         bypass: (full.bypass_actors ?? []).length,
       };
+      // Strictest wins: more approvals required, and stale-dismissal on if ANY
+      // governing ruleset turns it on.
+      ruleset =
+        ruleset == null || here.required > ruleset.required
+          ? { ...here, dismissStaleOnPush: here.dismissStaleOnPush || (ruleset?.dismissStaleOnPush ?? false) }
+          : { ...ruleset, dismissStaleOnPush: ruleset.dismissStaleOnPush || here.dismissStaleOnPush };
+      if (governing.length > 1) ruleset.name = `${ruleset.name} (strictest of ${governing.length})`;
     }
   } catch {
     // `/branches/*/protection` is 403 for an App; `/rulesets` is not. If even
@@ -521,7 +615,10 @@ export function main() {
       EXACT: 'YES — reviewed this exact commit',
       ANCESTOR: 'PARTLY — reviewed an ancestor; commits since it are unreviewed',
       VOID: 'NO — VOID. The reviewed commit is not in this head\'s history.',
-      UNKNOWN: 'UNKNOWN — that sha is not in this clone (git fetch first)',
+      UNKNOWN:
+        'UNKNOWN — that commit is not reachable from here. Run this from a clone of the ' +
+        'repository if you need the answer; from an agent workspace, which is not a ' +
+        'clone, this is the normal result rather than a fault.',
     }[verdict];
     say(`review saw this code?`, `${verdictText}\n${' '.repeat(34)}round ${latest.round} read ${latest.sha}`);
   }

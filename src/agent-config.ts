@@ -1143,12 +1143,22 @@ const GITHUB_TOKEN_DIR_MOUNT = 'container.githubTokenDir, bind-mounted read-only
  *
  * ── Still NOT exhaustive, and this is the honest remainder ───────────────
  *
- * Three read-only mounts still do not appear here: `gws-cli`, `pr-cli` and the
- * Google service-account key. `pr-cli` was added by #218 and this sentence was
- * updated with it — the count is stated so that adding a fourth without touching
- * this paragraph is visibly wrong rather than quietly incomplete. They are read-only, so nothing in a container can write
- * them — the risk is not a forged claim but a shared secret, since a path placed
- * in one would be visible to BOTH deployments' agents.
+ * FOUR read-only mounts still do not appear here: `gws-cli`, `browser-cli`,
+ * `pr-cli` and the Google service-account key. All four are hardcoded paths in
+ * `docker/run-container.sh` rather than config keys, which is why they are not
+ * in the list — `paths` holds only `discordCli` and `skillsDir`.
+ *
+ * The count is stated so that adding a fifth without touching this paragraph is
+ * visibly wrong rather than quietly incomplete. It said THREE when this note was
+ * written and `browser-cli` had been missing from it since before #218 — so the
+ * tripwire was tripped by the very commit that installed it, which is the
+ * cheapest possible demonstration that an enumeration nobody counts is an
+ * enumeration nobody maintains. Count them against `run-container.sh` before
+ * changing this number; do not increment it.
+ *
+ * They are read-only, so nothing in a container can write them — the risk is not
+ * a forged claim but a shared secret, since a path placed in one would be
+ * visible to BOTH deployments' agents.
  *
  * `container.githubTokenDir` WAS a third such omission and is now in the list,
  * which is this paragraph's warning coming true in the interval since it was
