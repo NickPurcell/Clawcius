@@ -522,3 +522,23 @@ test('a stale token releases the session and says so', () => {
   assert.equal(out.released, 1);
   assert.match(out.err.join('\n'), /stale token/);
 });
+
+test('an async death RELEASES the session, or the agent goes deaf for good (#241 round 7)', () => {
+  // `onError` is the path this change is named for — "THE PATH THAT ATE FIVE
+  // MESSAGES ON 2026-08-24" — and it was the one branch of the three with no
+  // test. Its two lines are not interchangeable with `onNeedsRespawn`'s.
+  //
+  // `#consume`'s catch settles the turn but never clears `busy`, so after an
+  // asynchronous death the session reports `busy === true` for ever. Only
+  // `release()` takes it out of the pool — and with `isBusy` now
+  // `busy || turnPending`, a dead session left in the pool means the waker skips
+  // that agent for the life of the process. That is round 3's deafness arriving
+  // down the exact path this PR exists to fix, and a mutation dropping the
+  // `release()` passed the suite until this test.
+  const { events, out } = wired();
+  events.onError(new Error('connecting to control server: connection refused'));
+
+  assert.equal(out.released, 1, 'a dead session must leave the pool, or nothing wakes this agent again');
+  assert.match(out.err.join('\n'), /connection refused/, 'and the journal must name what killed it');
+  assert.deepEqual(out.log, [], 'a turn that died did not finish');
+});
