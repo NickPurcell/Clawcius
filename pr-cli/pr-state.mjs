@@ -197,7 +197,31 @@ export function approvalsFor(reviews, head) {
   }
   return [...latest.values()]
     .filter((r) => r.state === 'APPROVED')
-    .map((r) => ({ by: r.user?.login, at: r.submitted_at, sha: r.commit_id, stale: r.commit_id !== head }));
+    .map((r) => ({
+      by: r.user?.login,
+      at: r.submitted_at,
+      sha: r.commit_id,
+      // THREE STATES, because the datum can be absent and a boolean cannot say so.
+      //
+      // `stale: commit_id !== head` was TRUE when `commit_id` was null, so every
+      // reader had to remember `&& a.sha`. Round 3 of #218 added that at two
+      // sites and round 4 found two more that had not got it — the tool printed
+      // three consecutive lines taking three positions on whether a stale
+      // approval existed. A third and fourth guard would have left the fifth.
+      //
+      // The field answered "does commit_id differ from head" while every reader
+      // was asking "is this approval for code that has been superseded". Those
+      // are different questions, which is this tool's entire subject. It answers
+      // the second now, and `unknown` is a value rather than something each
+      // caller reconstructs from a second field.
+      // `!r.commit_id`, not `== null`: an empty string is not a sha, and treating
+      // it as one classified it 'stale' and printed `STALE: approved , head is …`
+      // with a hole in it. The readers this replaced used falsy tests, so `""`
+      // landed in the unknown bucket; narrowing to `== null` silently moved it.
+      // No evidence GitHub returns `""` here — it returns a sha or null — so this
+      // is a bucket restored rather than a bug fixed.
+      coverage: !r.commit_id ? 'unknown' : r.commit_id === head ? 'current' : 'stale',
+    }));
 }
 
 /**
@@ -206,6 +230,26 @@ export function approvalsFor(reviews, head) {
  * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
  * FULL ref, so `refs/heads/*` is the ordinary way to say "every branch" and a
  * literal comparison misses it entirely.
+ *
+ * `*` is translated to `.*`, which CROSSES `/` — so `refs/heads/*` also matches
+ * `refs/heads/a/b`. Whether GitHub's fnmatch does the same for `ref_name` is not
+ * checkable offline and only differs on a base ref containing a slash, so it is
+ * left as an open question (#238) rather than guessed at.
+ *
+ * WHAT IS NOT OPEN is the size of the fix, and an earlier version of this comment
+ * got it wrong in a way that would have caused the damage. It said "one character
+ * (`[^/]*`) and a test". It is not:
+ *
+ *   under any fnmatch where `*` stops at `/`, `**` is the form that crosses it —
+ *   that is the entire reason the second form exists. A blanket
+ *   star-to-`[^/]*` replace rewrites BOTH, so the edit that fixes `*` breaks
+ *   `**`, and breaks it in the UNDER-matching direction: a ruleset targeting
+ *   `refs/heads/**` is dropped, taking the `ruleset` line, the "of N required"
+ *   and `explainMergeState`'s honest `required` with it.
+ *
+ * Today `**` works by accident, because `.*.*` and `.*` are the same language.
+ * So: handle `**` before `*` (and `?` is the same class), and test both — do not
+ * make the one-character edit and a passing test for `*` alone.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -239,7 +283,7 @@ export function refPatternMatches(pattern, branch) {
  */
 export function explainMergeState(state, approvals, ruleset) {
   const required = ruleset?.required;
-  const stale = approvals.filter((a) => a.stale && a.sha);
+  const stale = approvals.filter((a) => a.coverage === 'stale');
   switch (state) {
     case 'clean':
       // GitHub's own verdict, plus the thing GitHub does not count as blocking.
@@ -248,31 +292,87 @@ export function explainMergeState(state, approvals, ruleset) {
       // is no longer here". Observed on #228: green check, approval for
       // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
       // this function's own finding-1 defect a third time.
-      if (stale.length === 0) return 'nothing blocking';
-      // (a) `a.sha` as well as `a.stale`. `approvalsFor` sets `stale = commit_id
-      //     !== head`, which is TRUE when `commit_id` is null — so an approval
-      //     whose commit is simply absent was reported as being for a superseded
-      //     one. The printed approval line thirty lines down already said
-      //     "commit_id absent, so whether it covers X is unknown", and this line
-      //     contradicted it on the same screen from the same field.
+      // UNKNOWN reaches this line too. `nothing blocking` is true of GitHub and
+      // answers "does GitHub block" when the reader asked "has anyone read this
+      // code" — which is this file's own header defect, and the reason the
+      // tri-state was worth doing is that the third sentence is now expressible.
       //
-      // (b) Read `dismissStaleOnPush` instead of asserting it. The parenthetical
-      //     hardcoded "is false" and never consulted the value the tool had in
-      //     hand, so it said so against a ruleset that sets it true, and against
-      //     a `/rulesets` read that failed and established nothing.
+      // EVERY BUCKET, not the first non-empty one. The previous version returned
+      // on `stale` and phrased each branch as though its bucket were the whole
+      // set. Both directions were reachable and both were false:
       //
-      // Both are this file's own defect, committed twice in the branch added to
-      // stop a third instance of it. The header's heuristic applies to its
-      // author: a clean answer is the moment to be suspicious.
+      //   stale + current   -> "the approval is STALE", while an approval that
+      //                        DOES cover this head existed — which under
+      //                        `required: 1` is the answer to the question asked
+      //   current + unknown -> "the approval …is UNKNOWN", naming the wrong one
+      //
+      // The JSON was honest in both; only the sentence was not, which is the
+      // narrower form of this file's own header defect. OJ round 2 on #235.
+      //
+      // The gate answers MAY I merge. It does not answer SHOULD I.
+      const unknown = approvals.filter((a) => a.coverage === 'unknown');
+      // COUNTED, not inferred by subtraction. `current` produces "N DOES cover
+      // this head" — the one assertion in this message a reader acts on by
+      // merging — and deriving it from the absence of the other two meant any
+      // coverage value that was neither counted as covering. Only reachable
+      // through a hand-built caller today, but it is the strongest claim here
+      // and it should not rest on a subtraction.
+      const current = approvals.filter((a) => a.coverage === 'current').length;
+      if (stale.length === 0 && unknown.length === 0) return 'nothing blocking';
+
+      // The dismissal clause READS `dismissStaleOnPush` rather than asserting it:
+      // it hardcoded "is false" and said so against a ruleset that set it true and
+      // against a read that established nothing. Only shown when something is
+      // stale, since it is the setting that lets a stale approval keep counting.
+      // `it` / `them` follows the count for the same reason the footnote's does:
+      // the headline three words earlier says `2 STALE`, and a singular pronoun
+      // under it reads as though one of the two were the relevant one. OJ named
+      // the footnote at :791; this is the same sentence defect at a site it did
+      // not name, and fixing one and not the other is how the next round finds it.
+      const them = stale.length === 1 ? 'it' : 'them';
       const dismissal =
-        ruleset?.dismissStaleOnPush === false
-          ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
-          : ruleset?.dismissStaleOnPush === true
-            ? ' — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts it'
-            : ' (whether stale reviews are dismissed could not be read)';
+        stale.length === 0
+          ? ''
+          : ruleset?.dismissStaleOnPush === false
+            ? ` (dismiss_stale_reviews_on_push is false, so GitHub still counts ${them})`
+            : ruleset?.dismissStaleOnPush === true
+              ? ` — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts ${them}`
+              : ' (whether stale reviews are dismissed could not be read)';
+
+      const said = [];
+      if (stale.length > 0) {
+        said.push(
+          `${stale.length} STALE, for a commit no longer at the head`,
+        );
+      }
+      if (unknown.length > 0) {
+        said.push(`${unknown.length} with no commit_id, so coverage is UNKNOWN`);
+      }
       return (
-        `nothing GitHub blocks on — but ${stale.length === 1 ? 'the approval is' : `${stale.length} approvals are`} ` +
-        `STALE, for a commit no longer at the head. Merging now merges code no review has read${dismissal}`
+        `nothing GitHub blocks on — but of ${approvals.length} approval(s): ` +
+        `${said.join(', and ')}. ` +
+        (current > 0
+          ? `${current} DOES cover this head`
+          : // THE CONSEQUENCE, not just the fact. This clause was dropped in the
+            // bucket rewrite along with the assertion that pinned it — and it is
+            // this tool's whole subject: the gate answers MAY I merge, not
+            // SHOULD I. It belongs only here, where nothing is known to cover
+            // the head; in the `N DOES cover` case the old code warned wrongly.
+            //
+            // AND IT SPLITS ON UNKNOWN, which is #235 round 4's finding against
+            // the restored clause. `no review has read` is a claim about the
+            // world; with an UNKNOWN approval in hand, only a claim about
+            // KNOWLEDGE is available. An approval with an absent `commit_id` may
+            // have read exactly this head — that is the entire content of
+            // UNKNOWN, and the reason three rounds went into stopping this tool
+            // collapsing it into STALE. Saying it anyway, on the line a reader
+            // acts on, would collapse it again in the last clause of the same
+            // sentence.
+            (unknown.length > 0
+              ? 'None is KNOWN to cover this head and the UNKNOWN one(s) may or may not, ' +
+                'so whether this code has been reviewed cannot be settled from here'
+              : 'None covers this head, so merging now merges code no review has read')) +
+        dismissal
       );
     case 'dirty':
       return 'merge conflicts';
@@ -615,6 +715,7 @@ export function main() {
     ruleset = { name: '(unreadable)', required: null, dismissStaleOnPush: null, bypass: null };
   }
 
+  const why = explainMergeState(pr.mergeable_state, approvals, ruleset);
   const report = {
     repo,
     number: Number(number),
@@ -628,8 +729,12 @@ export function main() {
     merge: {
       mergeable: pr.mergeable,
       mergeable_state: pr.mergeable_state,
-      why: explainMergeState(pr.mergeable_state, approvals, ruleset),
-      staleApprovals: approvals.filter((a) => a.stale && a.sha).length,
+      why,
+      staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
+      // Sibling of the above, and added for the same reason: without it a scripted
+      // consumer reading `staleApprovals: 0` gets the unannotated adjacent field —
+      // 0 stale is not the same as 0 unread.
+      unknownCoverageApprovals: approvals.filter((a) => a.coverage === 'unknown').length,
     },
     approvals,
     ruleset,
@@ -669,7 +774,6 @@ export function main() {
     say(`review saw this code?`, `${verdictText}\n${' '.repeat(33)}round ${latest.round} read ${latest.sha}`);
   }
 
-  const why = explainMergeState(pr.mergeable_state, approvals, ruleset);
   say('can it merge?', `${pr.mergeable_state} — ${why}`);
   say('', `(mergeable: ${pr.mergeable} — only says git can combine the trees; not the question)`);
 
@@ -680,16 +784,26 @@ export function main() {
       say(
         'approval',
         `${a.by} at ${a.at} — ${
-          !a.sha
+          a.coverage === 'unknown'
             ? `commit_id absent, so whether it covers ${head.slice(0, 8)} is unknown`
-            : a.stale
+            : a.coverage === 'stale'
               ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}`
               : 'for this exact head'
         }`,
       );
     }
-    if (approvals.some((a) => a.stale) && ruleset?.dismissStaleOnPush === false) {
-      say('', 'dismiss_stale_reviews_on_push is FALSE — GitHub still counts the stale one');
+    const staleCount = approvals.filter((a) => a.coverage === 'stale').length;
+    if (staleCount > 0 && ruleset?.dismissStaleOnPush === false) {
+      // COUNTED, not "the stale one". The headline four lines above says
+      // `2 STALE` for the same input, and a singular footnote under it reads as
+      // though one of the two were somehow the relevant one. It survived two
+      // rounds because the README sample happens to have exactly one approval.
+      say(
+        '',
+        `dismiss_stale_reviews_on_push is FALSE — GitHub still counts ${
+          staleCount === 1 ? 'the stale one' : `all ${staleCount} stale ones`
+        }`,
+      );
     }
   }
 

@@ -172,9 +172,9 @@ test('an approval is flagged stale when the branch has moved under it', () => {
   ];
   const got = approvalsFor(reviews, 'new22222');
   assert.equal(got.length, 1, 'only APPROVED counts as an approval');
-  assert.equal(got[0].stale, true);
+  assert.equal(got[0].coverage, 'stale');
 
-  assert.equal(approvalsFor(reviews, 'old11111')[0].stale, false);
+  assert.equal(approvalsFor(reviews, 'old11111')[0].coverage, 'current');
 });
 
 // ── OJ round 1 on #218: the misreports were all in the untested part ────────
@@ -250,7 +250,7 @@ test('approvals are counted per reviewer, from their latest review', () => {
     'bbb',
   );
   assert.equal(twice.length, 1, 're-approving after a push is one approval, not two');
-  assert.equal(twice[0].stale, false, 'and it is the latest one that counts');
+  assert.equal(twice[0].coverage, 'current', 'and it is the latest one that counts');
 
   // A COMMENTED review does not retract an approval, so it must not supersede.
   const commented = approvalsFor(
@@ -281,7 +281,7 @@ test('`blocked` is only blamed on approvals when approvals are actually short', 
   // count is SATISFIED and the tool used to print "needs 1, has 1" as the
   // explanation — pointing at the met condition and away from the flagged one.
   const ruleset = { name: 'OJ1', required: 1, dismissStaleOnPush: false, bypass: 0 };
-  const one = [{ by: 'nick', at: 't', sha: 'x', stale: false }];
+  const one = [{ by: 'nick', at: 't', sha: 'x', coverage: 'current' }];
 
   assert.match(explainMergeState('blocked', [], ruleset), /needs 1 approval\(s\), has 0/);
 
@@ -292,7 +292,7 @@ test('`blocked` is only blamed on approvals when approvals are actually short', 
 
   // And more approvals than required is the same case, not a different one.
   assert.match(
-    explainMergeState('blocked', [...one, { by: 'b', at: 't', sha: 'x', stale: false }], ruleset),
+    explainMergeState('blocked', [...one, { by: 'b', at: 't', sha: 'x', coverage: 'current' }], ruleset),
     /NOT the approval count \(2 of 1\)/,
   );
 
@@ -326,15 +326,109 @@ test('a stale approval is named on the "can it merge" line, not only beside the 
   // false. "nothing blocking" is GitHub's truth and the wrong thing to tell a
   // reader deciding whether to press merge — which is this function's own
   // finding-1 defect a third time, so it says both.
-  const fresh = [{ by: 'oj', at: 't', sha: 'head1234', stale: false }];
-  const stale = [{ by: 'oj', at: 't', sha: 'old12345', stale: true }];
+  const fresh = [{ by: 'oj', at: 't', sha: 'head1234', coverage: 'current' }];
+  const stale = [{ by: 'oj', at: 't', sha: 'old12345', coverage: 'stale' }];
 
   assert.equal(explainMergeState('clean', fresh, { required: 1 }), 'nothing blocking');
 
   const said = explainMergeState('clean', stale, { required: 1 });
   assert.match(said, /STALE/);
-  assert.match(said, /merges code no review has read/);
   assert.doesNotMatch(said, /^nothing blocking$/);
+
+  // EVERY BUCKET, not the first non-empty one. Naming one bucket as though it
+  // were the whole set was false in both directions and the JSON was honest
+  // while the sentence was not (OJ round 2 on #235):
+  const mixed = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'head1234', coverage: 'current' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(mixed, /1 STALE/);
+  assert.match(mixed, /1 DOES cover this head/, 'a covering approval must be named when one exists');
+
+  const both = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: null, coverage: 'unknown' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(both, /1 STALE/);
+  assert.match(both, /1 with no commit_id/, 'the unknown one must not go unmentioned');
+  // AND THE CONSEQUENCE, which the bucket rewrite dropped along with the
+  // assertion that pinned it. The all-stale case is the one that started #218
+  // and the one that got merged past; a statement of fact is not what a reader
+  // needs there.
+  //
+  // ROUND 4: but the consequence SPLITS ON UNKNOWN, and the first restored
+  // version did not. `no review has read` is a claim about the world, and an
+  // approval with an absent commit_id may have read exactly this head — that is
+  // the whole content of UNKNOWN and the thing this branch exists to stop the
+  // tool collapsing into STALE. With one in hand only a claim about KNOWLEDGE
+  // is available, so that is what it says.
+  assert.match(both, /None is KNOWN to cover this head/);
+  assert.match(both, /cannot be settled from here/);
+  assert.doesNotMatch(
+    both,
+    /no review has read/i,
+    'an UNKNOWN approval may have read this head; asserting otherwise is the collapse this branch removes',
+  );
+
+  // Unknown ALONE — the same claim with nothing stale to lend it cover.
+  const unknownOnly = explainMergeState(
+    'clean',
+    [{ by: 'b', at: 't', sha: null, coverage: 'unknown' }],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(unknownOnly, /1 with no commit_id/);
+  assert.doesNotMatch(unknownOnly, /no review has read/i);
+
+  // Stale ALONE is the state where the strong claim is TRUE and must survive:
+  // every approval names a commit, and none of them names this one.
+  const staleOnly = explainMergeState(
+    'clean',
+    [{ by: 'a', at: 't', sha: 'old12345', coverage: 'stale' }],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(staleOnly, /merging now merges code no review has read/i);
+  assert.match(staleOnly, /still counts it\)/, 'one stale approval is "it"');
+
+  // PLURAL, pinned. The headline says `2 STALE` three words earlier, and a
+  // singular pronoun under it reads as though one of the two were the relevant
+  // one. Round 4 named the same defect in the footnote; it was in this sentence
+  // too, and an unpinned fix is one somebody drops again.
+  const twoStale = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old11111', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'old22222', coverage: 'stale' },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.match(twoStale, /2 STALE/);
+  assert.match(twoStale, /still counts them\)/, 'two stale approvals are "them"');
+
+  // It must NOT appear when something does cover the head — the old code warned
+  // wrongly there, which is why the clause belongs in one branch and not the
+  // sentence.
+  assert.doesNotMatch(mixed, /merges code no review has read/i);
+
+  // `current` is COUNTED, not inferred by subtraction: an unrecognised coverage
+  // value must not be reported as covering the head, since that is the one claim
+  // a reader acts on by merging.
+  const odd = explainMergeState(
+    'clean',
+    [
+      { by: 'a', at: 't', sha: 'old12345', coverage: 'stale' },
+      { by: 'b', at: 't', sha: 'x', coverage: undefined },
+    ],
+    { required: 1, dismissStaleOnPush: false },
+  );
+  assert.doesNotMatch(odd, /DOES cover this head/);
 });
 
 test('ruleset ref patterns match the way GitHub writes them', () => {
@@ -363,16 +457,21 @@ test('the stale-approval warning does not assert what it has not established', (
   //     commit is merely ABSENT as being for a superseded one — while the printed
   //     approval line said "commit_id absent … unknown" on the same screen.
   const OJ1 = { name: 'OJ1', required: 1, dismissStaleOnPush: false, bypass: 0 };
-  assert.equal(
-    explainMergeState('clean', [{ by: 'n', at: 't', sha: null, stale: true }], OJ1),
-    'nothing blocking',
-    'an absent commit_id is unknown, not stale',
-  );
+  const absent = explainMergeState('clean', [{ by: 'n', at: 't', sha: null, coverage: 'unknown' }], OJ1);
+  assert.doesNotMatch(absent, /STALE/, 'an absent commit_id is unknown, not stale');
+  // The dismissal footnote is about a STALE approval keeping its count, so it
+  // must not appear when nothing is stale.
+  assert.doesNotMatch(absent, /dismiss_stale_reviews_on_push/);
+  // …and `unknown` must not be silently rounded to `nothing blocking` either. That
+  // sentence is true of GitHub and answers "does GitHub block" when the reader
+  // asked "has anyone read this code" — this file's own header defect. The
+  // tri-state exists so the third sentence is expressible; saying it is the point.
+  assert.match(absent, /coverage is UNKNOWN/);
 
   // (b) The parenthetical hardcoded "is false" and never read the value the tool
   //     had in hand — so it said so against a ruleset that sets it TRUE, and
   //     against a read that established nothing at all.
-  const stale = [{ by: 'n', at: 't', sha: 'old12345', stale: true }];
+  const stale = [{ by: 'n', at: 't', sha: 'old12345', coverage: 'stale' }];
   assert.match(explainMergeState('clean', stale, OJ1), /is false, so GitHub still counts it/);
   assert.match(
     explainMergeState('clean', stale, { ...OJ1, dismissStaleOnPush: true }),
@@ -404,4 +503,50 @@ test('a ruleset read successfully with no approval rule means zero, not unknown'
 
   // And the genuinely unknown case still says so.
   assert.match(explainMergeState('blocked', [], { name: '(unreadable)', required: null }), /could not be read/);
+});
+
+test('coverage is three states, because commit_id can be absent', () => {
+  // OJ round 4 on #218, and the reason it is a refactor rather than two more
+  // `&& a.sha` guards: `stale: commit_id !== head` was TRUE when commit_id was
+  // null, so every reader had to remember the extra clause. Round 3 fixed two
+  // sites; round 4 found two more that had not got it, and the tool printed
+  // three consecutive lines taking three positions on whether a stale approval
+  // existed. A third and fourth guard would have left the fifth.
+  //
+  // The field answered "does commit_id differ from head" while every reader was
+  // asking "is this approval for code that has been superseded". Different
+  // questions — which is this tool's whole subject.
+  const [current] = approvalsFor(
+    [{ state: 'APPROVED', user: { login: 'n' }, submitted_at: 't', commit_id: 'head1234' }],
+    'head1234',
+  );
+  const [stale] = approvalsFor(
+    [{ state: 'APPROVED', user: { login: 'n' }, submitted_at: 't', commit_id: 'old12345' }],
+    'head1234',
+  );
+  const [unknown] = approvalsFor(
+    [{ state: 'APPROVED', user: { login: 'n' }, submitted_at: 't', commit_id: null }],
+    'head1234',
+  );
+  assert.equal(current.coverage, 'current');
+  assert.equal(stale.coverage, 'stale');
+  assert.equal(unknown.coverage, 'unknown', 'absent is not the same as superseded');
+
+  // The boolean is gone, so a reader cannot accidentally get the old semantics.
+  assert.equal('stale' in unknown, false);
+
+  // The headline must not call an absent commit superseded — nor round it to
+  // "nothing blocking", which answers a different question from the one asked.
+  const said = explainMergeState('clean', [unknown], { name: 'OJ1', required: 1, dismissStaleOnPush: false });
+  assert.doesNotMatch(said, /STALE/);
+  assert.match(said, /coverage is UNKNOWN/);
+
+  // An empty-string commit_id is not a sha. `== null` treated it as one and
+  // printed `STALE: approved , head is …` with a hole in it; the readers this
+  // replaced used falsy tests, so `""` belonged in the unknown bucket.
+  const [empty] = approvalsFor(
+    [{ state: 'APPROVED', user: { login: 'n' }, submitted_at: 't', commit_id: '' }],
+    'head1234',
+  );
+  assert.equal(empty.coverage, 'unknown');
 });
