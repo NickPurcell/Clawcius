@@ -197,7 +197,25 @@ export function approvalsFor(reviews, head) {
   }
   return [...latest.values()]
     .filter((r) => r.state === 'APPROVED')
-    .map((r) => ({ by: r.user?.login, at: r.submitted_at, sha: r.commit_id, stale: r.commit_id !== head }));
+    .map((r) => ({
+      by: r.user?.login,
+      at: r.submitted_at,
+      sha: r.commit_id,
+      // THREE STATES, because the datum can be absent and a boolean cannot say so.
+      //
+      // `stale: commit_id !== head` was TRUE when `commit_id` was null, so every
+      // reader had to remember `&& a.sha`. Round 3 of #218 added that at two
+      // sites and round 4 found two more that had not got it — the tool printed
+      // three consecutive lines taking three positions on whether a stale
+      // approval existed. A third and fourth guard would have left the fifth.
+      //
+      // The field answered "does commit_id differ from head" while every reader
+      // was asking "is this approval for code that has been superseded". Those
+      // are different questions, which is this tool's entire subject. It answers
+      // the second now, and `unknown` is a value rather than something each
+      // caller reconstructs from a second field.
+      coverage: r.commit_id == null ? 'unknown' : r.commit_id === head ? 'current' : 'stale',
+    }));
 }
 
 /**
@@ -206,6 +224,13 @@ export function approvalsFor(reviews, head) {
  * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
  * FULL ref, so `refs/heads/*` is the ordinary way to say "every branch" and a
  * literal comparison misses it entirely.
+ *
+ * `*` is translated to `.*`, which CROSSES `/` — so `refs/heads/*` also matches
+ * `refs/heads/a/b`. Whether GitHub's fnmatch does the same for `ref_name` is not
+ * something I can check offline, and it only differs on a base ref containing a
+ * slash. Recorded rather than guessed at: if it turns out GitHub stops at the
+ * separator, this is one character (`[^/]*`) and a test. OJ round 4 on #218
+ * raised it as an open question and I am leaving it as one.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -239,7 +264,7 @@ export function refPatternMatches(pattern, branch) {
  */
 export function explainMergeState(state, approvals, ruleset) {
   const required = ruleset?.required;
-  const stale = approvals.filter((a) => a.stale && a.sha);
+  const stale = approvals.filter((a) => a.coverage === 'stale');
   switch (state) {
     case 'clean':
       // GitHub's own verdict, plus the thing GitHub does not count as blocking.
@@ -249,21 +274,13 @@ export function explainMergeState(state, approvals, ruleset) {
       // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
       // this function's own finding-1 defect a third time.
       if (stale.length === 0) return 'nothing blocking';
-      // (a) `a.sha` as well as `a.stale`. `approvalsFor` sets `stale = commit_id
-      //     !== head`, which is TRUE when `commit_id` is null — so an approval
-      //     whose commit is simply absent was reported as being for a superseded
-      //     one. The printed approval line thirty lines down already said
-      //     "commit_id absent, so whether it covers X is unknown", and this line
-      //     contradicted it on the same screen from the same field.
+      // Counts `coverage === 'stale'`, so an approval whose commit is merely
+      // ABSENT is not reported as superseded — a distinction that used to need
+      // `&& a.sha` at every call site, and which two of them did not have.
       //
-      // (b) Read `dismissStaleOnPush` instead of asserting it. The parenthetical
-      //     hardcoded "is false" and never consulted the value the tool had in
-      //     hand, so it said so against a ruleset that sets it true, and against
-      //     a `/rulesets` read that failed and established nothing.
-      //
-      // Both are this file's own defect, committed twice in the branch added to
-      // stop a third instance of it. The header's heuristic applies to its
-      // author: a clean answer is the moment to be suspicious.
+      // The dismissal clause READS `dismissStaleOnPush` rather than asserting it:
+      // it hardcoded "is false" and said so against a ruleset that set it true and
+      // against a read that established nothing.
       const dismissal =
         ruleset?.dismissStaleOnPush === false
           ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
@@ -615,6 +632,7 @@ export function main() {
     ruleset = { name: '(unreadable)', required: null, dismissStaleOnPush: null, bypass: null };
   }
 
+  const why = explainMergeState(pr.mergeable_state, approvals, ruleset);
   const report = {
     repo,
     number: Number(number),
@@ -628,8 +646,8 @@ export function main() {
     merge: {
       mergeable: pr.mergeable,
       mergeable_state: pr.mergeable_state,
-      why: explainMergeState(pr.mergeable_state, approvals, ruleset),
-      staleApprovals: approvals.filter((a) => a.stale && a.sha).length,
+      why,
+      staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
     },
     approvals,
     ruleset,
@@ -669,7 +687,6 @@ export function main() {
     say(`review saw this code?`, `${verdictText}\n${' '.repeat(33)}round ${latest.round} read ${latest.sha}`);
   }
 
-  const why = explainMergeState(pr.mergeable_state, approvals, ruleset);
   say('can it merge?', `${pr.mergeable_state} — ${why}`);
   say('', `(mergeable: ${pr.mergeable} — only says git can combine the trees; not the question)`);
 
@@ -680,15 +697,15 @@ export function main() {
       say(
         'approval',
         `${a.by} at ${a.at} — ${
-          !a.sha
+          a.coverage === 'unknown'
             ? `commit_id absent, so whether it covers ${head.slice(0, 8)} is unknown`
-            : a.stale
+            : a.coverage === 'stale'
               ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}`
               : 'for this exact head'
         }`,
       );
     }
-    if (approvals.some((a) => a.stale) && ruleset?.dismissStaleOnPush === false) {
+    if (approvals.some((a) => a.coverage === 'stale') && ruleset?.dismissStaleOnPush === false) {
       say('', 'dismiss_stale_reviews_on_push is FALSE — GitHub still counts the stale one');
     }
   }
