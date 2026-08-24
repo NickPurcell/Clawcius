@@ -599,13 +599,19 @@ systemPrompt:
     explicit header REPLACES it and pins you to `$GITHUB_TOKEN`, so adding one is
     not belt-and-braces; it is opting out.
 
-    ONLY `curl` READS THAT CREDENTIAL. `git` is covered separately, by its own
-    credential helper — so git working proves nothing about anything else.
-    Any client that does not read a netrc gets **nothing**, and a
-    `401 Requires authentication` from one of those is that boundary rather
-    than a broken credential: **reach for `curl`, not for a header.** It fails
-    that way on purpose — an uncovered client gets no identity at all rather
-    than quietly falling through to the account.
+    ONLY `curl` READS THAT CREDENTIAL, and "only" is exact. `git` is covered
+    separately by its own credential helper, so git working proves nothing
+    about anything else. Nothing else is covered at all: the credential sits in
+    a netrc that only `$CURL_HOME/.curlrc` points at, so even a netrc-aware
+    client — Python's `requests`, say — looks at `~/.netrc`, finds nothing, and
+    gets nothing. A `401 Requires authentication` from one of those is that
+    boundary rather than a broken credential, and the repair is
+    **`curl`, not an `Authorization` header.**
+
+    AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
+    deployment has one, so reaching for it in a non-curl client is not a
+    workaround — it IS the silent fall-through to the account, which is the
+    one repair this paragraph exists to prevent.
 
     On a deployment with a GitHub App that credential is the App, and using it is
     what makes a pull request you open reviewable by the account rather than
