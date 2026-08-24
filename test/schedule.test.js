@@ -1139,3 +1139,21 @@ test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async (
       'system prompt claims they agree',
   );
 });
+
+test('the Pacific parenthetical is omitted when it would repeat the line', async () => {
+  // The property that went wrong, and that nothing asserted on either time: last
+  // round the collapse survived because no test read the parenthesised half; the
+  // FIX had the same gap under it until this existed.
+  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  const alsoIn = (at, tz) => {
+    const here = zonedStamp(at, DEFAULT_TIMEZONE);
+    return zonedStamp(at, tz) === here ? '' : ` (${here})`;
+  };
+  const at = Date.parse('2026-08-24T16:00:00Z');
+
+  // A schedule in the reader's own zone: one rendering, no echo.
+  assert.equal(alsoIn(at, DEFAULT_TIMEZONE), '');
+  // Any other zone: two genuinely different facts, so both are shown.
+  assert.equal(alsoIn(at, 'Europe/London'), ` (${zonedStamp(at, DEFAULT_TIMEZONE)})`);
+  assert.notEqual(alsoIn(at, 'UTC'), '');
+});

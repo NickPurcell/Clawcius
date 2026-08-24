@@ -431,9 +431,16 @@ export function renderArmed(
       // `isTimezone` because a row's spec is only guaranteed to be an object —
       // see `summarise`. An unreadable zone must cost this line, not the listing.
       const zone = typeof spec.timezone === 'string' && isTimezone(spec.timezone) ? spec.timezone : '';
-      lines.push(
-        `      ${zone ? `${zonedStamp(condition.dueAt, zone)} local · ` : ''}${history(condition)}`,
-      );
+      // The same suppression `alsoIn` does, at the one site shaped as two lines
+      // rather than a parenthetical. In the default zone this rendered the line
+      // above it verbatim and then labelled it `local`, which reads as a claim
+      // that the first line was something else. And the default zone is the
+      // COMMON case, so this is where a reader met the duplication most often.
+      const localPrefix =
+        zone && zonedStamp(condition.dueAt, zone) !== stamp(condition.dueAt)
+          ? `${zonedStamp(condition.dueAt, zone)} local · `
+          : '';
+      lines.push(`      ${localPrefix}${history(condition)}`);
     }
   }
   const overflow = active.slice(MAX_LISTED_ACTIVE);
