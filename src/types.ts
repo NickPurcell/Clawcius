@@ -55,6 +55,9 @@ export type WakeContext =
       count: number;
     };
 
+/** Why a refused turn has no retry coming. See `TurnSummary.noRetryReason`. */
+export type NoRetryReason = 'not-retryable' | 'exhausted' | 'abandoned';
+
 export type TurnSummary = {
   /**
    * Set when the turn ended because the API refused it — a revoked OAuth
@@ -76,6 +79,33 @@ export type TurnSummary = {
   retryScheduled?: boolean;
   /** 1-based attempt number when `retryScheduled`, else 0. */
   retryAttempt?: number;
+  /**
+   * Why no retry was queued, when the API refused the turn and nothing is
+   * coming. Null when the turn succeeded or when a retry IS queued.
+   *
+   * THREE STATES, AND THEY WANT OPPOSITE THINGS FROM A HUMAN. Before this
+   * existed the caller had one bit — `retryScheduled` — and said the same
+   * sentence for all of them: "retries are exhausted or would not help, so this
+   * needs a look at the host". That covers every case and therefore tells the
+   * reader none of them, and for a 529 it is false twice: the fault is
+   * Anthropic's, and waiting is exactly what helps.
+   *
+   *   not-retryable  a standing condition — `billing_error`, `invalid_request`.
+   *                  A retry reproduces the same answer. THIS is the one that
+   *                  genuinely needs a look at the host.
+   *   exhausted      a transient kind that used every rung of its ladder. The
+   *                  fault is upstream and time is the fix.
+   *   abandoned      rungs were left, but the session was closed or its stored
+   *                  context cleared out from under the retry — `!reset`,
+   *                  `!stop`, or `onError` dropping a session whose child
+   *                  process died. NOT an outage, and not the user's fault to
+   *                  diagnose: something on this side threw the message away.
+   *
+   * Computed where the distinction is legible — beside the `willRetry`
+   * expression that makes it — rather than re-derived by a caller from
+   * `apiErrorKind`, which cannot see `#closed` or `#lastContext` at all.
+   */
+  noRetryReason?: NoRetryReason | null;
   isError: boolean;
   costUsd: number;
   numTurns: number;

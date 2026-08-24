@@ -224,6 +224,99 @@ export function mailWakeEvents(opts: {
   };
 }
 
+/**
+ * The journal's half-line reason for no retry.
+ *
+ * `not retrying — this one does not clear on its own` was printed for EVERY
+ * refusal with no retry queued, and for a transient kind it is false by all
+ * three of the exits from `willRetry` (`agent.ts`): the ladder ran out, the
+ * session closed, or its stored context was cleared. A 529 clears on its own
+ * by definition — that is what puts it in `TRANSIENT_ERRORS` at all.
+ *
+ * Kept terse and separate from `outageMessage`: this line is read by whoever
+ * is looking at the host, who wants the mechanism; that one is read by
+ * somebody in Discord, who wants to know whether to wait.
+ */
+export function noRetryJournalReason(summary: TurnSummary): string {
+  switch (summary.noRetryReason) {
+    case 'exhausted':
+      return 'transient, but every retry was spent';
+    case 'abandoned':
+      return 'transient with retries left — the session was closed or cleared under it';
+    default:
+      return 'this one does not clear on its own';
+  }
+}
+
+/**
+ * What to tell the human when a turn was refused and nothing is coming.
+ *
+ * THREE FACTS, IN THIS ORDER: whose fault it is, whether they were heard, and
+ * what to do. The message this replaced carried none of them reliably —
+ *
+ *     ⚠️ I could not run that turn — the API refused it (`server_error`).
+ *        Retries are exhausted or would not help, so this needs a look at the host.
+ *
+ * — which the operator met twice on 2026-08-23 at 23:07 and 23:10 PDT against
+ * Anthropic 529s. Three things wrong with it, and they compound:
+ *
+ *   1. `this needs a look at the host` is FALSE for a 529. It sends a human to
+ *      our machine when the fault is entirely upstream, at the moment they are
+ *      least able to check.
+ *   2. `server_error` is the SDK's token, not a fact. `summary.apiError`
+ *      already holds the sentence the API sent — "529 Overloaded … try again
+ *      in a moment" — and this threw it away in favour of the jargon.
+ *   3. `exhausted OR would not help` covers both cases and so states neither,
+ *      and they want opposite actions from the reader: one means wait, the
+ *      other means go and fix something.
+ *
+ * `summary.noRetryReason` now says which of three states this is, decided in
+ * `AgentSession` where `#closed` and `#lastContext` are visible. The host
+ * sentence survives — in the one branch where it is true. It was never a wrong
+ * sentence, only a wrong unconditional one.
+ */
+export function outageMessage(summary: TurnSummary): string {
+  const heard = '**Your message did not reach me.**';
+  const detail = (summary.apiError ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+
+  switch (summary.noRetryReason) {
+    case 'exhausted':
+      // Upstream, and time is the fix. Named as Anthropic's rather than "the
+      // API", because "the API refused it" reads as ours to a human staring at
+      // our bot. No promise to retry: nothing here does yet, and a promise the
+      // code does not keep would be a fourth false statement in the message
+      // that exists to remove three.
+      return (
+        `⚠️ Anthropic's API refused that turn — their side, not ours` +
+        (detail ? `: ${detail}` : '.') +
+        `\n${heard} Try again in a few minutes.`
+      );
+    case 'abandoned':
+      // Rungs were left on the ladder and something on THIS side took them
+      // away: `!reset`, `!stop`, or a session dropped because its child
+      // process died. Saying "outage" here would be a false alarm, and saying
+      // "needs a look at the host" would send them after a fault that is not
+      // there.
+      return (
+        `⚠️ That turn hit a temporary API error and I was retrying it, but the ` +
+        `session was cleared before the retry ran.\n${heard} Send it again and ` +
+        `it will go through.`
+      );
+    default:
+      // `not-retryable`, and the only branch where the original sentence was
+      // ever true: a standing condition a retry reproduces exactly. The
+      // machine-readable kind stays HERE and only here, because this is the
+      // one case where a human needs the token to go and look it up.
+      return (
+        `⚠️ I could not run that turn — the API refused it ` +
+        `(\`${summary.apiErrorKind}\`), and that is a standing condition a retry ` +
+        `cannot change` +
+        (detail ? `: ${detail}` : '.') +
+        `\n${heard} This one needs a look at the host.`
+      );
+  }
+}
+
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   const { config, client, sessions, registry, mail, mailWaker } = deps;
   const { armedStore, github, windows, alwaysOnChannels } = deps;
@@ -492,10 +585,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     try {
       const channel = await client.channels.fetch(channelId);
       if (!channel || !channel.isTextBased() || !('send' in channel)) return;
-      await channel.send(
-        `⚠️ I could not run that turn — the API refused it (\`${summary.apiErrorKind}\`). ` +
-          `Retries are exhausted or would not help, so this needs a look at the host.`,
-      );
+      await channel.send(outageMessage(summary));
     } catch (error) {
       // Best effort. If Discord is also unreachable the journal is the record,
       // and throwing out of a completion handler would take the process with it.
@@ -556,7 +646,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
                 `  ${summary.apiError.replace(/\s+/g, ' ').slice(0, 300)}\n` +
                 (summary.retryScheduled
                   ? `  retry ${summary.retryAttempt} queued\n`
-                  : `  not retrying — this one does not clear on its own\n`),
+                  : `  not retrying — ${noRetryJournalReason(summary)}\n`),
             );
             // A respawn is about to be attempted for auth failures, so that path
             // owns the announcement. Saying "this needs a look at the host" here

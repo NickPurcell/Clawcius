@@ -30,7 +30,7 @@ import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
 import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
-import type { TurnSummary, WakeContext } from './types.js';
+import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
 /**
@@ -98,6 +98,52 @@ export function retryPlanFor(errorKind: string): RetryPlan | null {
     return { kind: 'transient', delays: TRANSIENT_RETRY_DELAYS_MS };
   }
   return null;
+}
+
+/**
+ * Whether to retry a refused turn, and if not, why not.
+ *
+ * PURE, AND EXPORTED, BECAUSE THE ANSWER IS USER-FACING PROSE. `daemon.ts` turns
+ * `noRetryReason` into the sentence a human reads in Discord, so a wrong
+ * classification does not crash — it tells somebody confidently to go and look
+ * at a machine that is fine, or to wait for a credential that will never work.
+ * Inside the session this was three conditions spread across an expression and a
+ * ternary, reachable only by constructing an `AgentSession`; a mutation making
+ * it answer `not-retryable` for everything passed the whole suite.
+ *
+ * The three answers want opposite things from the reader:
+ *
+ *   not-retryable  a standing condition. `retryPlanFor` has no plan for it, so
+ *                  a retry reproduces the same answer. Go and look.
+ *   exhausted      a transient kind that used every rung of its ladder. Wait.
+ *   abandoned      rungs were LEFT, and the session was closed or its stored
+ *                  context cleared out from under the retry. Nothing is broken
+ *                  and nothing is coming; send it again.
+ *
+ * `abandoned` is the one that had no name before. Two of the nine refusals in
+ * the 2026-08-24 05:45–06:10Z window took that exit, and both were reported as
+ * "this one does not clear on its own" — false about a 529 twice over.
+ */
+export function classifyRetry(state: {
+  /** The SDK's error kind, or null when the turn did not hit an API error. */
+  errorKind: string | null;
+  /** Whether the turn failed at all. A success has no reason and no retry. */
+  failed: boolean;
+  /** Rungs already used on THIS context. Reset by `wake()`, not by a retry. */
+  retriesSpent: number;
+  /** A closed session has no queue to push to. */
+  closed: boolean;
+  /** A wake with no stored context has nothing to re-send. */
+  hasContext: boolean;
+}): { willRetry: boolean; noRetryReason: NoRetryReason | null } {
+  const plan = state.errorKind !== null ? retryPlanFor(state.errorKind) : null;
+  const delay = plan?.delays[state.retriesSpent];
+  const willRetry = delay !== undefined && !state.closed && state.hasContext;
+
+  if (!state.failed || willRetry) return { willRetry, noRetryReason: null };
+  if (plan === null) return { willRetry, noRetryReason: 'not-retryable' };
+  if (delay === undefined) return { willRetry, noRetryReason: 'exhausted' };
+  return { willRetry, noRetryReason: 'abandoned' };
 }
 
 /**
@@ -841,15 +887,18 @@ export class AgentSession {
         //
         // Settling first costs nothing: the sweep then finds a turn whose mail
         // is already accounted for, and still does the job it exists for.
+        const { willRetry, noRetryReason } = classifyRetry({
+          errorKind: this.#apiErrorKindThisTurn,
+          failed: this.#apiErrorThisTurn !== null,
+          retriesSpent: this.#retries,
+          closed: this.#closed,
+          hasContext: this.#lastContext !== null,
+        });
         const plan =
           this.#apiErrorKindThisTurn !== null
             ? retryPlanFor(this.#apiErrorKindThisTurn)
             : null;
         const delay = plan?.delays[this.#retries];
-        // A closed session has no queue to push to, and a wake with no stored
-        // context has nothing to re-send.
-        const willRetry =
-          delay !== undefined && !this.#closed && this.#lastContext !== null;
 
         // SETTLED HERE, at the one place a turn ends, rather than in three
         // callbacks the caller wires. A refusal WITH a retry queued is left
@@ -872,6 +921,7 @@ export class AgentSession {
           apiErrorKind: this.#apiErrorKindThisTurn,
           retryScheduled: willRetry,
           retryAttempt: willRetry ? this.#retries + 1 : 0,
+          noRetryReason,
         });
 
         if (willRetry) {
