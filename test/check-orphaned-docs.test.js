@@ -183,3 +183,99 @@ test('the orphan half still runs when the base comparison has nothing to compare
   assert.doesNotMatch(out, /LOST DOCS/);
   assert.equal(code, 1);
 });
+
+test('a block left at the END of a file, its declaration deleted, is reported', () => {
+  // OJ #256 round 1, finding 1. TypeScript attaches a trailing JSDoc to
+  // `EndOfFileToken`, so before this it looked ATTACHED and passed — and the
+  // `LOST DOCS` half cannot see it either, because the symbol is gone and that
+  // takes the `removed or renamed — a different question` branch.
+  //
+  // A block documenting nothing at the bottom of a file is the same defect as
+  // one in the middle; only the node it happened to land on differed.
+  const dir = repoWith({
+    working: [
+      '/** Header. */',
+      '',
+      'export const before = 1;',
+      '',
+      '/** Doc for a function somebody deleted. */',
+      '',
+    ].join('\n'),
+  });
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.match(out, /ORPHANED\s+src\/a\.ts:5/, `expected the trailing block — got:\n${out}`);
+  assert.equal(code, 1);
+});
+
+test('the first block is excluded only when it is SET OFF like a header', () => {
+  // OJ #256 round 1, finding 2. The rule excluded "the first block"; the header
+  // and the comment both said "a file header". Those differ exactly where it
+  // matters — in a file that opens straight into a documented declaration, the
+  // orphan IS the first block, which is the #241 shape at the top of a NEW
+  // file, and one of the two states this half exists to answer.
+  //
+  // A header is set off by a blank line. An orphan is butted against whatever
+  // stole its declaration. That is the discriminator, and it is the shape
+  // rather than the position.
+  const dir = repoWith({
+    working: [
+      '/** Doc that WAS for TurnSettle and is now orphaned. */',
+      '/** Doc for the newly inserted sdk. */',
+      'export const sdk = 1;',
+      '',
+      'export class TurnSettle {}',
+      '',
+    ].join('\n'),
+  });
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.match(out, /ORPHANED\s+src\/a\.ts:1/, `first-block orphan must be reported — got:\n${out}`);
+  assert.equal(code, 1);
+});
+
+test('a real 86-line-style header, set off by a blank line, is still not an orphan', () => {
+  // The other side of the same rule, and the one that decides whether the fix
+  // above is safe: `armed.ts` opens with a long header followed by a blank line
+  // and then imports. Pinned here so a future tightening of the header test
+  // cannot quietly start flagging every module in `src/`.
+  const dir = repoWith({
+    working: [
+      '/**',
+      ' * A long file header, of the kind every module here opens with.',
+      ' *',
+      ' * Several paragraphs, then a blank line, then the code.',
+      ' */',
+      '',
+      'export const x = 1;',
+      '',
+    ].join('\n'),
+  });
+
+  const { code, out } = run(dir, 'HEAD');
+  assert.doesNotMatch(out, /ORPHANED/, `a set-off header is not an orphan — got:\n${out}`);
+  assert.equal(code, 0);
+});
+
+test('the excerpt carries the block\'s first real line, not the delimiter', () => {
+  // OJ #256 round 1, finding 3. Two of the three historical instances printed
+  // `documents nothing — /**`, an excerpt doing no work in the common case.
+  const dir = repoWith({
+    working: [
+      '/** Header. */',
+      '',
+      '/**',
+      ' * What this block actually says.',
+      ' */',
+      '/** Doc for the type that displaced it. */',
+      'export type T = { x: number };',
+      '',
+      'export function f(): void {}',
+      '',
+    ].join('\n'),
+  });
+
+  const { out } = run(dir, 'HEAD');
+  assert.match(out, /What this block actually says/, `got:\n${out}`);
+  assert.doesNotMatch(out, /documents nothing — \/\*\*\s*$/m, 'excerpt is the bare delimiter');
+});
