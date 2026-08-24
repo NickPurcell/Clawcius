@@ -56,7 +56,11 @@ export type WakeContext =
     };
 
 /** Why a refused turn has no retry coming. See `TurnSummary.noRetryReason`. */
-export type NoRetryReason = 'not-retryable' | 'exhausted' | 'abandoned';
+export type NoRetryReason =
+  | 'not-retryable'
+  | 'exhausted'
+  | 'abandoned'
+  | 'credential-dead';
 
 export type TurnSummary = {
   /**
@@ -100,6 +104,12 @@ export type TurnSummary = {
    *                  `!stop`, or `onError` dropping a session whose child
    *                  process died. NOT an outage, and not the user's fault to
    *                  diagnose: something on this side threw the message away.
+   *   credential-dead  the AUTH ladder is spent. Distinct from `exhausted`,
+   *                  which is a transient that ran out of time — this one is
+   *                  the token being dead, and no amount of waiting fixes it.
+   *                  `AUTH_RETRY_DELAYS_MS` has one rung precisely because "if
+   *                  that fails the credential is genuinely dead and hammering
+   *                  it is pointless".
    *
    * Computed where the distinction is legible — beside the `willRetry`
    * expression that makes it — rather than re-derived by a caller from

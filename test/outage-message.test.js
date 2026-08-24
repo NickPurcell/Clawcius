@@ -225,3 +225,74 @@ test('exhaustion and abandonment are distinguished at the boundary rung', () => 
   assert.equal(classifyRetry(state({ retriesSpent: 2, closed: true })).noRetryReason, 'abandoned');
   assert.equal(classifyRetry(state({ retriesSpent: 2 })).willRetry, true);
 });
+
+test('a spent AUTH ladder is a dead credential, not a transient that ran out of time', () => {
+  // OJ #263 round 1, blocking. `retryPlanFor` returns THREE outcomes — null,
+  // transient, and auth with its single 2s rung — and branching on
+  // `delay === undefined` alone put a dead credential in the transient arm.
+  //
+  // The harm is specific: the operator is told the fault is Anthropic's and to
+  // wait a few minutes, while the host needs a re-login. Both false, and BOTH
+  // WERE TRUE BEFORE this change — the unconditional sentence it replaced is
+  // exactly right for a revoked token. For this one kind the change moved a
+  // true sentence to a false one, in the direction it exists to prevent.
+  const spent = classifyRetry(
+    state({ errorKind: 'authentication_failed', retriesSpent: 1 }),
+  );
+  assert.equal(spent.willRetry, false, 'the auth ladder has one rung');
+  assert.equal(spent.noRetryReason, 'credential-dead');
+
+  const text = outageMessage({
+    apiErrorKind: 'authentication_failed',
+    apiError: 'OAuth token revoked',
+    noRetryReason: 'credential-dead',
+  });
+  assert.match(text, /re-login on the host/, 'the action is specific, not "go and look"');
+  assert.match(text, /did not reach me/);
+  assert.doesNotMatch(text, /Anthropic's API/, 'the fault is ours, not upstream');
+  assert.doesNotMatch(text, /try again in a few minutes/i, 'waiting never fixes a dead token');
+});
+
+test('the auth ladder still retries on its one rung before it is called dead', () => {
+  // Guards the other side: `credential-dead` must not fire on the FIRST auth
+  // failure, which is the one a respawn is about to handle. Announcing then put
+  // the same warning in the channel twice per failure — observed on 2026-08-03
+  // as four identical messages in three seconds.
+  const first = classifyRetry(state({ errorKind: 'authentication_failed', retriesSpent: 0 }));
+  assert.equal(first.willRetry, true);
+  assert.equal(first.noRetryReason, null);
+});
+
+test('classifyRetry returns the delay the session uses, so there is only one copy', () => {
+  // It used to be computed twice — once inside the classifier and once in
+  // `AgentSession` for the `setTimeout`. They agreed because both read the same
+  // fields in the same tick, but the whole argument for extracting this was
+  // that the copy reachable only through `AgentSession` is the one that drifts
+  // unobserved.
+  assert.equal(classifyRetry(state({ retriesSpent: 0 })).delayMs, 5_000);
+  assert.equal(classifyRetry(state({ retriesSpent: 2 })).delayMs, 45_000);
+  assert.equal(classifyRetry(state({ retriesSpent: 3 })).delayMs, undefined);
+  assert.equal(
+    classifyRetry(state({ errorKind: 'authentication_failed', retriesSpent: 0 })).delayMs,
+    2_000,
+    'the auth ladder has its own, shorter rung',
+  );
+});
+
+test('the abandoned branch does not guarantee a resend will work', () => {
+  // OJ #263 round 1, non-blocking, and it is this PR's own standard applied one
+  // branch over: "Send it again and it will go through" is a promise the code
+  // cannot keep. The abandoned state means the API was still erroring when the
+  // ladder was taken away, so a resend seconds later hits the same wall.
+  const text = outageMessage(summary({ noRetryReason: 'abandoned' }));
+  assert.match(text, /Send it again\./, 'the action stands');
+  assert.doesNotMatch(text, /will go through/, 'the guarantee does not');
+});
+
+test('a very long apiError is cut at a word boundary, not mid-word', () => {
+  const long = `Overloaded ${'diagnostic '.repeat(60)}end`;
+  const text = outageMessage(summary({ apiError: long, noRetryReason: 'exhausted' }));
+  assert.match(text, /…/, 'truncation should be visible');
+  assert.doesNotMatch(text, /diagnosti…/, 'must not stop mid-word');
+  assert.match(text, /did not reach me/, 'the rest of the message survives');
+});

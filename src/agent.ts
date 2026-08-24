@@ -135,15 +135,28 @@ export function classifyRetry(state: {
   closed: boolean;
   /** A wake with no stored context has nothing to re-send. */
   hasContext: boolean;
-}): { willRetry: boolean; noRetryReason: NoRetryReason | null } {
+}): { willRetry: boolean; delayMs: number | undefined; noRetryReason: NoRetryReason | null } {
   const plan = state.errorKind !== null ? retryPlanFor(state.errorKind) : null;
   const delay = plan?.delays[state.retriesSpent];
   const willRetry = delay !== undefined && !state.closed && state.hasContext;
 
-  if (!state.failed || willRetry) return { willRetry, noRetryReason: null };
-  if (plan === null) return { willRetry, noRetryReason: 'not-retryable' };
-  if (delay === undefined) return { willRetry, noRetryReason: 'exhausted' };
-  return { willRetry, noRetryReason: 'abandoned' };
+  if (!state.failed || willRetry) return { willRetry, delayMs: delay, noRetryReason: null };
+  if (plan === null) return { willRetry, delayMs: delay, noRetryReason: 'not-retryable' };
+  if (delay === undefined) {
+    // A SPENT AUTH LADDER IS NOT A TRANSIENT THAT RAN OUT OF TIME. Branching on
+    // `delay === undefined` alone put a dead credential in the transient arm,
+    // where the message says the fault is Anthropic's and waiting is the fix.
+    // Both false, and both were TRUE before this change -- the sentence it
+    // replaced, "this needs a look at the host", is exactly right for a revoked
+    // token. For this one kind the enumeration moved a true sentence to a false
+    // one, in the direction this whole change exists to prevent.
+    return {
+      willRetry,
+      delayMs: delay,
+      noRetryReason: plan.kind === 'auth' ? 'credential-dead' : 'exhausted',
+    };
+  }
+  return { willRetry, delayMs: delay, noRetryReason: 'abandoned' };
 }
 
 /**
@@ -887,18 +900,17 @@ export class AgentSession {
         //
         // Settling first costs nothing: the sweep then finds a turn whose mail
         // is already accounted for, and still does the job it exists for.
-        const { willRetry, noRetryReason } = classifyRetry({
+        // `delayMs` comes back from the classifier rather than being recomputed
+        // here. They agreed today because both read the same fields in the same
+        // tick -- but the whole argument for extracting this was that a copy
+        // reachable only through `AgentSession` is the one that drifts unseen.
+        const { willRetry, delayMs: delay, noRetryReason } = classifyRetry({
           errorKind: this.#apiErrorKindThisTurn,
           failed: this.#apiErrorThisTurn !== null,
           retriesSpent: this.#retries,
           closed: this.#closed,
           hasContext: this.#lastContext !== null,
         });
-        const plan =
-          this.#apiErrorKindThisTurn !== null
-            ? retryPlanFor(this.#apiErrorKindThisTurn)
-            : null;
-        const delay = plan?.delays[this.#retries];
 
         // SETTLED HERE, at the one place a turn ends, rather than in three
         // callbacks the caller wires. A refusal WITH a retry queued is left

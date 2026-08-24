@@ -224,6 +224,14 @@ export function mailWakeEvents(opts: {
   };
 }
 
+/** Cut to `max`, at a word boundary, marking that something was removed. */
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 /**
  * The journal's half-line reason for no retry.
  *
@@ -243,6 +251,8 @@ export function noRetryJournalReason(summary: TurnSummary): string {
       return 'transient, but every retry was spent';
     case 'abandoned':
       return 'transient with retries left — the session was closed or cleared under it';
+    case 'credential-dead':
+      return 'the auth retry was spent — the credential itself is dead';
     default:
       return 'this one does not clear on its own';
   }
@@ -277,7 +287,11 @@ export function noRetryJournalReason(summary: TurnSummary): string {
  */
 export function outageMessage(summary: TurnSummary): string {
   const heard = '**Your message did not reach me.**';
-  const detail = (summary.apiError ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  // Cut at a word boundary with an ellipsis. The tests pin that an ABSENT
+  // `apiError` leaves no dangling sentence; a long one used to leave a sentence
+  // that stopped mid-word, which reads as the bot having been cut off rather
+  // than as a quotation being trimmed.
+  const detail = truncate((summary.apiError ?? '').replace(/\s+/g, ' ').trim(), 200);
 
   switch (summary.noRetryReason) {
     case 'exhausted':
@@ -299,8 +313,20 @@ export function outageMessage(summary: TurnSummary): string {
       // there.
       return (
         `⚠️ That turn hit a temporary API error and I was retrying it, but the ` +
-        `session was cleared before the retry ran.\n${heard} Send it again and ` +
-        `it will go through.`
+        `session was cleared before the retry ran.\n${heard} Send it again.`
+      );
+    case 'credential-dead':
+      // The auth ladder is spent and a respawn has already failed, so this is
+      // the ONLY thing the channel ever hears about a dead token: the first
+      // failure is suppressed because a respawn is about to be attempted, and it
+      // is the post-respawn attempt that reaches here. Named more precisely than
+      // the generic host sentence, because the action is specific and somebody
+      // standing in front of the machine should not have to guess it.
+      return (
+        `⚠️ I could not authenticate to the API, and retrying did not fix it — ` +
+        `the credential on the host is not usable` +
+        (detail ? `: ${detail}` : '.') +
+        `\n${heard} This needs a re-login on the host.`
       );
     default:
       // `not-retryable`, and the only branch where the original sentence was
