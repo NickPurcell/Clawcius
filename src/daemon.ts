@@ -625,11 +625,14 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
       //
       // A FULL POOL IS DIFFERENT and is the exception this earns. Nothing is
       // wrong with the request, the channel or the credentials; the messages in
-      // this bundle are dropped and no later message in this channel will fare
-      // any better on its own, because with `idleTimeoutMinutes: 0` nothing
-      // frees a slot in the ordinary course — someone spending another
-      // channel's transcript with `!reset` is what changes that, and it is a
-      // deliberate act rather than something to wait for. Silence here is
+      // this bundle are dropped, and a later message may or may not fare
+      // better. Under `idleTimeoutMinutes: 0` it could not: nothing freed a
+      // slot in the ordinary course, and someone spending another channel's
+      // transcript with `!reset` was the only thing that changed it. At the
+      // shipped 30 an idle session is reclaimed eventually — but "eventually"
+      // is up to thirty minutes, it depends on somebody else's channel going
+      // quiet, and none of it is visible from here. So this still announces
+      // rather than staying silent: the messages in hand are gone eitherway. Silence here is
       // indistinguishable from the bot being down — the same reading
       // `announceOutage` exists to prevent — and spawn is what makes it
       // reachable by a coordinator rather than only by the operator: a spawned

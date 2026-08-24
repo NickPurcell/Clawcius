@@ -189,14 +189,22 @@ export type SpawnToolOptions = {
    * and it is less obvious than `wakeOnMail` because it depends on arithmetic
    * rather than on a boolean. `acquire` throws at
    * `#sessions.size >= sessions.maxConcurrent`, `#evictIdle` returns
-   * immediately when `sessions.idleTimeoutMinutes` is 0, and nothing else frees
+   * immediately when `sessions.idleTimeoutMinutes` is 0 — which is no longer the
+   * shipped value, though it remains a supported one — and nothing else frees
    * a slot in the ordinary course. `spawn` runs INSIDE the calling
    * coordinator's turn, so that coordinator is necessarily holding a slot when
    * the call happens. Both shipped configs set `maxConcurrent: 10` since
    * 2026-08-20, up from 3 and 1 — which DEFERS this rather than fixing it.
-   * With `idleTimeoutMinutes` still 0 nothing frees a slot in the ordinary
-   * course, so it still fills; it now takes ten sessions to get there instead
-   * of three on instance 1 and one on hamachi. `!reset` can spend a channel's
+   * At `idleTimeoutMinutes: 0` nothing freed a slot in the ordinary course, so
+   * the pool still filled; ten sessions to get there instead of three on
+   * instance 1 and one on hamachi. The shipped value is 30 now, so a full pool
+   * recovers on its own — which changes the SHAPE of this failure without
+   * removing it: `spawn` runs inside a turn that is holding a slot, so the
+   * caller can still meet a full pool, and it is now a busy moment that passes
+   * rather than a permanent lockout. The refusal below is gated on 0 and is
+   * therefore unreachable on both shipped configs; it is kept because 0 is
+   * still a supported value and it is the right answer for a pool that genuinely
+   * cannot recover. `!reset` can spend a channel's
    * transcript to give that channel's slot back, but it is a person's remedy
    * and not the caller's — see the refusal below for why that distinction
    * matters here in particular.

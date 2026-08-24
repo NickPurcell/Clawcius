@@ -924,11 +924,14 @@ sessions:
   # Costs at least ~400 MB RSS per live session, standing, whether busy or not,
   # and materially more for a busy one — see the measurements above.
   #
-  # This is what makes maxConcurrent a permanent ceiling rather than a busy
-  # moment: nothing reclaims a session on its own, so once `maxConcurrent`
-  # sessions have run, the pool stays full until the process restarts — or
-  # until someone spends a channel's transcript with `!reset`, as above.
-  # Raising the cap defers that lockout, it does not remove it.
+  # At 0 this is what made maxConcurrent a permanent ceiling rather than a busy
+  # moment: nothing reclaimed a session on its own, so once `maxConcurrent`
+  # sessions had run, the pool stayed full until the process restarted — or
+  # until someone spent a channel's transcript with `!reset`, as above.
+  # Raising the cap deferred that lockout, it did not remove it. THAT IS NO
+  # LONGER THE SHIPPED STATE — see below — and the sentences are in the past
+  # tense because they describe what 0 does, which is still what you get if you
+  # set it back to 0.
   #
   # Any positive value evicts after that many idle minutes; the session ID
   # survives in SQLite and is resumed on the next mention, so conversation

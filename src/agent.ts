@@ -269,9 +269,12 @@ export class AtCapacityError extends Error {
  * The sentence a user reads when their mention was dropped for want of a slot.
  *
  * Deliberately says the message was dropped rather than "try again": a retry
- * is what a person would naturally do, and on the shipped configuration
- * (`sessions.idleTimeoutMinutes: 0`) it cannot work, because nothing frees a
- * slot in the ordinary course. Naming the remedies is the useful half — and
+ * is what a person would naturally do, and it cannot be relied on. Under
+ * `sessions.idleTimeoutMinutes: 0` it could not work at all, because nothing
+ * freed a slot in the ordinary course. The shipped value is now 30, so a slot
+ * does free itself eventually — but "eventually" is up to thirty minutes away
+ * and the message in hand is already dropped, so telling the reader to try
+ * again would still be telling them to wait for something they cannot see. Naming the remedies is the useful half — and
  * `!reset` comes first because it is the only one the reader can act on
  * themselves. A restart is the operator's and raising the cap is an edit and a
  * redeploy, so a message that named only those two told the reader to wait for
@@ -1093,7 +1096,7 @@ export class SessionManager {
     this.#mail = mail;
     this.#armed = armed;
     this.#spawnLog = spawnLog;
-    this.#sweeper = setInterval(() => void this.#evictIdle(), 60_000);
+    this.#sweeper = setInterval(() => void this.evictIdle(), 60_000);
     this.#sweeper.unref();
   }
 
@@ -1169,12 +1172,20 @@ export class SessionManager {
    * Sessions with a turn actually in flight.
    *
    * Distinct from `liveCount` and the distinction is load-bearing for the ops
-   * executor. With the shipped `sessions.idleTimeoutMinutes: 0` a session is
-   * never evicted, so `liveCount` is a high-water mark: after the first mention
-   * it never returns to zero for the life of the process. An executor that
-   * waited for `liveCount === 0` before recreating a container would wait
-   * forever, and the obvious fix — waiting a bit and going anyway — is the
-   * thing that kills someone's turn.
+   * executor. Under `sessions.idleTimeoutMinutes: 0` a session was never
+   * evicted, so `liveCount` was a high-water mark that never returned to zero
+   * for the life of the process, and an executor waiting for `liveCount === 0`
+   * would have waited forever.
+   *
+   * The shipped value is 30 now, so `liveCount` does come back down — but this
+   * is still the field to read, and MORE so rather than less. `liveCount`
+   * returning to zero is now a real event and also a transient one: it says
+   * nothing is resident this second, not that nothing is running, and a session
+   * can be acquired between the read and the act. `busyCount` answers "is a
+   * turn in flight", which is the question, and it does not depend on the
+   * eviction setting at all. The obvious fix for a wait that never ends —
+   * waiting a bit and going anyway — is still the thing that kills someone's
+   * turn.
    *
    * `busyCount === 0` is the real "nobody is mid-conversation" signal. A live
    * but idle session costs nothing to recreate: it is resumed from SQLite on
@@ -1407,13 +1418,37 @@ export class SessionManager {
     await session.close();
   }
 
-  async #evictIdle(): Promise<void> {
+  /**
+   * Reclaim sessions nobody is using. Driven by the 60s sweeper.
+   *
+   * PUBLIC so it can be driven directly. It was private, which meant the only
+   * way to observe an eviction was to wait a minute for the interval — so the
+   * behaviour had no test, and #242 is a whole issue about what that costs in
+   * this file. `release`, `persist` and `isBusy` are public for the same sort of
+   * reason; this is not a test-only hook bolted onto a private.
+   */
+  async evictIdle(): Promise<void> {
     // 0 disables eviction: sessions stay alive for the life of the process.
     if (config().agent.sessions.idleTimeoutMinutes === 0) return;
 
     const cutoff = Date.now() - config().agent.sessions.idleTimeoutMinutes * 60_000;
     for (const [channelId, session] of this.#sessions) {
       if (session.busy || session.lastActiveAt > cutoff) continue;
+      // ANNOUNCED, because this is the only release in the tree that happened
+      // silently. `onError` writes the error first, `onNeedsRespawn` writes
+      // "respawning", `!reset` replies in the channel, `spawn` logs the queue —
+      // and eviction, now that it is on, shrinks the pool on its own with
+      // nothing recording when, which agent, or how long it had been idle.
+      //
+      // That matters for THIS change specifically rather than as tidiness. The
+      // success test for turning eviction on is "do the sentry OOMs stop", the
+      // cadence is hours, and the first question when they do not stop is
+      // whether it was accumulation or a burst. Answering that needs to know
+      // whether eviction fired at all and how often — which the waker's status
+      // file cannot say, being an overwritten snapshot of a count rather than a
+      // record of events. OJ #249 round 1.
+      const idleMinutes = Math.round((Date.now() - session.lastActiveAt) / 60_000);
+      this.#spawnLog?.(`evicting ${channelId} — idle ${idleMinutes} minute(s), slot freed`);
       // The session ID survives in SQLite, so the next mention resumes rather
       // than starting a cold conversation.
       await this.release(channelId);

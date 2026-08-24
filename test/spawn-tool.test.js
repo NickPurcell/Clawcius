@@ -462,7 +462,9 @@ test('updater is spawnable, and the refusal still names the roles that are not',
 test('spawn refuses when the session pool is full and nothing empties it on its own', async () => {
   const { registry, mail, spawnOf, capacity, logged } = spawnBoard();
 
-  // The shipped shape: idleTimeoutMinutes 0, so nothing gives a slot back in
+  // The `idleTimeoutMinutes: 0` shape — no longer shipped (#249 set 30) but
+  // still supported, and the branch this refusal is gated on. Nothing gives a
+  // slot back in
   // the ordinary course. `spawn` runs inside the calling coordinator's turn, so
   // a slot is always held when the call happens, and once the pool has filled it
   // stays full — not just a busy moment. A person can still spend a channel's

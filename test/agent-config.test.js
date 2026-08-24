@@ -299,6 +299,27 @@ test('the shipped instance files extend the shared base rather than copying it',
     const raw = parse(readFileSync(file, 'utf8'));
     assert.equal(raw.extends, 'agent-config.base.yaml', `${file} must extend the base`);
     assert.ok(raw.crew, `${file} must name its crew`);
+
+    // `sessions` IS SHARED POLICY, and until #249 that was a convention nothing
+    // enforced. `DERIVED_KEYS` refuses `sessions.workspaceRoot` in an instance
+    // file but says nothing about `maxConcurrent` or `idleTimeoutMinutes`, so
+    // an instance could have opted one crew out of a memory policy and every
+    // test would still have passed.
+    //
+    // #203's line is that instance files carry FACTS — crew, displayName,
+    // channel lists — and everything else stays shared, precisely so a policy
+    // cannot be true of one crew and false of the other with no drift check
+    // left to catch it. This is that check.
+    //
+    // IF THIS FAILS, IT IS NOT NECESSARILY WRONG. A crew that genuinely needs a
+    // different `maxConcurrent` is a legitimate thing to want; what must not
+    // happen is it arriving silently. Deleting this assertion is a fine answer
+    // — taken deliberately, which is the whole point of it being here.
+    assert.equal(
+      raw.sessions,
+      undefined,
+      `${file} must not override shared session policy — see the comment above`,
+    );
   }
 });
 
