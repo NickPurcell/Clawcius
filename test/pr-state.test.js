@@ -353,3 +353,55 @@ test('ruleset ref patterns match the way GitHub writes them', () => {
   assert.equal(refPatternMatches('refs/heads/a.b', 'aXb'), false);
   assert.equal(refPatternMatches('refs/heads/a.b', 'a.b'), true);
 });
+
+test('the stale-approval warning does not assert what it has not established', () => {
+  // ROUND 3, FINDING 1, and both halves are this file's own defect committed
+  // inside the branch added to prevent a third instance of it.
+  //
+  // (a) `approvalsFor` sets stale = commit_id !== head, which is TRUE when
+  //     commit_id is null. Filtering on `stale` alone reported an approval whose
+  //     commit is merely ABSENT as being for a superseded one — while the printed
+  //     approval line said "commit_id absent … unknown" on the same screen.
+  const OJ1 = { name: 'OJ1', required: 1, dismissStaleOnPush: false, bypass: 0 };
+  assert.equal(
+    explainMergeState('clean', [{ by: 'n', at: 't', sha: null, stale: true }], OJ1),
+    'nothing blocking',
+    'an absent commit_id is unknown, not stale',
+  );
+
+  // (b) The parenthetical hardcoded "is false" and never read the value the tool
+  //     had in hand — so it said so against a ruleset that sets it TRUE, and
+  //     against a read that established nothing at all.
+  const stale = [{ by: 'n', at: 't', sha: 'old12345', stale: true }];
+  assert.match(explainMergeState('clean', stale, OJ1), /is false, so GitHub still counts it/);
+  assert.match(
+    explainMergeState('clean', stale, { ...OJ1, dismissStaleOnPush: true }),
+    /is TRUE, so check why GitHub still counts it/,
+  );
+  assert.match(
+    explainMergeState('clean', stale, { name: '(unreadable)', required: null }),
+    /could not be read/,
+  );
+  assert.doesNotMatch(
+    explainMergeState('clean', stale, { name: '(unreadable)', required: null }),
+    /is false/,
+  );
+});
+
+test('a ruleset read successfully with no approval rule means zero, not unknown', () => {
+  // ROUND 3, FINDING 2. A ruleset enforcing required status checks and nothing
+  // else is ordinary: it governs, it was READ, and it requires zero approvals.
+  // Skipping it left `required` null, which the finding-1 fix then reports as
+  // "could not be read" — the one thing that is not true — and drops the ruleset
+  // line entirely, in the configuration where `blocked` most likely DOES mean a
+  // required check.
+  //
+  // The distinction is between a read that FAILED (unknown) and a read that
+  // SUCCEEDED with no approval rule (zero).
+  const said = explainMergeState('blocked', [], { name: 'checks-only', required: 0 });
+  assert.match(said, /NOT the approval count \(0 of 0\)/);
+  assert.doesNotMatch(said, /could not be read/);
+
+  // And the genuinely unknown case still says so.
+  assert.match(explainMergeState('blocked', [], { name: '(unreadable)', required: null }), /could not be read/);
+});

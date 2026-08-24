@@ -239,7 +239,7 @@ export function refPatternMatches(pattern, branch) {
  */
 export function explainMergeState(state, approvals, ruleset) {
   const required = ruleset?.required;
-  const stale = approvals.filter((a) => a.stale);
+  const stale = approvals.filter((a) => a.stale && a.sha);
   switch (state) {
     case 'clean':
       // GitHub's own verdict, plus the thing GitHub does not count as blocking.
@@ -248,11 +248,32 @@ export function explainMergeState(state, approvals, ruleset) {
       // is no longer here". Observed on #228: green check, approval for
       // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
       // this function's own finding-1 defect a third time.
-      return stale.length === 0
-        ? 'nothing blocking'
-        : `nothing GitHub blocks on — but ${stale.length === 1 ? 'the approval is' : `${stale.length} approvals are`} ` +
-          'STALE, for a commit no longer at the head. Merging now merges code no ' +
-          'review has read (dismiss_stale_reviews_on_push is false)';
+      if (stale.length === 0) return 'nothing blocking';
+      // (a) `a.sha` as well as `a.stale`. `approvalsFor` sets `stale = commit_id
+      //     !== head`, which is TRUE when `commit_id` is null — so an approval
+      //     whose commit is simply absent was reported as being for a superseded
+      //     one. The printed approval line thirty lines down already said
+      //     "commit_id absent, so whether it covers X is unknown", and this line
+      //     contradicted it on the same screen from the same field.
+      //
+      // (b) Read `dismissStaleOnPush` instead of asserting it. The parenthetical
+      //     hardcoded "is false" and never consulted the value the tool had in
+      //     hand, so it said so against a ruleset that sets it true, and against
+      //     a `/rulesets` read that failed and established nothing.
+      //
+      // Both are this file's own defect, committed twice in the branch added to
+      // stop a third instance of it. The header's heuristic applies to its
+      // author: a clean answer is the moment to be suspicious.
+      const dismissal =
+        ruleset?.dismissStaleOnPush === false
+          ? ' (dismiss_stale_reviews_on_push is false, so GitHub still counts it)'
+          : ruleset?.dismissStaleOnPush === true
+            ? ' — though dismiss_stale_reviews_on_push is TRUE, so check why GitHub still counts it'
+            : ' (whether stale reviews are dismissed could not be read)';
+      return (
+        `nothing GitHub blocks on — but ${stale.length === 1 ? 'the approval is' : `${stale.length} approvals are`} ` +
+        `STALE, for a commit no longer at the head. Merging now merges code no review has read${dismissal}`
+      );
     case 'dirty':
       return 'merge conflicts';
     case 'behind':
@@ -555,12 +576,23 @@ export function main() {
       : [];
     for (const summary of governing) {
       const full = api(`/rulesets/${summary.id}`, repo);
+      // NO `continue` when there is no pull_request rule. A ruleset that enforces
+      // required status checks and nothing else is an ordinary configuration: it
+      // governs the branch, it was read successfully, and it requires ZERO
+      // approvals. Skipping it left `ruleset` null, which the finding-1 fix then
+      // reports as "the required approval count could not be read" — the one
+      // thing that is not true — and drops the `ruleset` line entirely, so the
+      // reader is not even told one exists. That is also the configuration where
+      // `blocked` most likely DOES mean a required check.
+      //
+      // The distinction to keep is between "the read failed" (unknown) and "the
+      // read succeeded and there is no approval rule" (zero). Round 2 had this
+      // right by accident, via `?? 0` on an optional chain.
       const rule = (full.rules ?? []).find((r) => r.type === 'pull_request');
-      if (!rule) continue;
       const here = {
         name: full.name,
-        required: rule.parameters?.required_approving_review_count ?? 0,
-        dismissStaleOnPush: rule.parameters?.dismiss_stale_reviews_on_push ?? false,
+        required: rule?.parameters?.required_approving_review_count ?? 0,
+        dismissStaleOnPush: rule?.parameters?.dismiss_stale_reviews_on_push ?? false,
         bypass: (full.bypass_actors ?? []).length,
       };
       // Strictest wins: more approvals required, and stale-dismissal on if ANY
@@ -569,7 +601,13 @@ export function main() {
         ruleset == null || here.required > ruleset.required
           ? { ...here, dismissStaleOnPush: here.dismissStaleOnPush || (ruleset?.dismissStaleOnPush ?? false) }
           : { ...ruleset, dismissStaleOnPush: ruleset.dismissStaleOnPush || here.dismissStaleOnPush };
-      if (governing.length > 1) ruleset.name = `${ruleset.name} (strictest of ${governing.length})`;
+    }
+    // AFTER the loop, once. Inside it, every iteration re-suffixed the name it
+    // was already holding: `OJ1 (strictest of 2) (strictest of 2)`. Cosmetic, and
+    // on the printed line — and the multi-ruleset path was the only new code this
+    // round with no test, which is round 1 finding 1's pattern exactly.
+    if (ruleset && governing.length > 1) {
+      ruleset.name = `${ruleset.name} (strictest of ${governing.length})`;
     }
   } catch {
     // `/branches/*/protection` is 403 for an App; `/rulesets` is not. If even
@@ -584,7 +622,15 @@ export function main() {
     merged: pr.merged,
     round,
     reviewSawThisCode: latest ? { round: latest.round, sha: latest.sha, verdict } : null,
-    merge: { mergeable: pr.mergeable, mergeable_state: pr.mergeable_state },
+    // `why` and `staleApprovals` are in the JSON as well as the text, because a
+    // scripted consumer reading `mergeable_state === 'clean'` would otherwise get
+    // exactly the adjacent-answer field this tool exists to annotate, unannotated.
+    merge: {
+      mergeable: pr.mergeable,
+      mergeable_state: pr.mergeable_state,
+      why: explainMergeState(pr.mergeable_state, approvals, ruleset),
+      staleApprovals: approvals.filter((a) => a.stale && a.sha).length,
+    },
     approvals,
     ruleset,
   };
@@ -620,7 +666,7 @@ export function main() {
         'repository if you need the answer; from an agent workspace, which is not a ' +
         'clone, this is the normal result rather than a fault.',
     }[verdict];
-    say(`review saw this code?`, `${verdictText}\n${' '.repeat(34)}round ${latest.round} read ${latest.sha}`);
+    say(`review saw this code?`, `${verdictText}\n${' '.repeat(33)}round ${latest.round} read ${latest.sha}`);
   }
 
   const why = explainMergeState(pr.mergeable_state, approvals, ruleset);
