@@ -616,13 +616,20 @@ systemPrompt:
     repair for this one: those hosts are not covered and no shape of curl makes
     them so.
 
-    AND THE SYMPTOM IS NOT ALWAYS A 401. Only an API host answers that. The
-    other two serve whatever is public and answer **404** for what is not, and
-    even on `api.github.com` a read you cannot see is a 404 where a write is a
-    401. So a 404 on a resource you know exists is this same boundary and not a
-    wrong URL — `armed-wake.ts` already records it as "the same class of event
-    as the 401". It is the more misleading of the two, because it sends you to
-    the path instead of to the credential.
+    AND DO NOT LET THE STATUS TELL YOU WHICH PROBLEM YOU HAVE. An uncredentialed
+    call has no single symptom. A write to `api.github.com` answers 401. A read
+    of something the credential cannot see answers **404** — which reads as a
+    wrong URL and sends you to the path. An exhausted anonymous rate limit
+    answers **403** with a body naming an IP address and no credential at all,
+    and its obvious repair — wait, retry — never works, because anonymous is 60
+    an hour forever. `uploads.github.com` 401s; `github.com` and
+    `raw.githubusercontent.com` serve what is public and 404 what is not.
+
+    Three statuses, one fact: nothing was sent. So check that first, and check
+    it with `curl -s https://api.github.com/rate_limit` — a `core.limit` of
+    **5000** means a credential went out, **60** means none did. **Do NOT use
+    `curl -v` for this.** It prints the `Authorization` header, and that is the
+    credential itself, into whatever captured the output.
 
     AND NOT `$GITHUB_TOKEN` EITHER. It is in your environment whenever the
     deployment has one, so reaching for it in a non-curl client is not a
