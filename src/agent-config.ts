@@ -925,6 +925,19 @@ const DERIVED_KEYS: ReadonlyArray<[string, string]> = [
  * where the class needed deriving. This list is the rest of that fix.
  */
 const BASE_FORBIDDEN: ReadonlyArray<[string, string]> = [
+  // `standalone` is NOT here, though it is refused in a base. It lives beside the
+  // chain check instead, because `refuseKeys` appends one shared rule sentence to
+  // every entry in this list and that sentence is false of a mode key: a base's
+  // `standalone` is never INHERITED (it is read from the instance only), it has
+  // nothing to do with another crew's identity, and its advice — "put it in the
+  // instance file, or let it derive from `crew`" — is either the both-modes
+  // refusal or, if the operator clears `extends:` to escape that, the exact #221
+  // harm the sibling error spends eight lines warning against. A mode key cannot
+  // derive from anything.
+  //
+  // This file already learned this once, at the two `refuseKeys` calls below:
+  // one rule sentence cannot be true of two kinds of entry. The list had two
+  // kinds and #228 briefly gave it a third. OJ round 2 on #228, new item 1.
   ['crew', 'names one instance'],
   ['displayName', 'names one instance'],
   ['discord.allowedChannelIds', 'each crew lives in its own guild'],
@@ -1245,11 +1258,105 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   // already refused with a good message, but in YAML those are the same edit
   // made two ways and the silent one was the safe-looking one.
   // OJ round 1 on #207, finding 2.
+  const standalone = bool(instance['standalone'], 'standalone', false);
+
+  // THE MODE IS DECLARED, NEVER INFERRED. Silence used to MEAN standalone, and
+  // #207 closed only the spelling that looks like a mistake:
+  //
+  //   extends:                    refused since #207 — looks like a mistake
+  //   extends: ""                 refused since #207
+  //   <the line deleted entirely>  LOADED SILENTLY — looks like a deletion
+  //
+  // That third row is #221. Delete one line from a shipped instance file and the
+  // crew starts with a 0-character system prompt, `claude-opus-5` instead of
+  // `claude-opus-5[1m]`, and `maxConcurrent: 3` instead of 10 — measured, on
+  // merged `main`. Instance files are now twelve lines and hand-edited, and
+  // `extends:` is the one line in them that reads like boilerplate.
+  //
+  // Nothing upstream catches it any more, and that is this change's own doing:
+  // `container.stateDir` was required-with-no-default and would have thrown, but
+  // #203 derived it from `crew`, so a file containing `crew:` satisfies the
+  // loader completely. The protection was never a guard — it was a side effect
+  // of a different requirement, and deriving removed it.
+  if (!('extends' in instance) && !standalone) {
+    // A BASE POINTED AT DIRECTLY gets its own message, because the generic one
+    // below tells it to extend ITSELF. `AGENT_CONFIG_PATH` naming the base is a
+    // mistake three documents already warn about, and the reader is in exactly
+    // the state where a hedge four lines down is what gets skipped. OJ round 3
+    // on #228, new item 2.
+    //
+    // Detected by CONTENT, not by filename — a `.base.yaml` suffix is a
+    // convention a third crew need not follow. But the discriminator is prompt
+    // content AND NO `crew`, and both halves are load-bearing.
+    //
+    // The first version tested prompt content alone, justified by "an instance
+    // file is refused for those keys". That is false of two files, and OJ round 4
+    // named the states:
+    //
+    //   an instance setting `systemPrompt.useClaudeCodeDefault` — a documented
+    //   knob (SETUP.md), on no refusal list, which LOADS in an instance file. Delete
+    //   its `extends:` line — THE #221 SCENARIO THIS CHANGE EXISTS FOR — and it was
+    //   told it is the shared base, told to point AGENT_CONFIG_PATH elsewhere, and
+    //   told that adding `extends:` back "is not the fix". It is exactly the fix.
+    //
+    //   a `standalone: true` config, which carries prompt content BY DEFINITION —
+    //   that is what self-contained means. Drop its declaration and it was told
+    //   `standalone: true` is not the fix, when it is the only fix.
+    //
+    // `crew` is the discriminator and it is the same by-construction argument done
+    // correctly: `BASE_FORBIDDEN` refuses `crew` in a base, and a loaded config
+    // REQUIRES it. So prompt content with no `crew` is the base and nothing else
+    // is. Both false positives above carry a `crew` line.
+    //
+    // `systemPrompt.append` rather than `systemPrompt`, so the code matches the
+    // list its own reasoning cites: `PROMPT_CONTENT` refuses `systemPrompt.append`
+    // and `prompts`, not the whole `systemPrompt` block.
+    if ((hasKey(instance, 'systemPrompt.append') || 'prompts' in instance) && !('crew' in instance)) {
+      throw new Error(
+        `${path}: this looks like the SHARED BASE, and AGENT_CONFIG_PATH must name an ` +
+          'INSTANCE file rather than the base.\n' +
+          '  It carries prompt content and names no `crew` — a base may not have one, and ' +
+          'every instance file must.\n' +
+          '  Point AGENT_CONFIG_PATH at agent-config.yaml, or at whichever instance file ' +
+          'this crew uses; that file names this one with `extends:`.\n' +
+          'A base has no mode of its own, so adding `extends:` or `standalone: true` here ' +
+          'is not the fix — the first would be a chain and is refused.',
+      );
+    }
+
+    // The two ways out are NOT symmetric and the message must not present them
+    // as though they were. An operator reads this having just been refused, in a
+    // hurry, and `standalone: true` is the shorter line — but taking it
+    // reproduces #221 exactly: a crew with a 0-character prompt on the wrong
+    // model, now blessed by the message that offered it. OJ round 1 on #228,
+    // note 2. The declaration guards the SPELLING; nothing here guards the HARM,
+    // which is #230.
+    throw new Error(
+      `${path}: has no \`extends:\` and does not declare itself standalone.\n` +
+        '\n  Almost certainly you want:  extends: agent-config.base.yaml\n' +
+        '    Every crew that ships extends the base. It carries the system prompt, the\n' +
+        '    prompt templates, the model and the session limits — around 90% of what a\n' +
+        '    crew runs on. If this file is an instance config, this is the line.\n' +
+        '\n  Only if this file really is the whole config:  standalone: true\n' +
+        '    There is no such config in this repository. A crew with no base starts\n' +
+        '    with NO SYSTEM PROMPT AT ALL, on the code default model — which is the\n' +
+        '    exact failure this error exists to stop, so do not take this option to\n' +
+        '    make the error go away.',
+    );
+  }
+  if ('extends' in instance && standalone) {
+    throw new ConfigError(
+      'standalone',
+      'cannot be true in a file that also has `extends:` — those are the two modes, ' +
+        'and a file claiming both says nothing about which one it means',
+    );
+  }
+
   if (!('extends' in instance)) {
-    // Standalone: one file, no layering, and therefore nothing the two lists
-    // protect against — they exist to stop one instance inheriting another's
-    // identity through a SHARED file, and there is no shared file here. Both
-    // shipped configs use `extends`, and a test asserts it.
+    // Standalone, and now DECLARED. Nothing the refusal lists protect against
+    // applies: they exist to stop one instance inheriting another's identity
+    // through a SHARED file, and there is no shared file here. Both shipped
+    // configs use `extends`, and a test asserts it.
     root = instance;
   } else {
     if (typeof extendsRaw !== 'string' || extendsRaw.trim() === '') {
@@ -1265,6 +1372,16 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       throw new ConfigError('extends', `cannot point at the file itself (${basePath})`);
     }
     const base = readYaml(basePath, 'Base config named by `extends`');
+    // Both mode keys, refused in one place, because they are one decision: a base
+    // is not a file that has a mode, it is the thing a mode points at.
+    if ('standalone' in base) {
+      throw new Error(
+        `${basePath}: has \`standalone:\`, which declares the MODE of one instance file ` +
+          'and is meaningless in a shared base. A base is not standalone or extending — it ' +
+          'is the thing an instance extends. Delete the line; it is read only from the ' +
+          'instance file and was silently ignored here before #228.',
+      );
+    }
     if (base['extends'] !== undefined) {
       // One level, deliberately. A chain would make "which file is this value
       // from" a question you answer by tracing, which is the state this whole
@@ -1303,6 +1420,12 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     root = deepMerge(base, instance, keyProvenance, basePath, path);
   }
   delete root['extends'];
+  // Belt and braces only, and labelled as such rather than as a guard: the
+  // config object below is built key by key from `root`, so an unhandled root
+  // key cannot reach it whether or not these deletes happen. A test asserting
+  // `config.standalone === undefined` therefore passes with the delete removed,
+  // which is a test that looks like coverage and is not — found by mutating it.
+  delete root['standalone'];
 
   // Refused wherever it appears, including a standalone file, because unlike
   // everything else here this key MOVED. Left working under its old name it

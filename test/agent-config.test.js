@@ -34,11 +34,20 @@ import { parse, stringify } from 'yaml';
 
 import { loadAgentConfig } from '../dist/agent-config.js';
 
-/** Exactly the lines given, for tests about the container block itself. */
+/**
+ * Exactly the lines given, for tests about the container block itself.
+ *
+ * `standalone: true` is prepended unless the caller supplies `extends:`, because
+ * since #221 a config must DECLARE which mode it is in rather than have it
+ * inferred from silence. Almost every fixture here is standalone, and this is
+ * the one place that has to say so — the two helpers were the whole cost of that
+ * change on the test side, which is why it was worth doing.
+ */
 function writeConfigRaw(lines) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-'));
   const path = join(dir, 'agent-config.yaml');
-  writeFileSync(path, [...lines, ''].join('\n'));
+  const declared = lines.some((l) => l.startsWith('extends:') || l.startsWith('standalone:'));
+  writeFileSync(path, [...(declared ? [] : ['standalone: true']), ...lines, ''].join('\n'));
   return path;
 }
 
@@ -52,6 +61,22 @@ function writeConfigRaw(lines) {
  */
 function writeConfig(lines) {
   return writeConfigRaw(['crew: x', 'container:', ...lines]);
+}
+
+/**
+ * Exactly the lines given and NOTHING prepended — for the tests that assert an
+ * undeclared mode is refused.
+ *
+ * It exists because `writeConfigRaw` adds `standalone: true`, which is correct
+ * for every other fixture and silently defeats these two: the first version of
+ * this test passed the undeclared case through the helper and got a declared
+ * file back, so it asserted a throw that could not happen.
+ */
+function writeUndeclared(lines) {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-undeclared-'));
+  const path = join(dir, 'agent-config.yaml');
+  writeFileSync(path, [...lines, ''].join('\n'));
+  return path;
 }
 
 /** Absolute, because a fixture in a tmpdir cannot resolve a relative base. */
@@ -391,9 +416,18 @@ test('the shared base may not carry instance identity — the inheritance bug, c
     ['discord:', "  alwaysOnChannelIds: ['1']"],
     ['crew: someoneelse'],
     ['displayName: SomeoneElse'],
+    // `standalone` is deliberately NOT in this list. It is refused in a base
+    // too, but beside the chain check rather than here, because this list's one
+    // shared rule sentence is false of a mode key — see BASE_FORBIDDEN's note.
   ];
   for (const lines of forbidden) {
-    const fakeBase = writeConfigRaw(['model: some-model', ...lines]);
+    // `writeUndeclared`, not `writeConfigRaw`: the helper prepends
+    // `standalone: true` to anything without a mode key, which is right for an
+    // instance fixture and WRONG for a base — a base may not declare a mode at
+    // all, so the fixture would trip that refusal before reaching this one. The
+    // same helper defeated the #221 test the same way; it is a good default with
+    // exactly one exception, and a base file is it.
+    const fakeBase = writeUndeclared(['model: some-model', ...lines]);
     const instance = writeConfigRaw(['crew: x', `extends: ${fakeBase}`]);
     assert.throws(
       () => loadAgentConfig(instance),
@@ -507,6 +541,113 @@ test('a derived key is refused in an instance file, not just in the base', () =>
     loadAgentConfig(writeConfig(['  execEnvDir: /var/lib/x-env'])).container.execEnvDir,
     '/var/lib/x-env',
   );
+});
+
+test('a config must DECLARE its mode; silence is an error (#221)', () => {
+  // #207 closed the spelling that looks like a mistake and left open the one
+  // that looks like a deletion:
+  //
+  //   extends:                     refused since #207
+  //   extends: ""                  refused since #207
+  //   <the line deleted entirely>  LOADED SILENTLY  <- this test
+  //
+  // Measured on merged main before the fix: deleting that one line from the
+  // shipped agent-config.yaml gave a 0-character system prompt, `claude-opus-5`
+  // instead of `claude-opus-5[1m]`, and maxConcurrent 3 instead of 10.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /has no `extends:` and does not declare itself standalone/,
+  );
+  // The error names both ways out — but NOT as equals. An operator reads it
+  // having just been refused, in a hurry, and `standalone: true` is the shorter
+  // line; taking it reproduces #221 exactly, blessed by the message that offered
+  // it. So the message must rank them and say what the second one costs.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /Almost certainly you want:\s+extends: agent-config\.base\.yaml/,
+  );
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /Only if this file really is the whole config:\s+standalone: true/,
+  );
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: clawcius'])),
+    /NO SYSTEM PROMPT AT ALL[\s\S]*do not take this option to\n\s+make the error go away/,
+  );
+
+  // Declaring standalone is the opt-in, and it still works.
+  assert.equal(loadAgentConfig(writeConfigRaw(['standalone: true', 'crew: x'])).crew, 'x');
+
+  // Claiming both modes says nothing about which is meant, so it is refused
+  // rather than resolved by precedence — a precedence rule here would be a
+  // silent choice, which is the whole thing this key exists to stop.
+  assert.throws(
+    () => loadAgentConfig(writeConfigRaw(['standalone: true', `extends: ${BASE}`, 'crew: x'])),
+    /standalone cannot be true in a file that also has `extends:`/,
+  );
+
+  // NO assertion here that the mode keys are absent from the resolved config.
+  // There was one, and mutating the `delete` calls away did not fail it: the
+  // config object is built key by key, so an unhandled root key cannot reach it
+  // in the first place. The assertion could not fail, which makes it worse than
+  // no assertion — it reads as coverage of a delete that is only belt and
+  // braces. Removed rather than rewritten, because there is nothing to check.
+});
+
+test('every shipped config, minus its extends line, is refused (#221)', () => {
+  // THE REPRODUCTION FROM THE ISSUE, against the files that actually ship rather
+  // than a fixture — because a fixture is what I would have got right.
+  //
+  // BOTH files, not just Clawcius's. The first version hardcoded
+  // `agent-config.yaml` while carrying a PR description claiming both were
+  // refused; Hamachi's has the byte-identical warning, is edited by the same
+  // operator on the same host, and was not a thing that ran (OJ round 1 on #228,
+  // note 3). The list is the same one the render test uses, so a third crew is
+  // covered by adding a filename in one place.
+  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
+    const real = readFileSync(file, 'utf8');
+    assert.match(real, /^extends: /m, `precondition: ${file} uses extends`);
+
+    const dir = mkdtempSync(join(tmpdir(), 'agent-config-221-'));
+    const path = join(dir, 'agent-config.yaml');
+    writeFileSync(path, real.split('\n').filter((l) => !l.startsWith('extends:')).join('\n'));
+
+    assert.throws(
+      () => loadAgentConfig(path),
+      /has no `extends:` and does not declare itself standalone/,
+      `${file}: deleting one line must not silently produce a crew with no system prompt`,
+    );
+  }
+});
+
+test('a base file may not claim a mode either (#228 note 1)', () => {
+  // `extends` in a base was already refused; `standalone` was silently ignored,
+  // which is the same silence one file over.
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-basemode-'));
+  writeFileSync(join(dir, 'base.yaml'), 'standalone: true\nmodel: from-the-base\n');
+  writeFileSync(join(dir, 'inst.yaml'), 'extends: base.yaml\ncrew: x\n');
+
+  assert.throws(() => loadAgentConfig(join(dir, 'inst.yaml')), /has `standalone:`/);
+
+  // AND THE MESSAGE MUST BE TRUE OF A MODE KEY. Putting it in BASE_FORBIDDEN
+  // attached that list's shared rule sentence, which says the value is INHERITED
+  // by instances that do not override it, that it is another crew's identity,
+  // and that the fix is to move it to the instance file or let it derive from
+  // `crew`. All three are false here: it is read from the instance only, it is
+  // not an identity, moving it there is the both-modes refusal, and a mode key
+  // derives from nothing. OJ round 2 on #228.
+  const said = (() => {
+    try {
+      loadAgentConfig(join(dir, 'inst.yaml'));
+      return '';
+    } catch (e) {
+      return e.message;
+    }
+  })();
+  assert.doesNotMatch(said, /inherited/i);
+  assert.doesNotMatch(said, /other crew's identity/i);
+  assert.doesNotMatch(said, /derive from `crew`/);
+  assert.match(said, /Delete the line/);
 });
 
 test('a bare `extends:` is an error, not a silent standalone file', () => {
@@ -797,4 +938,73 @@ test('githubTokenDir is refused inside OR equal to any other bind mount', () => 
       `${dir} must be refused — the sandbox can reach it`,
     );
   }
+});
+
+test('pointing AGENT_CONFIG_PATH at the base says so, rather than telling it to extend itself', () => {
+  // OJ round 3 on #228, new item 2. The base has neither mode key, so it took the
+  // generic error — which offers `extends: agent-config.base.yaml` as the likely
+  // fix. That is the shared base being told to name itself, read by an operator
+  // in the state where the hedge four lines down is what gets skipped.
+  //
+  // Detected by content rather than filename: a file carrying prompt content is a
+  // base by construction, since an instance file is refused for those keys.
+  let said = '';
+  try {
+    loadAgentConfig('agent-config.base.yaml');
+  } catch (e) {
+    said = e.message;
+  }
+  assert.match(said, /this looks like the SHARED BASE/);
+  assert.match(said, /must name an INSTANCE file/);
+  assert.doesNotMatch(said, /Almost certainly you want/, 'must not tell the base to extend itself');
+
+  // A file with prompt content and NO `crew` is a base however it is named — the
+  // suffix is a convention, not a guarantee.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['prompts:', '  roleNotice: hi'])),
+    /this looks like the SHARED BASE/,
+  );
+
+  // AND THE `crew` HALF IS LOAD-BEARING. This fixture used to carry `crew: x` and
+  // was asserted to be the shared base — which it cannot be, since a base
+  // carrying `crew` is refused for that key. The assertion pinned a detector that
+  // over-fired on two files that are not bases, and OJ round 4 named both states.
+  //
+  // 1. An instance setting `systemPrompt.useClaudeCodeDefault` — documented, on no
+  //    refusal list, and it loads in an instance file. Delete its `extends:` line
+  //    (THE #221 SCENARIO THIS CHANGE EXISTS FOR) and it was told it is the shared
+  //    base and that adding `extends:` back "is not the fix". It is the fix.
+  // 2. A `standalone: true` config, which carries prompt content by definition.
+  //    Drop the declaration and it was told `standalone: true` is not the fix.
+  //
+  // Both carry `crew`. A base may not, and every loaded config must, so prompt
+  // content with no `crew` is the base and nothing else is.
+  for (const notABase of [
+    ['crew: x', 'systemPrompt:', '  useClaudeCodeDefault: false'],
+    ['crew: x', 'prompts:', '  roleNotice: hi'],
+    ['crew: x', 'systemPrompt:', '  append: hello'],
+  ]) {
+    assert.throws(
+      () => loadAgentConfig(writeUndeclared(notABase)),
+      /has no `extends:` and does not declare itself standalone/,
+      `${notABase.join(' ')} names a crew, so it is an instance file and must get the ordinary error`,
+    );
+    assert.doesNotThrow(
+      () => {
+        try {
+          loadAgentConfig(writeUndeclared(notABase));
+        } catch (e) {
+          if (/SHARED BASE/.test(e.message)) throw new Error('told an instance file it is the base');
+        }
+      },
+      /told an instance file it is the base/,
+    );
+  }
+
+  // And an ordinary instance file with neither mode key still gets the ordinary
+  // error, because it carries no prompt content.
+  assert.throws(
+    () => loadAgentConfig(writeUndeclared(['crew: x'])),
+    /has no `extends:` and does not declare itself standalone/,
+  );
 });
