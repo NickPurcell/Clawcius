@@ -168,6 +168,12 @@ function drive() {
      * `assert.equal(h.pushed.length, 2)`, which reads as a regression in the
      * retry path rather than as a slow machine. Polling is deterministic and
      * faster: these two tests were ~4.8s of the suite.
+     *
+     * IT WAITS FOR **AT LEAST** `n`, so it does not replace an exact-count
+     * assertion — it only gates the array read that follows. Removing
+     * `assert.equal(h.pushed.length, 2)` along with the sleeps cost a real
+     * detection: a `#rewake()` that pushes twice was caught before the refactor
+     * and not after. Both callers assert the exact count immediately after.
      */
     async waitForPushes(n, capMs = 8_000) {
       const started = Date.now();
@@ -454,6 +460,13 @@ test('a retry after a tool call CONTINUES; a retry after none REPLAYS (#242)', a
     await h.send(RESULT);
     await h.waitForPushes(2);
 
+    // EXACTLY two, not at least two. `waitForPushes` gates the array read; this
+    // pins that the retry ran ONCE. Dropping it alongside the sleep cost a real
+    // detection — OJ made `#rewake()` push twice and this file caught it before
+    // the refactor and not after. AUTH_RETRY_DELAYS_MS has one entry, so a
+    // second push here is a retry that fired twice.
+    assert.equal(h.pushed.length, 2, 'the retry must run exactly once');
+
     const retried = String(h.pushed[1].message.content);
     assert.match(retried, /cut short by an API error/, 'a turn that acted must CONTINUE');
     assert.match(retried, /do not repeat completed work/);
@@ -472,6 +485,7 @@ test('a retry with no tool call replays the wake verbatim, and stays synthetic (
     await h.send(refusal('authentication_failed'));
     await h.send(RESULT);
     await h.waitForPushes(2);
+    assert.equal(h.pushed.length, 2, 'the retry must run exactly once');
 
     const retried = String(h.pushed[1].message.content);
     assert.doesNotMatch(retried, /cut short by an API error/, 'nothing ran, so nothing to continue');
