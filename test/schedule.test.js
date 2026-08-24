@@ -517,6 +517,59 @@ test('the mail hedges the missed count when it is a floor, and does not when it 
   assert.doesNotMatch(total.body, /FLOOR AND NOT A TOTAL/);
 });
 
+// THE THIRD SUPPRESSION SITE, and the one the other two tests cannot reach.
+// `armed-wake.ts` holds its own private `alsoIn`, independent of the copy in
+// `armed-tool.ts`; both other tests drive `scheduleRecurring` and `listArmed`,
+// which are both in `armed-tool.ts`. So gutting THIS copy to `return ''` left
+// the suite green at 389/389 — verified by doing it — while the mail that wakes
+// an agent silently lost the Pacific instant it was handed.
+//
+// This is the surface where the argument is strongest: a schedule mail is what
+// an agent reads when it is WOKEN, not something it asked for and can re-read
+// with different eyes.
+//
+// Asserted in both directions, because a one-directional test passes on
+// `return ''` for exactly the case that matters. The shape, not the
+// abbreviation: `GMT[^(]*\(.*P[DS]T\)` for the reason at the London preview
+// below — London returns to `GMT` on 25 October 2026 and a pinned `GMT\+1`
+// would go red on correct code.
+test('the schedule mail carries the reader\'s instant, and drops it when it would repeat', () => {
+  const at = Date.UTC(2026, 7, 24, 16, 0); // 17:00 in London, 09:00 Pacific
+  const base = {
+    id: 5,
+    owner: 'hamachi-engineer1',
+    kind: 'schedule',
+    armedAt: 0,
+    dueAt: at,
+    active: true,
+    firedAt: null,
+    seen: { lastFiredAt: null, fires: 0, missed: 0 },
+  };
+  const opts = { nextAt: at + 86_400_000, skipped: 0, skippedExact: true, phaseReset: false };
+
+  const abroad = composeScheduleMail(
+    { ...base, spec: { note: 'n', cron: '0 17 * * *', timezone: 'Europe/London', everyN: 1, anchorAt: 0 } },
+    at,
+    opts,
+  );
+  assert.match(
+    abroad.body,
+    /GMT[^(]*\(.*P[DS]T\)/,
+    'the wake mail dropped the Pacific instant beside the schedule zone',
+  );
+
+  const home = composeScheduleMail(
+    { ...base, spec: { note: 'n', cron: '0 9 * * *', timezone: LA, everyN: 1, anchorAt: 0 } },
+    at,
+    opts,
+  );
+  assert.doesNotMatch(
+    home.body,
+    /P[DS]T \(.*P[DS]T\)/,
+    'a Pacific schedule was rendered twice in the same zone',
+  );
+});
+
 test('the hedge follows the number into listArmed, and latches once it is set', () => {
   const { registry, mail, store } = board();
   const spec = { note: 'dense', cron: '* * * * *', timezone: LA, everyN: 1, anchorAt: 0 };
@@ -1071,5 +1124,137 @@ test('the tool descriptions state what a schedule is and is not', () => {
   assert.doesNotMatch(remindMe.description, /There is no repeat option/);
   assert.match(remindMe.description, /ONE-SHOT/);
   assert.match(remindMe.description, /scheduleRecurring/);
+  registry.close();
+});
+
+// ── everything an agent is shown is PT, and says so ─────────────────────────
+//
+// THESE EPOCHS ARE CHOSEN, NOT ARBITRARY. The waker runs on the host, which is
+// Europe/Berlin; agent containers are America/Los_Angeles. A test that only
+// asserts "a zone label is present" passes in both, so it would not have caught
+// the defect — the old code produced a correct-looking number in a container and
+// a wrong one on the host.
+//
+// So each epoch below renders in a DIFFERENT HOUR in the two zones, and the
+// assertions pin the hour and the literal abbreviation. Weakening either one
+// makes these pass on the host, which is the thing they exist to stop.
+
+test('a rendered time is PT, in the hour PT would use — not the host process zone', async () => {
+  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+
+  // 02:30Z: 19:30 the previous day in PT, 04:30 the same day in Berlin.
+  // Different hour AND different date, so nothing accidental can align them.
+  const at = Date.parse('2026-08-24T02:30:00Z');
+
+  assert.equal(zonedStamp(at, DEFAULT_TIMEZONE, 'time'), '19:30 PDT');
+  assert.equal(zonedStamp(at, DEFAULT_TIMEZONE), '2026-08-23 19:30 PDT');
+
+  // The rendering the host would have produced, kept in the file so the contrast
+  // is here rather than in a commit message. Asserted as a DIFFERENCE rather
+  // than as a literal: the first draft asserted 'CEST' from memory and this ICU
+  // renders Europe/Berlin as 'GMT+2'. What matters is that the host's hour is
+  // not PT's, which is the whole defect; the abbreviation it happens to print is
+  // not this test's business.
+  const asHost = zonedStamp(at, 'Europe/Berlin', 'time');
+  assert.notEqual(asHost.slice(0, 5), '19:30', 'host and PT must not agree here');
+  assert.equal(asHost.slice(0, 5), '04:30');
+});
+
+test('the abbreviation follows the changeover rather than being hardcoded', async () => {
+  const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  // Same wall-clock intent, six months apart. A hardcoded "PDT" passes the test
+  // above and fails this one.
+  assert.match(zonedStamp(Date.parse('2026-08-24T02:30:00Z'), DEFAULT_TIMEZONE, 'time'), /PDT$/);
+  assert.match(zonedStamp(Date.parse('2026-01-15T02:30:00Z'), DEFAULT_TIMEZONE, 'time'), /PST$/);
+});
+
+test('DEFAULT_TIMEZONE is the agents\' zone, not the process\'s', async () => {
+  const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  assert.equal(DEFAULT_TIMEZONE, 'America/Los_Angeles');
+});
+
+test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async () => {
+  // The system prompt tells every agent that `date` in its container agrees with
+  // what the waker renders. That is true only while these two independent
+  // constants match — one in TypeScript, one in a shell script — and nothing
+  // derived either from the other. A sentence asserting a stricter mechanism
+  // than the one that shipped is the defect this whole change is about, so the
+  // honest comment beside each is now a guarantee instead.
+  const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
+  const { readFileSync } = await import('node:fs');
+  const sh = readFileSync('docker/run-container.sh', 'utf8');
+  const m = sh.match(/AGENT_TZ="\$\{AGENT_TZ:-([^}"]+)\}"/);
+  assert.ok(m, 'AGENT_TZ default not found in run-container.sh — has it moved?');
+  assert.equal(
+    m[1],
+    DEFAULT_TIMEZONE,
+    'run-container.sh and schedule.ts disagree about the agent timezone; the ' +
+      'system prompt claims they agree',
+  );
+});
+
+test('a schedule in the reader\'s own zone is rendered once, not twice', async () => {
+  // THIS TEST'S FIRST DRAFT TESTED A COPY OF THE FUNCTION. It pasted `alsoIn`'s
+  // three lines into the test body and asserted on those, so deleting the whole
+  // fix from `armed-tool.ts` left the suite green at 388/388. It was written to
+  // close a finding about a duplication nothing asserted on, and it had the
+  // identical defect: it asserted on something that was not the shipped code.
+  //
+  // So it drives the real tool now, and reads the string an agent would read.
+  const { registry, store } = board();
+  const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
+
+  // BOTH surfaces, because they use different code and I checked: undoing
+  // `alsoIn` leaves `listArmed` green, and undoing the `local` suppression
+  // leaves the receipt green. One assertion would have caught one defect.
+  const receipt = said(
+    await scheduleRecurring.handler(
+      { note: 'stand-up', cron: '0 9 * * *', timezone: 'America/Los_Angeles' },
+      {},
+    ),
+  );
+  assert.doesNotMatch(receipt, /P[DS]T\)/, 'the preview echoed each fire in the same zone');
+
+  const mine = said(await listArmed.handler({}, {}));
+
+  // The reader's own zone: one rendering. No ` (…)` echo, and no second line
+  // repeating the first and calling it `local`.
+  assert.match(mine, /fires \d{4}-\d{2}-\d{2} \d{2}:\d{2} P[DS]T/);
+  assert.doesNotMatch(mine, /P[DS]T\)/, 'the parenthetical repeated the line it annotates');
+  assert.doesNotMatch(mine, /P[DS]T local/, 'the `local` line repeated the line above it');
+
+  registry.close();
+});
+
+test('a schedule in another zone still shows both, because they are two facts', async () => {
+  const { registry, store } = board();
+  const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
+
+  const receipt = said(
+    await scheduleRecurring.handler(
+      { note: 'london stand-up', cron: '0 9 * * *', timezone: 'Europe/London' },
+      {},
+    ),
+  );
+  // The preview must still carry both: the schedule's zone and the reader's.
+  //
+  // NOT `/GMT\+1/`. The first draft pinned London's summer abbreviation, and the
+  // schedule is armed at the current time — so it would have gone red on
+  // 25 October 2026, on correct code, when London returns to `GMT`. A test that
+  // fails on a date rather than on a defect, inside the pull request about
+  // times that are wrong for half the year.
+  //
+  // I had used `P[DS]T` for Pacific in the same line, which is the same problem
+  // solved. The awareness did not generalise from one zone to the other, so this
+  // asserts the PROPERTY — a schedule-zone rendering, then a parenthetical
+  // carrying the reader's — rather than either abbreviation.
+  assert.match(receipt, /GMT[^(]*\(.*P[DS]T\)/, 'the preview dropped the Pacific instant');
+
+  const mine = said(await listArmed.handler({}, {}));
+
+  // Suppression must not have eaten the case it exists to preserve: the
+  // schedule's own zone and the reader's are different numbers here.
+  assert.match(mine, /local/, 'the schedule-zone line was suppressed when it carried a fact');
+  assert.match(mine, /P[DS]T/, 'the reader\'s own zone is missing');
   registry.close();
 });

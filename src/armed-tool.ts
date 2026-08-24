@@ -268,9 +268,24 @@ function refuse(text: string) {
   return { content: [{ type: 'text' as const, text }], isError: true };
 }
 
-/** UTC, spelled out. Same format `renderMail` uses. */
+/** PT and labelled. Same format `renderMail` uses. */
 function stamp(at: number): string {
-  return new Date(at).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  return zonedStamp(at, DEFAULT_TIMEZONE);
+}
+
+/**
+ * The absolute instant beside a schedule-zone rendering, or nothing.
+ *
+ * The parenthetical exists so a reader can check the arithmetic on a time
+ * shown in some other zone. Now that `stamp` is Pacific and Pacific is also
+ * the default schedule zone, the pair collapsed into the same string twice --
+ * `2026-08-24 09:00 PDT (2026-08-24 09:00 PDT)`. Two identical numbers teach
+ * a reader that one of them is noise, which is how the useful one stops being
+ * read on the day the zones differ.
+ */
+function alsoIn(at: number, timeZone: string): string {
+  const here = zonedStamp(at, DEFAULT_TIMEZONE);
+  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
 }
 
 /**
@@ -416,9 +431,16 @@ export function renderArmed(
       // `isTimezone` because a row's spec is only guaranteed to be an object —
       // see `summarise`. An unreadable zone must cost this line, not the listing.
       const zone = typeof spec.timezone === 'string' && isTimezone(spec.timezone) ? spec.timezone : '';
-      lines.push(
-        `      ${zone ? `${zonedStamp(condition.dueAt, zone)} local · ` : ''}${history(condition)}`,
-      );
+      // The same suppression `alsoIn` does, at the one site shaped as two lines
+      // rather than a parenthetical. In the default zone this rendered the line
+      // above it verbatim and then labelled it `local`, which reads as a claim
+      // that the first line was something else. And the default zone is the
+      // COMMON case, so this is where a reader met the duplication most often.
+      const localPrefix =
+        zone && zonedStamp(condition.dueAt, zone) !== stamp(condition.dueAt)
+          ? `${zonedStamp(condition.dueAt, zone)} local · `
+          : '';
+      lines.push(`      ${localPrefix}${history(condition)}`);
     }
   }
   const overflow = active.slice(MAX_LISTED_ACTIVE);
@@ -523,8 +545,11 @@ function describeRemindMe(agentId: string): string {
     '               with no conversation around it, so "finish that" will not mean anything.',
     '    inMinutes  minutes from now. Use this or `at`, not both.',
     '    at         an ISO 8601 instant WITH a zone, e.g. 2026-08-15T09:00:00Z. A bare',
-    '               local time is refused — this tool runs on the host, not in your',
-    '               container, and the two do not share a timezone.',
+    '               local time is still refused, because a bare time names no',
+    '               instant — rendering output in a zone does not make ambiguous',
+    '               input safe. Separately: what you are READ BACK is Pacific.',
+    '               So the receipt shows a different number from the one you typed —',
+    '               09:00Z reads back as 02:00 PDT. Same instant, your zone.',
     '',
     'ONE-SHOT. It fires once and disarms, and this tool has no repeat argument — the turn that',
     'receives a reminder is a turn that holds this tool, so "again tomorrow" is a call you make',
@@ -704,13 +729,13 @@ export function buildArmedTools(
 
       if (dueAt <= now) {
         return refuse(
-          `Not armed — that moment (${new Date(dueAt).toISOString()}) has already passed. ` +
+          `Not armed — that moment (${stamp(dueAt)}) has already passed. ` +
             'A reminder is for the future; if you need to act now, act now.',
         );
       }
       if (dueAt - now > MAX_AHEAD_MS) {
         return refuse(
-          `Not armed — that is more than a year away (${new Date(dueAt).toISOString()}), ` +
+          `Not armed — that is more than a year away (${stamp(dueAt)}), ` +
             'which is almost always a typo in `inMinutes`.',
         );
       }
@@ -721,7 +746,7 @@ export function buildArmedTools(
       const armed = options.store.arm(agentId, 'reminder', dueAt, { note: text });
 
       return ok(
-        `Armed reminder ${armed.id} for ${agentId}, due ${new Date(dueAt).toISOString()} ` +
+        `Armed reminder ${armed.id} for ${agentId}, due ${stamp(dueAt)} ` +
           `(in ${Math.round((dueAt - now) / 60_000)} minutes). It is on disk, so a restart ` +
           'does not lose it, and it fires late rather than never if the service is down when ' +
           'it comes due.',
@@ -834,7 +859,7 @@ export function buildArmedTools(
         if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
           const past = anchorAt < now;
           return refuse(
-            `Not armed — the anchor ${new Date(anchorAt).toISOString()} is more than a year ` +
+            `Not armed — the anchor ${stamp(anchorAt)} is more than a year ` +
               `${past ? 'in the past' : 'away'}, which is almost always a typo. ` +
               (past
                 ? 'A past anchor only chooses which occurrences are selected, and every phase ' +
@@ -888,7 +913,7 @@ export function buildArmedTools(
       const armed = options.store.arm(agentId, 'schedule', first.at, spec, seen);
 
       const fires = preview(fields, zone, step, first.at, PREVIEW_FIRES)
-        .map((at) => `      ${zonedStamp(at, zone)}  (${stamp(at)})`)
+        .map((at) => `      ${zonedStamp(at, zone)}${alsoIn(at, zone)}`)
         .join('\n');
 
       return ok(

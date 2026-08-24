@@ -89,6 +89,13 @@
  * the schedule is armed is a schedule that means what it meant when it was
  * written down. Only the second is auditable a year later.
  */
+// Kept in step BY HAND with `AGENT_TZ` in `docker/run-container.sh`, which
+// sets the same zone inside an agent container. Two independent constants,
+// and the system prompt tells agents their `date` agrees with what the waker
+// renders -- which is true only while these two match. If you change one,
+// change the other, or that sentence becomes the defect it was written to fix.
+// `test/schedule.test.js` asserts they are equal, so this is a guarantee
+// rather than a hope -- it reads the default straight out of the shell script.
 export const DEFAULT_TIMEZONE = 'America/Los_Angeles';
 
 /** How far `nextAfter` will scan for a matching day before calling it never. */
@@ -429,8 +436,17 @@ export function epochFromWall(
   return earliest;
 }
 
-/** "2026-08-17 09:00 PDT" — the only rendering in which a schedule is legible. */
-export function zonedStamp(at: number, timeZone: string): string {
+/**
+ * "2026-08-17 09:00 PDT", or "09:00 PDT" — the only renderings in which a time
+ * shown to an agent is legible.
+ *
+ * WIDENED RATHER THAN CLONED. A Discord message line has no room for the date
+ * and every other caller needs it, but both need the zone abbreviation and both
+ * need it to be right across the March and November changeovers — which is what
+ * `timeZoneName: 'short'` buys and what a second formatter would eventually get
+ * wrong on its own schedule. One function, one `Intl` configuration.
+ */
+export function zonedStamp(at: number, timeZone: string, style: 'full' | 'time' = 'full'): string {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     hourCycle: 'h23',
@@ -442,10 +458,9 @@ export function zonedStamp(at: number, timeZone: string): string {
     timeZoneName: 'short',
   }).formatToParts(new Date(at));
   const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? '';
-  return (
-    `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')} ` +
-    `${get('timeZoneName')}`
-  );
+  const clock = `${get('hour')}:${get('minute')} ${get('timeZoneName')}`;
+  if (style === 'time') return clock;
+  return `${get('year')}-${get('month')}-${get('day')} ${clock}`;
 }
 
 // ── Walking occurrences ────────────────────────────────────────────────────
