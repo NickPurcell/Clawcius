@@ -1,44 +1,9 @@
-/**
- * Osmosis Jones.
- *
- * OJ reviews pull requests in rounds and keeps one worker directory per PR at
- * `<workersRoot>/<owner>__<repo>__<pr>`. It is NOT running on this host yet, so
- * every line of this file was written against a shape that does not exist to be
- * checked against. That is worth being honest about, and it dictates the whole
- * approach:
- *
- *   - Missing is not an error. No workers root, no state file, an empty root —
- *     all of these render as "no OJ data yet". A red banner for the expected
- *     state of the world would teach you to ignore red banners.
- *
- *   - Nothing is required. Rounds and verdicts are read from whichever of a
- *     small set of plausible keys is present, and their absence produces null,
- *     not a throw. When OJ ships and the real keys differ, the page degrades to
- *     showing worker directories with unknown status — which is still useful —
- *     rather than failing to render.
- *
- *   - Every string that comes out of here is attacker-controlled. A worker
- *     directory is named after a repository and holds text about a pull
- *     request, and anyone can open a pull request. The directory names are
- *     therefore pattern-checked before use, the JSON is size-capped before
- *     parsing, and the values go through the same redaction and the same
- *     escaping-by-construction rendering as transcript content. There is no
- *     "internal, so it's fine" data on this page.
- */
-
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { OjConfig } from './config.js';
 import { redact, resolveWithin } from './transcripts.js';
 
-/**
- * Cap on any JSON file read here.
- *
- * A worker directory is written by a process that reads pull requests. A
- * hostile or merely broken PR could produce an enormous state file, and
- * `readFile` on it would be a memory exhaustion the page has no reason to be
- * vulnerable to.
- */
+/** Cap on any JSON file read here. */
 const MAX_JSON_BYTES = 2_000_000;
 
 /** GitHub owner/repo charset, plus the digits of a PR number. */
@@ -114,14 +79,6 @@ async function readJsonCapped(path: string): Promise<unknown | null> {
   }
 }
 
-/**
- * Rounds, from whichever representation OJ turns out to use.
- *
- * Two are handled: a `rounds` array inside the worker's state file, and
- * `round-N/` subdirectories on disk. Neither is confirmed. Whichever is
- * present wins; if both are, the array does, because a structured record beats
- * an inference from directory names.
- */
 function roundsFromState(state: Record<string, unknown>): OjRound[] {
   const raw = state['rounds'];
   if (!Array.isArray(raw)) return [];
@@ -246,11 +203,6 @@ export async function readOjSnapshot(config: OjConfig): Promise<OjSnapshot> {
       repo: match?.[2] ?? null,
       pr: match?.[3] ? Number(match[3]) : null,
       status: workerState ? pick(workerState, ['status', 'state', 'phase']) : null,
-      // A worker-level verdict if OJ records one, otherwise the last round's.
-      // The fallback is not conditional on the state file being absent: a
-      // state.json that tracks status but leaves the verdict in the rounds is
-      // just as likely a shape, and reporting "no verdict" next to a list of
-      // rounds that plainly ends in one would be silly.
       verdict:
         (workerState ? pick(workerState, ['verdict', 'result', 'outcome', 'decision']) : null) ??
         resolvedRounds.at(-1)?.verdict ??

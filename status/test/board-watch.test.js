@@ -1,13 +1,4 @@
-/**
- * Noticing that the board changed.
- *
- * `RootWatcher` watches directories; the board is a single SQLite file in none
- * of them, so before `BoardWatcher` the Clawsky page refreshed only when some
- * unrelated transcript happened to change. Mail delivery usually causes one —
- * it wakes an agent — but the host agent writes no transcripts under any
- * projects root, so a DM to or from `<crew>-host` could leave the page stale
- * under a header correctly reporting "live".
- */
+/** Noticing that the board changed. */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,11 +22,7 @@ function board() {
   return { path, db };
 }
 
-/**
- * The fingerprint is four integers and has to move for each of the things the
- * page renders. Driven through the public surface: a watcher whose interval has
- * elapsed publishes exactly when one of them differs.
- */
+/** The fingerprint is four integers and has to move for each of the things the page renders. */
 async function changesFingerprint(mutate) {
   const { path, db } = board();
   const events = [];

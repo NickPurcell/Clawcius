@@ -1,59 +1,18 @@
 /**
- * Reading Claude Code transcripts off local disk.
+ * Reading Claude Code transcripts off local disk. The on-disk shape:
  *
- * The on-disk shape, as it actually is on this host (verified 2026-08-08 and
- * re-counted 2026-08-17 against /var/lib/hamachi/agent-home/projects):
+ *     <projectsRoot>/<slugified-cwd>/
+ *       <sessionId>.jsonl                            the main transcript
+ *       <sessionId>/subagents/agent-<id>.jsonl       one per directly spawned subagent
+ *       <sessionId>/subagents/agent-<id>.meta.json   {agentType, description, toolUseId, parentAgentId?, spawnDepth, model?}
+ *       <sessionId>/subagents/workflows/<runId>/     the same pair per subagent of that run, plus journal.jsonl
+ *       <sessionId>/workflows/<runId>.json           {workflowName, summary, status, agentCount, durationMs, startTime, phases}
  *
- *     <projectsRoot>/
- *       <slugified-cwd>/                      e.g. -var-lib-hamachi-workspaces-146707…
- *         <sessionId>.jsonl                   the main transcript
- *         <sessionId>/
- *           subagents/
- *             agent-<agentId>.jsonl           one per directly spawned subagent
- *             agent-<agentId>.meta.json       {agentType, description, toolUseId,
- *                                              parentAgentId?, spawnDepth, model?}
- *             workflows/
- *               <runId>/                      wf_4f93cd23-af9
- *                 agent-<agentId>.jsonl       one per subagent of that RUN
- *                 agent-<agentId>.meta.json   {agentType: "workflow-subagent",
- *                                              spawnDepth} — and nothing else
- *                 journal.jsonl               the run's own log, not an agent
- *           workflows/
- *             <runId>.json                    {workflowName, summary, status,
- *                                              agentCount, durationMs, startTime,
- *                                              phases[{title, detail}]}
- *           tool-results/                     spilled tool output, not read here
- *
- * The `subagents/workflows/` level is easy to miss and is where MOST of them
- * are: 58 of the 104 subagent transcripts under Hamachi's root on 2026-08-17.
- * This file read only the first level until then, so every subagent count it
- * printed was a little over half the real one.
- *
- * Every line is one JSON object. Most carry the conversation
- * (`type: user | assistant | attachment`), some are operational records with a
- * quite different shape (`type: queue-operation | mode | ai-title |
- * last-prompt`) that have no `uuid` at all. Nothing may assume a key exists.
- *
- * ── Why this file is built the way it is ──────────────────────────────────
- *
- * The obvious implementation reads the JSONL and keeps the parsed objects. On
- * this host one session directory is 4.3 MB with 2.6 MB of subagents, and it
- * is a single Discord channel that has been running for a week. Holding parsed
- * transcripts for every session, re-read on every poll of a page that refreshes
- * itself over SSE, is a memory leak with a UI attached.
- *
- * So the unit of caching is an *index*, not a transcript: for each line we keep
- * its byte offset, its length, its type and its timestamp, and we throw the
- * content away. Rendering a page of the transcript seeks to those offsets and
- * reads back only the lines being shown. An index of a 1.8 MB transcript is
- * tens of kilobytes.
- *
- * The second thing that falls out of JSONL being append-only: re-indexing after
- * an agent writes a line does not have to re-read the file. We remember how
- * many bytes we have indexed and read only the tail. The guard against a file
- * that was rewritten rather than appended to is a fingerprint of its first
- * bytes — a rewrite that happened to keep the size growing would otherwise
- * produce an index that is silently wrong about every offset in it.
+ * Every line is one JSON object. Operational records (`queue-operation`,
+ * `mode`, `ai-title`, `last-prompt`) have no `uuid`, so nothing may assume a
+ * key exists. What is cached is an index per transcript — byte offset, length,
+ * type and timestamp per line, never the content — extended by reading only
+ * the appended tail, and rebuilt when the fingerprint of the first bytes changes.
  */
 
 import { createReadStream, type Dirent } from 'node:fs';
@@ -63,19 +22,6 @@ import type { AgentRoot, ReadConfig, StatusConfig } from './config.js';
 
 // ── Untrusted-input handling ────────────────────────────────────────────────
 
-/**
- * Credential shapes redacted from anything rendered.
- *
- * This is defence in depth and NOT a guarantee. It catches the well-known
- * prefixed formats — the ones that get pasted into a terminal and end up in a
- * transcript because the agent echoed a command back. It cannot catch a
- * password, a bare hex token, or a key format invented after this list was
- * written. Nothing here should be read as "it is safe to show this page to
- * someone else"; the page is loopback + tailnet for that reason.
- *
- * Ordered longest-first where patterns could overlap, so the more specific
- * match wins.
- */
 const SECRET_PATTERNS: readonly RegExp[] = [
   // PEM private keys — the whole block, not just the header, or the payload
   // would survive with only its label removed.
@@ -87,24 +33,16 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/g,
   // Anthropic.
   /\bsk-ant-[A-Za-z0-9_-]{10,}/g,
-  // OpenAI-style, included because agents paste other providers' keys too.
   /\bsk-[A-Za-z0-9]{32,}/g,
   // Discord bot tokens: base64ish.base64ish.base64ish with a long tail.
   /\b[MNO][A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}/g,
   // Authorization headers, whatever the scheme. Keeps the scheme so the reader
   // can still see what kind of auth was in play.
   /\b(Authorization:\s*(?:Bearer|Basic|token))\s+\S+/gi,
-  // AWS access key ids, which are distinctive enough to be worth the line.
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
 ];
 
-/**
- * Replace credential-shaped substrings with a marker.
- *
- * Applied server-side, on the way out, to every piece of transcript text —
- * rather than at render time in the browser — so that the redaction is not
- * something a future UI change can forget to call.
- */
+/** Replace credential-shaped substrings with a marker. */
 export function redact(text: string): string {
   let out = text;
   for (const pattern of SECRET_PATTERNS) {
@@ -118,31 +56,6 @@ export function redact(text: string): string {
   return out;
 }
 
-/**
- * Prose out of a sidecar or a workflow descriptor, made safe to render.
- *
- * `redact` plus a cap, in one place, for the same reason `truncate` exists
- * below: there should be one function that turns metadata into renderable text
- * so "did we remember to redact that one" has a single answer.
- *
- * It did not have one. A subagent's `description` and a workflow's
- * `workflowName`, `summary` and `phases[].detail` went out untouched while
- * mail bodies, transcript blocks and every OJ string were redacted — and
- * `index.ts` states the redaction as a property of the service without
- * qualification. All four are free prose written by a model that has just been
- * reading files; the real workflow summary on this host is the report of a
- * sudoers audit, which is precisely where a pasted credential would survive.
- *
- * The cap is fixed rather than configurable. These are labels — a description
- * and a one-line summary — not documents, and `read.maxBlockChars` is about a
- * transcript page. Anything longer than this is not a label any more.
- *
- * It marks where it cut. Generous as the cap is — the longest description
- * across all 104 sidecars on this host is 49 characters and the real workflow
- * summary is 90 — a body that is shortened silently is a body the reader
- * believes is complete, and everything else here that shortens says so:
- * transcript blocks render "… truncated", mail carries `bodyTruncated`.
- */
 const MAX_META_CHARS = 2000;
 
 function metaText(value: unknown): string | null {
@@ -151,34 +64,8 @@ function metaText(value: unknown): string | null {
   return safe.length <= MAX_META_CHARS ? safe : `${safe.slice(0, MAX_META_CHARS)}…`;
 }
 
-/**
- * Session and agent ids arrive from the URL. They are used to build file
- * paths, so they are validated against a shape rather than sanitised — a
- * denylist of `..` and `/` invites the next encoding trick, whereas "hex and
- * dashes, nothing else" has no interesting cases.
- *
- * `resolveWithin` below is the second, independent check: even a validated id
- * has to land inside its configured root before anything opens it.
- */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-/**
- * Slugified cwds are the cwd with every non-alphanumeric turned into `-`.
- *
- * Note the leading `-`, which is not a typo and is not optional: the cwd starts
- * with `/`, so EVERY real slug on this host begins with a dash —
- * `-var-lib-hamachi-workspaces-1467070145343258628`. An earlier version of this
- * pattern required an alphanumeric first character, the way the session-id
- * pattern does, and the result was a status page that found zero sessions
- * under a root containing a week of them and reported it as a healthy, empty
- * host. Caught 2026-08-09 by running it against the real transcripts; it would
- * never have shown up against synthetic fixtures, because you would have named
- * those sensibly.
- *
- * `.` and `..` are excluded separately below rather than by the pattern — they
- * consist entirely of characters the pattern allows, and they are the two
- * names that must never be joined onto a root.
- */
 const PROJECT_SLUG_PATTERN = /^[A-Za-z0-9._-][A-Za-z0-9._-]{0,255}$/;
 
 export function isValidSessionId(value: string): boolean {
@@ -187,15 +74,6 @@ export function isValidSessionId(value: string): boolean {
 export function isValidSubagentId(value: string): boolean {
   return SUBAGENT_ID_PATTERN.test(value);
 }
-/**
- * Workflow run ids, `wf_4f93cd23-af9` as written on this host.
- *
- * Named separately from the session pattern because it names a DIRECTORY that
- * gets joined onto a root, and because the underscore is not accidental —
- * every run id carries one and the session pattern would accept it silently
- * either way. `.` is excluded outright rather than by enumerating `.` and
- * `..`: nothing in a run id needs one.
- */
 const WORKFLOW_RUN_PATTERN = /^wf_[A-Za-z0-9_-]{1,120}$/;
 
 export function isValidWorkflowRunId(value: string): boolean {
@@ -206,15 +84,7 @@ export function isValidProjectSlug(value: string): boolean {
   return PROJECT_SLUG_PATTERN.test(value);
 }
 
-/**
- * Resolve `parts` under `root` and refuse anything that escapes it.
- *
- * Belt and braces with the id patterns above. The patterns already exclude
- * `/` and `.`-only names, but this is the check that would still hold if
- * someone later relaxes a pattern to allow, say, dots in a session id and does
- * not think about `..`. The trailing separator matters: without it,
- * `/var/lib/clawcius-evil` passes a naive `startsWith('/var/lib/clawcius')`.
- */
+/** Resolve `parts` under `root` and refuse anything that escapes it. */
 export function resolveWithin(root: string, ...parts: string[]): string | null {
   const target = resolve(root, ...parts);
   if (target === root) return target;
@@ -244,19 +114,6 @@ export type LineMeta = {
 /** A Task/Agent tool call seen in a transcript — one subagent being spawned. */
 export type SpawnRecord = {
   toolUseId: string;
-  /**
-   * `subagent_type` from the tool input — `general-purpose`, `Explore`,
-   * `Plan`, `workflow-subagent`.
-   *
-   * NOT a crew role. This comment used to say "the ROLE", in a repository
-   * where `role` means one of CLAWSKY.md's crew roles, plus `host`. Those live
-   * in the registry (`registry.ts`, column `role`) and belong to agents with
-   * an identity and a mailbox. This one is the harness's word for how a
-   * *subagent* was spawned, it comes from a tool argument the parent chose,
-   * and it is meaningless to anyone reading this page for the crew. Calling
-   * both of them "role" is what put `general-purpose` on a page the operator
-   * went to for `engineer`.
-   */
   subagentType: string;
   description: string;
   /** Model override on the spawn, when the caller named one. */
@@ -264,11 +121,7 @@ export type SpawnRecord = {
   spawnedAt: number | null;
   /** uuid of the assistant line that made the call, for ordering. */
   uuid: string | null;
-  /**
-   * Filled in from the tool_result, which announces the id the runtime
-   * assigned. This is the link that survives when the `.meta.json` sidecar is
-   * absent — older sessions on this host have transcripts without one.
-   */
+  /** Filled in from the tool_result, which announces the id the runtime assigned. */
   agentId: string | null;
 };
 
@@ -277,14 +130,6 @@ export type UsageTotals = {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
-  /**
-   * Sum of any cost field the transcript happened to carry, or null when it
-   * carried none.
-   *
-   * Null and zero are different answers and the UI shows them differently: the
-   * SDK-driven sessions on this host record token usage but no cost at all, and
-   * printing "$0.00" for those would be a lie rather than an omission.
-   */
   costUsd: number | null;
 };
 
@@ -299,7 +144,6 @@ export type TranscriptIndex = {
   fingerprint: string;
   lines: LineMeta[];
   spawns: SpawnRecord[];
-  /** Lines that failed to parse. Reported rather than silently dropped. */
   malformedLines: number;
   firstTs: number | null;
   lastTs: number | null;
@@ -344,16 +188,6 @@ function extractCost(line: Record<string, unknown>): number | null {
   return null;
 }
 
-/**
- * The runtime announces an async subagent's id in the tool_result text:
- *
- *   "agentId: a57d8e224b89bd4cb (internal ID - do not mention to user…)"
- *
- * Matching on that string is admittedly matching on prose, which is why it is
- * the *fallback* and the `.meta.json` sidecar is preferred. When the wording
- * changes this returns null and the sidecar still links the tree; if both ever
- * fail the subagent shows up as an orphan rather than disappearing.
- */
 const AGENT_ID_IN_RESULT = /\bagentId:\s*([0-9a-f]{8,})/;
 
 function contentBlocks(line: Record<string, unknown>): unknown[] {
@@ -394,16 +228,7 @@ function emptyIndex(path: string): TranscriptIndex {
   };
 }
 
-/**
- * Fold one raw line into the index.
- *
- * A line that will not parse is counted and skipped. That is not defensive
- * programming for its own sake: the newest line of a transcript being written
- * right now is routinely a half-written one, and treating it as corruption
- * would make every live session look broken. Partial trailing lines are
- * excluded by the reader below, so anything reaching here and failing is a
- * genuinely malformed record.
- */
+/** Fold one raw line into the index. */
 function foldLine(index: TranscriptIndex, raw: string, offset: number, length: number): void {
   let parsed: unknown;
   try {
@@ -435,10 +260,6 @@ function foldLine(index: TranscriptIndex, raw: string, offset: number, length: n
       hasToolUse = true;
       index.toolCalls += 1;
 
-      // The spawn tool has been called both `Task` and `Agent` across
-      // versions — this host's transcripts from 2026-08 use `Agent`, older
-      // ones and the documentation say `Task`. Accept either; a rename is not
-      // worth losing the whole subagent tree over.
       const name = asString(block['name']);
       if (name === 'Task' || name === 'Agent') {
         const input = asRecord(block['input']);
@@ -540,20 +361,11 @@ function flattenBlockText(block: Record<string, unknown>, limit: number): string
   return '';
 }
 
-/**
- * Read `path` from `fromByte` and fold every COMPLETE line into `index`.
- *
- * Returns the byte offset just past the last complete line, which becomes the
- * new `indexedBytes`. A trailing fragment is deliberately left unindexed: it is
- * a line being written right now, and it will be complete on the next pass.
- */
+/** Read `path` from `fromByte` and fold every COMPLETE line into `index`. */
 async function foldFrom(index: TranscriptIndex, path: string, fromByte: number): Promise<number> {
   return new Promise<number>((resolvePromise, rejectPromise) => {
     const stream = createReadStream(path, { start: fromByte });
-    // Buffers, not strings: offsets have to be byte offsets for the page
-    // reader to seek with them, and a chunk boundary can land in the middle of
-    // a multi-byte character. Splitting on 0x0a and decoding whole lines is
-    // correct for both.
+    // Buffers, not strings: offsets must be byte offsets for the page reader to seek with, and a chunk boundary can land inside a multi-byte character.
     let pending: Buffer = Buffer.alloc(0);
     let consumed = fromByte;
 
@@ -612,13 +424,7 @@ export type SubagentRef = {
   meta: SubagentMeta | null;
   size: number;
   mtimeMs: number;
-  /**
-   * The workflow run this subagent belongs to, or null for a direct spawn.
-   *
-   * Non-null means it came from `subagents/workflows/<runId>/`, where the
-   * sidecar carries only `{agentType: "workflow-subagent", spawnDepth: 1}` —
-   * so this id is the only route to a description, via `workflowRuns()`.
-   */
+  /** The workflow run this subagent belongs to, or null for a direct spawn. */
   workflowRunId: string | null;
 };
 
@@ -634,13 +440,7 @@ export type WorkflowRun = {
   phases: Array<{ title: string | null; detail: string | null }>;
 };
 
-/**
- * Cache of transcript indexes, keyed by path, with LRU eviction.
- *
- * A Map preserves insertion order, so "least recently used" is "first key" as
- * long as every hit re-inserts. That is the whole implementation; a real LRU
- * structure would be more code than the problem deserves.
- */
+/** Cache of transcript indexes, keyed by path, with LRU eviction. */
 class IndexCache {
   #entries = new Map<string, TranscriptIndex>();
   #limit: number;
@@ -694,15 +494,7 @@ export class TranscriptStore {
     return this.#config.agents;
   }
 
-  /**
-   * Index for a transcript, built or refreshed as needed.
-   *
-   * The refresh is where the append-only assumption earns its keep: a session
-   * that grew by one line re-reads that one line. The fingerprint check is the
-   * escape hatch for when the assumption is wrong — a compacted or rewritten
-   * transcript throws the index away and starts again, which is slow and
-   * correct rather than fast and lying.
-   */
+  /** Index for a transcript, built or refreshed as needed. */
   async index(path: string): Promise<TranscriptIndex> {
     const info = await stat(path);
     const cached = this.#cache.get(path);
@@ -731,13 +523,7 @@ export class TranscriptStore {
     return fresh;
   }
 
-  /**
-   * Every session under an agent's root.
-   *
-   * Missing or unreadable roots return an empty list and set `error`. They do
-   * not throw: one instance that has never started must not blank the page for
-   * the one that is running.
-   */
+  /** Every session under an agent's root. */
   async sessions(agent: AgentRoot): Promise<{ sessions: SessionRef[]; error: string | null }> {
     let projectDirs: string[];
     try {
@@ -749,9 +535,6 @@ export class TranscriptStore {
 
     const sessions: SessionRef[] = [];
     for (const slug of projectDirs) {
-      // A slug that fails the pattern is skipped rather than served: it could
-      // not be round-tripped through a URL anyway, and anything unexpected
-      // sitting in a projects directory is not ours to interpret.
       if (!isValidProjectSlug(slug)) continue;
       const dir = resolveWithin(agent.projectsRoot, slug);
       if (!dir) continue;
@@ -789,30 +572,6 @@ export class TranscriptStore {
     return sessions.find((candidate) => candidate.sessionId === sessionId) ?? null;
   }
 
-  /**
-   * Subagent transcripts belonging to a session, with their sidecar metadata.
-   *
-   * TWO PLACES, not one, and the second is where most of them are. Counted on
-   * this host on 2026-08-17: of 104 `agent-*.jsonl` under Hamachi's root, 45
-   * sit directly in `<sessionId>/subagents/` and **58 sit one level deeper**,
-   * in `<sessionId>/subagents/workflows/wf_<runId>/`. This method used to
-   * `readdir` the first directory and filter for files, so the 58 were not
-   * merely undiscoverable — they were invisible, and every count of subagents
-   * this service has ever printed was a little over half the real number.
-   *
-   * The two populations have different metadata and want handling accordingly:
-   *
-   *   direct      {agentType, description, toolUseId, spawnDepth, model?,
-   *                parentAgentId?}  — named, and self-describing
-   *   workflow    {agentType: "workflow-subagent", spawnDepth: 1}  — thin,
-   *                identical on all 58, and no description at all
-   *
-   * A workflow subagent's description is not missing, it is somewhere else:
-   * `<sessionId>/workflows/<runId>.json` holds one record per run with
-   * `workflowName`, `summary`, `phases[]` and `agentCount`. So the run is what
-   * names them, and `workflowRunId` on the ref is the join to it — see
-   * `workflowRuns` below.
-   */
   async subagents(session: SessionRef): Promise<SubagentRef[]> {
     const root = join(session.sessionDir, 'subagents');
     const refs: SubagentRef[] = [];
@@ -821,8 +580,6 @@ export class TranscriptStore {
     try {
       entries = await readdir(root, { withFileTypes: true });
     } catch {
-      // No subagents directory at all is the normal case for a session that
-      // never delegated. Not an error, not worth reporting.
       return [];
     }
 
@@ -839,9 +596,8 @@ export class TranscriptStore {
 
     for (const runDir of runDirs) {
       if (!runDir.isDirectory()) continue;
-      // Same discipline as the project slug: validated against a shape, and
-      // then resolved inside its root independently. This name reaches a path
-      // join, and it comes off a directory an agent can write into.
+      // Validated against a shape, then resolved inside its root: this name
+      // reaches a path join, and it comes off a directory an agent can write into.
       if (!isValidWorkflowRunId(runDir.name)) continue;
       const resolved = resolveWithin(workflowsDir, runDir.name);
       if (!resolved) continue;
@@ -869,10 +625,7 @@ export class TranscriptStore {
     into: SubagentRef[],
   ): Promise<void> {
     for (const entry of entries) {
-      // `journal.jsonl` sits beside the agents in a run directory and is the
-      // run's own log, not a subagent. Requiring the `agent-` prefix rather
-      // than excluding that one name by hand: an unknown file appearing here
-      // later should be skipped, not rendered as an agent with a strange id.
+      // `journal.jsonl` sits beside the agents in a run directory and is the run's own log, not a subagent.
       if (!entry.isFile()) continue;
       if (!entry.name.startsWith('agent-') || !entry.name.endsWith('.jsonl')) continue;
 
@@ -901,14 +654,6 @@ export class TranscriptStore {
     }
   }
 
-  /**
-   * The workflow runs a session recorded, by run id.
-   *
-   * These are what give the 58 thin-metadata subagents above a name. One JSON
-   * file per run in `<sessionId>/workflows/`, written when the run ends — so a
-   * run in progress has agents on disk and no descriptor yet, which is why
-   * every field here is optional and a missing record is not an error.
-   */
   async workflowRuns(session: SessionRef): Promise<Map<string, WorkflowRun>> {
     const dir = join(session.sessionDir, 'workflows');
     const runs = new Map<string, WorkflowRun>();
@@ -963,12 +708,7 @@ export class TranscriptStore {
     return runs;
   }
 
-  /**
-   * A page of a transcript, read back from disk by byte offset.
-   *
-   * `from` is a line ordinal, not a byte offset — the client pages through
-   * lines and should never see the file layout. Bytes are how we get there.
-   */
+  /** A page of a transcript, read back from disk by byte offset. */
   async page(
     path: string,
     from: number,
@@ -1014,11 +754,6 @@ async function readSubagentMeta(dir: string, jsonlName: string): Promise<Subagen
     const record = asRecord(parsed);
     if (!record) return null;
     return {
-      // agentType is a `subagent_type` — how this subagent was spawned, NOT a
-      // crew role; see `SpawnRecord.subagentType` above for the distinction and
-      // why it matters. It reaches the page as a heading and a colour key, and
-      // description is free prose. Both are rendered, so both go through the
-      // same door.
       agentType: metaText(record['agentType']),
       description: metaText(record['description']),
       toolUseId: asString(record['toolUseId']),
@@ -1064,14 +799,7 @@ function truncate(text: string, limit: number): { text: string; truncated: boole
   return { text: redacted.slice(0, limit), truncated: true };
 }
 
-/**
- * Turn one raw JSONL line into something the UI can draw.
- *
- * Everything textual goes through `truncate`, which redacts. That is on
- * purpose: there is exactly one function that produces renderable text from a
- * transcript, so "did we remember to redact this field" has one answer rather
- * than one per call site.
- */
+/** Turn one raw JSONL line into something the UI can draw. */
 function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine {
   let parsed: unknown;
   try {
@@ -1108,10 +836,7 @@ function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine
   }
 
   if (blocks.length === 0) {
-    // The operational records — queue-operation, mode, ai-title, last-prompt —
-    // have no `message` at all. They are genuinely useful for reading a
-    // session (they are where a wake came from), so they get a summary line
-    // instead of being dropped.
+    // The operational records — queue-operation, mode, ai-title, last-prompt — have no `message` at all.
     const operational =
       asString(line['operation']) ??
       asString(line['aiTitle']) ??

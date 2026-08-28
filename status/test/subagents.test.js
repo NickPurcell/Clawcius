@@ -1,14 +1,3 @@
-/**
- * Finding the subagents, all of them.
- *
- * The fixture is built to the shape counted on this host on 2026-08-17: some
- * subagents directly under `<sessionId>/subagents/`, and MORE of them one level
- * further down in `subagents/workflows/<runId>/`. That second population is
- * where 58 of the 104 transcripts under Hamachi's root live, and it was
- * invisible to this service until now — so the count is what most of these
- * tests are really about.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -35,18 +24,7 @@ function line(type, atMs, textValue) {
   });
 }
 
-/**
- * Two direct subagents, three workflow subagents, one run descriptor.
- *
- * The proportions are the point: a reader who only walks the first directory
- * gets 2 and believes it, and 2 is wrong by more than half.
- */
-/**
- * The id the runtime announces in a tool_result, and the file name that
- * matches it. Hex and at least eight characters, because that is what
- * `AGENT_ID_IN_RESULT` matches — a shorter id links nothing and the test would
- * pass for the wrong reason.
- */
+/** Two direct subagents, three workflow subagents, one run descriptor. */
 const SIDECARLESS = 'c00000000000000a';
 
 function fixture({
@@ -70,10 +48,7 @@ function fixture({
   const subagents = join(sessionDir, 'subagents');
   mkdirSync(subagents, { recursive: true });
 
-  // A subagent with NO `.meta.json` whose type is recorded only in the parent
-  // transcript, as a `Task` call and the tool_result that announces its id.
-  // This is the shape older sessions on this host have, and it is the one case
-  // where the roll-up and the session view legitimately know different things.
+  // A subagent with NO `.meta.json` whose type is recorded only in the parent transcript, as a `Task` call and the tool_result that announces its id.
   if (spawnedWithoutSidecar) {
     writeFileSync(
       join(projectsRoot, SLUG, `${SESSION}.jsonl`),
@@ -181,8 +156,6 @@ function fixture({
   }
 
   // A one-row board, so the roll-up can be asked whose subagents these are.
-  // Without it every scope reads as "this instance has no registry", which is
-  // a true sentence about a fixture and no test of the case that matters.
   const boardDb = join(base, 'hamachi.db');
   const db = new DatabaseSync(boardDb);
   db.exec(`
@@ -226,8 +199,6 @@ test('subagents are found in both places, not just the first', async () => {
   const { sessions } = await store.sessions(agent);
   const refs = await store.subagents(sessions[0]);
 
-  // Two directly, three under the run. Reading only `subagents/` gives 2, and
-  // that was this service's answer until 2026-08-17.
   assert.equal(refs.length, 5);
   assert.equal(refs.filter((ref) => ref.workflowRunId === null).length, 2);
   assert.equal(refs.filter((ref) => ref.workflowRunId === RUN).length, 3);
@@ -305,20 +276,9 @@ test('the roll-up groups by subagent type and says how many came from workflows'
   assert.equal(rollup.projectSlug, null);
   assert.equal(rollup.scopeNote, null);
 
-  // `subagent_type` is not called a role anywhere in this payload. That
-  // conflation is the whole bug — `general-purpose` shown where a person came
-  // looking for `engineer`.
   assert.equal(JSON.stringify(rollup).includes('"role"'), false);
 });
 
-/**
- * Scoping to one agent, without any transcript becoming unreachable.
- *
- * Clawcius #80 was 58 of 104 subagent transcripts living in a directory
- * nothing read. Moving subagents off the front page must not do that again, so
- * this asserts the property directly: every entry the unscoped roll-up returns
- * is returned by exactly one scope, and the scopes together are the whole.
- */
 test('a scoped roll-up partitions the unscoped one — nothing is unreachable', async () => {
   const { config, store, agent, now } = fixture();
   const all = await buildSubagentRollup(store, agent, config, now);
@@ -350,9 +310,6 @@ test('scoping to a registered agent needs no note — the two sources agree', as
   const scoped = await buildSubagentRollup(store, agent, config, now, { projectSlug: SLUG });
 
   assert.equal(scoped.projectSlug, SLUG);
-  // Null because a registry row does claim this directory. The note exists for
-  // the case where they DISAGREE, and a note on every page is a note nobody
-  // reads.
   assert.equal(scoped.scopeNote, null);
   assert.equal(scoped.total, 5);
 });
@@ -371,19 +328,6 @@ test('a scope that matches nothing is an empty roll-up, not an error', async () 
   assert.match(scoped.scopeNote, /No agent in the registry/);
 });
 
-/**
- * The note must not explain an unclaimed directory it has not looked at.
- *
- * It used to end every unclaimed slug with "on this host those are the `/tmp`
- * paths where engineers ran permission probes" — checked for three directories
- * and asserted about all of them. It is wrong in the case that matters most: a
- * directory that DID belong to an agent the registry no longer carries, which
- * is what an operator scopes to when something has gone wrong.
- *
- * The earlier test above uses `-var-lib-nobody` and asserts only the first
- * sentence, so it walks straight through this and sees nothing. This is the
- * assertion that has eyes.
- */
 test('the scope note explains a /tmp directory and speculates about no other', async () => {
   const { config, store, agent, now } = fixture();
 
@@ -407,15 +351,6 @@ test('the scope note explains a /tmp directory and speculates about no other', a
   assert.match(retired.scopeNote, /Nothing here can tell those apart/);
 });
 
-/**
- * An empty `subagentType` from the roll-up means "no sidecar" and not "no type
- * anywhere" — the session view reads a second source and finds it.
- *
- * The roll-up's doc used to claim the two-source fallback that `buildNode`
- * has and it does not, and the page rendered its empty string as "type not
- * recorded": a positive claim that nothing recorded it, about a subagent whose
- * type is sitting in the parent transcript. Same subagent, two answers.
- */
 test('the roll-up reads only the sidecar, and the session view finds what it cannot', async () => {
   const { config, store, agent, now } = fixture({ spawnedWithoutSidecar: true });
 
@@ -426,10 +361,6 @@ test('the roll-up reads only the sidecar, and the session view finds what it can
   assert.notEqual(sidecarless, undefined, 'the sidecar-less subagent is in the roll-up');
   assert.equal(sidecarless.subagentType, '');
 
-  // The other source. `buildSessionDetail` indexes, so it sees the
-  // `subagent_type` on the Task call that spawned it — and the roll-up does
-  // not index, which is why it does not and why its label says "no sidecar"
-  // rather than "type not recorded".
   const { sessions } = await store.sessions(agent);
   const detail = await buildSessionDetail(store, sessions[0], config, now);
   const node = [...detail.subagents, ...detail.orphans].find((n) => n.agentId === SIDECARLESS);
@@ -438,14 +369,7 @@ test('the roll-up reads only the sidecar, and the session view finds what it can
   assert.equal(node.description, 'find every caller');
 });
 
-/**
- * The join that stops the list saying "no description recorded" three times.
- *
- * A workflow subagent's sidecar is `{agentType, spawnDepth}` and identical on
- * every one of them. The run's name is the only thing that says what they were
- * for, and it is carried per-entry so the UI can label it AS the run's rather
- * than passing it off as the agent's own description.
- */
+/** The join that stops the list saying "no description recorded" three times. */
 test('a workflow subagent carries its run name, and no invented description', async () => {
   const { config, store, agent, now } = fixture();
   const rollup = await buildSubagentRollup(store, agent, config, now);
@@ -467,16 +391,6 @@ test('without a descriptor the run name is null rather than guessed at', async (
   for (const entry of group.subagents) assert.equal(entry.workflowName, null);
 });
 
-/**
- * Metadata prose is rendered, so it goes through `redact()` like everything
- * else that is.
- *
- * `index.ts` states the redaction as a property of the service, without
- * qualification, and until now `description`, `workflowName`, `summary` and
- * `phases[].detail` were the exception — all four are free prose written by a
- * model that has just been reading files, and the real workflow summary on
- * this host is the report of a sudoers audit.
- */
 test('descriptions and workflow prose are redacted, like every other rendered string', async () => {
   const { config, store, agent, now } = fixture({ secrets: true });
   const { sessions } = await store.sessions(agent);
@@ -519,10 +433,6 @@ test('the session tree carries the workflow agents too, labelled by their run', 
   assert.equal(detail.subagentCount, 5);
   const all = [...detail.subagents, ...detail.orphans];
 
-  // Each node says how it was SPAWNED, on a field named for that. Not `role`:
-  // a subagent has no registry row, so it has no crew role, and the field that
-  // used to carry this name is what put `general-purpose` in front of an
-  // operator looking for `engineer`.
   assert.deepEqual(
     all.map((node) => node.subagentType).sort(),
     ['Explore', 'general-purpose', 'workflow-subagent', 'workflow-subagent', 'workflow-subagent'],
@@ -540,28 +450,12 @@ test('the session tree carries the workflow agents too, labelled by their run', 
   assert.equal(detail.orphans.length, 0);
 });
 
-/**
- * The cache limit has to stay above one session, and the cliff has to be loud.
- *
- * `buildSessionDetail` walks a session's own transcript plus every subagent,
- * in order. If that exceeds the LRU, each pass evicts exactly what the next
- * pass asks for first — so the cache does not degrade, it stops working.
- * Measured on this host when finding the other 58 subagents took one session
- * to 104 transcripts against a limit of 64: warm rebuilds went from 107ms to
- * 786ms, on a page that rebuilds on every change event.
- *
- * The default is pinned because the failure is invisible from the outside: the
- * page renders correctly and slowly, which is how 64 survived.
- */
 test('the default index cache is larger than the largest session on this host', async () => {
   const { loadStatusConfig: load } = await import('../dist/config.js');
   const { mkdtempSync: mk, writeFileSync: write } = await import('node:fs');
   const path = join(mk(join(tmpdir(), 'status-cache-')), 'status-config.yaml');
   write(path, ['agents:', '  - id: hamachi', '    projectsRoot: /tmp/x', ''].join('\n'));
 
-  // 104 transcripts: one session plus 103 subagents, counted under Hamachi's
-  // root on 2026-08-17. Raise this number when a bigger session appears — and
-  // raise the default with it.
   assert.equal(
     load(path).read.maxCachedSessions > 104,
     true,
@@ -572,10 +466,6 @@ test('the default index cache is larger than the largest session on this host', 
 
 test('a session that does not fit the cache says so, once, naming the number to raise', async () => {
   const { resetOversizeWarnings } = await import('../dist/views.js');
-  // Module state, shared by every test in this file. Without this reset the
-  // assertion below depends on no earlier test having warned for the same
-  // fixture session id — which is a constant — and the failure would read as
-  // the warning being broken rather than as ordering.
   resetOversizeWarnings();
 
   const { config, store, agent, now } = fixture();

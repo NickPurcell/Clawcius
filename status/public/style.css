@@ -1,23 +1,3 @@
-/*
- * Dark, dense, information-first.
- *
- * The palette is not improvised. Surfaces, inks and the four status colours are
- * the validated dark-mode steps from the house data-viz palette, and the eight
- * categorical slots used for subagent TYPES are in their fixed validated order
- * — that order is the colour-blind-safety mechanism, not decoration, so slots
- * are assigned by type in a stable sequence and never cycled. A ninth type
- * folds into "other" rather than inventing a hue.
- *
- * Types, not roles: the categorical hues belong to `general-purpose`,
- * `Explore` and `workflow-subagent`, which are how a subagent was spawned. A
- * CREW role is never a colour here, because there is no palette that can say
- * "engineer" and because the two were confusable enough already.
- *
- * Status colour never carries meaning alone: every liveness dot is accompanied
- * by its word ("running", "idle", "stale"), and every swimlane bar sits on a
- * row that names its subagent type in text.
- */
-
 :root {
   color-scheme: dark;
 
@@ -79,18 +59,6 @@ a:hover {
 
 /* ── Chrome ──────────────────────────────────────────────────────────────── */
 
-/*
- * Wraps, because the tab list grows.
- *
- * This was a nowrap flex row with a fixed 24px gap, sized when there were two
- * tabs. Adding a third — Clawsky — pushed it 13px past a 380px viewport: the
- * liveness indicator was clipped mid-word and the whole DOCUMENT became 393px
- * wide, so every view inherited a horizontal scrollbar from the header alone.
- * Exactly what the fifth stat tile did to the overview card, one level up.
- *
- * A header that grows a tab per view is a header that has to reflow, so the
- * gap collapses before anything is allowed to overflow.
- */
 .topbar {
   display: flex;
   align-items: center;
@@ -128,8 +96,7 @@ a:hover {
   gap: 4px;
   flex: 1 1 auto;
   flex-wrap: wrap;
-  /* Without this a flex item refuses to shrink below its content, which is how
-     the row overflowed rather than wrapping in the first place. */
+  /* A flex item refuses to shrink below its content without this. */
   min-width: 0;
 }
 
@@ -334,21 +301,6 @@ a.card:hover {
   word-break: break-all;
 }
 
-/*
- * A grid that reflows, not a flex row that cannot.
- *
- * This was `display: flex` with no wrap, which held four items and stopped
- * holding five. `Agents` was the fifth (Clawcius #14) and at 380px — a phone,
- * which is the width this page exists to be read at — the last item's value
- * rendered outside the card's padding, because flex can shrink a track but not
- * the text in it.
- *
- * `auto-fit` puts as many columns on a row as fit and expands them to fill, so
- * a wide card still shows one row and a narrow one wraps instead of clipping.
- * The minimum is set to hold the longest label, `LAST ACTIVITY`, on one line:
- * below that the labels break mid-phrase and the row goes ragged, which was
- * the other half of what this looked like.
- */
 .card-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
@@ -507,8 +459,7 @@ a.card:hover {
   overflow: hidden;
 }
 
-/* The subagent TYPE in a swimlane row label. Named for what it is: the crew
-   roles live on the front page and are not drawn as lanes. */
+/* The subagent TYPE in a swimlane row label. Crew roles are not drawn as lanes. */
 .lane-type {
   font-size: 12px;
   font-weight: 600;
@@ -753,10 +704,7 @@ a.chip:hover {
   font-style: italic;
 }
 
-/* The crew role, on the front page and on an agent's card. One weight for every
-   value, however many there are: colouring engineer differently from researcher
-   would invent a hierarchy the system does not have, and pinning the count here
-   only guarantees this comment goes stale the next time a role is added. */
+/** The crew role, on the front page and on an agent's card. */
 .chip[data-role] {
   color: var(--ink);
   border-color: var(--baseline);
@@ -787,13 +735,6 @@ a.chip:hover {
 
 /* ── Registry ────────────────────────────────────────────────────────────── */
 
-/*
- * Declared status and last-active, on one line, because neither is worth much
- * alone. `status` is written by a kill and by nothing else — see the comment
- * on declaredStatus() in app.js — so the word is deliberately NOT given the
- * green of the liveness dot. It is a claim about intent, not an observation,
- * and colouring it like an observation would be the whole bug in a swatch.
- */
 .declared {
   display: inline-flex;
   align-items: baseline;
@@ -833,17 +774,7 @@ a.chip:hover {
   margin-top: 4px;
 }
 
-/*
- * An agent's sessions sit inside its card, so the table needs room to breathe.
- *
- * And it needs somewhere to overflow TO. Eleven columns do not fit in a phone,
- * and a table's min-content width is not negotiable — left to itself it sets
- * the width of the document, which at 380px meant the table running clean
- * through the card's border while the header, the headings and every other
- * card stayed in a 380px column beside it. The wrapper scrolls; the min-width
- * keeps the columns legible rather than crushing "Aug 17, 00:16:13" into a
- * three-line stack to make room.
- */
+/** An agent's sessions sit inside its card, so the table needs room to breathe. */
 .card > .table-scroll {
   margin-top: 12px;
 }
@@ -853,10 +784,7 @@ a.chip:hover {
   scrollbar-width: thin;
 }
 
-/*
- * The wrapper carries tabindex="0" so the scroll region is reachable by
- * keyboard; this is what makes that focus visible instead of silent.
- */
+/** The wrapper carries tabindex="0" so the scroll region is reachable by keyboard; this is what makes that focus visible instead of silent. */
 .table-scroll:focus-visible {
   outline: 2px solid var(--series-1);
   outline-offset: 2px;
@@ -866,11 +794,7 @@ a.chip:hover {
   min-width: 720px;
 }
 
-/*
- * Agent cards on the instance view are stacked full width rather than laid out
- * in the `.cards` grid — each one carries a table of its sessions, and a 330px
- * grid cell cannot hold eleven columns.
- */
+/* Agent cards on the instance view are stacked full width, not laid out in the `.cards` grid: each carries a table of its sessions. */
 .main > .card {
   margin-top: 12px;
 }
@@ -939,8 +863,7 @@ a.chip:hover {
 .subagent-desc {
   color: var(--ink-secondary);
   margin-top: 2px;
-  /* Task descriptions are a sentence, not a token; they must wrap rather than
-     do what the session table did and set the width of the document. */
+  /* Task descriptions are a sentence, not a token; they must wrap. */
   overflow-wrap: anywhere;
 }
 
@@ -996,16 +919,6 @@ a.chip:hover {
   overflow-wrap: anywhere;
 }
 
-/*
- * A message body is the longest untrusted string on the page and the reason
- * this view exists is to read it.
- *
- * `pre-wrap` + `overflow-wrap: anywhere` so an unbroken 400-character URL from
- * a pull request wraps instead of setting the width of the document — the
- * failure the session tables had at 380px. `max-height` keeps one long message
- * from burying the next; the region scrolls and carries tabindex so a keyboard
- * can reach it.
- */
 .mail-body {
   margin: 8px 0 0;
   padding: 8px 10px;

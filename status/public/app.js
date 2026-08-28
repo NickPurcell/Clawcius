@@ -1,40 +1,6 @@
-/*
- * The client.
- *
- * ── The one rule ──────────────────────────────────────────────────────────
- *
- * NOTHING from the server is ever assigned to innerHTML, or interpolated into a
- * string that becomes markup. Every value goes onto the page as a text node or
- * through `textContent`, and every element is created with createElement. The
- * `el()` helper below is the only way this file builds DOM, and it has no code
- * path that parses HTML — so "did we escape that one?" is not a question that
- * can be asked about any particular field.
- *
- * This is not caution about a hypothetical. The strings on this page are: what
- * people typed into Discord, what web pages the agent fetched said, the
- * contents of files the agent read, and — once Osmosis Jones runs — the body of
- * pull requests opened by strangers. That is attacker-controlled input by any
- * definition. The page being private does not change what a script tag does
- * once it executes in the browser of the person who owns the host.
- *
- * The server's Content-Security-Policy (`default-src 'none'`, no
- * 'unsafe-inline') is the second layer, and the reason there is no inline
- * script or style anywhere in the HTML.
- *
- * Server-side redaction of credential-shaped strings is the third. All three
- * are cheap; none is sufficient alone.
- */
-
 // ── DOM construction ────────────────────────────────────────────────────────
 
-/**
- * Build an element.
- *
- * `attrs` sets properties, not raw attributes, and the two special-cased keys
- * are `class` and `dataset`. Anything in `children` that is not an element is
- * converted with String() and appended as a text node — which is what makes
- * this safe by construction rather than by discipline.
- */
+/** Build an element. */
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -65,14 +31,7 @@ function fmtDuration(seconds) {
   return `${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
-/**
- * "3m ago".
- *
- * Clamped at zero. The server already clamps its own age arithmetic, but this
- * one is computed against the *browser's* clock, which is a third clock and
- * can easily be a minute off the host's. "in 40 seconds" next to a liveness
- * dot reads as a broken page.
- */
+/** "3m ago". */
 function fmtAgo(iso) {
   if (!iso) return 'never';
   const ms = Date.parse(iso);
@@ -127,13 +86,6 @@ function fmtTokens(usage) {
   return `${(total / 1000).toFixed(1)}k`;
 }
 
-/**
- * Cost, or an honest dash.
- *
- * The SDK-driven sessions on this host record token usage but carry no cost
- * field at all, so "$0.00" would be a fabrication. Null means the transcript
- * did not say; it does not mean free.
- */
 function fmtCost(usage) {
   if (!usage || usage.costUsd === null || usage.costUsd === undefined) return '—';
   return `$${usage.costUsd.toFixed(2)}`;
@@ -156,23 +108,7 @@ function liveness(state) {
 
 // ── Subagent-type colours ───────────────────────────────────────────────────
 
-/**
- * Subagent TYPES get categorical slots in a FIXED order.
- *
- * Types, not roles. `general-purpose`, `Explore`, `workflow-subagent` — how a
- * subagent was spawned. Nothing coloured here is a crew role; the crew roles
- * are on the front page and are not a palette.
- *
- * The order is the colour-blind-safety property of the palette — adjacent
- * slots are the pairs validated for separation — so types are sorted and
- * assigned deterministically per session rather than in whatever order the
- * filesystem listed them. Two loads of the same session therefore paint the
- * same types the same colours, which matters when you are comparing a page you
- * left open to the one you just refreshed.
- *
- * Past eight types, everything else is one muted "other" colour. Generating a
- * ninth hue would produce a pair nobody validated.
- */
+/** Subagent TYPES get categorical slots in a FIXED order. */
 const SERIES = [
   '#3987e5',
   '#d95926',
@@ -194,25 +130,6 @@ function subagentTypeColors(types) {
   return map;
 }
 
-/*
- * An empty `subagentType` means two DIFFERENT things depending on which view
- * produced it, so there are two labels and not one.
- *
- * The session view (`buildSessionDetail`) reads the sidecar AND the
- * `subagent_type` on the `Task` call that spawned it. Empty there means both
- * were silent — nothing recorded a type anywhere we look.
- *
- * The roll-up (`buildSubagentRollup`) reads the sidecar only, because the
- * spawning call lives in the parent transcript and reading it would mean
- * indexing, which that view is built not to do. Empty there means "no
- * sidecar", and the session view may well know the answer.
- *
- * Printing "type not recorded" for the second would be the page asserting
- * something it did not check — the same defect this whole change is about, one
- * layer down. Neither says "unknown": that word in a column of agent-ish
- * things reads as a missing value, and beside a page where `role` means
- * engineer or researcher it reads as a missing ROLE.
- */
 const NO_TYPE_ANYWHERE = 'type not recorded';
 const NO_TYPE_IN_SIDECAR = 'no sidecar';
 
@@ -289,15 +206,7 @@ function tile(label, value, sub) {
   ]);
 }
 
-/**
- * The crew role of one registry row, as a chip.
- *
- * `role` is the registry's column, and this is the only place on the page that
- * renders a word under the heading "Role". Nothing derives it, nothing falls
- * back to a `subagent_type`, and a row that has none says so in words rather
- * than showing a blank cell or borrowing "unknown" from somewhere it would
- * look like a value.
- */
+/** The crew role of one registry row, as a chip. */
 function roleChip(role) {
   if (!role) {
     return el('span', { class: 'chip', dataset: { absent: 'true' } }, [
@@ -307,37 +216,6 @@ function roleChip(role) {
   return el('span', { class: 'chip', dataset: { role } }, [role]);
 }
 
-/**
- * The front page: every crew agent on this host, by crew role.
- *
- * ── What this used to be ───────────────────────────────────────────────────
- *
- * Two cards, "Clawcius" and "Hamachi", under a heading reading "Agents on this
- * host". Those are containers, not agents; the roles were a click away and the
- * only words on the page that looked like an agent's type were a subagent's —
- * `general-purpose`, `Explore`, `workflow-subagent`. The operator asked to see
- * "the types of agents, so like engineer or researcher", which is the registry
- * column those three words are not.
- *
- * So the page is now the registry's rows, grouped by the instance they belong
- * to, with the role in a column of its own. The instance survives as a
- * grouping and keeps its own warnings — an unreadable board has to be visible
- * next to the crew it emptied — but it is no longer the thing being listed.
- *
- * ── Why there are no subagents on it ───────────────────────────────────────
- *
- * Because a subagent is not an agent that happens to be small. It has no
- * registry row, no mailbox, no persistence, and it dies with its parent;
- * CLAWSKY.md's rule is that it inherits its parent's identity and "is an
- * extension of the named agent". Listing one here would file part of an
- * engineer as a colleague of that engineer, and give it a column headed Role
- * that it can never have a value for.
- *
- * They are not deleted and they are not hidden. Their transcripts hang off the
- * agent that spawned them, one click down, and the whole-instance roll-up that
- * reaches every one of them — including the 58 that #80 found in
- * `subagents/workflows/<runId>/` — is still one link from the instance page.
- */
 async function viewOverview() {
   const data = await api('/api/overview');
   const frag = document.createDocumentFragment();
@@ -364,11 +242,6 @@ async function viewOverview() {
     0,
   );
 
-  // Instances whose registry could not be read, or that have none configured.
-  // Their agents are not counted in the tiles and every one of their sessions
-  // falls into "unattributable", so a tile that did not say so would be the
-  // "empty roster reads as a host with no agents" failure this page is built
-  // to avoid — in the one place that summarises everything.
   const blind = instances.filter(
     (instance) => instance.registryError || !instance.registryConfigured,
   );
@@ -377,7 +250,6 @@ async function viewOverview() {
   frag.append(
     el('div', { class: 'tiles' }, [
       // Agents come from the registry; instances are the configured roots.
-      // Conflating the two is what made this page report 49 of something.
       tile(
         'Agents',
         blind.length === instances.length ? '—' : fmtCount(registered),
@@ -417,10 +289,6 @@ async function viewOverview() {
             `${fmtCount(instance.activeSessionCount)} written recently`,
         ]),
       ]),
-      // The instance's own liveness and root, kept because they are facts
-      // about the container rather than about any one agent — an instance
-      // whose whole root has gone quiet is a different problem from an idle
-      // engineer, and the path is what you need to go and look.
       el('div', { class: 'instance-line' }, [
         liveness(instance.liveness),
         text('span', 'card-path mono', instance.projectsRoot),
@@ -460,10 +328,6 @@ async function viewOverview() {
         el('a', { class: 'chip', href: `#/agent/${encodeURIComponent(instance.id)}` }, [
           'Sessions and unclaimed directories →',
         ]),
-        // The whole-instance roll-up, linked from the front page as well as
-        // from the instance page. Subagents are off this list, and "off the
-        // list" has to keep meaning "one link away" — a directory nothing
-        // links to is how #80 happened.
         el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(instance.id)}` }, [
           'All subagent transcripts →',
         ]),
@@ -509,11 +373,7 @@ function agentTable(instance) {
         ]),
         el('td', {}, [roleChip(agent.role)]),
         el('td', {}, [agent.crew]),
-        // Two columns, not one, and this is the reason. `State` is observed —
-        // a file was written N seconds ago. `Declared` is the registry's
-        // `status`, which a kill writes and a crash does not, so it can say
-        // `live` about a process that is gone. Living and dead stay
-        // distinguishable only while both are on the row.
+        // Observed liveness and declared status are separate columns.
         el('td', {}, [liveness(agent.liveness)]),
         el('td', {}, [
           el('span', { class: 'declared-word', dataset: { status: agent.declaredStatus } }, [
@@ -535,15 +395,7 @@ function agentTable(instance) {
   );
 }
 
-/**
- * The session table, used for a registry agent's sessions and for the
- * unattributed ones alike.
- *
- * `currentSessionId` marks the one the registry says this agent is resuming.
- * Without the marker the top row is only "the file written most recently",
- * which is a different claim and is wrong whenever a subagent of an older
- * session wrote last.
- */
+/** The session table, used for a registry agent's sessions and for the unattributed ones alike. */
 function sessionTable(agentId, sessions, currentSessionId) {
   const table = el('table', { class: 'table' }, [
     el('thead', {}, [
@@ -604,17 +456,6 @@ function sessionTable(agentId, sessions, currentSessionId) {
 
   table.append(body);
 
-  // Wrapped, because these tables now live INSIDE an agent's card and eleven
-  // columns of session stats do not fit in a phone. Unwrapped, the table's
-  // min-content width wins: at 380px it rendered straight through the card's
-  // border and set the width of the whole document, so every other element on
-  // the page sat in a 380px column beside a 900px scroll region. The wrapper
-  // takes the width it is given and scrolls inside itself instead.
-  //
-  // `tabindex` and `role` are what make that scroll region reachable without a
-  // mouse. A div with overflow and no focusable child is a part of the page a
-  // keyboard cannot get to in every browser, and the columns that end up off
-  // the right edge here are tokens, cost and last activity — not decoration.
   return el(
     'div',
     { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': 'Sessions' },
@@ -622,15 +463,6 @@ function sessionTable(agentId, sessions, currentSessionId) {
   );
 }
 
-/**
- * Declared status and last-active, always together.
- *
- * `status` in the registry is written, never observed — a kill writes `dead`,
- * and an agent that died mid-turn writes nothing at all. Today nothing writes
- * `dead` even in principle, because kill is CLAWSKY.md phase 5, so the word on
- * its own would be the same on every row forever. Beside "last spoke 4m ago"
- * it reads correctly now and stays correct the day spawn/kill lands.
- */
 function declaredStatus(agent) {
   return el('span', { class: 'declared' }, [
     el('span', { class: 'declared-word', dataset: { status: agent.declaredStatus } }, [
@@ -641,12 +473,7 @@ function declaredStatus(agent) {
   ]);
 }
 
-/**
- * One registry agent's card: who it is, its crew role, and its sessions.
- *
- * Shared by the instance roster and by the per-agent page, so the two cannot
- * drift into telling different stories about the same row.
- */
+/** One registry agent's card: who it is, its crew role, and its sessions. */
 function agentCard(instanceId, agent) {
   const card = el('div', { class: 'card' }, [
     el('div', { class: 'card-head' }, [
@@ -664,10 +491,6 @@ function agentCard(instanceId, agent) {
   const chips = el('div', { class: 'chips' });
   if (agent.spawnedBy) chips.append(el('span', { class: 'chip' }, [`spawned by ${agent.spawnedBy}`]));
 
-  // This agent's subagents, and the sentence that says whose they are. A
-  // subagent inherits its parent's identity, so the transcripts of the ones
-  // this agent spawned are this agent's work — which is why the link lives on
-  // its card and not on a list of agents.
   chips.append(
     agent.subagentCount > 0
       ? el(
@@ -680,14 +503,6 @@ function agentCard(instanceId, agent) {
           },
           [`${fmtCount(agent.subagentCount)} subagent transcript(s) →`],
         )
-      // "None here", and nothing about why. It read "this role has no subagent
-      // tool" for a coordinator or poster, which CLAWSKY.md does say — under
-      // phase 5, unmarked, while phase 6 is Done — but there is no
-      // `disallowedTools`, `allowedTools` or `canUseTool` anywhere in `src/`
-      // today. So it was the page stating as mechanism something that is
-      // currently prompt text. It could only render at a count of zero, so it
-      // never visibly contradicted itself; that makes it the kind of wrong
-      // sentence that survives, not the kind that gets caught.
       : el('span', { class: 'chip', dataset: { absent: 'true' } }, [
           'no subagent transcripts',
         ]),
@@ -697,16 +512,6 @@ function agentCard(instanceId, agent) {
   if (agent.sessions.length > 0) {
     card.append(sessionTable(instanceId, agent.sessions, agent.sessionId));
   } else {
-    // What this says is what it can check. The previous copy concluded "it
-    // has not run a turn", which this page has no way of knowing and which
-    // is false today for both boards on this host: `<crew>-host` has a
-    // registry row whose `last_active_at` the ops daemon stamps on every
-    // boot, so the card said "last spoke 4m ago" directly above "it has not
-    // run a turn". Its transcripts are real and are written by root under a
-    // different config dir entirely.
-    //
-    // So: report the absence, which is true and checkable, and let the
-    // reason be a separate sentence that only claims what is known.
     card.append(
       text(
         'p',
@@ -729,13 +534,7 @@ function agentCard(instanceId, agent) {
     );
   }
 
-  // Outside the branch above, not inside it. A row with a session id and no
-  // matching transcripts is the registry's own record that the agent DID run
-  // — so it is exactly the case that must not be told it has not — and it is
-  // also what this whole page degrades into if the slug join ever stops
-  // matching. Having the contradiction visible on the card is the difference
-  // between finding that out here and finding it out from a page confidently
-  // reporting that every agent has never run.
+  // Shown whether or not the agent has sessions.
   if (agent.sessionId && !agent.currentSessionPresent) {
     card.append(
       text(
@@ -753,21 +552,6 @@ function agentCard(instanceId, agent) {
   return card;
 }
 
-/**
- * One instance: its agents from the registry, then everything else. With
- * `slug`, one agent of that instance on its own.
- *
- * The list is NOT the directories under the projects root. That was Clawcius
- * #14 — Clawcius showed 49 of them, and three of Hamachi's five were `/tmp`
- * paths where an engineer ran permission probes. Those still appear, under
- * "Other transcripts", because they are real and readable; they are just not
- * agents.
- *
- * The `slug` form is filtered from the same response rather than fetched from
- * a narrower endpoint. That keeps one shape of data on this page, and it means
- * a slug that matches nothing renders a page that can say what it looked for
- * and what the instance actually has — rather than a 404 that cannot.
- */
 async function viewAgent(agentId, slug = null) {
   const data = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`);
   const frag = document.createDocumentFragment();
@@ -789,11 +573,6 @@ async function viewAgent(agentId, slug = null) {
 
   frag.append(
     el('div', { class: 'chips' }, [
-      // Unscoped, and it stays unscoped. Every subagent transcript under this
-      // root is reachable through this one link whether or not any registry
-      // row claims the directory it sits in — which is the property #80 was
-      // about, and the per-agent links below cannot provide on their own
-      // because three of the five directories here belong to no agent.
       el('a', { class: 'chip', href: `#/subagents/${encodeURIComponent(agentId)}` }, [
         'All subagent transcripts →',
       ]),
@@ -857,10 +636,6 @@ async function viewAgent(agentId, slug = null) {
             text('span', 'card-title mono', group.projectSlug),
             liveness(group.liveness),
           ]),
-          // These directories get the same scoped link an agent's card gets.
-          // They have no agent to hang off, which is exactly why they need
-          // their own way in: a subagent transcript reachable only through the
-          // agent that owns the directory is unreachable when nobody does.
           el('div', { class: 'chips' }, [
             subagents > 0
               ? el(
@@ -886,19 +661,7 @@ async function viewAgent(agentId, slug = null) {
   main.replaceChildren(frag);
 }
 
-/**
- * One agent of one instance, reached from the front page.
- *
- * This is where a subagent goes once it is off the list of agents: under the
- * agent whose identity it borrowed. The card carries its own link to that
- * agent's subagent transcripts, and this page carries the unscoped one as
- * well, so no path here is a dead end for a transcript that exists.
- *
- * A slug that matches no registry row is answered, not 404'd. The registry and
- * the transcript directories are two different lists and they are allowed to
- * disagree; when they do, the page says which one it is showing rather than
- * implying the agent was deleted.
- */
+/** One agent of one instance, reached from the front page. */
 function viewOneAgent(instanceId, slug, data, frag) {
   const agent = data.agents.find((row) => row.projectSlug === slug);
 
@@ -1038,18 +801,6 @@ async function viewSession(agentId, sessionId) {
   main.replaceChildren(frag);
 }
 
-/**
- * The swimlane.
- *
- * One row per subagent, indented by tree depth, with a bar spanning its start
- * to its end on a shared time axis. Time is on the x-axis because that is the
- * question this view answers — what ran at the same time as what, and where
- * the run actually spent its wall clock. A pure indented tree hides exactly
- * that.
- *
- * Bars are positioned as percentages of the session span rather than in
- * pixels, so the whole thing reflows with the window without recomputation.
- */
 function renderLanes(detail, nodes, agentId, sessionId) {
   const spanStart = Date.parse(detail.spanStart ?? detail.startedAt ?? '') || Date.now();
   let spanEnd = Date.parse(detail.spanEnd ?? detail.endedAt ?? '') || spanStart + 1000;
@@ -1082,8 +833,6 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     const endMs = Date.parse(node.endedAt ?? '') || startMs;
 
     const left = ((startMs - spanStart) / spanMs) * 100;
-    // A floor on width so an instant subagent — one that failed immediately —
-    // is still a visible mark rather than a zero-pixel nothing.
     const width = Math.max(0.6, ((endMs - startMs) / spanMs) * 100);
 
     const bar = el('div', {
@@ -1140,9 +889,7 @@ function renderLanes(detail, nodes, agentId, sessionId) {
     lanes.append(el('div', { class: 'lane' }, [label, el('div', { class: 'lane-track' }, [bar])]));
   }
 
-  // Legend for identity, always — the row labels already name each subagent
-  // type in text, so colour is never the only channel, but the legend makes
-  // the type→colour mapping readable at a glance across many rows.
+  // Legend for identity; the row labels already name each type, so colour is never the only channel.
   const legend = el('div', { class: 'legend' });
   for (const [subagentType, color] of colors) {
     legend.append(
@@ -1240,9 +987,7 @@ async function viewTranscript(agentId, sessionId, subagentId) {
   const list = el('div');
   frag.append(list);
 
-  // Paged rather than dumped. The largest transcript on this host is 1.8 MB in
-  // one file and the largest session directory is 4.3 MB; putting that in the
-  // DOM at once is seconds of layout and hundreds of megabytes of nodes.
+  // Paged rather than dumped.
   const pager = el('div', { class: 'pager' });
   const more = el('button', { type: 'button' }, ['Load more']);
   const progress = el('span');
@@ -1279,31 +1024,6 @@ async function viewTranscript(agentId, sessionId, subagentId) {
 
 // ── Subagents ───────────────────────────────────────────────────────────────
 
-/**
- * Every subagent an instance has run, grouped by `subagent_type` — or one
- * agent's, when `slug` scopes it.
- *
- * ── The page this is, and the page it is not ───────────────────────────────
- *
- * The session view draws one run's tree over a time axis and answers "what
- * happened here". It cannot answer "where is the transcript of the thing that
- * died at 4am" unless you already know which session it belonged to — which is
- * Clawcius #22, and is what this list is for. Types are ordered by count
- * because "what does this system spend its subagents on" is the question you
- * arrive with; within a type, newest first, because the next question is
- * always "what was the last one doing".
- *
- * It is NOT a list of agents, and the heading used to say "By role", which
- * made it look like one. A subagent has no crew role: it has no registry row
- * to carry one, it shares its parent's identity and it dies with its parent.
- * What it has is a `subagent_type` — the argument its parent passed when it
- * spawned it — and that is what is grouped here, under that name.
- *
- * The UNSCOPED form of this page is the one that reaches everything. Scoped to
- * an agent it shows that agent's; scoped to a directory no agent claims it
- * shows that directory's and says so. Both are filters over the same walk, so
- * "reachable from here" does not depend on the registry being right.
- */
 async function viewSubagents(agentId, slug = null) {
   const query = slug === null ? '' : `?slug=${encodeURIComponent(slug)}`;
   const data = await api(`/api/agents/${encodeURIComponent(agentId)}/subagents${query}`);
@@ -1419,8 +1139,7 @@ async function viewSubagents(agentId, slug = null) {
       card.append(stats);
 
       // The descriptor records how many agents the run believed it spawned;
-      // `observedAgents` is how many transcripts are actually on disk. They
-      // agree today. Saying so when they do not is cheaper than wondering.
+      // `observedAgents` is how many transcripts are actually on disk.
       if (typeof run.agentCount === 'number' && run.agentCount !== run.observedAgents) {
         card.append(
           text(
@@ -1463,11 +1182,6 @@ async function viewSubagents(agentId, slug = null) {
       ]),
     ]);
 
-    // The one group that is an absence rather than a type. It says what is
-    // missing and where the answer may still be, because this list reads the
-    // sidecar only and the session view reads the spawning call as well — so
-    // these are not subagents whose type is lost, they are subagents whose
-    // type this page did not go and look for.
     if (!group.subagentType) {
       card.append(
         text(
@@ -1501,11 +1215,7 @@ async function viewSubagents(agentId, slug = null) {
           entry.depth !== null ? el('span', { class: 'tag' }, [`depth ${entry.depth}`]) : null,
           entry.workflowRunId ? el('span', { class: 'tag' }, [entry.workflowRunId]) : null,
         ]),
-        // A workflow subagent has no description of its own — the sidecar is
-        // `{agentType, spawnDepth}` and identical on all of them — so what is
-        // shown is the RUN's name, labelled as the run's rather than passed off
-        // as this agent's. Saying "no description recorded" 58 times when the
-        // answer is one join away is technically true and no use to anybody.
+        // A workflow subagent has no description of its own (the sidecar is `{agentType, spawnDepth}` on all of them), so the run's name is shown.
         entry.description
           ? text('div', 'subagent-desc', entry.description)
           : entry.workflowName
@@ -1547,10 +1257,6 @@ function mailCard(message) {
 
   if (message.subject) card.append(text('div', 'mail-subject', message.subject));
 
-  // `pre` with a scroll cap rather than a clamp-and-expand: a body can be
-  // 20,000 characters and the point of this view is to read them. tabindex,
-  // because a scroll region with no focusable child is unreachable by keyboard
-  // — the same lesson as the session tables.
   card.append(
     el('pre', { class: 'mail-body', tabindex: '0', role: 'region', 'aria-label': 'Message body' }, [
       message.body,
@@ -1598,12 +1304,7 @@ async function viewClawsky() {
       frag.append(text('div', 'warning-row', instance.mailError));
     }
 
-    // Every number and every sentence below is gated on this. `posterCount: 0`
-    // means "no poster" when the board was read and "we did not get to look"
-    // when it was not, and only the first licenses the copy under an empty
-    // feed. The server decides it — see `boardReadable` in views.ts — so the
-    // claim is on the wire where a test can see it, rather than being a shape
-    // this file happens to draw.
+    // Every number and every sentence below is gated on this.
     const readable = instance.boardReadable;
 
     frag.append(
@@ -1613,11 +1314,6 @@ async function viewClawsky() {
           readable ? fmtCount(instance.participants.length) : '—',
           readable ? `${instance.posterCount} poster(s)` : 'board unreadable',
         ),
-        // Each list carries its own total, so each can say when it is showing
-        // a window rather than everything. The feed used to have no such
-        // qualifier at all, which mattered more than it sounds: its
-        // empty-state copy is a positive claim, and a claim under an
-        // unmentioned ceiling is a lie waiting for the row count to grow.
         tile(
           'Posts',
           readable ? fmtCount(instance.totalFeed) : '—',
@@ -1653,10 +1349,6 @@ async function viewClawsky() {
 
     frag.append(el('h3', {}, ['Feed']));
     if (!readable) {
-      // The explanation is gated on having read the thing it explains. This is
-      // the state the page names itself — mail goes dark exactly when the
-      // roster does (#72) — so it is where a confident "nothing is broken"
-      // would be read, and it is the one place it must not appear.
       frag.append(
         text(
           'p',
@@ -1666,12 +1358,6 @@ async function viewClawsky() {
         ),
       );
     } else if (instance.feed.length === 0) {
-      // `totalFeed` is counted in SQL over the whole table and the feed query
-      // has its own limit, so "no posts" here means no posts — not "none in
-      // the window I asked for". Only a poster may write to the feed
-      // (src/mail.ts), and `posterCount` came from a successful registry read,
-      // so this says the feed CANNOT have posts rather than that it happens
-      // not to.
       frag.append(
         text(
           'p',
@@ -1709,8 +1395,6 @@ async function viewClawsky() {
   main.replaceChildren(frag);
 }
 
-// ── Osmosis Jones ───────────────────────────────────────────────────────────
-
 async function viewOj() {
   const data = await api('/api/oj');
   const frag = document.createDocumentFragment();
@@ -1721,8 +1405,6 @@ async function viewOj() {
   );
 
   if (!data.present && data.workers.length === 0) {
-    // Deliberately calm. OJ not running is the expected state today, and a red
-    // error banner for the expected state teaches you to ignore banners.
     frag.append(
       text('p', 'placeholder', data.message || 'No OJ data yet.'),
       text(
@@ -1808,14 +1490,7 @@ async function viewOj() {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-/**
- * Hash routing, not the History API.
- *
- * A hash route never reaches the server, so there is no deep-link path that
- * needs an SPA fallback and no route that could be confused for an API path.
- * For a page served off a handful of static files behind a proxy, that is one
- * fewer thing to get wrong.
- */
+/** Hash routing, not the History API. */
 function parseRoute() {
   const raw = window.location.hash.replace(/^#\/?/, '');
   const parts = raw.split('/').filter(Boolean).map(decodeURIComponent);
@@ -1834,10 +1509,7 @@ async function render() {
   }
 
   try {
-    // `#/agent/<instance>` is the whole instance; `#/agent/<instance>/<slug>`
-    // is one agent of it. Same for `#/subagents/`. The second segment is a
-    // project slug, which is `slug(workspace_path)` and identifies exactly one
-    // registry row — an id would have needed a lookup the client cannot do.
+    // `#/agent/<instance>` is the whole instance; `#/agent/<instance>/<slug>` is one agent of it.
     if (route.name === 'agent' && route.args[0]) {
       await viewAgent(route.args[0], route.args[1] ?? null);
     } else if (route.name === 'subagents' && route.args[0]) {
@@ -1876,15 +1548,6 @@ function setStreamState(state, label) {
   streamLabel.replaceChildren(document.createTextNode(label));
 }
 
-/**
- * A change coalesces into one re-render.
- *
- * The server already debounces filesystem events, but several agents can
- * change at once and the transcript view is expensive to rebuild. This also
- * deliberately skips re-rendering the transcript view: it is paginated and
- * scrolled, and yanking it back to page one because a subagent wrote a line
- * would make it unusable to read.
- */
 function scheduleRefresh() {
   if (parseRoute().name === 'transcript') return;
   if (refreshTimer) return;
@@ -1925,15 +1588,6 @@ function connect() {
   };
 }
 
-/**
- * The watchdog.
- *
- * This is the whole point of having a heartbeat. A TCP connection through a
- * proxy can stay established and silently stop carrying anything; without this
- * check the page would sit there with a green dot showing data from hours ago,
- * which is a worse failure than showing nothing. Two missed beats and it says
- * so, in words, next to a red dot.
- */
 setInterval(() => {
   const silentFor = (Date.now() - lastBeat) / 1000;
   if (silentFor > heartbeatSeconds * 2 + 2) {

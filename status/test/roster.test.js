@@ -1,12 +1,3 @@
-/**
- * The roster: agents from the registry, sessions hung off them.
- *
- * This is the shape Clawcius #14 asked for, so the fixture is built to look
- * like the host that produced the bug — one registry agent with two sessions,
- * and a `/tmp` directory from a permission probe that is a real transcript and
- * is not an agent.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
@@ -76,10 +67,6 @@ function seedBoard(path, rows) {
      VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
   );
   for (const row of rows) {
-    // `status` comes from the row and is NOT hardcoded here. It was, and that
-    // made `declaredLiveCount` equal `registeredAgentCount` in every fixture —
-    // so an implementation that simply returned the row count would have
-    // passed the assertion that exists to check it.
     insert.run(
       row.id,
       row.crew,
@@ -94,15 +81,6 @@ function seedBoard(path, rows) {
   db.close();
 }
 
-/**
- * A host in miniature: one instance, one registry agent with two sessions, and
- * a scratch directory nobody registered.
- *
- * The CURRENT session is given the OLDER mtime on purpose. Sorting by mtime is
- * what the page used to do, and it gets this case wrong: the session an agent
- * is actually resuming is a fact from the registry, not the file that happened
- * to be written last.
- */
 function fixture({ withBoard = true } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'status-roster-'));
   const projectsRoot = join(base, 'agent-home', 'projects');
@@ -138,8 +116,6 @@ function fixture({ withBoard = true } = {}) {
         workspacePath: '/var/lib/hamachi/workspaces/hamachi-poster',
       },
       // Declared dead, so `declaredLiveCount` is not simply the row count.
-      // Nothing writes `dead` today; the page has to render it correctly the
-      // day something does.
       {
         id: 'hamachi-engineer0',
         crew: 'hamachi',
@@ -148,8 +124,7 @@ function fixture({ withBoard = true } = {}) {
         workspacePath: '/var/lib/hamachi/workspaces/hamachi-engineer0',
       },
       // A session id the registry believes in, and no transcript anywhere for
-      // it. This is what the whole page degrades into if the slug join stops
-      // matching, so it is a fixture rather than a hypothetical.
+      // it: what the whole page degrades into if the slug join stops matching.
       {
         id: 'hamachi-ghost',
         crew: 'hamachi',
@@ -157,11 +132,8 @@ function fixture({ withBoard = true } = {}) {
         sessionId: 'cccccccc-3333-4333-8333-333333333333',
         workspacePath: '/var/lib/hamachi/workspaces/hamachi-ghost',
       },
-      // The host agent, exactly as `ops/src/board.ts` register() writes it —
-      // empty session id, and a workspace deliberately outside every
-      // agent-home, so its slug can never name a directory under any
-      // projectsRoot. This row is on both live boards on this host right now;
-      // it is not a hypothetical and it never goes away.
+      // The host agent: empty session id, and a workspace outside every
+      // agent-home, so its slug names no directory under any projects root.
       {
         id: 'hamachi-host',
         crew: 'hamachi',
@@ -222,8 +194,7 @@ test('an agent gets its own sessions, current first', async () => {
   );
   assert.equal(engineer.currentSessionPresent, true);
   assert.equal(engineer.projectSlug, AGENT_SLUG);
-  // Historical sessions are listed, not only the current one — the operator
-  // asked to "look through historical sessions as much as possible".
+  // Historical sessions are listed, not only the current one.
   assert.equal(engineer.sessions.length, 2);
 });
 
@@ -236,9 +207,7 @@ test('a registry row with no transcripts is still an agent', async () => {
   assert.deepEqual(poster.sessions, []);
   assert.equal(poster.liveness, 'unknown');
   assert.equal(poster.lastTranscriptActivity, null);
-  // Declared live, and it has never written a line. That pair is the whole
-  // reason both are shown: the word alone would be a green light on an agent
-  // that has never run.
+  // Declared live, and it has never written a line. Both are shown.
   assert.equal(poster.declaredStatus, 'live');
   assert.equal(poster.lastActiveAt, new Date(1_700_000_500_000).toISOString());
   // No session id either, which is what separates "has not run" from the ghost
@@ -247,15 +216,7 @@ test('a registry row with no transcripts is still an agent', async () => {
   assert.equal(poster.currentSessionPresent, false);
 });
 
-/**
- * The contradiction the page must not paper over.
- *
- * A row with a session id and no matching transcript is the registry's own
- * record that this agent DID run, next to a directory that says it did not.
- * It is also precisely what every agent looks like if the slug join ever stops
- * matching — so a page that renders "it has not run a turn" here would report
- * a broken join as a quiet, plausible, entirely wrong fact about the crew.
- */
+/** The contradiction the page must not paper over. */
 test('a row with a session id and no transcript is not reported as never having run', async () => {
   const { config, store, agent, now } = fixture();
   const ghost = (await buildRoster(store, agent, config, now)).agents.find(
@@ -269,24 +230,6 @@ test('a row with a session id and no transcript is not reported as never having 
   assert.equal(ghost.currentSessionPresent, false);
 });
 
-/**
- * The host agent: a real agent whose transcripts this page cannot see, ever.
- *
- * `ops/src/board.ts` register() puts this row on every board with a `board:`
- * block — both of them — with an empty session id and a workspace outside
- * every agent-home, and stamps `last_active_at` each time the daemon takes it.
- * Meanwhile `ops/src/host-agent.ts` really does mint a session per task, as
- * root, under a config dir this service does not read.
- *
- * So the card shows a recent last-active time and an empty session list at the
- * same time, and both are correct. That is the shape that makes "it has not
- * run a turn" a fabrication rather than an inference — which is what the copy
- * used to say, above a line reading "last spoke 4m ago".
- *
- * There is nothing for the server to fix here; the fixture exists so that the
- * combination is on the wire and staring at anyone who reintroduces a
- * conclusion the page cannot check.
- */
 test('the host agent has a live last-active time and no transcripts, and both are true', async () => {
   const { config, store, agent, now } = fixture();
   const host = (await buildRoster(store, agent, config, now)).agents.find(
@@ -296,8 +239,7 @@ test('the host agent has a live last-active time and no transcripts, and both ar
   assert.equal(host.role, 'host');
   assert.deepEqual(host.sessions, []);
   assert.equal(host.sessionId, '');
-  // Finding 3's guard does not reach this row, and cannot: there is no session
-  // id to disagree with. Only the copy can be honest about it.
+  // There is no session id to disagree with here, so only the copy can say it.
   assert.equal(host.currentSessionPresent, false);
   assert.equal(host.lastActiveAt, new Date(1_700_000_500_000).toISOString());
   // Its workspace is outside the projects root by construction, so the slug is
@@ -359,14 +301,7 @@ test('the overview counts agents and directories as different things', async () 
   assert.equal(overview.registryConfigured, true);
 });
 
-/**
- * The front page lists agents, with the CREW role on each.
- *
- * The operator's complaint was that the page showed `general-purpose`,
- * `Explore` and `workflow-subagent` where they expected `engineer` and
- * `researcher`. Those first three are `subagent_type`; the roles are in the
- * registry, and this asserts they are what reaches the wire.
- */
+/** The front page lists agents, with the CREW role on each. */
 test('the overview lists registry agents, labelled by crew role', async () => {
   const { config, store, agent, now } = fixture();
   const overview = await buildInstanceOverview(store, agent, config, now);
@@ -383,23 +318,13 @@ test('the overview lists registry agents, labelled by crew role', async () => {
   );
   assert.equal(overview.agents.length, overview.registeredAgentCount);
 
-  // No `subagent_type` anywhere on the front page's payload. This is the
-  // assertion that fails if someone reintroduces the confusion by adding
-  // subagents back onto this list.
+  // No `subagent_type` anywhere on the front page's payload: subagents are not on this list.
   const wire = JSON.stringify(overview.agents);
   for (const harnessType of ['general-purpose', 'Explore', 'workflow-subagent', 'subagentType']) {
     assert.equal(wire.includes(harnessType), false, `front page carries ${harnessType}`);
   }
 });
 
-/**
- * Living and dead stay distinguishable, and by two independent signals.
- *
- * `declaredStatus` is written and can be stale; `liveness` is observed off a
- * file mtime. The fixture's engineer0 is declared dead, and the fixture's
- * engineer1 has transcripts written an hour ago. Neither column alone is the
- * answer, which is why both are on the row.
- */
 test('the overview carries declared status and observed liveness per agent', async () => {
   const { config, store, agent, now } = fixture();
   const overview = await buildInstanceOverview(store, agent, config, now);
@@ -408,9 +333,6 @@ test('the overview carries declared status and observed liveness per agent', asy
   const engineer1 = byId.get('hamachi-engineer1');
   assert.equal(engineer1.declaredStatus, 'live');
   assert.equal(engineer1.sessionCount, 2);
-  // From the NEWEST of its two transcripts — the old session, written 60s ago,
-  // not the current one written an hour ago. An agent's liveness is the last
-  // time anything of its wrote, which is why this is not read off `sessionId`.
   assert.equal(engineer1.liveness, 'running');
   assert.equal(
     Math.round((now - Date.parse(engineer1.lastActivity)) / 1000),
@@ -443,14 +365,6 @@ test('an instance with no registry lists no agents rather than guessing', async 
   assert.equal(overview.unattributedSessionCount, 3);
 });
 
-/**
- * The promise in the README, assembled end to end.
- *
- * "Transcripts are unaffected; they are read straight off disk" is the whole
- * reason the WAL hazard is a degradation rather than an outage, and until now
- * it was only ever asserted one layer down, on `readRegistry` alone. This
- * drives a real read failure through the views the page actually calls.
- */
 test('when the registry cannot be read the transcripts still render', { skip: process.getuid?.() === 0 ? 'runs as root; mode bits do not apply' : false }, async () => {
   const { config, store, agent, now, boardDb } = fixture();
   chmodSync(boardDb, 0o000);
