@@ -1,7 +1,8 @@
 import { Client, Events, GatewayIntentBits, Partials, type Message } from 'discord.js';
 import { join } from 'node:path';
 import { loadConfig, type Config } from './config.js';
-import { AgentRegistry, hostAgentId } from './store.js';
+import { AgentRegistry } from './store.js';
+import { BUILD_INFO } from './build-info.js';
 import {
   AtCapacityError,
   DEFAULT_CHANNEL_ROLE,
@@ -55,8 +56,6 @@ export type DiscordHandlers = {
   deliver: (channelId: string, buffered: BufferedMessage[], afterRespawn?: boolean) => void;
   announceOutage: (channelId: string, summary: TurnSummary) => Promise<void>;
   announceAtCapacity: (channelId: string, error: AtCapacityError) => Promise<void>;
-  describeHostAgent: () => string;
-  describeCrew: () => string;
   isAuthorized: (message: Message) => boolean;
   stripMention: (message: Message) => string;
 };
@@ -213,51 +212,14 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
 
       case 'status': {
         const persisted = registry.get(channelId);
-        const idle = config.agent.sessions.idleTimeoutMinutes;
         await message.reply(
           [
-            `Live sessions: ${sessions.liveCount}/${config.agent.sessions.maxConcurrent}` +
-              ` (${sessions.busyCount} mid-turn)`,
-            `Model: ${
-              config.agent.modelByRole[persisted?.role ?? DEFAULT_CHANNEL_ROLE] ??
-              config.agent.model
-            }`,
-            `Turns: ${config.agent.maxTurns === 0 ? 'unlimited' : config.agent.maxTurns}`,
-            `Idle eviction: ${idle === 0 ? 'never' : `${idle}m`}`,
-            `Buffered: ${bundler.pendingCount(channelId)} message(s)`,
-            `Container: ${config.agent.container.name}`,
-            `Always-on: ${alwaysOnChannels.has(channelId) ? 'yes — every message wakes me' : 'no'}`,
-            `Follow-up window: ${
-              !windows.enabled
-                ? 'disabled'
-                : !windows.allows(channelId)
-                  ? 'not permitted in this channel'
-                  : windows.isOpen(channelId)
-                    ? `open, ${windows.remainingSeconds(channelId)}s left`
-                    : `closed (${config.agent.discord.followUpWindowSeconds}s when open)`
-            }`,
-            // Naming the enforcing proxy matters: "uncontrolled" here would be the
-            // difference between a contained agent and one with open egress.
-            `Egress: Squid allowlist (${config.agent.container.name} has no other route)`,
+            `Build ${BUILD_INFO.shortCommit ?? 'unknown'}${BUILD_INFO.dirty ? ' (dirty)' : ''}`,
+            `Sessions: ${sessions.liveCount}/${config.agent.sessions.maxConcurrent} live, ${sessions.busyCount} mid-turn`,
             persisted?.sessionId
-              ? `This channel: session ${persisted.sessionId.slice(0, 8)}…`
+              ? `This channel: session ${persisted.sessionId.slice(0, 8)}…, ${mail ? mail.unread(channelId).length : 0} unread mail`
               : 'This channel: no session yet',
-            mail
-              ? `Mail: ${mail.unread(channelId).length} unread as ${channelId} (crew ${config.agent.clawsky.crew})` +
-                `, wake-on-mail ${mailWaker ? 'on' : 'off'}`
-              : 'Mail: disabled',
-            // Whether the ops executor has claimed its row. A coordinator that
-            // is about to be told "unknown recipient" would rather find out here.
-            mail ? `Host agent: ${describeHostAgent()}` : 'Host agent: unreachable (mail disabled)',
-            // The crew, by role.
-            mail ? `Crew: ${describeCrew()}` : 'Crew: not on a board (mail disabled)',
-            // Whether watchPr can arm at all is a property of THIS process, and
-            // the agent inside the container has no way to see it — its own
-            // GITHUB_TOKEN says nothing about the waker's. So it is reported.
-            armedStore
-              ? `Armed: ${armedStore.listFor(channelId).length} condition(s) for ${channelId}` +
-                `, GitHub ${github ? 'reachable' : 'UNAVAILABLE — no token in the waker process'}`
-              : 'Armed: disabled',
+            armedStore ? `Armed: ${armedStore.listFor(channelId).length} condition(s)` : 'Armed: disabled',
           ].join('\n'),
         );
         return true;
@@ -268,47 +230,13 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     }
   }
 
-  /** Is there a host agent on this board, and is this channel allowed to reach it? */
-  function describeHostAgent(): string {
-    const id = hostAgentId(config.agent.clawsky.crew);
-    const row = registry.get(id);
-    if (!row || row.role !== 'host') {
-      return `${id} is not on this board — the ops executor has not registered it ` +
-        '(no board: block in ops-config.yaml, or it could not open the database)';
-    }
-    return `DM ${id} — coordinators only, enforced in code`;
-  }
 
-  /** Who is on this crew's board, by role, and how many of them were spawned. */
-  function describeCrew(): string {
-    const crew = config.agent.clawsky.crew;
-    const rows = registry.listByCrew(crew);
-    if (rows.length === 0) return `${crew} — no rows on the board`;
-
-    const byRole = new Map<string, number>();
-    for (const row of rows) byRole.set(row.role, (byRole.get(row.role) ?? 0) + 1);
-    const roles = [...byRole.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([role, n]) => `${n} ${role}`)
-      .join(', ');
-    const spawned = rows.filter((row) => row.spawnedBy !== null).length;
-
-    const notes: string[] = [];
-    if ((byRole.get('coordinator') ?? 0) > 1) {
-      notes.push('a coordinator row is one Discord channel or thread, not one agent');
-    }
-    if (byRole.has('host')) notes.push('the host runs outside the container and is not crew');
-    notes.push(spawned > 0 ? `${spawned} spawned` : 'none spawned');
-
-    return `${crew} — ${rows.length} row(s): ${roles} (${notes.join('; ')})`;
-  }
 
   function silentEvents() {
     return {
       onToolUse: () => {},
       onDone: () => {},
       onError: () => {},
-      onCliFailure: () => {},
       // Reached only by `!stop`/`!status`, which acquire a session to look at or
       // interrupt it rather than to run a turn. There is no wake in flight to
       // rescue, so respawning here would be churn.
@@ -419,13 +347,6 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
           const detail = cmd ? `: ${cmd.replace(/\s+/g, ' ').slice(0, 160)}` : '';
           process.stdout.write(`[clawcius ${channelId}] ${tool}${detail}\n`);
         },
-        onCliFailure: (command, output) => {
-          process.stderr.write(
-            `[clawcius ${channelId}] discord CLI FAILED — nothing was posted\n` +
-              `  cmd: ${command.replace(/\s+/g, ' ').slice(0, 200)}\n` +
-              `  out: ${output.replace(/\s+/g, ' ').slice(0, 300)}\n`,
-          );
-        },
         onDone: (summary) => {
           sessions.persist(channelId);
           const seconds = (summary.durationMs / 1000).toFixed(1);
@@ -450,7 +371,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
           }
           process.stdout.write(
             `[clawcius ${channelId}] turn ${summary.subtype} in ${seconds}s ` +
-              `$${summary.costUsd.toFixed(4)} (spoke=${summary.sentMessage})\n`,
+              `$${summary.costUsd.toFixed(4)}\n`,
           );
         },
         onError: (error) => {
@@ -501,7 +422,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     try {
       const channel = await client.channels.fetch(channelId);
       if (!channel || !channel.isTextBased() || !('send' in channel)) return;
-      await channel.send(atCapacityNotice(error, config.agent.sessions.idleTimeoutMinutes));
+      await channel.send(atCapacityNotice(error));
     } catch (sendError) {
       // Best effort, as in announceOutage. If Discord is unreachable too, the
       // journal is the record, and throwing here would take the process down.
@@ -526,8 +447,6 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     deliver,
     announceOutage,
     announceAtCapacity,
-    describeHostAgent,
-    describeCrew,
     isAuthorized,
     stripMention,
   };
@@ -684,10 +603,6 @@ export async function main(): Promise<void> {
           start: (agent, context, settle) => {
             const session = sessions.acquire(agent.id, {
               onToolUse: (tool) => process.stdout.write(`[clawcius ${agent.id}] ${tool}\n`),
-              onCliFailure: (cmd, out) =>
-                process.stderr.write(
-                  `[clawcius ${agent.id}] discord CLI FAILED\n  ${cmd}\n  ${out}\n`,
-                ),
               ...mailWakeEvents({
                 persist: () => sessions.persist(agent.id),
                 release: () => void sessions.release(agent.id),

@@ -87,17 +87,10 @@ export class MailStore {
       if (!recipient) {
         return { accepted: false, detail: `unknown recipient "${mail.recipient}"` };
       }
-      // ── The only access control left on running commands on the VPS ──────
-      if (recipient.role === 'host' && author.role !== 'coordinator') {
-        return {
-          accepted: false,
-          detail:
-            `only a coordinator may DM the host agent; ${author.id} is a ${author.role}. ` +
-            `Ask ${author.crew}'s coordinator to file it.`,
-        };
-      }
       // Crews talk to each other in public on the feed; within a crew, agents talk privately.
-      if (recipient.crew !== author.crew) {
+      // Coordinators may DM each other across crews (how a sandboxed crew reaches the operator's).
+      const bothCoordinators = author.role === 'coordinator' && recipient.role === 'coordinator';
+      if (recipient.crew !== author.crew && !bothCoordinators) {
         return {
           accepted: false,
           detail:

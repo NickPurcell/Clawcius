@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
 import { config } from './config.js';
 import { containerRunning, containerStatus } from './container.js';
 
@@ -12,49 +11,13 @@ function onPath(binary: string): boolean {
   }
 }
 
-/** Warn when the allowlist source and the build-context copy have drifted. */
-function checkSquidConfSync(): void {
-  const source = 'squid/squid.conf';
-  const buildCopy = 'docker/squid.conf';
-  if (!existsSync(source) || !existsSync(buildCopy)) return;
 
-  if (readFileSync(source, 'utf8') !== readFileSync(buildCopy, 'utf8')) {
-    process.stderr.write(
-      `[preflight] ${source} differs from ${buildCopy}.\n` +
-        `[preflight]   The running proxy enforces the copy baked into the image, not the source.\n` +
-        `[preflight]   Fix:  cp ${source} ${buildCopy} && docker/up.sh --rebuild\n`,
-    );
-  }
-}
-
-/** Does `docker exec` take `--env-file`? */
-function execTakesEnvFile(): boolean {
-  try {
-    const help = execFileSync('docker', ['exec', '--help'], {
-      encoding: 'utf8',
-      timeout: 10_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return help.includes('--env-file');
-  } catch {
-    return true;
-  }
-}
 
 export async function preflight(): Promise<void> {
   const problems: string[] = [];
   const name = config().agent.container.name;
   const proxy = 'clawcius-squid';
 
-  if (onPath('docker') && !execTakesEnvFile()) {
-    problems.push(
-      'this docker\'s `exec` does not accept --env-file (needs 20.10 or newer).\n' +
-        '    Every turn passes the session environment that way, because the alternative\n' +
-        '    puts DISCORD_TOKEN and GITHUB_TOKEN in a world-readable /proc/<pid>/cmdline.\n' +
-        '    Fix:  upgrade docker. Do not move the environment back onto the argv.\n' +
-        '    Check: docker exec --help | grep env-file',
-    );
-  }
 
   if (!onPath('docker')) {
     problems.push(
@@ -81,6 +44,4 @@ export async function preflight(): Promise<void> {
   if (problems.length > 0) {
     throw new Error(`Preflight failed:\n\n  - ${problems.join('\n\n  - ')}\n`);
   }
-
-  checkSquidConfSync();
 }

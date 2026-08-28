@@ -237,6 +237,7 @@ export class AgentRegistry {
     this.#db.prepare('UPDATE agents SET last_active_at = ? WHERE id = ?').run(Date.now(), id);
   }
 
+
   setStatus(id: string, status: AgentStatus): void {
     this.#db.prepare('UPDATE agents SET status = ? WHERE id = ?').run(status, id);
   }

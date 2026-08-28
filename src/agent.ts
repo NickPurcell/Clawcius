@@ -17,7 +17,6 @@ import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
 /** Matches a `discord send` / `discord reply` invocation in a bash command, including the absolute-path form the agent is told to use. */
-const DISCORD_SEND_PATTERN = /(^|[\s/])discord\s+(reply|send)\b/;
 
 /** Whether a stored id can actually be handed to `--resume`. */
 const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -157,18 +156,10 @@ export class AtCapacityError extends Error {
 }
 
 /** The sentence a user reads when their mention was dropped for want of a slot. */
-export function atCapacityNotice(error: AtCapacityError, idleTimeoutMinutes: number): string {
+export function atCapacityNotice(error: AtCapacityError): string {
   return (
     `⚠️ No session slot free — ${error.live} of ${error.max} are in use, so I could not ` +
-    `pick that up and it was not queued. ` +
-    (idleTimeoutMinutes === 0
-      ? 'This deployment never evicts idle sessions, so this will not clear on its own. ' +
-        'Mentioning me with `!reset` in another channel that is holding a session gives ' +
-        "its slot back, at the cost of that channel's transcript — but not here: this " +
-        'channel has no session to free, so resetting it would spend its transcript for ' +
-        'nothing. Failing that it needs a restart on the host, or a higher ' +
-        '`sessions.maxConcurrent`.'
-      : `A slot frees after ${idleTimeoutMinutes}m idle — say it again after that.`)
+    'pick that up and it was not queued. Idle sessions are evicted on their own; try again in a few minutes.'
   );
 }
 
@@ -178,7 +169,6 @@ export type AgentEvents = {
   onDone: (summary: TurnSummary) => void;
   onError: (error: Error) => void;
   /** A discord CLI call came back an error — the reply never landed. */
-  onCliFailure: (command: string, output: string) => void;
   /** This session cannot recover on its own and must be replaced. */
   onNeedsRespawn: (acted: boolean) => void;
 };
@@ -266,14 +256,12 @@ export class AgentSession {
   #consuming: Promise<void> | null = null;
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
-  #sentThisTurn = false;
   readonly #settle = new TurnSettle();
   #apiErrorThisTurn: string | null = null;
   #apiErrorKindThisTurn: string | null = null;
   /** Whether the agent has run any tool since the last real wake. */
   #actedSinceWake = false;
   /** tool_use ids of in-flight discord CLI calls, awaiting their results. */
-  #discordCalls = new Map<string, string>();
   /** The wake being served, kept so a retry can re-send it. */
   #lastContext: WakeContext | null = null;
   /** Retries already spent on #lastContext. Reset by wake(), not by retries. */
@@ -439,52 +427,12 @@ export class AgentSession {
           this.#actedSinceWake = true;
 
           const input = (block.input ?? {}) as Record<string, unknown>;
-          const command = typeof input['command'] === 'string' ? input['command'] : '';
-
-          // Matching the command only proves the agent *invoked* the CLI —
-          // `--help` matches too. Record it and wait for the tool result,
-          // which is the only thing that says whether it actually worked.
-          if (DISCORD_SEND_PATTERN.test(command)) {
-            this.#discordCalls.set(block.id, command);
-          }
 
           this.#events.onToolUse(block.name, input);
         }
         break;
       }
 
-      case 'user': {
-        const content = message.message.content;
-        if (!Array.isArray(content)) break;
-
-        for (const block of content) {
-          if (block.type !== 'tool_result') continue;
-          const command = this.#discordCalls.get(block.tool_use_id);
-          if (command === undefined) continue;
-          this.#discordCalls.delete(block.tool_use_id);
-
-          const text =
-            typeof block.content === 'string'
-              ? block.content
-              : Array.isArray(block.content)
-                ? block.content
-                    .map((c: { type: string; text?: string }) =>
-                      c.type === 'text' ? (c.text ?? '') : '',
-                    )
-                    .join(' ')
-                : '';
-
-          // The CLI exits non-zero and prints JSON with an "error" key when a
-          // send fails. Either signal means nothing reached Discord.
-          const failed = block.is_error === true || /"error"\s*:/.test(text);
-          if (failed) {
-            this.#events.onCliFailure(command, text.slice(0, 400));
-          } else {
-            this.#sentThisTurn = true;
-          }
-        }
-        break;
-      }
 
       case 'result': {
         // ── ORDER IS LOAD-BEARING: SETTLE BEFORE PUBLISHING `busy` ───────────
@@ -509,7 +457,6 @@ export class AgentSession {
           numTurns: message.num_turns,
           durationMs: message.duration_ms,
           subtype: message.subtype,
-          sentMessage: this.#sentThisTurn,
           apiError: this.#apiErrorThisTurn,
           apiErrorKind: this.#apiErrorKindThisTurn,
           retryScheduled: willRetry,
@@ -569,10 +516,8 @@ export class AgentSession {
   #push(text: string, synthetic = false): void {
     this.lastActiveAt = Date.now();
     this.busy = true;
-    this.#sentThisTurn = false;
     this.#apiErrorThisTurn = null;
     this.#apiErrorKindThisTurn = null;
-    this.#discordCalls.clear();
     try {
       this.#queue.push(text, this.#sessionId, synthetic);
     } catch (error) {

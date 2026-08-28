@@ -50,19 +50,5 @@ export type TurnSummary = {
   durationMs: number;
   /** `success`, or a failure subtype such as `error_max_turns`. */
   subtype: string;
-  /** Whether the agent actually invoked the discord CLI during this turn. */
-  sentMessage: boolean;
 };
 
-export type Schedule = {
-  id: string;
-  channelId: string;
-  prompt: string;
-  nextRunAt: number;
-  /** Repeat every N seconds, or null for one-shot / daily. */
-  intervalSeconds: number | null;
-  /** 'HH:MM' local time for daily repeats, or null. */
-  dailyAt: string | null;
-  createdAt: number;
-  lastRunAt: number | null;
-};

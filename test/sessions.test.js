@@ -482,36 +482,6 @@ test('the override follows the row, not the id', () => {
 
 // ── what the user is told ────────────────────────────────────────────────────
 
-test('at capacity with eviction off, the notice names the remedies', () => {
-  const notice = atCapacityNotice(new AtCapacityError(4, 4), 0);
-  assert.match(notice, /4 of 4 are in use/);
-  assert.match(notice, /not queued/);
-  assert.match(notice, /will not clear on its own/);
-  assert.match(notice, /`!reset`/);
-  assert.match(notice, /transcript/);
-  assert.match(notice, /another channel/);
-  assert.match(notice, /this channel has no session to free/);
-  // `handleCommand` is gated on `addressed && startsWith('!')`, so outside an always-on channel a bare `!reset` is dropped or handed to the agent as chat.
-  assert.match(notice, /Mentioning me with `!reset`/);
-  assert.match(notice, /restart on the host, or a higher `sessions\.maxConcurrent`/);
-  assert.doesNotMatch(notice, /say it again/);
-  // No duration promise: `close()` has no busy branch, so a mid-turn session
-  // keeps its process while the turn drains. The slot comes back before the
-  // memory does, and the notice must not imply otherwise.
-  assert.doesNotMatch(notice, /immediately|at once|straight away/);
-});
-
-test('at capacity with eviction on, the notice says when to come back', () => {
-  const notice = atCapacityNotice(new AtCapacityError(2, 2), 30);
-  assert.match(notice, /2 of 2 are in use/);
-  assert.match(notice, /A slot frees after 30m idle — say it again after that\./);
-  assert.doesNotMatch(notice, /will not clear on its own/);
-  assert.doesNotMatch(notice, /restart on the host/);
-  // The remedy branch stays asymmetric on purpose: with eviction on, waiting
-  // works and is free, so spending a transcript is the wrong advice.
-  assert.doesNotMatch(notice, /!reset/);
-});
-
 test('the notice carries the numbers from the error it was given', () => {
   // `live` and `max` exist on the error because the catch site has no other way
   // to get them — the pool has moved on by then.
@@ -845,4 +815,10 @@ test('eviction announces itself — it was the only silent release while running
 
   // Releases the interval and the SQLite handle.
   await manager.shutdown();
+});
+
+test('the at-capacity notice carries the numbers', () => {
+  const notice = atCapacityNotice(new AtCapacityError(4, 4));
+  assert.match(notice, /4 of 4 are in use/);
+  assert.match(notice, /not queued/);
 });

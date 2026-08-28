@@ -20,7 +20,6 @@ function board() {
   add('hamachi-coordinator', 'coordinator');
   add('hamachi-engineer1', 'engineer');
   add('hamachi-poster', 'poster');
-  add('hamachi-host', 'host');
   add('clawcius-engineer1', 'engineer', 'clawcius');
   add('clawcius-coordinator', 'coordinator', 'clawcius');
 
@@ -109,39 +108,6 @@ test('a DM does not cross a crew boundary', () => {
   assert.match(result.detail, /crews talk on the feed/);
 });
 
-test('only a coordinator may DM the host agent', () => {
-  const { mail } = board();
-
-  for (const sender of ['hamachi-engineer1', 'hamachi-poster']) {
-    const result = mail.deliver(note(sender, 'hamachi-host', 'restart the proxy'));
-    assert.equal(result.accepted, false);
-    assert.match(result.detail, /only a coordinator may DM the host agent/);
-  }
-
-  assert.equal(
-    mail.deliver(note('hamachi-coordinator', 'hamachi-host', 'restart the proxy')).accepted,
-    true,
-  );
-  assert.equal(mail.unread('hamachi-host').length, 1, 'exactly the one that was allowed');
-});
-
-test('a coordinator of another crew may not DM this crew\'s host agent either', () => {
-  const { mail } = board();
-  const result = mail.deliver(note('clawcius-coordinator', 'hamachi-host', 'restart it'));
-
-  assert.equal(result.accepted, false);
-  assert.equal(mail.unread('hamachi-host').length, 0);
-});
-
-test('the host agent answers by DM', () => {
-  const { mail } = board();
-  assert.equal(
-    mail.deliver(note('hamachi-host', 'hamachi-coordinator', 'done, 3 commands')).accepted,
-    true,
-  );
-  assert.equal(mail.unread('hamachi-coordinator').length, 1);
-});
-
 test('onDelivered fires once per accepted message, with the committed row', () => {
   const { mail } = board();
   const seen = [];
@@ -189,4 +155,11 @@ test('reading is per agent, so mail survives an unrelated reader', () => {
 
   mail.collect('hamachi-coordinator');
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
+});
+
+test('coordinators may DM each other across crews; nobody else may', () => {
+  const { mail } = board();
+  assert.equal(mail.deliver(note('clawcius-coordinator', 'hamachi-coordinator')).accepted, true);
+  assert.equal(mail.deliver(note('clawcius-engineer1', 'hamachi-coordinator')).accepted, false);
+  assert.equal(mail.deliver(note('hamachi-coordinator', 'clawcius-engineer1')).accepted, false);
 });

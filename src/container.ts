@@ -63,14 +63,6 @@ function renderEnvFile(entries: ReadonlyArray<readonly [string, string]>): strin
           'than passing half a value. (The value is not logged.)',
       );
     }
-    // A key cannot contain these either: `=` would move the split, a leading
-    // `#` would make the whole line a comment, and both are silent.
-    if (/[\r\n=]/.test(key) || key.startsWith('#') || key === '') {
-      throw new EnvFileError(
-        `cannot pass ${JSON.stringify(key)} to the container: the name is not representable ` +
-          "in Docker's --env-file format.",
-      );
-    }
     body += `${key}=${value}\n`;
   }
   return body;

@@ -187,22 +187,6 @@ test('mail does not resurrect a dead agent', () => {
   );
 });
 
-test('the waker never runs the host agent — that mailbox belongs to the executor', () => {
-  const { mail, waker, add, started } = board();
-  add('hamachi-host', 'host');
-  mail.deliver(note('hamachi-coordinator', 'hamachi-host', 'restart the proxy'));
-
-  assert.equal(started.length, 0);
-  assert.equal(
-    mail.unread('hamachi-host').length,
-    1,
-    'left for the ops executor to read from the host, outside the sandbox',
-  );
-
-  waker.sweep();
-  assert.equal(started.length, 0, 'and the sweep does not pick it up either');
-});
-
 test('a turn that could not be started leaves the mail unread', () => {
   const { registry, mail } = board();
   const started = [];
@@ -285,8 +269,6 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
   registry.close();
 });
 
-
-
 // ── the ceiling on re-offers ────────────────────────────────────────────────
 
 test('a message that never settles stops being offered, and the line says so (#241 round 3)', () => {
@@ -313,7 +295,6 @@ test('a message that never settles stops being offered, and the line says so (#2
 
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
-
 
 test('a superseded turn does NOT spend one of a message s re-offers (#241 round 4)', () => {
   // Three Discord messages interleaved with a pending mail turn is ordinary traffic in a coordinator's channel.

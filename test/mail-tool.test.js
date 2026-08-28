@@ -84,22 +84,22 @@ test('an author passed as an argument is ignored — identity is the closure', a
 
 test('two sessions are two identities, and neither can borrow the other', async () => {
   const { registry, mail, sessionOf } = board();
+  registry.ensure('clawcius-coordinator', { crew: 'clawcius', role: 'coordinator', workspacePath: '/w/cc' });
 
   const engineer = sessionOf('hamachi-engineer1').sendMail;
   const coordinator = sessionOf('hamachi-coordinator').sendMail;
-  const task = { to: 'hamachi-host', subject: 'restart', body: 'restart the waker' };
+  const task = { to: 'clawcius-coordinator', subject: 'deploy', body: 'please deploy main' };
 
+  // A `from` argument is ignored: the sender is the session, and an engineer may not DM another crew.
   const refused = await engineer.handler({ ...task, from: 'hamachi-coordinator' }, {});
   assert.equal(refused.isError, true);
-  assert.match(said(refused), /only a coordinator may DM the host agent/);
 
   const accepted = await coordinator.handler(task, {});
   assert.equal(accepted.isError, false);
 
-  const inbox = mail.unread('hamachi-host');
-  assert.equal(inbox.length, 1, 'the engineer got nothing into the host agent\'s mailbox');
+  const inbox = mail.unread('clawcius-coordinator');
+  assert.equal(inbox.length, 1, 'the engineer got nothing into the other crew\'s mailbox');
   assert.equal(inbox[0].author, 'hamachi-coordinator');
-  registry.close();
 });
 
 test('the feed refusal comes back to the sender rather than to the journal', async () => {

@@ -1,4 +1,4 @@
-/** A one-line status file the waker publishes so the ops executor can tell whether this instance is mid-turn. */
+/** A small status file the waker publishes: build, pid, live sessions, and when it was written. */
 
 import { mkdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -44,9 +44,6 @@ export class WakerStatusPublisher {
     return this.#options.path.length > 0;
   }
 
-  get path(): string {
-    return this.#options.path;
-  }
 
   start(): void {
     if (!this.enabled) return;
