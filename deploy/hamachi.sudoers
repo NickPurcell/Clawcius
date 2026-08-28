@@ -1,0 +1,2 @@
+# Hamachi is the operator's hands on this machine. Its safety net is the provider backup, not this file.
+hamachi ALL=(ALL) NOPASSWD: ALL

@@ -1,0 +1,9 @@
+[Unit]
+Description=Deploy %i from origin/main (or the ref a crew requested)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/deploy %i
+TimeoutStartSec=20min
