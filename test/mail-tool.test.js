@@ -23,7 +23,7 @@ function board() {
 
   /** The tools one session gets, as that session's agent. */
   const sessionOf = (agentId) => {
-    const tools = buildMailTools(mail, agentId, 'hamachi-host');
+    const tools = buildMailTools(mail, agentId);
     return Object.fromEntries(tools.map((t) => [t.name, t]));
   };
 
@@ -36,13 +36,13 @@ const said = (result) => result.content.map((part) => part.text).join('\n');
 test('the mail server builds as an in-process SDK server carrying both tools', () => {
   const { registry, mail } = board();
 
-  const servers = buildMailServer(mail, 'hamachi-engineer1', 'hamachi-host');
+  const servers = buildMailServer(mail, 'hamachi-engineer1');
 
   assert.equal(servers.clawsky.type, 'sdk');
   assert.equal(servers.clawsky.name, 'clawsky');
   assert.ok(servers.clawsky.instance);
 
-  const names = buildMailTools(mail, 'hamachi-engineer1', 'hamachi-host').map((t) => t.name);
+  const names = buildMailTools(mail, 'hamachi-engineer1').map((t) => t.name);
   assert.deepEqual(names, ['checkMail', 'sendMail']);
   registry.close();
 });

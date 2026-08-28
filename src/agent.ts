@@ -12,7 +12,7 @@ import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
-import { hostAgentId, type AgentIdentity, type AgentRegistry } from './store.js';
+import { type AgentIdentity, type AgentRegistry } from './store.js';
 import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
@@ -356,17 +356,17 @@ export class AgentSession {
       options.resume = resumeSessionId;
     }
 
-    // The agent process itself lives inside gVisor, so containment is the
-    // container's job. Permission prompts would only block every tool call
-    // with nothing there to answer them.
-    options.spawnClaudeCodeProcess = containerSpawner({
-      name: config().agent.container.name,
-      claudePath: config().agent.container.claudePath,
-      // The env above holds both tokens, and it reaches the container through
-      // a 0600 file in here rather than through the exec's argv, which is
-      // world-readable. See the header of src/container.ts.
-      execEnvDir: config().agent.container.execEnvDir,
-    });
+    // A crew in a sandbox runs its sessions through docker exec; Hamachi runs them on the host.
+    if (config().agent.container.enabled) {
+      options.spawnClaudeCodeProcess = containerSpawner({
+        name: config().agent.container.name,
+        claudePath: config().agent.container.claudePath,
+        // The env above holds both tokens, and it reaches the container through
+        // a 0600 file in here rather than through the exec's argv, which is
+        // world-readable. See the header of src/container.ts.
+        execEnvDir: config().agent.container.execEnvDir,
+      });
+    }
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
 
@@ -703,7 +703,6 @@ export class SessionManager {
         ? buildMailServer(
             this.#mail,
             channelId,
-            hostAgentId(config().agent.clawsky.crew),
             [
               ...(this.#armed ? buildArmedTools(channelId, this.#armed) : []),
               // Offered to a coordinator and to nobody else — CLAWSKY.md, "Spawn and kill: held by the coordinator alone".
