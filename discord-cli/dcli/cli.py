@@ -1,18 +1,8 @@
 """discord -- a small Discord CLI meant to be driven by an AI agent.
 
-Design rules, in case they are not obvious from the code:
-
-  * No mutable context. Every command names its channel explicitly. A stored
-    "current channel" would be hidden state the caller cannot see and cannot
-    recover from when it is wrong.
-  * Output format follows the TTY: table for humans, JSON for pipes and agents.
-  * Data on stdout, diagnostics on stderr.
-  * Exit codes are a contract (see errors.py).
-  * Destructive commands refuse and exit 4 rather than prompting, because a
-    prompt is a hang, not a question.
-  * No abbreviated flags and no "did you mean" guessing. Flags are a stable
-    contract, and a caller that misreads a suggestion as a confirmation will
-    happily run the wrong command.
+Data on stdout, diagnostics on stderr; JSON when piped, a table at a TTY.
+Every command names its channel explicitly. Exit codes are a contract (see
+errors.py); destructive commands refuse and exit 4 rather than prompting.
 """
 
 import argparse
@@ -112,9 +102,8 @@ def cmd_read(args):
 
 def cmd_search(args):
     """Discord's server-side search endpoint is unavailable to bot accounts, so
-    this pages backwards through history and filters locally. That makes it
-    bounded by --max-scan rather than exhaustive, which the stderr summary
-    reports on every run."""
+    this pages backwards through history and filters locally, bounded by
+    --max-scan."""
     if not any([args.query, args.author, args.since]):
         raise ValidationError(
             "Nothing to search for.",
@@ -263,12 +252,7 @@ def cmd_delete(args):
 
 
 def cmd_download(args):
-    """Save attachments to disk, either a whole message's worth or one URL.
-
-    The URL form exists because attachment links are signed and expire: when a
-    caller already holds a fresh URL there is no reason to spend a round trip
-    re-reading the message to rediscover it.
-    """
+    """Save attachments to disk, either a whole message's worth or one URL."""
     if args.max_bytes < 1:
         raise ValidationError("--max-bytes must be at least 1.")
 
@@ -479,14 +463,8 @@ def build_parser():
 def _resolve_text(text, allow_empty=False):
     """Message text from --text or stdin.
 
-    `allow_empty` is set when the message carries an attachment, and it changes
-    how hard we are willing to wait for stdin. Without a file, blocking on stdin
-    is correct -- text is the only thing the message could be, so there is
-    nothing to do but wait for it. With a file the caption is optional, and
-    blocking is a trap: an unattended caller that never redirects stdin (a
-    script, a service, an agent shelling out) has a pipe that is neither a tty
-    nor ever written to, and read() there hangs forever rather than erroring.
-    So when a file is attached we only take stdin that is already there.
+    With a file attached the caption is optional, so only stdin that is already
+    there is taken; without one, block on stdin.
     """
     if text is None:
         if allow_empty and not _stdin_ready():
@@ -514,13 +492,7 @@ def _resolve_text(text, allow_empty=False):
 
 
 def _stdin_ready():
-    """Is there input on stdin we can take without waiting?
-
-    A tty is never "ready": the human has not typed yet, and treating an empty
-    terminal as an empty caption would swallow the prompt. Anything else is
-    asked with a zero timeout, so a pipe nobody will ever write to reports as
-    empty instead of blocking the process forever.
-    """
+    """Is there input on stdin we can take without waiting? A tty never is."""
     if sys.stdin.isatty():
         return False
     try:

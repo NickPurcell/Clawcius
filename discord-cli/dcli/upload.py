@@ -1,14 +1,7 @@
 """Attachment uploads: validating local files and hand-rolling multipart bodies.
 
-Standard library only, as everywhere else in this tool, so the multipart body is
-assembled here rather than delegated to a third-party HTTP library. The whole
-payload is held in memory, which the size ceiling below makes comfortable and
-the boundary check makes necessary: the boundary cannot be chosen until the file
-bytes are available to check it against.
-
-Files are read and measured before any network call, on the same bargain the
-rest of the tool strikes with snowflake validation -- a bad path should cost one
-fast turn, not a round trip and an opaque HTTP 400.
+Standard library only. The whole payload is held in memory, and files are read
+and sized before any network call.
 """
 
 import json
@@ -24,25 +17,20 @@ from .render import human_size
 # Discord accepts at most ten attachments on a single message.
 MAX_ATTACHMENTS = 10
 
-# The per-message upload ceiling belongs to the server, not the account: 10 MiB
-# with no boosts, 50 MiB at boost tier 2, 100 MiB at tier 3. Nothing the bot can
-# cheaply read tells us which applies, and finding out the hard way costs a full
-# upload followed by an HTTP 413. So we assume the floor and let
-# --max-upload-bytes raise it on a server known to be boosted.
+# The per-message ceiling belongs to the server: 10 MiB unboosted, 50 MiB at
+# boost tier 2, 100 MiB at tier 3. This assumes the floor; --max-upload-bytes
+# raises it.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
-# A boundary that also occurs inside an attachment would silently corrupt the
-# request. With binary payloads that is a real possibility rather than a
-# theoretical one, so the boundary is checked against every byte we are about to
-# send and redrawn if it collides.
+# A boundary that also occurs inside an attachment would corrupt the request,
+# so it is checked against every byte about to be sent and redrawn on collision.
 BOUNDARY_ATTEMPTS = 8
 BOUNDARY_BYTES = 24
 
 # Control characters, quotes and backslashes would break out of the quoted
-# filename in the Content-Disposition header, so they are replaced rather than
-# escaped -- an upload with a mangled name beats a malformed request.
+# filename in Content-Disposition, so they are replaced.
 _HEADER_UNSAFE = re.compile(r'[\x00-\x1f\x7f"\\]')
 
 
@@ -145,8 +133,7 @@ def attachments_metadata(files):
 def build_multipart(payload, files):
     """Encode a JSON payload plus files as multipart/form-data.
 
-    Returns (body_bytes, content_type_header). The modern shape Discord expects
-    is one 'payload_json' part carrying the whole message object, and one
+    Returns (body_bytes, content_type_header): one 'payload_json' part and one
     'files[N]' part per attachment.
     """
     payload_json = json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -1,14 +1,8 @@
 """Fetching attachments back off Discord's CDN and writing them to disk.
 
-Two things earn this a module of its own rather than another method on Client.
-Attachment URLs live on cdn.discordapp.com and media.discordapp.net rather than
-discord.com, and they carry their own signature in the query string, so the bot
-Authorization header is neither wanted nor sent -- handing credentials to a host
-that does not need them is a habit worth not acquiring.
-
-The second is that attachment filenames are supplied by whoever uploaded them.
-Every one is therefore treated as hostile until it has been reduced to a bare
-basename and proved to land inside the requested directory.
+Attachment URLs are signed and served from the CDN hosts, so no Authorization
+header is sent. Filenames come from whoever uploaded them and are reduced to a
+bare basename that lands inside the requested directory.
 """
 
 import os
@@ -23,19 +17,13 @@ from .api import USER_AGENT
 from .errors import CliError, ValidationError
 from .render import human_size
 
-# Attachments are served from these hosts. The list is a whitelist rather than
-# decoration: it keeps 'discord download --url' from being a general-purpose
-# fetcher pointed at whatever a message happens to contain.
+# A whitelist: it keeps 'discord download --url' from being a general-purpose
+# fetcher. discord.com is the API host, not an attachment host.
 CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
-# Discord also serves through per-shard and proxy subdomains of the two hosts
-# above (images-ext-1.discordapp.net and friends), so the suffixes are needed.
-# discord.com deliberately is NOT among them: it is the API host, not an
-# attachment host, and widening the whitelist to cover it would buy nothing.
+# Per-shard and proxy subdomains of the two hosts above.
 CDN_HOST_SUFFIXES = (".discordapp.com", ".discordapp.net")
 
-# A ceiling so that one oversized attachment cannot fill the disk. 100 MiB is
-# the largest a boost tier 3 server can produce, so this refuses nothing Discord
-# would have allowed while still bounding the damage; --max-bytes moves it.
+# 100 MiB is the largest a boost tier 3 server can produce; --max-bytes moves it.
 DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 
 CHUNK_BYTES = 64 * 1024
@@ -45,10 +33,8 @@ _UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def validate_url(url):
-    """Accept only an https Discord CDN URL, query string intact.
-
-    The query string is load-bearing: modern attachment links are signed with
-    ex/is/hm parameters and are simply 404s or 403s without them.
+    """Accept only an https Discord CDN URL, query string intact: attachment
+    links are signed with ex/is/hm parameters.
     """
     raw = str(url or "").strip()
     if not raw:
@@ -83,9 +69,7 @@ def filename_from_url(url):
 def safe_filename(raw):
     """Reduce an attachment filename to a bare, writable basename.
 
-    Directory components are stripped rather than rejected, because a name like
-    'a/b.png' is more likely careless than hostile; '.' and '..' are rejected
-    outright, since neither has an innocent reading.
+    Directory components are stripped; '.' and '..' are rejected.
     """
     name = _UNSAFE_CHARS.sub("", str(raw or "").strip())
     name = name.replace("\\", "/")  # a Windows-style path is still a path
@@ -124,9 +108,8 @@ def ensure_dir(out):
 def target_path(out_dir, filename, overwrite=False):
     """Where a given attachment may be written, or an error explaining why not.
 
-    Resolving the joined path and insisting its parent is still the output
-    directory catches traversal and a symlink planted in the output directory
-    alike; neither may be used to write outside where the caller asked.
+    Resolving the joined path and checking its parent catches traversal and a
+    symlink planted in the output directory alike.
     """
     directory = Path(out_dir).expanduser().resolve()
     name = safe_filename(filename)
@@ -159,9 +142,8 @@ def fetch(
     url = validate_url(url)
     target = target_path(out_dir, filename or filename_from_url(url), overwrite=overwrite)
 
-    # No Authorization header on purpose: the CDN authenticates the signed URL,
-    # not the bot, and sending the token here would leak it to a host that has
-    # no business with it.
+    # No Authorization header: the CDN authenticates the signed URL, not the
+    # bot.
     request = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
     )
@@ -205,10 +187,8 @@ def fetch(
 
 
 def _stream_to_disk(resp, target, max_bytes, url):
-    """Stream to a temporary file in the target directory, then rename.
-
-    Downloading through a temporary means an aborted or oversized fetch leaves
-    nothing behind that could be mistaken for a complete file.
+    """Stream to a temporary file in the target directory, then rename, so an
+    aborted or oversized fetch leaves nothing behind.
     """
     handle = tempfile.NamedTemporaryFile(
         dir=str(target.parent), prefix=".dcli-", suffix=".part", delete=False

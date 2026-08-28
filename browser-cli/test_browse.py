@@ -1,15 +1,6 @@
 """Tests for the parts of `browse` that do not need a browser.
 
     python3 browser-cli/test_browse.py
-
-Deliberately browser-free. Chromium only exists after an image rebuild, which
-is an operator action, so a suite that needed it could not be run by the person
-writing the code — and a test nobody can run is not a test. What is covered
-here is the logic that was actually got wrong during development: keyword
-collisions in the audit log, double-counted subresources, and viewport parsing.
-
-The repo's `npm test` runs `node --test`, so this is not wired into it. Run it
-by hand when touching `browse`; it takes well under a second.
 """
 
 import contextlib
@@ -48,11 +39,7 @@ class AuditTest(unittest.TestCase):
         self.assertTrue(self.path.parent.is_dir())
 
     def test_field_named_kind_does_not_collide(self):
-        """Regression. `event()` took the event name as a normal positional
-        parameter, so a field called `kind` raised "got multiple values for
-        argument 'kind'" from inside a Playwright listener and surfaced as a
-        TypeError on an unrelated later call. The `/` in the signature is the
-        fix and this is what pins it."""
+        """A field called `kind` must not collide with the event name."""
         self.audit.event("subresource_problem", url="u", reason="r", kind="failed")
         record = self.lines()[0]
         self.assertEqual(record["event"], "subresource_problem")
@@ -147,9 +134,8 @@ class ViewportTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, browse.VALIDATION_ERROR)
 
     def test_rejects_degenerate_and_absurd_sizes(self):
-        """`isdigit()` is true of "0", so 0x0 parsed happily and became a
-        playwright traceback; a fat-fingered 100000 is an OOM in a 2 GB
-        container rather than an error."""
+        """`isdigit()` is true of "0"; a fat-fingered 100000 is an OOM rather
+        than an error."""
         for spec in ("0x0", "1024x0", "0x768", "100000x100", "100x100000"):
             with self.subTest(spec=spec):
                 with self.assertRaises(browse.BrowseError) as caught:
@@ -232,13 +218,8 @@ class ProcessTest(unittest.TestCase):
 
 
 class LockScopeTest(unittest.TestCase):
-    """Regression. `single_browser_lock()` used to `yield` inside the `try`
-    whose `except OSError` diagnoses the lock, so every OSError raised by the
-    command body came back as "cannot take the browser lock" with a hint
-    pointing at /tmp and exit 3 for "bad arguments". A screenshot to an
-    unwritable path blamed the lock and sent the reader to the wrong file.
-    Both the pre-flight mkdir and playwright's own `page.screenshot(path=...)`
-    raise OSError, so this was the common case."""
+    """An OSError raised by the command body must not be reported as a lock
+    failure."""
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -268,10 +249,7 @@ class LockScopeTest(unittest.TestCase):
             pass  # re-acquirable, so the fd was closed
 
     def test_a_refused_attempt_leaks_no_descriptor(self):
-        """Regression. The BUSY path raised BrowseError with the fd open;
-        that is not an OSError, so the handler above did not see it and the
-        release below was never reached — one fd per refused attempt,
-        measured 5 -> 10 over five tries."""
+        """The BUSY path raises with the fd open; it must be closed."""
         with browse.single_browser_lock():                # hold it
             before = len(os.listdir("/proc/self/fd"))
             for _ in range(5):
@@ -298,10 +276,7 @@ class LockScopeTest(unittest.TestCase):
 
 
 class OutputModeTest(unittest.TestCase):
-    """Regression. `--output auto` resolved on isatty() alone, so
-    `browse text URL > page.txt` wrote a JSON object with the page inside an
-    escaped string field — the opposite of what the README promises and the
-    single most likely thing anyone will type."""
+    """`browse text URL > page.txt` must write the page, not a JSON wrapper."""
 
     def test_text_never_auto_switches_to_json(self):
         for command in ("text", "html"):
@@ -355,14 +330,8 @@ class WarningVolumeTest(unittest.TestCase):
         self.assertIn("do not read it as the finished page", self.warn().lower())
 
     def test_a_failed_data_request_is_never_an_all_clear(self):
-        """Regression, and the sharpest one in the suite. An earlier version
-        classified xhr/fetch as "does not affect the rendering" and printed
-        "the rendering above should be complete" over them. But for a
-        single-page app those ARE the path the content arrives on: a dashboard
-        whose /api/items 500s renders a spinner or an empty table, perfectly.
-        That is the exact case this tool exists to catch, so announcing it was
-        fine turned the warning into a reassurance — the same defect as
-        warning fatigue with the sign flipped."""
+        """A failed xhr/fetch is the path a single-page app's content arrives
+        on, so it must never be reported as harmless."""
         for kind in ("xhr", "fetch", "eventsource", "websocket"):
             with self.subTest(kind=kind):
                 load = browse.Load("https://app.example")
@@ -443,10 +412,7 @@ class ContractTest(unittest.TestCase):
                           browse.INTERNAL_ERROR), (0, 1, 2, 3, 4, 5))
 
     def test_an_unexpected_error_does_not_masquerade_as_a_failed_page(self):
-        """Regression. Only BrowseError and KeyboardInterrupt were handled, so
-        any other exception left a traceback and exit 1 — which the contract
-        defines as "the page would not load". The code easiest to reach by
-        accident must not be the one that lies."""
+        """An unexpected exception must exit INTERNAL_ERROR, not NAV_ERROR."""
         boom = lambda args, audit: 1 / 0            # noqa: E731
         saved = browse.COMMANDS["probe"]
         browse.COMMANDS["probe"] = boom

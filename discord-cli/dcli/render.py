@@ -1,12 +1,7 @@
 """Output. Data goes to stdout, diagnostics go to stderr, always.
 
-Format is chosen by TTY detection: a human at a terminal gets a table, a pipe
-or an agent gets JSON, and neither has to pass a flag.
-
-The slim projections matter more than they look. A raw Discord message object
-is roughly forty lines of nested JSON; a channel read of fifty of them would
-spend thousands of tokens on fields nobody asked for. Everything is projected
-down by default, with --full available when the raw object is genuinely needed.
+Format follows the TTY: a table for a human, JSON for a pipe. Messages are
+projected to slim objects by default; --full gives the raw object.
 """
 
 import json
