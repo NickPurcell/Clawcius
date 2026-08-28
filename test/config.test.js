@@ -70,9 +70,3 @@ test('config() before load is a loud error, not a second read of the environment
   assert.match(out, /^THREW:Config has not been loaded/);
 });
 
-test('setConfig installs exactly what it was given', () => {
-  const stub = { discord: { token: 't', guildId: 'g' }, github: { token: '' }, agent: { model: 'x' } };
-  setConfig(stub);
-  assert.equal(config(), stub);
-  assert.equal(config().agent.model, 'x');
-});

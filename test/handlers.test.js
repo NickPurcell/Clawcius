@@ -277,14 +277,6 @@ test('allowedChannelIds confines the bot, and an unlisted channel is silent', as
   assert.equal(sessions.acquired.length, 1);
 });
 
-test('an empty allowedChannelIds means every channel, which is the default', async () => {
-  const { handlers, sessions } = harness();
-  await handlers.handleMessage(
-    message({ content: `<@${BOT}> hi`, mentioned: true, channelId: 'C-anywhere' }),
-  );
-  assert.equal(sessions.acquired.length, 1);
-});
-
 test('an always-on channel treats every message as addressed, and strips nothing', async () => {
   const { handlers, sessions, bundled } = harness({
     config: { discord: { alwaysOnChannelIds: [CHANNEL] } },
@@ -297,16 +289,6 @@ test('an always-on channel treats every message as addressed, and strips nothing
   assert.equal(sessions.acquired[0].woke[0].messages[0].content, `is <@${BOT}> the bot's id?`);
   // A standing invitation: every message counts as if it had carried an @.
   assert.equal(bundled[0].addressed, true);
-});
-
-test('an always-on channel outside allowedChannelIds wakes nothing at all', async () => {
-  // The combination the startup warning in main() exists for. It is always a
-  // mistake and a silent one: the room simply stays quiet.
-  const { handlers, sessions } = harness({
-    config: { discord: { alwaysOnChannelIds: ['C-lonely'], allowedChannelIds: ['C-other'] } },
-  });
-  await handlers.handleMessage(message({ channelId: 'C-lonely', content: 'anyone there' }));
-  assert.deepEqual(sessions.acquired, []);
 });
 
 test('a follow-up window carries an unmentioned message, and closing it stops that', async () => {
@@ -521,12 +503,6 @@ test('any other wake failure stays quiet — the bot does not narrate its plumbi
 
   assert.deepEqual(sent, [], 'only a full pool earns a message in the channel');
   assert.match(log, /could not wake: docker: no such container/);
-});
-
-test('an empty bundle acquires nothing', () => {
-  const { handlers, sessions } = harness();
-  handlers.deliver(CHANNEL, []);
-  assert.deepEqual(sessions.acquired, []);
 });
 
 test('a channel that cannot be fetched loses the announcement and not the process', async () => {

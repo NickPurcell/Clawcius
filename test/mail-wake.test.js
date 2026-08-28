@@ -70,7 +70,7 @@ test('mail delivered to an idle agent starts a turn, and is read only once it RU
   );
 });
 
-test('a turn that dies before it runs leaves the mail for the next sweep (#239)', () => {
+test('a turn that dies before it runs leaves the mail for the next sweep', () => {
   const { mail, started, busy } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'the lost one'));
   assert.equal(started.length, 1);
@@ -212,7 +212,7 @@ test('a turn that could not be started leaves the mail unread', () => {
   );
 });
 
-test('settle called synchronously, from inside start(), leaves the mail unread (#239)', () => {
+test('settle called synchronously, from inside start(), leaves the mail unread', () => {
   const registry = new AgentRegistry(join(mkdtempSync(join(tmpdir(), 'sync-settle-')), 'c.db'), {
     crew: 'hamachi',
   });
@@ -271,7 +271,7 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
 
 // ── the ceiling on re-offers ────────────────────────────────────────────────
 
-test('a message that never settles stops being offered, and the line says so (#241 round 3)', () => {
+test('a message that never settles stops being offered, and the line says so', () => {
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -296,7 +296,7 @@ test('a message that never settles stops being offered, and the line says so (#2
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
-test('a superseded turn does NOT spend one of a message s re-offers (#241 round 4)', () => {
+test('a superseded turn does NOT spend one of a message s re-offers', () => {
   // Three Discord messages interleaved with a pending mail turn is ordinary traffic in a coordinator's channel.
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
@@ -314,7 +314,7 @@ test('a superseded turn does NOT spend one of a message s re-offers (#241 round 
   );
 });
 
-test('the ceiling is three offers PER WINDOW, not three ever (#241 round 4)', () => {
+test('the ceiling is three offers PER WINDOW, not three ever', () => {
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -367,7 +367,7 @@ function wired() {
   return { events, out };
 }
 
-test('a finished mail wake logs its SUBTYPE, not just that it finished (#241 round 6)', () => {
+test('a finished mail wake logs its SUBTYPE, not just that it finished', () => {
   const { events, out } = wired();
   events.onDone(summary());
   assert.equal(out.log.length, 1);
@@ -427,7 +427,7 @@ test('a stale token releases the session and says so', () => {
   assert.match(out.err.join('\n'), /stale token/);
 });
 
-test('an async death RELEASES the session, or the agent goes deaf for good (#241 round 7)', () => {
+test('an async death RELEASES the session, or the agent goes deaf for good', () => {
   const { events, out } = wired();
   events.onError(new Error('connecting to control server: connection refused'));
 

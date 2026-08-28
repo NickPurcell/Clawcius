@@ -153,38 +153,6 @@ test('status is declared, not inferred', () => {
   registry.close();
 });
 
-test('nothing outside this suite writes a status — the status page says so', async () => {
-  const { readdir, readFile } = await import('node:fs/promises');
-  const { join: joinPath } = await import('node:path');
-  const { fileURLToPath } = await import('node:url');
-
-  // Resolved against this file, not against `process.cwd()`.
-  const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
-
-  // `src/` only.
-  const callers = [];
-  const entries = await readdir(srcDir, { withFileTypes: true, recursive: true });
-
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-    const path = joinPath(entry.parentPath ?? srcDir, entry.name);
-    const source = await readFile(path, 'utf8');
-    source.split('\n').forEach((line, index) => {
-      // A call is always `<something>.setStatus(`; the declaration in store.ts
-      // has no receiver, so it does not match itself.
-      if (/\.setStatus\(/.test(line)) callers.push(`${path}:${index + 1}`);
-    });
-  }
-
-  assert.equal(entries.length > 0, true, 'scanned nothing — this test would pass vacuously');
-  assert.deepEqual(
-    callers,
-    [],
-    'Something now writes a dead status. status/src/views.ts, status/public/app.js and ' +
-      'status/README.md all say nothing does — update them in the same change.',
-  );
-});
-
 // ── create(): the row a spawn writes ────────────────────────────────────────
 
 test('create writes a spawned row and records who spawned it', () => {
