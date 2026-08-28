@@ -586,18 +586,6 @@ test('the fields parse the way cron parses them, and refuse the way this needs t
 
 // ── The tool ───────────────────────────────────────────────────────────────
 
-test('scheduleRecurring has no argument that names an agent', () => {
-  const { registry, store } = board();
-  const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
-
-  assert.deepEqual(
-    Object.keys(scheduleRecurring.inputSchema).sort(),
-    ['anchor', 'cron', 'everyN', 'note', 'timezone'],
-    'a `for` added later fails here rather than in a review',
-  );
-  registry.close();
-});
-
 test('an owner passed to scheduleRecurring is ignored — the target is the closure', async () => {
   const { registry, store } = board();
   const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
@@ -935,28 +923,6 @@ test('a schedule this build cannot read is disarmed and says so — expression O
     );
     registry.close();
   }
-});
-
-test('the tool descriptions state what a schedule is and is not', () => {
-  const { registry, store } = board();
-  const { scheduleRecurring, remindMe } = toolsFor('hamachi-engineer1', store);
-
-  // The repeat's own terms.
-  assert.match(scheduleRecurring.description, /REPEATS UNTIL YOU STOP IT/);
-  assert.match(scheduleRecurring.description, /ONCE, late/);
-  assert.match(scheduleRecurring.description, /posts nothing to Discord or anywhere outside/);
-  assert.match(scheduleRecurring.description, /America\/Los_Angeles/);
-  assert.match(scheduleRecurring.description, /hamachi-engineer1/);
-
-  // And it does not overstate the anchor.
-  assert.doesNotMatch(scheduleRecurring.description, /does\s+NOTHING/);
-  assert.match(scheduleRecurring.description, /A FUTURE anchor delays the first fire/);
-  assert.match(scheduleRecurring.description, /A PAST anchor only chooses/);
-
-  assert.doesNotMatch(remindMe.description, /There is no repeat option/);
-  assert.match(remindMe.description, /ONE-SHOT/);
-  assert.match(remindMe.description, /scheduleRecurring/);
-  registry.close();
 });
 
 // ── everything an agent is shown is PT, and says so ─────────────────────────

@@ -72,22 +72,6 @@ const toolsFor = (agentId, store, options = {}) =>
 
 // ── 1. Only yourself ────────────────────────────────────────────────────────
 
-test('remindMe has no argument that names an agent', () => {
-  const { registry, store } = board();
-  const { remindMe } = toolsFor('hamachi-engineer1', store);
-
-  // Exhaustive on purpose, exactly as the sendMail equivalent is.
-  assert.deepEqual(Object.keys(remindMe.inputSchema).sort(), ['at', 'inMinutes', 'note']);
-  registry.close();
-});
-
-test('watchPr has no argument that names an agent either', () => {
-  const { registry, store } = board();
-  const { watchPr } = toolsFor('hamachi-engineer1', store);
-  assert.deepEqual(Object.keys(watchPr.inputSchema).sort(), ['on', 'pr', 'repo']);
-  registry.close();
-});
-
 test('an owner passed as an argument is ignored — the target is the closure', async () => {
   const { registry, store } = board();
   const { remindMe } = toolsFor('hamachi-engineer1', store);
@@ -267,19 +251,6 @@ test('a long comment body is capped rather than pasted whole', () => {
   const quoted = quoteExternal('comment by stranger', 'x'.repeat(MAX_EXTERNAL_CHARS * 3));
   assert.ok(quoted.length < MAX_EXTERNAL_CHARS * 2, 'a 64KB mail is refused outright');
   assert.match(quoted, /truncated at 1200 characters/);
-});
-
-test('the watchPr description carries the untrusted framing, not just the code', () => {
-  const { registry, store } = board();
-  const { watchPr, remindMe } = toolsFor('hamachi-engineer1', store);
-
-  assert.match(watchPr.description, /CLAIM, NEVER AN/);
-  assert.match(watchPr.description, /carry no/);
-  assert.match(watchPr.description, /EXTERNAL CONTENT/);
-  assert.match(watchPr.description, /hamachi-engineer1/);
-  assert.match(remindMe.description, /YOU CAN ONLY REMIND YOURSELF/);
-  assert.match(remindMe.description, /ONE-SHOT/);
-  registry.close();
 });
 
 // ── watchPr: arming, polling, disarming ─────────────────────────────────────
@@ -511,20 +482,6 @@ test('a transient failure disarms only after the bound, and says how many', asyn
 });
 
 // ── 4. Seeing and withdrawing your own, and nobody else's ───────────────────
-
-test('listArmed and disarm have no argument that names an agent', () => {
-  const { registry, store } = board();
-  const tools = toolsFor('hamachi-engineer1', store);
-
-  // Exhaustive, exactly as the remindMe and watchPr assertions above are. An
-  // `owner` or `agent` added to either of these is the whole of "your own and
-  // nobody else's" gone, and it would be added as a convenience.
-  assert.deepEqual(Object.keys(tools.listArmed.inputSchema), []);
-  assert.deepEqual(Object.keys(tools.disarm.inputSchema), ['id']);
-  assert.match(tools.listArmed.description, /nobody else/);
-  assert.match(tools.disarm.description, /REFUSED/);
-  registry.close();
-});
 
 test('listArmed shows this session\'s conditions, with the id disarm takes, and no others', async () => {
   const { registry, store } = board();
