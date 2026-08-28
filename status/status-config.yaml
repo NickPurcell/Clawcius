@@ -7,78 +7,46 @@ server:
   host: 127.0.0.1
   port: 8477
 
-# One entry per agent instance. The service does not discover instances.
+# One entry per crew. The service does not discover crews.
 #
 # `projectsRoot` is the host side of the agent-home mount in
-# docker/run-container.sh, where the instance writes its transcripts. A root
-# that does not exist yet is shown as such.
+# docker/run-container.sh, where the crew's agents write their transcripts.
 #
-# `boardDb` is that instance's Clawsky board, its CLAWCIUS_DB_PATH. Opened
-# read-only and never created here.
+# `boardDb` is the crew's board, its CLAWCIUS_DB_PATH: the `agents` registry
+# and the `mail` table. Opened read-only and never created here.
 #
-# `socketPath` is a unix socket this service also serves the page on, inside
-# that instance's run directory — the only host path its container mounts.
-# Every socket reaches every route, for every instance configured here.
-# systemd/clawcius-status.service needs a matching `ReadWritePaths=` line for
-# the directory.
+# `workspacesRoot` holds one directory per agent plus `.bots/`, where
+# bots/supervise.sh runs each bot; the page reads every `health.json` there
+# and any `<workspace>/<bot>/run/health.json` an agent's own bot writes.
 agents:
   - id: clawcius
     label: Clawcius
     projectsRoot: /var/lib/clawcius/agent-home/projects
     boardDb: /var/lib/clawcius/clawcius.db
-    socketPath: /var/lib/clawcius/run/status.sock
+    workspacesRoot: /var/lib/clawcius/workspaces
 
   - id: hamachi
     label: Hamachi
     projectsRoot: /var/lib/hamachi/agent-home/projects
-    # Named for the instance, not for the variable.
     boardDb: /var/lib/hamachi/hamachi.db
-    socketPath: /var/lib/hamachi/run/status.sock
-
-  # Osmosis Jones, once it runs as a Claude Code instance of its own. No
-  # boardDb: CLAWSKY.md § Topology keeps OJ off the board.
-  # - id: oj
-  #   label: Osmosis Jones
-  #   projectsRoot: /var/lib/oj/agent-home/projects
-
-liveness:
-  # Newest transcript write within this many seconds => running. Generous:
-  # a long tool call writes nothing for minutes.
-  runningSeconds: 180
-
-  # Beyond runningSeconds but within this => idle. Beyond it => stale.
-  idleSeconds: 3600
-
-oj:
-  # Per-PR worker directories, <workersRoot>/<owner>__<repo>__<pr>. Missing
-  # renders as "no OJ data yet", not as an error.
-  workersRoot: /var/lib/oj/workers
-  stateFile: /var/lib/oj/state.json
+    workspacesRoot: /var/lib/hamachi/workspaces
 
 read:
-  # Transcript lines per page.
-  pageSize: 60
+  # Lane entries per page, and the most a request may ask for.
+  pageSize: 100
   # Ceiling on bytes read off disk for one page. A single JSONL line can hold a
   # whole file's contents, so a line count alone does not bound the response.
   maxPageBytes: 2000000
   # Characters kept per content block before truncation.
   maxBlockChars: 20000
   # Transcript indexes held in memory (offsets and per-line metadata, never
-  # message bodies), LRU beyond this. Counts transcripts, not sessions: a
-  # session is its own transcript plus one per subagent, and a session larger
-  # than the cache evicts what its next rebuild needs. The service logs a
-  # warning naming any session that does not fit.
+  # message bodies), LRU beyond this. One per transcript: a session is its own
+  # transcript plus one per subagent.
   maxCachedSessions: 256
 
-watch:
-  # Coalescing window for filesystem events. One agent turn is many writes.
-  debounceMs: 400
+stream:
   # SSE heartbeat. The client marks the stream dead after missing two.
   heartbeatSeconds: 15
-  # Rescan interval; 0 disables. gVisor does not reliably deliver inotify for
-  # writes made inside the sandbox, so fs.watch is set up but not trusted alone.
-  rescanSeconds: 10
-  # Seconds between board polls; 0 disables. The board is a SQLite file in
-  # none of the watched directories, and in WAL mode a directory watch fires
-  # on writes rather than on changes, so it is polled for four integers instead.
-  boardPollSeconds: 10
+  # Seconds between `tick` frames; the client refetches the timeline and the
+  # tail of every open lane on each. 0 disables.
+  tickSeconds: 10

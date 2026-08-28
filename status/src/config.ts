@@ -2,107 +2,63 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
 import { parse } from 'yaml';
 
-/** One agent instance to watch. */
+/** One crew: where its transcripts, board and workspaces live on this host. */
 export type AgentRoot = {
-  /** Stable, URL-safe id. Used in links and in the SSE payloads. */
+  /** URL-safe id, also the SSE scope. */
   id: string;
-  /** Human name for the header. */
   label: string;
-  /** Absolute path to the instance's `projects/` directory. */
+  /** The instance's `projects/` directory, where Claude Code writes transcripts. */
   projectsRoot: string;
+  /** The crew's board (its CLAWCIUS_DB_PATH), or null when the crew has none. */
   boardDb: string | null;
-  socketPath: string | null;
-};
-
-export type LivenessConfig = {
-  /** Newest transcript write within this many seconds ⇒ "running". */
-  runningSeconds: number;
-  /** Beyond `runningSeconds` but within this ⇒ "idle" — plausibly just waiting for someone to speak to it. */
-  idleSeconds: number;
-};
-
-export type OjConfig = {
-  workersRoot: string;
-  /** Optional JSON state file. Missing is normal; malformed is reported. */
-  stateFile: string;
-};
-
-export type ServerConfig = {
-  /** Loopback only. */
-  host: string;
-  port: number;
+  /** `<workspacesRoot>/<workspace>/<bot>/run/health.json` is a bot's health file. */
+  workspacesRoot: string | null;
 };
 
 export type ReadConfig = {
-  /** Transcript lines returned per page by the transcript endpoint. */
+  /** Lane entries returned per page, and the ceiling a request may ask for. */
   pageSize: number;
-  /** Hard ceiling on the bytes one page request may read off disk. */
+  /** Bytes one page may read off disk before it is cut short. */
   maxPageBytes: number;
-  /** Characters of message text kept per content block before truncation. */
+  /** Characters kept per content block. */
   maxBlockChars: number;
+  /** Transcript indexes held in memory before LRU eviction. */
   maxCachedSessions: number;
 };
 
+export type StreamConfig = {
+  heartbeatSeconds: number;
+  /** Seconds between `tick` frames; a client refetches on each. 0 disables. */
+  tickSeconds: number;
+};
+
 export type StatusConfig = {
-  server: ServerConfig;
+  server: { host: string; port: number };
   agents: AgentRoot[];
-  liveness: LivenessConfig;
-  oj: OjConfig;
   read: ReadConfig;
-  watch: {
-    debounceMs: number;
-    heartbeatSeconds: number;
-    rescanSeconds: number;
-    boardPollSeconds: number;
-  };
+  stream: StreamConfig;
 };
 
 const DEFAULTS: StatusConfig = {
-  server: {
-    host: '127.0.0.1',
-    port: 8477,
-  },
+  server: { host: '127.0.0.1', port: 8477 },
   agents: [
     {
       id: 'clawcius',
       label: 'Clawcius',
       projectsRoot: '/var/lib/clawcius/agent-home/projects',
       boardDb: '/var/lib/clawcius/clawcius.db',
-      // The host side of `-v "$STATE_RUN:$STATE_RUN:rw"` in
-      // docker/run-container.sh, so the container sees this at the same path.
-      socketPath: '/var/lib/clawcius/run/status.sock',
+      workspacesRoot: '/var/lib/clawcius/workspaces',
     },
     {
       id: 'hamachi',
       label: 'Hamachi',
       projectsRoot: '/var/lib/hamachi/agent-home/projects',
-      // `CLAWCIUS_DB_PATH` in .env.hamachi: named for the instance, not the variable.
       boardDb: '/var/lib/hamachi/hamachi.db',
-      socketPath: '/var/lib/hamachi/run/status.sock',
+      workspacesRoot: '/var/lib/hamachi/workspaces',
     },
   ],
-  liveness: {
-    runningSeconds: 180,
-    idleSeconds: 3600,
-  },
-  oj: {
-    workersRoot: '/var/lib/oj/workers',
-    stateFile: '/var/lib/oj/state.json',
-  },
-  read: {
-    pageSize: 60,
-    maxPageBytes: 2_000_000,
-    maxBlockChars: 20_000,
-    // Below the transcript count of one session this degrades sharply, not gradually.
-    maxCachedSessions: 256,
-  },
-  watch: {
-    debounceMs: 400,
-    heartbeatSeconds: 15,
-    rescanSeconds: 10,
-    // Same cadence as the rescan. The query is four integers.
-    boardPollSeconds: 10,
-  },
+  read: { pageSize: 100, maxPageBytes: 2_000_000, maxBlockChars: 20_000, maxCachedSessions: 256 },
+  stream: { heartbeatSeconds: 15, tickSeconds: 10 },
 };
 
 class ConfigError extends Error {
@@ -137,73 +93,42 @@ function section(raw: unknown, path: string): Record<string, unknown> {
   return raw;
 }
 
+/** An absolute path, resolved, or null when the key is absent. */
+function absolutePath(raw: unknown, path: string): string | null {
+  const value = str(raw, path, '');
+  if (!value) return null;
+  if (!isAbsolute(value)) throw new ConfigError(path, 'must be an absolute path');
+  return resolve(value);
+}
+
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 function agents(raw: unknown): AgentRoot[] {
   if (raw === undefined || raw === null) return DEFAULTS.agents;
   if (!Array.isArray(raw)) throw new ConfigError('agents', 'must be a list');
-  if (raw.length === 0) {
-    throw new ConfigError(
-      'agents',
-      'must name at least one agent — an empty list renders an empty page that ' +
-        'is indistinguishable from a host with nothing running',
-    );
-  }
+  if (raw.length === 0) throw new ConfigError('agents', 'must name at least one crew');
 
   const seen = new Set<string>();
-  const seenSockets = new Map<string, string>();
   return raw.map((entry, index) => {
     const path = `agents[${index}]`;
     if (!isRecord(entry)) throw new ConfigError(path, 'must be a mapping');
 
     const id = str(entry['id'], `${path}.id`, '');
     if (!AGENT_ID_PATTERN.test(id)) {
-      throw new ConfigError(
-        `${path}.id`,
-        'must be lowercase alphanumeric with . _ - (it appears in URLs)',
-      );
+      throw new ConfigError(`${path}.id`, 'must be lowercase alphanumeric with . _ - (it appears in URLs)');
     }
     if (seen.has(id)) throw new ConfigError(`${path}.id`, `duplicates an earlier agent id "${id}"`);
     seen.add(id);
 
-    const projectsRoot = str(entry['projectsRoot'], `${path}.projectsRoot`, '');
+    const projectsRoot = absolutePath(entry['projectsRoot'], `${path}.projectsRoot`);
     if (!projectsRoot) throw new ConfigError(`${path}.projectsRoot`, 'is required');
-    if (!isAbsolute(projectsRoot)) {
-      // A relative root would resolve against the service's working directory.
-      throw new ConfigError(`${path}.projectsRoot`, 'must be an absolute path');
-    }
-
-    const boardDb = str(entry['boardDb'], `${path}.boardDb`, '');
-    if (boardDb && !isAbsolute(boardDb)) {
-      throw new ConfigError(`${path}.boardDb`, 'must be an absolute path');
-    }
-
-    // Absolute, and unique per instance: a container only mounts its own run directory.
-    const rawSocket = str(entry['socketPath'], `${path}.socketPath`, '');
-    if (rawSocket && !isAbsolute(rawSocket)) {
-      throw new ConfigError(`${path}.socketPath`, 'must be an absolute path');
-    }
-    const socketPath = rawSocket ? resolve(rawSocket) : null;
-
-    if (socketPath) {
-      const owner = seenSockets.get(socketPath);
-      if (owner !== undefined) {
-        throw new ConfigError(
-          `${path}.socketPath`,
-          `duplicates agent "${owner}" — each instance needs its own socket, in its ` +
-            'own run directory, because a container only mounts its own',
-        );
-      }
-      seenSockets.set(socketPath, id);
-    }
 
     return {
       id,
       label: str(entry['label'], `${path}.label`, id),
-      // resolve() normalises `..` away, so the traversal guard in transcripts.ts compares against a canonical prefix.
-      projectsRoot: resolve(projectsRoot),
-      boardDb: boardDb ? resolve(boardDb) : null,
-      socketPath,
+      projectsRoot,
+      boardDb: absolutePath(entry['boardDb'], `${path}.boardDb`),
+      workspacesRoot: absolutePath(entry['workspacesRoot'], `${path}.workspacesRoot`),
     };
   });
 }
@@ -212,10 +137,7 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
   const path = resolve(configPath ?? process.env['STATUS_CONFIG_PATH'] ?? 'status-config.yaml');
 
   if (!existsSync(path)) {
-    throw new Error(
-      `Status config not found at ${path}. ` +
-        'Expected status-config.yaml in the working directory, or set STATUS_CONFIG_PATH.',
-    );
+    throw new Error(`Status config not found at ${path}; set STATUS_CONFIG_PATH.`);
   }
 
   let parsed: unknown;
@@ -227,10 +149,8 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
 
   const root = section(parsed, 'root');
   const server = section(root['server'], 'server');
-  const liveness = section(root['liveness'], 'liveness');
-  const oj = section(root['oj'], 'oj');
   const read = section(root['read'], 'read');
-  const watch = section(root['watch'], 'watch');
+  const stream = section(root['stream'], 'stream');
 
   const config: StatusConfig = {
     server: {
@@ -238,38 +158,10 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
       port: num(server['port'], 'server.port', DEFAULTS.server.port, 1, 65535),
     },
     agents: agents(root['agents']),
-    liveness: {
-      runningSeconds: num(
-        liveness['runningSeconds'],
-        'liveness.runningSeconds',
-        DEFAULTS.liveness.runningSeconds,
-        1,
-      ),
-      idleSeconds: num(
-        liveness['idleSeconds'],
-        'liveness.idleSeconds',
-        DEFAULTS.liveness.idleSeconds,
-        1,
-      ),
-    },
-    oj: {
-      workersRoot: str(oj['workersRoot'], 'oj.workersRoot', DEFAULTS.oj.workersRoot),
-      stateFile: str(oj['stateFile'], 'oj.stateFile', DEFAULTS.oj.stateFile),
-    },
     read: {
       pageSize: num(read['pageSize'], 'read.pageSize', DEFAULTS.read.pageSize, 1, 500),
-      maxPageBytes: num(
-        read['maxPageBytes'],
-        'read.maxPageBytes',
-        DEFAULTS.read.maxPageBytes,
-        64_000,
-      ),
-      maxBlockChars: num(
-        read['maxBlockChars'],
-        'read.maxBlockChars',
-        DEFAULTS.read.maxBlockChars,
-        200,
-      ),
+      maxPageBytes: num(read['maxPageBytes'], 'read.maxPageBytes', DEFAULTS.read.maxPageBytes, 64_000),
+      maxBlockChars: num(read['maxBlockChars'], 'read.maxBlockChars', DEFAULTS.read.maxBlockChars, 200),
       maxCachedSessions: num(
         read['maxCachedSessions'],
         'read.maxCachedSessions',
@@ -277,53 +169,29 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
         1,
       ),
     },
-    watch: {
-      debounceMs: num(watch['debounceMs'], 'watch.debounceMs', DEFAULTS.watch.debounceMs, 0),
+    stream: {
       heartbeatSeconds: num(
-        watch['heartbeatSeconds'],
-        'watch.heartbeatSeconds',
-        DEFAULTS.watch.heartbeatSeconds,
+        stream['heartbeatSeconds'],
+        'stream.heartbeatSeconds',
+        DEFAULTS.stream.heartbeatSeconds,
         1,
       ),
-      rescanSeconds: num(
-        watch['rescanSeconds'],
-        'watch.rescanSeconds',
-        DEFAULTS.watch.rescanSeconds,
-        0,
-      ),
-      boardPollSeconds: num(
-        watch['boardPollSeconds'],
-        'watch.boardPollSeconds',
-        DEFAULTS.watch.boardPollSeconds,
-        0,
-      ),
+      tickSeconds: num(stream['tickSeconds'], 'stream.tickSeconds', DEFAULTS.stream.tickSeconds, 0),
     },
   };
 
-  if (config.liveness.idleSeconds <= config.liveness.runningSeconds) {
-    throw new Error(
-      'status-config.yaml: liveness.idleSeconds must be > liveness.runningSeconds — ' +
-        'otherwise the "idle" band is empty and every agent jumps straight from ' +
-        'running to stale, which is precisely the alarm this page exists to make meaningful.',
-    );
-  }
-
   if (!isLoopback(config.server.host)) {
     throw new Error(
-      `status-config.yaml: server.host must be a loopback address, got "${config.server.host}". ` +
-        'This service is fronted by `tailscale serve`, which connects over loopback. ' +
-        'Binding elsewhere — 0.0.0.0 above all — would expose unauthenticated transcripts ' +
-        'to that interface, and would keep them exposed when Tailscale is down, which is ' +
-        'exactly the failure the loopback bind is there to make impossible.',
+      `status-config.yaml: server.host must be a loopback address, got "${config.server.host}"; ` +
+        'tailscale serve fronts this service and anything else would expose transcripts.',
     );
   }
 
   return config;
 }
 
-/** Loopback check. */
+/** `localhost`, `::1`, or anything in 127.0.0.0/8. */
 export function isLoopback(host: string): boolean {
   if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
-  // The whole 127.0.0.0/8, not just 127.0.0.1.
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }

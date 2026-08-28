@@ -38,7 +38,7 @@ MemoryHigh=256M
 MemoryMax=512M
 TasksMax=32
 
-# Strict: this process reads files and writes a socket, and spawns nothing.
+# Strict: this process reads files and runs the docker CLI for the snapshot age.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -65,27 +65,16 @@ SystemCallErrorNumber=EPERM
 # read-only, not true: the working directory and the config are under /home.
 ProtectHome=read-only
 
-# The roots this unit reads: one transcript root per instance in
-# status-config.yaml, plus the `oj:` block's state directory.
+# The paths this unit reads, per crew in status-config.yaml: the transcript
+# root, the workspaces (for bots' health.json) and the board. `-` prefixed
+# where a different service creates the path, because without the dash a
+# missing path fails namespace setup and the unit retries forever.
 ReadOnlyPaths=/var/lib/clawcius/agent-home
 ReadOnlyPaths=/var/lib/hamachi/agent-home
-ReadOnlyPaths=-/var/lib/oj
-
-# The Clawsky boards, opened readOnly. `-` prefixed: a different service
-# creates these files, and without the dash a missing path fails namespace
-# setup and the unit retries forever.
+ReadOnlyPaths=-/var/lib/clawcius/workspaces
+ReadOnlyPaths=-/var/lib/hamachi/workspaces
 ReadOnlyPaths=-/var/lib/clawcius/clawcius.db
 ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
-
-# The only thing this unit writes: one unix socket per instance, in the run
-# directory run-container.sh bind-mounts into that container. Under
-# ProtectSystem=strict listen() would otherwise fail with EROFS, and that
-# failure is not fatal — the page still serves on TCP and only the agents
-# notice. The directory, not the socket path: the socket does not exist before
-# this service creates it. `-` prefixed: run-container.sh creates these
-# directories. One line per instance with a `socketPath` in status-config.yaml.
-ReadWritePaths=-/var/lib/clawcius/run
-ReadWritePaths=-/var/lib/hamachi/run
 
 # No ReadWritePaths= for a board: a WAL reader needs the `-shm` beside the
 # board and cannot create it under ProtectSystem=strict, so a board with no
@@ -93,7 +82,7 @@ ReadWritePaths=-/var/lib/hamachi/run
 # a writable path here would make this service a second writer.
 
 # Accepts loopback connections and makes none of its own; `localhost` covers
-# 127.0.0.0/8 and ::1. AF_UNIX is for the sockets above.
+# 127.0.0.0/8 and ::1. AF_UNIX is for the docker CLI's socket.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 IPAddressDeny=any
 IPAddressAllow=localhost
