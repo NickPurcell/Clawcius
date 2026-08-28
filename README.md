@@ -1,181 +1,78 @@
 # Clawcius
 
-A Discord bot that wakes a long-lived, sandboxed Claude Code agent. The agent
-replies by driving a CLI itself — nothing pipes its output to Discord.
+A Discord bot that wakes a long-lived Claude Code agent. The agent replies by
+driving a CLI itself; nothing pipes its output to Discord.
 
 ```
-                    host                    gVisor container
-@mention ─┐                          ┆
-          ├─→ waker ──docker exec──→ ┆  agent (warm, persistent)
-self-wake ┘   (gateway, tokens)      ┆    │
-                                     ┆    ├─→ discord CLI ─┐
-                                     ┆    └─→ cron, daemons ┤
-                                     ┆                      ▼
-                                     ┆              Squid blocklist ─→ Discord
+                    host                         gVisor container
+@mention ─┐                                ┆
+mail      ├─→ waker ──docker exec──────→  ┆  agent (warm, persistent)
+armed wake┘   (gateway, tokens, SQLite)    ┆    ├─→ discord CLI ─→ Squid ─→ Discord
+                                           ┆    ├─→ browse (Chromium), gdoc, pr-state
+                                           ┆    └─→ bots/ (daemons under the bot identity)
 ```
 
-Two halves:
+Two crews run from one checkout: **Clawcius** (a public Discord server) in the
+sandbox above, and **Hamachi** (the operator's own server) directly on the host,
+as the operator's hands — it can restart, deploy, and add crews.
 
-- **`src/`** — the waker (TypeScript). Listens on the Discord gateway, decides
-  when to wake, keeps one persistent Claude Code session per channel, and owns
-  the timers for self-scheduling. It never composes or sends messages.
-- **`discord-cli/`** — the CLI the agent runs (Python, stdlib only, no install
-  step). Read, send, search, react, edit, delete. Structured exit codes so the
-  agent branches on status rather than parsing prose.
-- **`browser-cli/`** — `browse`, a headless Chromium the agent drives: a
-  screenshot to a PNG it can read back, the text of a page after its
-  JavaScript has run, and the URL a request actually finished on. Every
-  navigation and every host contacted is logged. Needs an image rebuild;
-  `browser-cli/README.md` says why.
-
-And one thing that only watches:
-
-- **`status/`** — a read-only observability page for every agent on the host.
-  Lists the agents from each instance's registry and hangs their transcripts —
-  current and historical — off them; shows liveness, session timelines and the
-  subagent tree over a time axis. Reads both the transcripts and the registry
-  off local disk, and writes to neither. Binds loopback only and is published
-  to the tailnet with `tailscale serve`. See [`status/README.md`](status/README.md).
+- **`src/`** — the waker (TypeScript). Listens on the Discord gateway, keeps
+  one persistent Claude Code session per channel, delivers mail between agents,
+  fires the conditions they arm. It never composes a message.
+- **`discord-cli/`**, **`browser-cli/`**, **`gws-cli/`**, **`pr-cli/`** — the
+  CLIs the agent runs. Python and Node, no install step.
+- **`bots/`** — daemons a crew runs under its own bot identity, supervised
+  inside its container (`bots/README.md`).
+- **`status/`** — Clawsky, a read-only page showing every agent's activity and
+  transcript (`status/README.md`).
+- **`deploy/`** — `deploy.sh` builds a release from `origin/main`, switches to
+  it, checks the services came up, and reverts if not. A timer runs it every
+  minute; a crew can request a ref. `setup.sh` prepares a fresh box.
 
 ## How it behaves
 
-**Wakes** on an @mention, on any message during a follow-up window after it has
-been addressed, or on a wake it scheduled for itself.
+**Wakes** on an @mention, on any message during a follow-up window, on mail
+from a colleague, or on a condition it armed (`remindMe`, `scheduleRecurring`,
+`watchPr`). **Bundles** a burst of messages into one turn. **Stays warm**: one
+session per channel, resumed from SQLite across restarts, evicted after thirty
+idle minutes.
 
-**Bundles** rapid messages — each new message restarts a short debounce, with a
-ceiling so continuous typing cannot defer it forever, so a burst of three lines
-arrives as one turn rather than three.
-
-**Stays warm while it is working.** One session per channel, resumed from
-SQLite across restarts. Nothing obliges it to reply; silence is a normal
-outcome.
-
-**Schedules itself.** No bespoke scheduler: the agent has cron inside its
-container and asks to be woken by dropping a JSON file in a watched directory.
-A rate limit still applies — a request is a request, not a command.
+A crew is a **coordinator** that holds Discord and the agents it spawns —
+engineers, researchers, a poster, an updater — talking by DM. Behaviour and
+persona live in `agent-config.base.yaml` → `systemPrompt.append`; the code
+contributes only mechanics.
 
 ## Containment
 
-The agent process lives inside a persistent **gVisor** container. gVisor
-intercepts syscalls in userspace, so nothing the agent does reaches the host
-kernel — and because the whole process is inside, the boundary covers every
-tool rather than only shell commands.
+Clawcius runs inside a persistent **gVisor** container on a Docker
+`--internal` network whose only route out is **Squid**. Squid is default-allow
+with a blocklist; it is a kill switch, not a boundary. The container is
+long-lived so what the agent installs survives; its writable layer is
+snapshotted nightly and a wedged one is `docker/up.sh --recreate` from clean.
 
-Egress is enforced by topology rather than configuration. The container sits on
-a Docker `--internal` network with no route to the outside; **Squid** is the
-only reachable thing that has one. Unsetting the proxy variables, passing
-`--noproxy '*'`, or connecting by raw IP all simply fail — there is no second
-route to find.
+Hamachi is not sandboxed. The box holds nothing but agents, and every service
+on it is root-equivalent, so the safety net is the provider's backup, not a
+wall. Hamachi snapshots before anything destructive.
 
-What Squid *decides* is a much smaller thing than the topology implies, and has
-been since 2026-08-01: egress is **default-allow**, filtered by a blocklist of
-named destinations that blocks nothing today — its one entry is `.invalid`,
-which can never resolve and is there only to keep the config parseable. It is a
-kill switch, not a
-containment boundary. `squid/squid.conf` §5 is the authority and explains what
-that moved.
+## Pipeline
 
-The container is long-lived on purpose: cron jobs, daemons and Discord bots the
-agent writes keep running between turns, with no model in the loop.
-
-There is no docker socket and no host socket inside, so the agent cannot touch
-its own deployment directly. What it has instead is a conversation: a crew's
-**coordinator** DMs `<crew>-host` with a **task** — free text,
-"clawcius.service has been restarting every 30s since the deploy, find out why
-and fix it" — and a separate root daemon hands it to a Claude Code session
-running on the host, with a shell and sudo. The answer comes back as a DM.
-
-Until 2026-08-10 that path carried a closed list of seven verbs, and the
-argument for it was that a finite, enumerated set of operations is a safety
-property. It is, and it was given up deliberately: a closed set can only hold
-what somebody imagined in advance, and every gap in it turned the operator into
-the agent's hands. **For that one component the sandbox is no longer a security
-boundary.** What replaces it is a complete audit of every command the session
-runs, written before each command's result is known; the fact that only a
-coordinator can ask at all, checked twice against a column no message body can
-reach; and the fact that this is a personal VPS with snapshots. Since 2026-08-11
-it also runs as an unprivileged system account of its own (`clawcius-ops`)
-rather than as the operator — who is in the `docker` group, which is root, which
-made every other control in `ops/` decoration. The daemon refuses to start a
-session as an account that is missing, is uid 0, is in a root-equivalent group,
-or can read the operator's secrets.
-
-**There used to be more, and it is worth knowing what went.** Until 2026-08-16
-the way in was a bind-mounted spool directory, and around it stood a snapshot
-before every task, an automatic rollback if the task failed or a service stopped
-being healthy, a deadline the agent had to answer or be reverted, and a circuit
-breaker that froze the whole mechanism after two failed recoveries. All of it
-was retired with the spool. **Nothing undoes a task now.** The health sample
-either side of a task survives and it reports; it does not repair. Undoing is a
-person's decision, with the VPS snapshot and git.
-
-See [`ops/README.md`](ops/README.md) — the trust model section is the honest
-account — and [`MIGRATION.md`](MIGRATION.md), which is how the host gets from
-one to the other and has not been run yet. It ships in dry-run, and in dry-run
-the session has no shell at all — nothing in `systemd/` sets `OPS_DRY_RUN`, so a
-fresh install comes up in dry run and says so in its first line. **The executor
-on this host runs with dry run off**, and the way that is expressed is a tracked
-systemd drop-in, `systemd/clawcius-ops.service.d/live.conf`, rather than an edit
-to the config — which keeps the safe default. Installing that drop-in is an
-operator step (SETUP.md § *Going live*) and had not been taken when this
-paragraph was written; the boot line in `journalctl -u clawcius-ops` is what
-answers whether it has, naming the value in force and which of the three inputs
-decided it.
+`main` is always deployable. Only pull requests reach it; CI (typecheck, tests,
+the Python suites) and OJ's review are required; merges are squashed; the
+deploy timer on the box pulls, builds, switches and health-checks within a
+minute. Rollback is the same script with an older commit.
 
 ## Configuration
 
-| File | Holds | Committed |
-|---|---|---|
-| `agent-config.base.yaml` | Model, turn cap, system prompt, prompt templates, sessions, scheduling — everything shared by every crew | yes |
-| `agent-config.yaml`, `agent-config.<crew>.yaml` | One instance each: its `crew`, `displayName` and Discord channels, and nothing else. `AGENT_CONFIG_PATH` picks one; it names the base with `extends:` | yes |
-| `squid/squid.conf` | The egress policy — the only copy. A blocklist, not an allowlist, since 2026-08-01 | yes |
-| `ops/ops-config.yaml` | The ops executor's health manifest, limits and instances — *not* an allowlist of what it may do. Ships `dryRun: true` and keeps saying it | yes |
-| `systemd/clawcius-ops.service.d/live.conf` | `Environment=OPS_DRY_RUN=false` — the one setting that legitimately differs between this repository and this machine. A drop-in rather than a line in the unit, so that installing the unit alone can never turn the executor live | yes; installing it is an operator step |
-| `ops/clawcius-sudoers` | What the host agent may do with sudo, by exact command and exact unit name, and why | yes |
-| `MIGRATION.md` | Creating the host agent's service account, the shared group, the deploy key — with a rollback path. **Not yet executed.** | yes |
-| `status/status-config.yaml` | Transcript roots, per-instance board databases, port, liveness thresholds | yes |
-| `.env` | Discord token, guild id, optional API key | **no** |
-
-Behaviour and persona live in `systemPrompt.append`. The code contributes only
-mechanics — that the agent's stdout is invisible and which command makes words
-appear.
-
-By default there is no API key: the agent inherits the environment and
-authenticates with the same OAuth login as Claude Code.
+| File | Holds |
+|---|---|
+| `agent-config.base.yaml` | Model, system prompt, prompt templates, sessions, scheduling |
+| `agent-config.yaml`, `agent-config.hamachi.yaml` | One crew each: `crew`, `displayName`, channels; `extends:` the base |
+| `squid/squid.conf` | The egress blocklist |
+| `status/status-config.yaml` | Transcript roots, boards, port |
+| `bots/manifest` | Which daemons each crew runs |
+| `/etc/clawcius/*.env` | Discord tokens, GitHub App key path (not in the repo) |
 
 ## Setup
 
-See [SETUP.md](SETUP.md) — prerequisites, authentication, the systemd units,
-and the memory budget. [`squid/README.md`](squid/README.md) covers the egress
-proxy and how to change the allowlist.
-
-Requires Node 22+, Docker with the `runsc` (gVisor) runtime, and Python 3.11+.
-
-## Recovery
-
-The container is persistent, and resetting it is deliberate. `up.sh` reuses an
-existing container and `down.sh` stops rather than removes it, so packages the
-agent installed and crontabs it wrote survive restarts and reboots — otherwise
-"persistent sandbox" would be a fiction.
-
-Code the agent writes lives in git; the writable layer is snapshotted nightly
-by a host-side timer *per instance* that the agent cannot reach. A wedged
-container is one flag from clean, with the workspace mount untouched:
-
-```sh
-docker/up.sh --recreate   # discard the writable layer, rebuild from the image
-```
-
-Those snapshots are now restore-tested rather than trusted:
-`clawcius-snapshot-verify.timer` boots the newest one in a throwaway container
-nightly and fails loudly if it does not come up. The usual cause of a failed
-rollback is a restore path nobody ever ran.
-
-It also checks how old that snapshot is, which it did not until 2026-08-19 —
-and the reason is the same argument one level up. **One timer per instance**,
-and for days there was only one timer and two instances, so the second
-instance's newest image never moved while a restore test booted it every night
-and reported the rollback path healthy. It was healthy. It restored to last
-week. A backup nobody has restored is optimism; a backup nobody has *dated* is
-the same optimism with a green light on it. See Clawcius #87 and `ops/README.md`
-§ *The age check, and why a green light needed one*.
+[SETUP.md](SETUP.md). Requires Node 22+, Docker with the `runsc` (gVisor)
+runtime, Python 3.11+, and a `claude` CLI login for each crew.
