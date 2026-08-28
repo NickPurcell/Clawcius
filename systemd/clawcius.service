@@ -3,107 +3,56 @@ Description=Clawcius — wakes a sandboxed Claude Code agent on Discord mentions
 Documentation=file:/home/npurcell/clawcius/SETUP.md
 After=network-online.target docker.service
 Wants=network-online.target
-# The agent runs via `docker exec`, so the daemon must be up first. Requires,
-# not Wants: without docker there is no agent, and failing loudly at boot beats
-# a bot that connects to Discord and then cannot answer anything.
+# Every agent turn is a `docker exec`; without the daemon there is no agent.
 Requires=docker.service
 
-# Never give up on a crash loop. These are [Unit] directives — in [Service]
-# systemd ignores them with a warning, leaving the default of 5 starts per 10s
-# before permanently stopping the unit, which is the opposite of what a 24/7
-# bot wants.
+# Never give up on a crash loop. [Unit] directives: in [Service] systemd
+# ignores them and keeps the default of 5 starts per 10s.
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
 [Service]
 Type=notify
-# The bot calls sd_notify READY=1 once the Discord gateway is connected, so
-# systemd does not report the unit started until it can actually serve.
-#
-# `all`, not `main`: Node cannot write to the notify socket itself (it is
-# SOCK_DGRAM, which neither node:dgram nor node:net can address), so the bot
-# shells out to systemd-notify. That helper sends from its own PID, which
-# NotifyAccess=main would reject — leaving the unit stuck in `activating`.
+# READY=1 is sent once the Discord gateway is connected. `all`, not `main`:
+# the bot shells out to systemd-notify, which sends from its own PID.
 NotifyAccess=all
 
-# Runs as npurcell, not a dedicated service account, and that is load-bearing:
-# the agent authenticates with the same OAuth login as Claude Code, and those
-# credentials live in this user's home directory. A separate service account
-# would have no login, and every agent turn would fail on auth.
-#
-# Switch to a dedicated user only if you also set ANTHROPIC_API_KEY in .env.
+# npurcell owns the checkout and the state directory and is in the docker group.
 User=npurcell
 Group=npurcell
 
 WorkingDirectory=/home/npurcell/clawcius
 EnvironmentFile=/home/npurcell/clawcius/.env
 
-# An absolute path here is not enough. The Agent SDK spawns Claude Code as a
-# child process invoking bare `node`, and systemd hands services a minimal
-# PATH that excludes ~/.local — so the bot starts fine and every agent spawn
-# dies with ENOENT. The agent's own bash commands need this too.
+# The Agent SDK spawns Claude Code invoking bare `node`; systemd's default PATH
+# excludes ~/.local, so without this every spawn dies with ENOENT.
 Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
 
-# ── Restart policy ────────────────────────────────────────────────────────
 Restart=always
 RestartSec=5
 
-# ── Watchdog ──────────────────────────────────────────────────────────────
-# The bot only pings while the Discord gateway is healthy, so this catches the
-# process-alive-but-gateway-dead failure that Restart=always misses.
+# The bot pings only while the Discord gateway is healthy, so this catches
+# process-alive-but-gateway-dead, which Restart=always cannot.
 WatchdogSec=90
 
-# ── State ─────────────────────────────────────────────────────────────────
-# Creates and chowns /var/lib/clawcius (DB + per-channel workspaces).
+# /var/lib/clawcius: the DB and the per-channel workspaces.
 StateDirectory=clawcius
 StateDirectoryMode=0750
 
-# ── Resource limits ───────────────────────────────────────────────────────
-# Sized against the Contabo VPS's 12 GB (migrated 2026-08-08), replacing the
-# old 3.4 GB VM budget. Roomier on purpose: this box runs only the two agent
-# stacks, so the ceiling exists to stop a runaway, not to ration a shared VM.
-#
-# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop. The gap
-# between MemoryMax and total RAM is deliberate — a ceiling close to total
-# would squeeze the OS instead of stopping the runaway agent. Raise both
-# together, never one alone.
-#
-# This used to say to raise these alongside sessions.maxConcurrent, which named
-# the wrong PRIMARY limit: the agent itself runs in `clawcius-agent`, so that
-# container's --memory (2g) and --pids-limit (512) are what bind first, and the
-# setting that moves with maxConcurrent is CLAWCIUS_CONTAINER_MEMORY.
-#
-# But these do still scale with it, just not dominantly. Each live session holds
-# a standing host-side `docker exec` client in THIS cgroup — `AgentSession.#start`
-# opens one streaming-input `query()` per session whose spawner lives until
-# close(), per session and not per turn, which is what "always warm" buys — plus
-# a per-session SDK message stream and in-process MCP mail servers in the bot's
-# heap. So when the cap moves, TasksMax is worth a look. See SETUP.md § 5.
+# MemoryHigh throttles first; MemoryMax is the hard stop, kept well under total
+# RAM so a runaway is stopped before it squeezes the OS. The agent itself is
+# bound by the container's --memory and --pids-limit; these cover the waker.
+# Each live session holds a standing `docker exec` client in this cgroup, so
+# TasksMax scales with sessions.maxConcurrent.
 MemoryHigh=3G
 MemoryMax=4G
 TasksMax=512
 
-# ── Hardening ─────────────────────────────────────────────────────────────
-# Deliberately moderate, and the reason has changed — read this before
-# tightening it.
-#
-# These directives were originally removed because the agent ran under bwrap,
-# which mounts a fresh /proc in a nested user namespace and needs an existing
-# fully-visible /proc to do it. PrivateTmp, ProtectSystem, ProtectHome,
-# ProtectKernelTunables, ProtectKernelModules and ProtectControlGroups each
-# broke that independently (bisected against the exact invocation).
-#
-# bwrap is gone. The agent is inside a gVisor container and this unit is only
-# the waker, so most of them could now come back. The one that still needs
-# care is ProtectSystem=strict: the waker reaches the agent over
-# /run/docker.sock, and connecting to a unix socket needs write permission on
-# the socket inode, which a read-only /run denies. Anything added here must be
-# verified with an actual `systemctl restart` and a real @mention, not by
-# reading — a broken waker looks exactly like a Discord outage.
-#
-# What is set today:
+# Moderate on purpose: the waker reaches the agent over /run/docker.sock, and
+# connecting to a unix socket needs write access on the inode, which
+# ProtectSystem=strict's read-only /run denies.
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 RemoveIPC=true

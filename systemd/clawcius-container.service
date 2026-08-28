@@ -4,9 +4,7 @@ Documentation=file:/home/npurcell/clawcius/SETUP.md
 After=docker.service
 Requires=docker.service
 
-# clawcius.service execs into the container for every agent turn, so this must
-# be up first. Without the ordering you get a bot that connects to Discord and
-# then fails every turn on `docker exec`, which reads as a Discord problem.
+# clawcius.service execs into this container on every agent turn.
 Before=clawcius.service
 
 [Service]
@@ -17,12 +15,11 @@ Group=npurcell
 SupplementaryGroups=docker
 WorkingDirectory=/home/npurcell/clawcius
 
-# Idempotent: recreates the networks and both containers from scratch, so a
-# half-torn-down state after an unclean shutdown still comes up clean.
+# Idempotent: up.sh creates what is missing, recreates Squid and reuses the agent container.
 ExecStart=/home/npurcell/clawcius/docker/up.sh
 ExecStop=/home/npurcell/clawcius/docker/down.sh
 
-# Bringing up two containers under gVisor is not instant.
+# Two containers under gVisor take a while to come up.
 TimeoutStartSec=180
 
 StandardOutput=journal
