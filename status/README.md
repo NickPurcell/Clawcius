@@ -18,9 +18,11 @@ last three hours; the range buttons, the wheel (ctrl+wheel zooms), dragging
 and the arrow buttons move it. Subagent rows appear only while their activity
 is in view or their lane is open.
 
-Below the agents: one row per bot found at
-`<workspacesRoot>/<workspace>/<bot>/run/health.json`, its span running from
-`since` to `updated`, red when `needs_human` is set. In the top bar: the age
+Below the agents: one row per bot, read from
+`<workspacesRoot>/.bots/<name>/health.json` (a bot `bots/supervise.sh` runs)
+or `<workspacesRoot>/<workspace>/<bot>/run/health.json` (a bot an agent runs
+from its workspace), its span running from `since` to `updated`, red when
+`needs_human` is set. In the top bar: the age
 of the newest `clawcius-agent` image tagged `snap-YYYYMMDD-HHMMSS` (red past
 48 h; "no docker" when the CLI cannot answer).
 
@@ -102,7 +104,7 @@ lines and any mail newer than the last line.
 | `agents[].label` | id | the crew's name on the page |
 | `agents[].projectsRoot` | | absolute path to the crew's `agent-home/projects` |
 | `agents[].boardDb` | none | the crew's board; without it no agents are listed |
-| `agents[].workspacesRoot` | none | where bots' `health.json` files are looked for |
+| `agents[].workspacesRoot` | none | the crew's workspaces; bots' `health.json` files are looked for under it |
 | `read.pageSize` | `100` | lane lines per page, and the most a request may ask for |
 | `read.maxPageBytes` | `2000000` | bytes one page may read off disk |
 | `read.maxBlockChars` | `20000` | characters kept per content block |

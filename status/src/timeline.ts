@@ -307,7 +307,14 @@ export function parseHealth(bot: string, workspace: string, raw: string): BotHea
   };
 }
 
-/** `<workspacesRoot>/<workspace>/<bot>/run/health.json`, one entry per file found. */
+/** The directory under a crew's workspaces where supervised bots run. */
+const BOTS_DIR = '.bots';
+
+/**
+ * One entry per health file: `<workspacesRoot>/.bots/<name>/health.json`
+ * (a supervised bot) and `<workspacesRoot>/<workspace>/<bot>/run/health.json`
+ * (a bot an agent runs from its own workspace).
+ */
 export async function readBots(
   workspacesRoot: string | null,
   agents: readonly RegistryAgent[],
@@ -328,8 +335,9 @@ export async function readBots(
     if (!isValidProjectSlug(workspace)) continue;
     const dir = resolveWithin(workspacesRoot, workspace);
     if (!dir) continue;
+    const supervised = workspace === BOTS_DIR;
     const owner = agents.find((agent) => agent.workspacePath === dir);
-    const label = owner ? (names.get(owner.id) ?? owner.id) : workspace;
+    const label = supervised ? '' : owner ? (names.get(owner.id) ?? owner.id) : workspace;
 
     let children: string[];
     try {
@@ -339,7 +347,7 @@ export async function readBots(
     }
     for (const bot of children.sort()) {
       if (!isValidProjectSlug(bot)) continue;
-      const path = resolveWithin(dir, bot, 'run', 'health.json');
+      const path = supervised ? resolveWithin(dir, bot, 'health.json') : resolveWithin(dir, bot, 'run', 'health.json');
       if (!path) continue;
       let raw: string;
       try {
@@ -352,4 +360,3 @@ export async function readBots(
   }
   return bots;
 }
-

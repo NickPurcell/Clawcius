@@ -147,7 +147,7 @@ function botRows() {
     const summary = bot.error ?? [bot.mode, bot.detail, counts].filter(Boolean).join(' · ');
     return {
       id: `b:${i}`,
-      name: bot.error ? 'bots' : `${bot.bot} · ${bot.workspace}`,
+      name: bot.error ? 'bots' : bot.workspace ? `${bot.bot} · ${bot.workspace}` : bot.bot,
       spans,
       needsHuman: bot.needsHuman,
       title: bot.needsHuman ? `needs human: ${bot.needsHuman}` : summary,

@@ -30,6 +30,7 @@ function fixture() {
   const sessionDir = join(projects, coordSlug);
   mkdirSync(join(sessionDir, 'sess-1', 'subagents'), { recursive: true });
   mkdirSync(join(coordWorkspace, 'vidbot', 'run'), { recursive: true });
+  mkdirSync(join(workspaces, '.bots', 'pollbot'), { recursive: true });
 
   writeFileSync(
     join(sessionDir, 'sess-1.jsonl'),
@@ -54,6 +55,7 @@ function fixture() {
     JSON.stringify({ agentType: 'general-purpose', description: 'Count files', toolUseId: 'toolu_2' }),
   );
   writeFileSync(join(coordWorkspace, 'vidbot', 'run', 'health.json'), JSON.stringify({ mode: 'gateway', detail: '282', since: at(0), updated: at(500), needs_human: null, counts: { reconnects: 2 } }));
+  writeFileSync(join(workspaces, '.bots', 'pollbot', 'health.json'), JSON.stringify({ mode: 'polling', since: at(0), updated: at(400), needs_human: 'token expired' }));
 
   const dbPath = join(root, 'hamachi.db');
   const db = new DatabaseSync(dbPath);
@@ -142,10 +144,11 @@ test('the timeline names rows for people, orders the coordinator first, nests th
   // Every stamped line, the operational record included: the lane pages over all of them.
   assert.equal(coordinator.lines, 8);
   assert.deepEqual(body.rows[2].spans, []);
-  assert.equal(body.bots.length, 1);
-  assert.equal(body.bots[0].bot, 'vidbot');
-  assert.equal(body.bots[0].workspace, 'Hamachi coordinator');
-  assert.deepEqual(body.bots[0].counts, { reconnects: 2 });
+  assert.deepEqual(body.bots.map((bot) => [bot.bot, bot.workspace, bot.needsHuman]), [
+    ['pollbot', '', 'token expired'],
+    ['vidbot', 'Hamachi coordinator', null],
+  ]);
+  assert.deepEqual(body.bots[1].counts, { reconnects: 2 });
 });
 
 test('a lane pages in order, labels by origin, folds results under calls, and merges the board by time', async () => {

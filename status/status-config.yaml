@@ -15,8 +15,9 @@ server:
 # `boardDb` is the crew's board, its CLAWCIUS_DB_PATH: the `agents` registry
 # and the `mail` table. Opened read-only and never created here.
 #
-# `workspacesRoot` holds one directory per agent; a bot running inside one
-# writes `<workspace>/<bot>/run/health.json`, which the page reads.
+# `workspacesRoot` holds one directory per agent plus `.bots/`, where
+# bots/supervise.sh runs each bot; the page reads every `health.json` there
+# and any `<workspace>/<bot>/run/health.json` an agent's own bot writes.
 agents:
   - id: clawcius
     label: Clawcius

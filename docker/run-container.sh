@@ -42,9 +42,6 @@ REPO=${CLAWCIUS_REPO_DIR:-/srv/clawcius}
 BOTS=$REPO/current/bots
 CREW=${CLAWCIUS_CREW:-${NAME%-agent}}
 # The container's only read-write window onto the host filesystem.
-# clawcius-status listens on a unix socket here, `$CLAWCIUS_STATE/run/status.sock`,
-# which is how the page is reachable from a network with no gateway. Mirrored
-# host->container because status-config.yaml names the socket by its host path.
 STATE_RUN=$CLAWCIUS_STATE/run
 
 # BROWSE_LOG (set on the container below) lives under $WORKSPACES rather than
