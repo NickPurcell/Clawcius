@@ -45,8 +45,6 @@ export type ScheduleSeen = {
   fires: number;
   /** Occurrences that passed with nothing running, over the schedule's life. */
   missed: number;
-  /** Whether `missed` is a total or a floor — see `SchedulePlan.skippedExact`. */
-  missedExact?: boolean;
 };
 
 /** Watermarks, so a poll reports what is new rather than everything. */
@@ -200,27 +198,6 @@ export class ArmedStore {
       )
       .all(owner) as Array<Record<string, unknown>>;
     return rows.map(toCondition).filter((c): c is ArmedCondition => c !== null);
-  }
-
-  spentFor(owner: string, since: number): { recent: ArmedCondition[]; older: number } {
-    const rows = this.#db
-      .prepare(
-        `SELECT ${COLUMNS} FROM armed_conditions
-          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) >= ?
-          ORDER BY fired_at DESC, id DESC`,
-      )
-      .all(owner, since) as Array<Record<string, unknown>>;
-    const older = this.#db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM armed_conditions
-          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) < ?`,
-      )
-      .get(owner, since) as { n: number };
-
-    return {
-      recent: rows.map(toCondition).filter((c): c is ArmedCondition => c !== null),
-      older: Number(older.n),
-    };
   }
 
   findPrWatch(owner: string, repo: string, pr: number): ArmedCondition | null {

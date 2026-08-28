@@ -539,45 +539,16 @@ test('listArmed shows this session\'s conditions, with the id disarm takes, and 
   const listing = said(await mine.listArmed.handler({}, {}));
   const ids = store.listFor('hamachi-engineer1').map((c) => c.id);
 
-  assert.match(listing, /2 armed for hamachi-engineer1/);
+  assert.equal(ids.length, 2);
   for (const id of ids) assert.match(listing, new RegExp(`#${id}\\b`));
-  assert.match(listing, /pr-watch {2}NickPurcell\/Clawcius#44 {2}on review/);
+  assert.match(listing, /NickPurcell\/Clawcius#44 on review/);
   assert.match(listing, /check the deploy has settled/);
-  assert.match(listing, /next poll .*\(in \d+ minutes?\)/);
-  assert.match(listing, /fires .*\(in \d+ hours?\)/);
+  assert.match(listing, /in \d+ minutes?\b/, 'the watch says when it next polls');
+  assert.match(listing, /in \d+ hours?\b/, 'the reminder says when it fires');
 
   const theirs = store.listFor('hamachi-coordinator');
   assert.equal(theirs.length, 1, 'the coordinator did arm one');
   assert.doesNotMatch(listing, new RegExp(`#${theirs[0].id}\\b`));
-  // And the listing says so, rather than leaving "not listed" to mean "not there".
-  assert.match(listing, /would not appear here/);
-  registry.close();
-});
-
-test('listArmed shows what has ended, so an empty list has one meaning rather than two', async () => {
-  const { registry, mail, store } = board();
-  const { remindMe, listArmed } = toolsFor('hamachi-engineer1', store);
-
-  await remindMe.handler({ note: 'the standup', inMinutes: 5 }, {});
-  const [row] = store.listFor('hamachi-engineer1');
-  store.reschedule(row.id, Date.now() - 1000);
-  new ArmedWaker({ store, registry, mail, github: null, tickMs: 1000, log: () => {} }).tick();
-
-  const listing = said(await listArmed.handler({}, {}));
-  assert.match(listing, /Nothing armed for hamachi-engineer1/);
-  assert.match(listing, /ENDED in the last 24 hours/);
-  assert.match(listing, new RegExp(`#${row.id} {2}reminder {2}"the standup" {2}ended`));
-
-  store.arm('hamachi-engineer1', 'reminder', Date.now() - 1000, { note: 'last week' });
-  const [old] = store.listFor('hamachi-engineer1');
-  store.disarm(old.id);
-  registry.db
-    .prepare('UPDATE armed_conditions SET fired_at = ? WHERE id = ?')
-    .run(Date.now() - 8 * 24 * 60 * 60 * 1000, old.id);
-
-  const later = said(await listArmed.handler({}, {}));
-  assert.doesNotMatch(later, /last week/);
-  assert.match(later, /1 older condition\(s\) have ended and are not listed/);
   registry.close();
 });
 
@@ -814,7 +785,7 @@ test('a condition disarmed after the tick\'s query, but before its turn, does no
   registry.close();
 });
 
-test('listArmed is bounded, and ids stay reachable well past the point it stops rendering in full', async () => {
+test('listArmed lists at most twenty, soonest first, and counts the rest', async () => {
   const { registry, store } = board();
   const now = Date.now();
   const armed = [];
@@ -823,69 +794,29 @@ test('listArmed is bounded, and ids stay reachable well past the point it stops 
       note: `reminder ${i}`,
     }));
   }
-  for (let i = 0; i < 15; i += 1) {
-    const spent = store.arm('hamachi-engineer1', 'reminder', now, { note: `spent ${i}` });
-    store.disarm(spent.id);
-  }
 
   const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
 
-  // The count is honest even where the rows are not rendered in full.
-  assert.match(listing, /^25 armed for hamachi-engineer1\./m);
-  assert.match(listing, /5 more armed, due later than those above/);
-  assert.match(listing, /and 5 more that ended in the last 24 hours/);
-  assert.ok(listing.length < 8000, `32KB of listing goes into a context window: ${listing.length}`);
-
-  // Bounded is not the same as unreachable.
-  for (const condition of armed) {
-    assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
+  const listed = listing.match(/^ {2}#\d+ /gm) ?? [];
+  assert.equal(listed.length, 20);
+  for (const condition of armed.slice(0, 20)) {
+    assert.match(listing, new RegExp(`#${condition.id}\\b`));
   }
-  // And the ones past the cap are the cheap form: no moments on those lines.
-  const full = listing.match(/^ {6}fires /gm) ?? [];
-  assert.equal(full.length, 20, 'twenty rendered in full, the rest one line each');
-
-  assert.doesNotMatch(listing, /Disarm some/i);
+  for (const condition of armed.slice(20)) {
+    assert.doesNotMatch(listing, new RegExp(`#${condition.id}\\b`));
+  }
+  assert.match(listing, /\b5 more\b/, 'the count past the cap is stated');
   registry.close();
 });
 
-test('past seventy the listing says the remaining ids are not recoverable, rather than implying they are', async () => {
+test('a note is previewed, not printed', async () => {
   const { registry, store } = board();
-  const now = Date.now();
-  const armed = [];
-  for (let i = 0; i < 75; i += 1) {
-    armed.push(store.arm('hamachi-engineer1', 'reminder', now + (i + 1) * 60_000, {
-      note: `reminder ${i}`,
-    }));
-  }
+  const note = `${'x'.repeat(200)} THE END`;
+  store.arm('hamachi-engineer1', 'reminder', Date.now() + 60_000, { note });
 
   const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
-
-  assert.equal(listing.match(/^ {2}#\d+ {2}reminder/gm).length, 70);
-  assert.match(listing, /^75 armed for hamachi-engineer1\./m, 'the count stays true');
-  assert.match(listing, /The next 50, one line each/, 'not "one line each" of 55');
-  assert.match(listing, /and 5 more, not listed at all — their ids are not recoverable/);
-
-  for (const condition of armed.slice(0, 70)) {
-    assert.match(listing, new RegExp(`^ {2}#${condition.id} {2}reminder`, 'm'));
-  }
-  for (const condition of armed.slice(70)) {
-    assert.doesNotMatch(listing, new RegExp(`#${condition.id}\\b`), 'and it does not pretend');
-  }
-
-  // Under the compact cap the heading is the unqualified one, and true.
-  const all = store.listFor('hamachi-engineer1');
-  const fewer = renderArmed('hamachi-engineer1', all.slice(0, 30), { recent: [], older: 0 }, now);
-  assert.match(fewer, /10 more armed, due later than those above\. One line each, no moments/);
-  assert.doesNotMatch(fewer, /not listed at all/);
-
-  // Seventy is the last one that fits. Seventy-one is the first that does not,
-  // and the tail is about a single condition there.
-  assert.doesNotMatch(
-    renderArmed('hamachi-engineer1', all.slice(0, 70), { recent: [], older: 0 }, now),
-    /not listed at all/,
-  );
-  const one = renderArmed('hamachi-engineer1', all.slice(0, 71), { recent: [], older: 0 }, now);
-  assert.match(one, /\(and 1 more, not listed at all — its id is not recoverable from this tool\.\)/);
+  assert.doesNotMatch(listing, /THE END/);
+  assert.ok(listing.length < 400, `a listing line is a preview: ${listing.length}`);
   registry.close();
 });
 
@@ -919,19 +850,6 @@ test('two watchPr calls that overlap in flight write one row, not two', async ()
   const refusal = said(a.isError ? a : b);
   assert.match(refusal, /already watching NickPurcell\/Clawcius#44/);
   assert.match(refusal, /armed while this call was fetching/);
-  registry.close();
-});
-
-test('a condition whose spec lost a field is listed as unreadable rather than taking the listing down', async () => {
-  const { registry, store } = board();
-  // What a schema change looks like from the far side: parses as JSON, is the right kind, and does not have the field the renderer wants.
-  store.arm('hamachi-engineer1', 'pr-watch', Date.now() + 60_000, { repo: 'NickPurcell/OJ', pr: 13 });
-  store.arm('hamachi-engineer1', 'reminder', Date.now() + 120_000, { note: 'a readable one' });
-
-  const listing = said(await toolsFor('hamachi-engineer1', store).listArmed.handler({}, {}));
-
-  assert.match(listing, /pr-watch {2}NickPurcell\/OJ#13 {2}on \(unreadable\)/);
-  assert.match(listing, /a readable one/, 'the good row is still there');
   registry.close();
 });
 

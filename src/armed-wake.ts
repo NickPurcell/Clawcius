@@ -401,10 +401,6 @@ export class ArmedWaker {
       lastFiredAt: now,
       fires: (seen?.fires ?? 0) + 1,
       missed: (seen?.missed ?? 0) + plan.skipped,
-      // Latches. One walk that stopped short makes the running total a floor
-      // for the rest of the row's life, and `listArmed` reads this to decide
-      // whether it may state the number plainly.
-      missedExact: (seen?.missedExact ?? true) && plan.skippedExact,
     };
     if (plan.nextAt === null) {
       this.#options.store.disarm(condition.id);

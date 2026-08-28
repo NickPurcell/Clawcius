@@ -26,19 +26,10 @@ import { EXTERNAL_WARNING, REPO_NAME, type PullRequestSource } from './github.js
 /** A note is prose the agent writes to itself, not a payload. */
 const MAX_NOTE_CHARS = 4000;
 
-/** How far back `listArmed` reaches for conditions that have already ended. */
-const SPENT_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 /** A note in a listing is an identifier, not the note. */
 const NOTE_PREVIEW_CHARS = 80;
 
-/** And past the cap it is an identifier only — enough to tell two apart. */
-const OVERFLOW_PREVIEW_CHARS = 32;
-
-const MAX_LISTED_ACTIVE = 20;
-const MAX_LISTED_ENDED = 10;
-/** Past this the listing stops entirely; the count is still true. */
-const MAX_LISTED_COMPACT = 50;
+const MAX_LISTED = 20;
 
 const MAX_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 
@@ -99,13 +90,12 @@ function relative(ms: number): string {
   return ms >= 0 ? `in ${count}` : `${count} ago`;
 }
 
-/** The refusal both duplicate checks return. `during` marks a watch that appeared while this call was in flight. */
+/** The refusal for a pull request this agent already watches. `during` marks a watch that appeared while this call was in flight. */
 function alreadyWatching(existing: ArmedCondition, during = false) {
-  const spec = existing.spec as Partial<PrWatchSpec>;
-  const on = Array.isArray(spec.on) ? spec.on.join(', ') : '(unreadable)';
+  const spec = existing.spec as PrWatchSpec;
   return refuse(
     `Not armed — you are already watching ${spec.repo}#${spec.pr}: that is watch ` +
-      `${existing.id}, armed ${stamp(existing.armedAt)}, on ${on}. A second watch would ` +
+      `${existing.id}, armed ${stamp(existing.armedAt)}, on ${spec.on.join(', ')}. A second watch would ` +
       'mail you every event on that pull request twice until it merges or closes. Nothing ' +
       `was written. If you want different terms, disarm(${existing.id}) and arm again; ` +
       'listArmed() shows the rest.' +
@@ -117,133 +107,45 @@ function alreadyWatching(existing: ArmedCondition, during = false) {
 }
 
 /** What a condition is waiting for, in one line. */
-function summarise(condition: ArmedCondition, previewChars = NOTE_PREVIEW_CHARS): string {
+function summarise(condition: ArmedCondition): string {
   if (condition.kind === 'pr-watch') {
-    const spec = condition.spec as Partial<PrWatchSpec>;
-    const on = Array.isArray(spec.on) && spec.on.length > 0 ? spec.on.join(', ') : '(unreadable)';
-    return `pr-watch  ${spec.repo ?? '(unreadable)'}#${spec.pr ?? '?'}  on ${on}`;
+    const spec = condition.spec as PrWatchSpec;
+    return `${spec.repo}#${spec.pr} on ${spec.on.join(', ')}`;
   }
-
-  const note = (condition.spec as Partial<ReminderSpec>).note;
-  const text = typeof note === 'string' ? note : '(unreadable)';
-  const shown = text.length > previewChars ? `${text.slice(0, previewChars)}…` : text;
+  const { note } = condition.spec as ReminderSpec;
+  const shown = note.length > NOTE_PREVIEW_CHARS ? `${note.slice(0, NOTE_PREVIEW_CHARS)}…` : note;
   const quoted = `"${shown.replace(/\s+/g, ' ')}"`;
-
   if (condition.kind === 'schedule') {
-    const spec = condition.spec as Partial<ScheduleSpec>;
-    const every = typeof spec.everyN === 'number' && spec.everyN > 1 ? ` every ${spec.everyN}` : '';
-    return (
-      `schedule  ${quoted}  \`${spec.cron ?? '(unreadable)'}\`${every} ` +
-      `· ${spec.timezone ?? '(unreadable)'}`
-    );
+    const spec = condition.spec as ScheduleSpec;
+    const every = spec.everyN > 1 ? ` every ${spec.everyN}` : '';
+    return `\`${spec.cron}\`${every} · ${spec.timezone}  ${quoted}`;
   }
-  return `reminder  ${quoted}`;
+  return quoted;
 }
 
-/** When a schedule last fired, which is half of what makes it auditable. */
-function history(condition: ArmedCondition): string {
-  const seen = condition.seen as Partial<ScheduleSeen> | null;
-  const fires = typeof seen?.fires === 'number' ? seen.fires : 0;
-  const missed = typeof seen?.missed === 'number' ? seen.missed : 0;
-  if (fires === 0) return 'has not fired yet';
-  const last = typeof seen?.lastFiredAt === 'number' ? stamp(seen.lastFiredAt) : 'an unknown moment';
-  // The hedge travels with the number wherever the number goes. A count that
-  // stopped short in the waker and is reprinted here as a bare total is the
-  // same untruth twice, and this is the copy somebody reads on purpose.
-  const exact = seen?.missedExact ?? true;
+/** When the waker next looks at a condition, in the schedule's own zone when it has one. */
+function due(condition: ArmedCondition, now: number): string {
+  const verb = condition.kind === 'pr-watch' ? 'next poll' : 'fires';
+  const zone =
+    condition.kind === 'schedule' ? (condition.spec as ScheduleSpec).timezone : DEFAULT_TIMEZONE;
   return (
-    `last fired ${last} · ${fires} time${fires === 1 ? '' : 's'}` +
-    (missed > 0
-      ? ` · ${exact ? '' : 'at least '}${missed} occurrence(s) missed while nothing was running`
-      : '')
+    `${verb} ${zonedStamp(condition.dueAt, zone)}${alsoIn(condition.dueAt, zone)}, ` +
+    relative(condition.dueAt - now)
   );
 }
 
-/** The listing, exported so a test can read it rather than the SQL. */
+/** The listing: one line per condition, soonest first, at most `MAX_LISTED` of them. */
 export function renderArmed(
   agentId: string,
   active: readonly ArmedCondition[],
-  spent: { recent: readonly ArmedCondition[]; older: number },
   now: number = Date.now(),
 ): string {
-  const lines: string[] = [];
-  lines.push(
-    active.length === 0
-      ? `Nothing armed for ${agentId}.`
-      : `${active.length} armed for ${agentId}.`,
-  );
-
-  // Soonest first, so what a cap removes is what is furthest from mattering.
-  for (const condition of active.slice(0, MAX_LISTED_ACTIVE)) {
-    const verb = condition.kind === 'pr-watch' ? 'next poll' : 'fires';
-    lines.push('');
-    lines.push(`  #${condition.id}  ${summarise(condition)}`);
-    lines.push(
-      `      ${verb} ${stamp(condition.dueAt)} (${relative(condition.dueAt - now)})` +
-        ` · armed ${stamp(condition.armedAt)}`,
-    );
-    // A repeat is the one kind whose past matters as much as its future: it is
-    // how an agent tells a schedule that is doing its job from one that has
-    // been firing into nothing since March.
-    if (condition.kind === 'schedule') {
-      const spec = condition.spec as Partial<ScheduleSpec>;
-      // `isTimezone` because a row's spec is only guaranteed to be an object —
-      // see `summarise`. An unreadable zone must cost this line, not the listing.
-      const zone = typeof spec.timezone === 'string' && isTimezone(spec.timezone) ? spec.timezone : '';
-      // The same suppression `alsoIn` does, at the one site shaped as two lines rather than a parenthetical.
-      const localPrefix =
-        zone && zonedStamp(condition.dueAt, zone) !== stamp(condition.dueAt)
-          ? `${zonedStamp(condition.dueAt, zone)} local · `
-          : '';
-      lines.push(`      ${localPrefix}${history(condition)}`);
-    }
+  if (active.length === 0) return `Nothing armed for ${agentId}.`;
+  const lines = [`${active.length} armed for ${agentId}, soonest first:`];
+  for (const condition of active.slice(0, MAX_LISTED)) {
+    lines.push(`  #${condition.id}  ${condition.kind}  ${due(condition, now)}  ${summarise(condition)}`);
   }
-  const overflow = active.slice(MAX_LISTED_ACTIVE);
-  if (overflow.length > 0) {
-    lines.push('');
-    const compact = overflow.slice(0, MAX_LISTED_COMPACT);
-    lines.push(
-      `── ${overflow.length} more armed, due later than those above. ` +
-        (compact.length < overflow.length
-          ? `The next ${compact.length}, one line each`
-          : 'One line each') +
-        ', no moments — disarm takes the id.',
-    );
-    for (const condition of compact) {
-      lines.push(`  #${condition.id}  ${summarise(condition, OVERFLOW_PREVIEW_CHARS)}`);
-    }
-    const unlisted = overflow.length - compact.length;
-    if (unlisted > 0) {
-      lines.push(
-        `  (and ${unlisted} more, not listed at all — ` +
-          `${unlisted === 1 ? 'its id is' : 'their ids are'} not recoverable from this tool.)`,
-      );
-    }
-  }
-
-  if (spent.recent.length > 0) {
-    lines.push('');
-    lines.push('── ENDED in the last 24 hours. Kept as a record; nothing further will fire.');
-    for (const condition of spent.recent.slice(0, MAX_LISTED_ENDED)) {
-      const at = condition.firedAt ?? condition.armedAt;
-      lines.push(`  #${condition.id}  ${summarise(condition)}  ended ${stamp(at)}`);
-    }
-    if (spent.recent.length > MAX_LISTED_ENDED) {
-      lines.push(
-        `  (and ${spent.recent.length - MAX_LISTED_ENDED} more that ended in the last 24 hours.)`,
-      );
-    }
-  }
-  if (spent.older > 0) {
-    lines.push('');
-    lines.push(`(${spent.older} older condition(s) have ended and are not listed.)`);
-  }
-
-  lines.push('');
-  lines.push(
-    'These are yours and only yours — a colleague may have armed a watch on the same ' +
-      'pull request and it would not appear here. Withdraw one with disarm(id).',
-  );
+  if (active.length > MAX_LISTED) lines.push(`  and ${active.length - MAX_LISTED} more.`);
   return lines.join('\n');
 }
 
@@ -773,17 +675,7 @@ export function buildArmedTools(
     // `owner` here would be the one thing that lets an agent read a
     // colleague's schedule, and the absence of the field is the guarantee.
     {},
-    async () => {
-      const now = Date.now();
-      return ok(
-        renderArmed(
-          agentId,
-          options.store.listFor(agentId),
-          options.store.spentFor(agentId, now - SPENT_WINDOW_MS),
-          now,
-        ),
-      );
-    },
+    async () => ok(renderArmed(agentId, options.store.listFor(agentId))),
     // Never deferred: the tool that tells you whether you already armed
     // something is no use if you have to go looking for it first, and the one
     // moment it is wanted is the moment before arming.
@@ -806,7 +698,7 @@ export function buildArmedTools(
       const outcome = options.store.disarmFor(agentId, target);
       if (outcome.disarmed) {
         return ok(
-          `Disarmed ${outcome.condition.kind} ${target} — ${summarise(outcome.condition)}. ` +
+          `Disarmed ${outcome.condition.kind} ${target}, ${summarise(outcome.condition)}. ` +
             'It will not fire. The row is kept, inactive, as the record that it existed.',
         );
       }
@@ -820,7 +712,7 @@ export function buildArmedTools(
       }
       if (outcome.reason === 'already-inactive') {
         return refuse(
-          `Not disarmed — condition ${target} has already ended (${summarise(outcome.condition)}` +
+          `Not disarmed — condition ${target} has already ended (${outcome.condition.kind}, ${summarise(outcome.condition)}` +
             `${outcome.condition.firedAt ? `, at ${stamp(outcome.condition.firedAt)}` : ''}). ` +
             'It was firing nothing to begin with.',
         );
