@@ -1,36 +1,3 @@
-/**
- * The session pool: who a turn is written back as, when `acquire` refuses, and
- * what eviction does when it is switched off.
- *
- * None of this could be tested before. `agent.ts` imports `config.ts`, which
- * read and validated the environment in its module body, so `dist/agent.js`
- * was unloadable without a live deployment — Clawcius #130. Everything below
- * covers something that went wrong in #128 and was found by reading or by
- * review rather than by a test:
- *
- *   - `#identityFor` returned `coordinator` unconditionally. An engineer whose
- *     row went missing came back as the one role that may DM the host agent.
- *   - Under the caps shipped at the time (3 and 1) a spawned agent could never
- *     take a turn, because `acquire` had no slot for it and
- *     `idleTimeoutMinutes: 0` meant nothing gave a slot back on its own. Both
- *     configs went to 10 on 2026-08-20, so a spawn succeeds until ten sessions
- *     have run — and #249 set `idleTimeoutMinutes` to 30, so the second half of
- *     that sentence no longer holds either: the pool fills and then recovers,
- *     which turns a permanent lockout into a busy moment that passes.
- *   - The at-capacity announcement, added to fix the second, was reasoned about
- *     and shipped unexercised.
- *
- * The last section is Clawcius #132: WHICH TOOLS `acquire` gives a session, and
- * in particular that the spawn tool is offered to a coordinator and to nobody
- * else. That became testable in #133 — `newSession` receives the built
- * `mcpServers` as its fifth argument — and was not tested in it. CLAWSKY.md:
- * "Spawn and kill: held by the coordinator alone."
- *
- * Run against `dist/`, like every other test here: Node's type stripping does
- * not resolve a `.js` specifier to a `.ts` file, and testing the built output
- * is also what catches the stale-dist failure this repo keeps hitting.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -51,15 +18,7 @@ function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-/**
- * Only the keys the pool reads, and deliberately so.
- *
- * A fixture obliged to be a complete `AgentConfig` would be a second copy of
- * `agent-config.yaml` drifting quietly out of step with the real one. What each
- * test stands up should be readable in the test — so if a future `acquire`
- * reads a key that is not here, it gets a `TypeError` naming the key rather
- * than a plausible default.
- */
+/** Only the keys the pool reads, and deliberately so. */
 function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, modelByRole = {} }) {
   setConfig({
     discord: { token: 'unused-by-the-pool', guildId: 'unused-by-the-pool' },
@@ -74,15 +33,7 @@ function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, model
   });
 }
 
-/**
- * A session that is a session in every way the pool cares about, and starts no
- * container.
- *
- * `SessionManager.newSession` exists for this. A real `AgentSession` stands up
- * a containerised `claude` from its constructor — an env file and a
- * `docker exec` — so a test of the bookkeeping would otherwise pass or fail on
- * whether the host had docker and a live image.
- */
+/** A session that is a session in every way the pool cares about, and starts no container. */
 class FakeSession {
   constructor(channelId, workspacePath, resumeSessionId, events, mcpServers, model) {
     this.channelId = channelId;
@@ -147,21 +98,6 @@ function deleteRow(dbPath, id) {
 
 // ── identity: the row wins ───────────────────────────────────────────────────
 
-/**
- * A registry that records the identity it was handed.
- *
- * `#identityFor` is private and its output goes to exactly two places:
- * `ensure`, which ignores it whenever a row already exists, and
- * `recordSession`, whose conflict clause updates the session and nothing else.
- * So with a row present the identity it computes is invisible from the
- * database — which is what makes this stub worth the lines. Assert on the
- * stored row instead and the assertion holds even when `#identityFor` returns
- * `coordinator` for everybody, which is precisely the bug (#128).
- *
- * That is not a criticism of the store: two independent defences is the design,
- * and the tests below cover the other one against a real database. It is that
- * an end-to-end assertion cannot tell you which of them is doing the work.
- */
 function recordingRegistry(rows = {}) {
   return {
     calls: [],
@@ -223,9 +159,6 @@ test('the identity written back for an engineer is the engineer, not a coordinat
   manager.persist('hamachi-engineer1');
 
   const written = registry.calls.find((call) => call.method === 'recordSession');
-  // The bug: `#identityFor` returned `coordinator` unconditionally. Coordinator
-  // is the one role that may DM the host agent, so the promotion would have been
-  // a privilege handed out on the way past.
   assert.equal(written.identity.role, 'engineer');
   assert.equal(written.identity.crew, CREW);
   assert.equal(written.identity.spawnedBy, 'hamachi-coordinator');
@@ -463,11 +396,6 @@ test('the sweeper is inert at idleTimeoutMinutes: 0, however idle a session is',
   await Promise.resolve();
   await Promise.resolve();
 
-  // 0 disables eviction: nothing here reclaims a session, so they stay alive.
-  // The `idleTimeoutMinutes: 0` branch — not the shipped value since #249, but
-  // the one that made `liveCount` a high-water
-  // mark. It is the sweeper that does nothing — `!reset` and the error paths
-  // still release, they are simply not on this timer.
   assert.equal(manager.capacity.live, 2);
   assert.equal(built.every((session) => session.closed === false), true);
   await manager.shutdown();
@@ -524,9 +452,7 @@ test('a role with an override gets that model; every other role gets undefined',
 
   // Resolved from the ROW's role. The updater runs cheap; nothing else moves.
   assert.equal(built[0].model, 'claude-haiku-4-5');
-  // undefined rather than the top-level model: the fallback lives in
-  // `#buildOptions`, so a role with no override is byte-identical to how it
-  // behaved before `modelByRole` existed.
+  // undefined rather than the top-level model: the fallback lives in `#buildOptions`.
   assert.equal(built[1].model, undefined);
 });
 
@@ -560,28 +486,12 @@ test('at capacity with eviction off, the notice names the remedies', () => {
   const notice = atCapacityNotice(new AtCapacityError(4, 4), 0);
   assert.match(notice, /4 of 4 are in use/);
   assert.match(notice, /not queued/);
-  // The branch is the point, and the branch is `0` — supported, but not the
-  // shipped value since #249. At 0 a retry genuinely cannot work; at 30 a slot
-  // does free itself, which is the other test.
   assert.match(notice, /will not clear on its own/);
-  // Clawcius #146: the reader's OWN remedy, and the reason this branch exists at
-  // all. A restart is the operator's and raising the cap is an edit and a
-  // redeploy, so naming only those two left a user waiting for somebody else
-  // when `!reset` would have freed a slot immediately.
   assert.match(notice, /`!reset`/);
   assert.match(notice, /transcript/);
-  // Round 1 of #156. `acquire` returns an existing session before the cap check
-  // (src/agent.ts:912-920), so AtCapacityError can only fire for a channel with
-  // NO live session — the channel this notice is posted in is guaranteed to be
-  // the one where `!reset` frees nothing, and it is not harmless there:
-  // `release` no-ops but `clearSession` still spends the row's resumable id.
-  // Sending the reader elsewhere is the whole value of the sentence.
   assert.match(notice, /another channel/);
   assert.match(notice, /this channel has no session to free/);
-  // `handleCommand` is gated on `addressed && startsWith('!')`, so outside an
-  // always-on channel a bare `!reset` is dropped or handed to the agent as
-  // chat. The reader is being sent to a DIFFERENT channel, so the form shown
-  // has to be the one that works in any of them.
+  // `handleCommand` is gated on `addressed && startsWith('!')`, so outside an always-on channel a bare `!reset` is dropped or handed to the agent as chat.
   assert.match(notice, /Mentioning me with `!reset`/);
   assert.match(notice, /restart on the host, or a higher `sessions\.maxConcurrent`/);
   assert.doesNotMatch(notice, /say it again/);
@@ -625,14 +535,6 @@ test('a stored UUID is resumed and a placeholder is not', async () => {
   // spawn keeps the workspace spawn chose.
   assert.equal(built[0].workspacePath, '/tmp/a');
 
-  // `b` gets a ROW and no session id, which is what `ensure` writes and so is
-  // the state of every channel that has been woken but has not yet persisted a
-  // UUID. Without the row this half tests nothing: `persisted` would be
-  // undefined, `resumeFrom` undefined either way, and the `pending-b` that came
-  // back would be FakeSession's own fallback rather than a decision `acquire`
-  // made. Found by OJ on #133 by mutating `isResumable(persisted?.sessionId)`
-  // away and watching the suite stay green — an eleventh mutant that the
-  // mutation table had missed.
   registry.ensure('b', { crew: CREW, role: 'coordinator', workspacePath: '/tmp/b', spawnedBy: null });
   assert.equal(registry.get('b').sessionId, '');
   manager.acquire('b', events);
@@ -642,17 +544,7 @@ test('a stored UUID is resumed and a placeholder is not', async () => {
 
 // ── which in-process tools a session is given ───────────────────────────────
 
-/**
- * The tool names on the MCP server `acquire` built for a session.
- *
- * `acquire` hands `newSession` the result of `buildMailServer`, which is an SDK
- * server config wrapping a live `McpServer`. There is no public accessor for
- * what is registered on one, so this reaches for `instance._registeredTools` —
- * and asserts that it found it, loudly. That direction matters: an SDK that
- * renames the field makes this throw rather than quietly return `[]`, which
- * would turn "an engineer is offered no spawn tool" into a test that passes
- * because nobody is offered anything.
- */
+/** The tool names on the MCP server `acquire` built for a session. */
 function toolNames(mcpServers) {
   assert.ok(mcpServers, 'acquire built no MCP servers for this session at all');
   const server = mcpServers.clawsky;
@@ -665,13 +557,6 @@ function toolNames(mcpServers) {
       'checks (CLAWSKY.md: "Spawn and kill: held by the coordinator alone") has not changed.',
   );
   const names = Object.keys(registered).sort();
-  // Self-supporting, and the reason is OJ's on #136: an SDK that kept the field
-  // and left it empty would make every NEGATIVE assertion here — "an engineer is
-  // offered no spawn tool" — pass vacuously. The positive cases would still go
-  // red, so the file would fail either way; this makes each case fail on its
-  // own rather than leaning on its neighbours. Every caller has a mail store, so
-  // these two are always present: the no-mail case asserts `mcpServers === null`
-  // and never reaches here.
   assert.ok(
     names.includes('checkMail') && names.includes('sendMail'),
     `a session with a mail store must always be offered the mail tools; got: ${names.join(', ')}`,
@@ -679,12 +564,7 @@ function toolNames(mcpServers) {
   return names;
 }
 
-/**
- * A pool with a real board behind it, and the built `mcpServers` captured.
- *
- * `spawnLog` is what `main()` passes when — and only when — mail is on, so it
- * is the second half of the gate under test alongside the role.
- */
+/** A pool with a real board behind it, and the built `mcpServers` captured. */
 function boardPool(options = {}) {
   const { maxConcurrent = 4, spawnLog = () => {}, mail: withMail = true } = options;
   const workspaceRoot = tempDir('clawsky-workspaces-');
@@ -727,11 +607,6 @@ test("an engineer's session is not, and that is the whole of CLAWSKY.md's rule",
   });
 
   manager.acquire('hamachi-engineer1', events);
-  // "Spawn and kill: held by the coordinator alone." The tool re-reads the row
-  // when it runs, so this is defence in depth rather than the only gate — which
-  // is exactly the sort of thing that rots unnoticed. An engineer that could
-  // spawn could mint a colleague, and #128's argument for refusing to spawn a
-  // coordinator is that spawning widens who may DM the host agent.
   assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail']);
   await manager.shutdown();
 });
@@ -746,10 +621,7 @@ test('a poster gets mail and nothing else either', async () => {
 });
 
 test('with no spawn log wired, not even a coordinator is offered spawn', async () => {
-  // `spawnLog` is null when the board is off, and `main()` in daemon.ts is
-  // where that is decided: a spawn's last step is delivering the new agent's
-  // first turn as mail, so without a board it would write a row nothing could
-  // reach.
+  // `spawnLog` is null when the board is off; `main()` in daemon.ts decides that.
   const { manager, registry, built } = boardPool({ spawnLog: null });
   registry.ensure('hamachi-coordinator', {
     crew: CREW,
@@ -778,12 +650,7 @@ test('with no mail store there are no in-process tools at all', async () => {
 });
 
 test('a Discord channel the registry has never heard of DOES get spawn', async () => {
-  // Stated because it is surprising and it is a privilege. `#identityFor`'s
-  // fallback is `coordinator` — Discord stays with the coordinator — so the
-  // first mention in a brand-new channel or thread is offered the tool. The
-  // widening is real and bounded by who can talk to the bot at all, which is
-  // `allowedChannelIds`. If that ever stops being the intent, this test is
-  // where it is written down.
+  // Stated because it is surprising and it is a privilege.
   const { manager, built } = boardPool();
   manager.acquire('9876543210', events);
   assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail', 'spawn']);
@@ -791,10 +658,6 @@ test('a Discord channel the registry has never heard of DOES get spawn', async (
 });
 
 test('the role acted on is the row, not the identity the fallback would have picked', async () => {
-  // The two halves together: an engineer row exists, so `#identityFor` prefers
-  // it, so `ensure` returns it, so the gate reads `engineer`. Mutating
-  // `#identityFor` back to an unconditional `coordinator` — the #128 bug —
-  // hands an engineer the spawn tool, and this is the assertion that says so.
   const { manager, registry, built } = boardPool();
   registry.ensure('hamachi-engineer2', {
     crew: CREW,
@@ -809,24 +672,6 @@ test('the role acted on is the row, not the identity the fallback would have pic
 });
 
 // ── The settle travels with the TURN, not with the session ──────────────────
-//
-// #241 round 1, BLOCKING, and it is worth writing down what the shape of the
-// mistake was rather than only the fix.
-//
-// The first version handed the per-turn `settle` callback to `acquire`. But
-// `acquire` returns an EXISTING session and drops everything else it was given
-// (`src/agent.ts:1091`), and `AgentSession` stores its events once, in the
-// constructor. So the callback reached the session only on the wake that
-// happened to CREATE it. Every mail wake after that settled nothing; the mail
-// was never marked read; the ten-second sweep re-offered it forever — a full
-// model turn against the same message every ten seconds, for the life of the
-// process, on the SUCCESS path. Strictly worse than the rare asynchronous loss
-// it was written to fix.
-//
-// The lifetime the callback belongs to is a TURN, and `wake()` is where a turn
-// begins, so that is where it is passed. This test is at the acquire/wake seam
-// because that seam is where it broke: a test of `AgentSession` alone, or of
-// `mailWakeEvents` alone, would have passed against the broken wiring.
 
 test('every wake carries its own settle, not just the one that built the session (#241)', () => {
   const { manager, registry, built } = pool();
@@ -849,8 +694,6 @@ test('every wake carries its own settle, not just the one that built the session
   const [session] = built;
   assert.equal(session.wakes.length, 3);
 
-  // The claim: three distinct callbacks arrived, one per turn. Under the old
-  // wiring the 2nd and 3rd were dropped by `acquire` and this is where it shows.
   for (const [i, w] of session.wakes.entries()) {
     assert.equal(typeof w.onSettled, 'function', `wake ${i + 1} arrived with no settle`);
   }
@@ -862,15 +705,7 @@ test('every wake carries its own settle, not just the one that built the session
   assert.deepEqual(settles, [{ which: 'second', ran: true, why: '' }]);
 });
 
-// ── TurnSettle: the rules that had no coverage at all ────────────────────────
-//
-// These exist because of a mutation run, not because they looked missing. With
-// the settle logic inline in `AgentSession`, five separate mutations of it —
-// never clearing the callback, deleting the supersede, ignoring the callback
-// `wake` is handed, deleting the catch's settle, settling TRUE through an API
-// refusal — every one passed the full suite green. The logic was inside the one
-// class in agent.ts that no test can construct, so "391 pass" said nothing
-// about any of it.
+// ── TurnSettle ──────────────────────────────────────────────────────────────
 
 test('a settle fires exactly once, however many times the turn ends', () => {
   // Belt and braces with mail-wake's own once-guard, deliberately: the two
@@ -898,8 +733,6 @@ test('adopting a new turn ends the previous one FALSE (#241)', () => {
 
   assert.deepEqual(calls, [{ turn: 'first', ran: false, why: 'superseded' }]);
 
-  // And the turn that took over is the one now in flight — the defect was the
-  // NEW callback being dropped, so proving the old one fired is only half of it.
   settle.done(true, 'done');
   assert.deepEqual(calls[1], { turn: 'second', ran: true, why: 'done' });
 });
@@ -938,12 +771,7 @@ test('a wake carrying no settle still ends the turn before it', () => {
 });
 
 test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backoff (#241)', () => {
-  // An API refusal WITH a retry queued leaves the turn deliberately unsettled —
-  // the retry re-runs it and its own completion decides. But the session is idle
-  // for the whole backoff, so without this the ten-second sweep re-offers mail
-  // that is already spoken for and `wake()` cancels the retry it is racing.
-  // `TurnSettle.pending` already means "this turn has not ended", so `isBusy`
-  // asks it rather than tracking a second flag.
+  // An API refusal WITH a retry queued leaves the turn deliberately unsettled — the retry re-runs it and its own completion decides.
   const { manager, registry, built } = pool();
   registry.ensure('hamachi-engineer1', {
     crew: CREW,
@@ -963,10 +791,6 @@ test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backof
 });
 
 test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
-  // Two definitions of busy in one class is how the ops status file came to
-  // publish a mid-backoff agent as idle while the waker was correctly skipping
-  // it. A comment of mine claimed this line already fixed the status file; it
-  // did not, because the file reads `busyCount`, which counted `busy` alone.
   const { manager, registry, built } = pool();
   registry.ensure('hamachi-engineer1', {
     crew: CREW,
@@ -987,16 +811,7 @@ test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
 });
 
 test('eviction announces itself — it was the only silent release while running (#249)', async () => {
-  // Every other path that drops a session says so: onError writes the error,
-  // onNeedsRespawn writes "respawning", !reset replies in the channel, spawn
-  // logs the queue. Eviction did not, and now that it is ON the pool shrinks by
-  // itself with nothing recording when or which agent.
-  //
-  // Not tidiness. The success test for turning eviction on is "do the sentry
-  // OOMs stop", and the first question if they do not is whether it was
-  // accumulation or a burst — which needs to know eviction fired at all. The
-  // waker's status file cannot answer it: an overwritten count is not a record
-  // of events.
+  // Every other path that drops a session says so in the journal.
   const lines = [];
   const dbPath = join(tempDir('clawsky-evict-'), 'clawcius.db');
   installConfig({
@@ -1005,12 +820,6 @@ test('eviction announces itself — it was the only silent release while running
     workspaceRoot: tempDir('clawsky-evict-ws-'),
   });
   const registry = new AgentRegistry(dbPath, { crew: CREW });
-  // The EVICTION sink, which is the FIFTH argument and not `spawnLog`. The
-  // first version passed it as the fourth — mail-null WITH a log function, a
-  // combination `main()` cannot construct — so it proved a line was emitted and
-  // said nothing about whether it reached a journal. It did not: `spawnLog` is
-  // prefixed `[spawn]` and is null whenever the mail board is off, so eviction
-  // was silent again on exactly the deployment the finding was about.
   const manager = new SessionManager(registry, null, null, null, (line) => lines.push(line));
   const built = [];
   manager.newSession = (...args) => {
@@ -1034,7 +843,6 @@ test('eviction announces itself — it was the only silent release while running
   assert.equal(evicted.length, 1, 'an eviction must leave a record');
   assert.match(evicted[0], /idle 45 minute\(s\)/, 'and say how long it had been idle');
 
-  // Every other manager-building test in this file tears down; this one left an
-  // interval armed and a SQLite handle open for the rest of the run.
+  // Releases the interval and the SQLite handle.
   await manager.shutdown();
 });

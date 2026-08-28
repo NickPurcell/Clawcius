@@ -1,28 +1,4 @@
-/**
- * `spawn` — a coordinator getting a colleague. CLAWSKY.md phase 5.
- *
- * Two halves, and the split is the design rather than a filing convention.
- *
- * THE TOOL. Identity is minted by this process and cannot be passed in. That is
- * the same property `sendMail` has when it refuses to take a `from`, reached
- * the same way — a variable in a closure rather than a field a model fills in —
- * and it is asserted the same way, by naming the complete argument list rather
- * than a denylist. A `spawn` that accepted an id would let a coordinator mint
- * `hamachi-host`, or a second row for a name another agent already answers to.
- *
- * THE WAKE. The whole of `src/spawn-tool.ts` rests on a row that has never run
- * not being a special case: `SessionManager.acquire` resumes a session id when
- * there is one and starts a fresh session when there is not, and `MailWaker`
- * does not look at the difference. That is what makes spawning "write the row,
- * then send it mail" rather than new session plumbing. If it stops being true,
- * spawn quietly becomes a way of creating agents nobody can reach — which is
- * why the last test here spawns into one process, reopens the database in
- * another, and checks the first turn is handed over late rather than never.
- *
- * Run against `dist/`, not `src/`: Node's type stripping does not resolve a
- * `.js` specifier to a `.ts` file, and testing the built output is also what
- * catches the stale-dist failure this repo keeps hitting.
- */
+/** `spawn` — a coordinator getting a colleague. */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,10 +14,7 @@ import { buildSpawnTools } from '../dist/spawn-tool.js';
 /** What the model reads back out of a tool result. */
 const said = (result) => result.content.map((part) => part.text).join('\n');
 
-/**
- * Stands in for `prompt.buildSpawnCharter`, which reads the template out of
- * agent-config.yaml. What matters here is which values reach it.
- */
+/** Stands in for `prompt.buildSpawnCharter`, which reads the template out of agent-config.yaml. */
 const spawnCharter = (vars) =>
   `You are ${vars.id}, a ${vars.role} of crew ${vars.crew}, spawned by ` +
   `${vars.spawnedBy}.\n\n${vars.instructions}`;
@@ -77,10 +50,7 @@ const spawnBoard = () => {
   return { registry, mail, spawnOf, workspaceRoot, logged, capacity };
 };
 
-/**
- * The same crew with the waker wired as `main()` in daemon.ts wires it — a delivery is the
- * fast path into a sweep — and `start` recorded instead of run.
- */
+/** The same crew with the waker wired as `main()` in daemon.ts wires it — a delivery is the fast path into a sweep — and `start` recorded instead of run. */
 const wakingBoard = () => {
   const board = spawnBoard();
   const started = [];
@@ -245,14 +215,8 @@ test('the description tells a coordinator what spawn costs and what it cannot un
   assert.match(spawn.description, /LONG-LIVED/);
   assert.match(spawn.description, /THERE IS NO KILL VERB YET/);
   assert.match(spawn.description, /ONLY A COORDINATOR MAY SPAWN/);
-  // The newest load-bearing claim in this string, and the one a coordinator has
-  // to act on twice — spawn, then DM. Round 4 of #163: it was the only part of
-  // the description with no assertion.
   assert.match(spawn.description, /AN UPDATER IS WORTH SPAWNING/);
   assert.match(spawn.description, /Spawn one, then DM it\s+the list/);
-  // Deliberately NOT asserting a number. The four-item cap lives in `<updater>`
-  // in agent-config.yaml; naming it here too would be the same enumeration drift
-  // this branch spent three review rounds closing, reintroduced in a test.
   assert.doesNotMatch(spawn.description, /at most four/);
   registry.close();
 });
@@ -303,10 +267,6 @@ test('an agent that has never run is woken by the mail its spawn delivered', asy
 
   assert.equal(registry.get('hamachi-researcher1').sessionId, '', 'nothing to resume — it is new');
 
-  // Handed over is not read. Since #239 the charter is consumed when the turn
-  // has actually RUN — a spawn whose first turn dies before producing leaves the
-  // charter for the next sweep rather than losing it, which is the same property
-  // that lost five messages when it was absent.
   assert.equal(mail.unread('hamachi-researcher1').length, 1, 'handed over, not yet run');
   woken[0].settle(true, 'turn completed');
   assert.equal(mail.unread('hamachi-researcher1').length, 0, 'the turn ran, so it is consumed');
@@ -381,9 +341,6 @@ test('a spawned agent survives the process that spawned it', async () => {
       workspacePath: '/w/coordinator',
     });
     // No waker at all: nothing is listening, so the first turn is never taken.
-    // That is the same situation as a restart landing between the delivery and
-    // the wake, and it is the one where a spawn would be lost if the first turn
-    // were a call rather than a row.
     await spawnInto({ registry, mail }, 'hamachi-coordinator', workspaceRoot).handler(
       { role: 'engineer', instructions: 'own the snapshot verifier' },
       {},
@@ -446,10 +403,7 @@ test('updater is spawnable, and the refusal still names the roles that are not',
   assert.equal(row?.role, 'updater');
   assert.match(logged.join('\n'), /hamachi-coordinator spawned hamachi-updater1 \(updater/);
 
-  // The two that stay refused, and the reason is privilege rather than taste:
-  // a coordinator is the only role that may DM the host agent, and `host` is a
-  // row the ops executor claims from outside the container. Adding a spawnable
-  // role must not quietly widen either.
+  // Refused for privilege: a coordinator is the only role that may DM the host agent, and `host` is not a role a crew mints.
   for (const role of ['coordinator', 'host']) {
     const refused = await spawnOf('hamachi-coordinator').handler({ role, instructions: 'x' }, {});
     assert.equal(refused.isError, true, role);
@@ -462,17 +416,6 @@ test('updater is spawnable, and the refusal still names the roles that are not',
 test('spawn refuses when the session pool is full and nothing empties it on its own', async () => {
   const { registry, mail, spawnOf, capacity, logged } = spawnBoard();
 
-  // The `idleTimeoutMinutes: 0` shape — no longer shipped (#249 set 30) but
-  // still supported, and the branch this refusal is gated on. Nothing gives a
-  // slot back in
-  // the ordinary course. `spawn` runs inside the calling coordinator's turn, so
-  // a slot is always held when the call happens, and once the pool has filled it
-  // stays full — not just a busy moment. A person can still spend a channel's
-  // transcript with `!reset`, which is why the refusal says so; what it must not
-  // do is tell the caller to run it, since the waker drops this bot's own
-  // messages before they reach a command. 1/1 is the smallest case that says it;
-  // both configs now set maxConcurrent 10, which moves when this happens and not
-  // whether.
   capacity.live = 1;
   capacity.max = 1;
   capacity.idleTimeoutMinutes = 0;
@@ -486,9 +429,6 @@ test('spawn refuses when the session pool is full and nothing empties it on its 
   assert.match(said(refused), /sessions\.maxConcurrent/);
   assert.match(said(refused), /sessions\.idleTimeoutMinutes/);
 
-  // Clawcius #146. This refusal is read by a coordinator, and it used to end
-  // "The operator has to raise the cap or turn eviction on" — routing the reader
-  // to a human as the only way out, which is false. It must name `!reset`...
   assert.match(said(refused), /`!reset`/);
   // ...and must say it is not the caller's to run, because it genuinely is not:
   // `handleCommand` has one call site and both the self-check and the bot check
@@ -498,12 +438,8 @@ test('spawn refuses when the session pool is full and nothing empties it on its 
   // sessions are keyed by channel id for channels and by agent id for spawned
   // agents, and `!reset` only ever carries a channel id.
   assert.match(said(refused), /never a spawned agent's slot/);
-  // The claim that survives, and the only one that was ever true.
+  // The claim that survives.
   assert.match(said(refused), /eviction is the only thing that reclaims a live, healthy session/);
-  // Round 1 of #156: this reader relays the instruction to a human who types it
-  // literally, so the form has to be the one that works. A bare `!reset` is only
-  // a command where `addressed` is true, and running it in a channel that holds
-  // no session spends that channel's transcript and frees nothing.
   assert.match(said(refused), /@-mention this bot/);
   assert.match(said(refused), /a channel that is holding a session/);
 
@@ -562,8 +498,7 @@ test('the description separates the policy limit from the machine limit', () => 
   const { registry, spawnOf } = spawnBoard();
   const spawn = spawnOf('hamachi-coordinator');
 
-  // "There is no limit on how many you may spawn and nothing will stop you"
-  // was true of the policy and false of the machine — the session cap will.
+  // No POLICY limit; the session cap is a limit of the machine.
   assert.match(spawn.description, /No POLICY limits how many you may spawn/);
   assert.match(spawn.description, /THE MACHINE LIMITS YOU EVEN SO/);
   assert.doesNotMatch(spawn.description, /nothing will stop you/);

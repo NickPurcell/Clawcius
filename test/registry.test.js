@@ -1,17 +1,3 @@
-/**
- * The registry, and above all the migration.
- *
- * There is live data in `thread_sessions` on both deployments — one row per
- * Discord channel, each holding the session id that keeps a conversation warm
- * across restarts. Losing one is invisible until someone speaks and the agent
- * has forgotten the entire conversation, so the copy is worth a test even
- * though it runs exactly once per database.
- *
- * Run against `dist/`, not `src/`: Node's type stripping does not resolve a
- * `.js` specifier to a `.ts` file, and testing the built output is also what
- * catches the stale-dist failure this repo keeps hitting.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -167,36 +153,15 @@ test('status is declared, not inferred', () => {
   registry.close();
 });
 
-/**
- * The status page says `dead` is a word nothing writes yet. This is the pin.
- *
- * `status/` renders the declared status beside `lastActive` and explains, in
- * the UI and in `status/README.md`, that a column of it alone would be the
- * same word on every row — because kill is CLAWSKY.md phase 5 and `setStatus`
- * has no caller outside this suite. That is a claim about code in a different
- * package, made in prose, which is exactly the kind of sentence that goes
- * quietly false when the code beside it changes (Clawcius #69).
- *
- * So it is asserted here, next to the method. When phase 5 lands and something
- * finally calls `setStatus`, this fails and names the copy to go and fix
- * rather than leaving a status page confidently explaining that a feature it
- * is now rendering does not exist.
- */
 test('nothing outside this suite writes a status — the status page says so', async () => {
   const { readdir, readFile } = await import('node:fs/promises');
   const { join: joinPath } = await import('node:path');
   const { fileURLToPath } = await import('node:url');
 
-  // Resolved against this file, not against `process.cwd()`. A relative 'src'
-  // silently scans whichever package the runner happened to start in — and
-  // `status/` has one too, so the test would pass green having checked the
-  // wrong tree entirely.
+  // Resolved against this file, not against `process.cwd()`.
   const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
 
-  // `src/` only. The registry class lives in `src/store.ts` and nothing else
-  // holds one — `ops/` reaches the same table through its own `Board`, which
-  // has no setStatus at all. Widening this to ops/ would catch the unrelated
-  // `setStatus` on the waker-status stub in ops/src/selftest.ts.
+  // `src/` only.
   const callers = [];
   const entries = await readdir(srcDir, { withFileTypes: true, recursive: true });
 
@@ -275,11 +240,7 @@ test('create refuses an id that is taken, where ensure would adopt it', () => {
 });
 
 test('recording a session does not rewrite who an agent is', () => {
-  // The upsert in `recordSession` runs after every turn. Its conflict clause
-  // touches the session and nothing else, which is what keeps a spawned
-  // engineer an engineer — `coordinator` is the role that may DM the host
-  // agent, so a role rewritten on the way past would be a privilege handed out
-  // by the waker.
+  // The upsert in `recordSession` runs after every turn.
   const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
   registry.create('hamachi-engineer1', {
     crew: 'hamachi',
@@ -303,16 +264,7 @@ test('recording a session does not rewrite who an agent is', () => {
 });
 
 test('the upsert mints a row when there is none — which is why persist must not call it', () => {
-  // Pinning the behaviour that makes `SessionManager.persist`'s absent-row
-  // guard necessary rather than decorative. `recordSession` is an upsert, so
-  // with no row it takes the plain-INSERT branch and writes `identity.role`
-  // verbatim — and the identity a missing row produces is the `coordinator`
-  // fallback, which is the one role that may DM the host agent. Preferring the
-  // row in `#identityFor` cannot narrow that: there is no row to prefer.
-  //
-  // The guard lives in agent.ts because that is where the decision belongs; the
-  // store stays a store. If this test ever starts failing because the upsert
-  // became an update, the guard is redundant and can go.
+  // Pinning the behaviour that makes `SessionManager.persist`'s absent-row guard necessary rather than decorative.
   const registry = new AgentRegistry(tempDb(), { crew: 'hamachi' });
 
   registry.recordSession('hamachi-engineer1', '0b3f4d1e-1111-4222-8333-444455556666', '/w/1', {

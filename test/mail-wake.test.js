@@ -1,12 +1,3 @@
-/**
- * Mail wakes an idle agent, and does not touch a busy one.
- *
- * The two properties worth a test are the ones that would be invisible if they
- * broke: a turn that gets interrupted looks like an agent behaving oddly rather
- * than like a bug here, and a message that is marked read without a turn ever
- * starting is simply gone.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -55,9 +46,6 @@ const note = (author, recipient, body = 'hello') => ({
 });
 
 test('mail delivered to an idle agent starts a turn, and is read only once it RUNS', () => {
-  // The title used to say "with the mail already read", which was the contract
-  // until #239: marked read at handoff, before the turn had produced anything.
-  // Five messages were lost that way in one second on 2026-08-24.
   const { mail, started } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -83,11 +71,6 @@ test('mail delivered to an idle agent starts a turn, and is read only once it RU
 });
 
 test('a turn that dies before it runs leaves the mail for the next sweep (#239)', () => {
-  // THE FIVE-MESSAGE LOSS, as a test. `start` only hands the turn to a session
-  // and returns; every way a turn actually dies is asynchronous and lands after
-  // that. The worst was `onError` — a dead transport, usually the gVisor sentry
-  // OOM-killed inside the container's memcg, which kills every agent in the same
-  // second and has done so seven times in four days.
   const { mail, started, busy } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'the lost one'));
   assert.equal(started.length, 1);
@@ -109,13 +92,6 @@ test('a turn that dies before it runs leaves the mail for the next sweep (#239)'
 });
 
 test('settle is once — onDone and onError can both fire for one turn', () => {
-  // THIS TEST COULD NOT FAIL until 2026-08-24, and a mutation run found it:
-  // removing the `if (settled) return` guard changed nothing it asserted. It
-  // checked `unread === 0` after settle(true) then settle(false) — but
-  // settle(false) only LOGS, it never un-marks, so the count was 0 either way.
-  //
-  // The fourth assertion of mine this day that asserted something unreachable.
-  // The observable difference is the LOG, so that is what this asserts now.
   const lines = [];
   const { mail, started } = board(lines);
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'x'));
@@ -176,9 +152,6 @@ test('a second message delivered while the first turn is starting is not lost', 
 
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'second'));
   assert.equal(started.length, 1, 'the running turn is not interrupted');
-  // TWO unread now, not one: since #239 the first is not consumed until its turn
-  // has actually run. `busy` is what stops it being re-offered meanwhile, which
-  // is why deferring the mark is safe.
   assert.equal(mail.unread('hamachi-engineer1').length, 2);
 
   // The first turn runs and consumes only what it was handed.
@@ -256,16 +229,6 @@ test('a turn that could not be started leaves the mail unread', () => {
 });
 
 test('settle called synchronously, from inside start(), leaves the mail unread (#239)', () => {
-  // THE UNTESTED NEIGHBOUR OF THE BUG. `AgentSession.#push` has a synchronous
-  // catch — "the child transport can be dead — a failed spawn, or a process that
-  // exited" — which routes straight to `onError`. So the daemon can settle
-  // BEFORE `start` returns, re-entrantly, while `#consider` is still executing
-  // the call that produced it.
-  //
-  // This is NOT the path that bit on 2026-08-24: there the queue push succeeded
-  // and the exec died asynchronously, which is why the journal shows the exit and
-  // the wake in the same second with a retry two seconds later. It is the
-  // ordering nobody thinks to write, which is why it is worth writing.
   const registry = new AgentRegistry(join(mkdtempSync(join(tmpdir(), 'sync-settle-')), 'c.db'), {
     crew: 'hamachi',
   });
@@ -313,9 +276,7 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
   );
   assert.equal(settleCalls, 1);
 
-  // And the log must not claim a wake that did not happen. Without the guard it
-  // read "turn died before it ran … left unread" and then "woke X with 1
-  // message(s)" — announcing a wake, in the path built to stop silent failure.
+  // And the log must not claim a wake that did not happen.
   assert.ok(lines.some((l) => /turn died before it ran/.test(l)));
   assert.ok(
     !lines.some((l) => /^woke hamachi-engineer1/.test(l)),
@@ -329,15 +290,6 @@ test('settle called synchronously, from inside start(), leaves the mail unread (
 // ── the ceiling on re-offers ────────────────────────────────────────────────
 
 test('a message that never settles stops being offered, and the line says so (#241 round 3)', () => {
-  // Deferring the mark means an unsettled turn leaves its mail unread and the
-  // next sweep re-offers it. That trade is deliberate. What is NOT deliberate is
-  // that the sweep now also fires synchronously on the busy flip at the end of a
-  // turn, so against an API refusing every call "re-offer" has no delay in it —
-  // OJ measured 26 turns for one message, ending only when the API recovered.
-  //
-  // A duplicate is one extra turn. A hot loop against a failing API for as long
-  // as the condition stands is a different thing, and this branch introduced it:
-  // before, the mail was consumed and the loop was one turn long.
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -352,10 +304,6 @@ test('a message that never settles stops being offered, and the line says so (#2
   assert.equal(capped.length, 1, 'and say so ONCE, not every sweep');
   assert.match(capped[0], /offered 3 times/);
   assert.match(capped[0], /stay UNREAD/i);
-  // The line is written to be read during an incident, so it must not promise a
-  // delivery that does not happen. Only `renderMail` (the wake this pause just
-  // stopped) and `checkMail` (which the agent chooses to call) put mail into a
-  // turn — a discord or scheduled wake does neither. Round 5.
   assert.doesNotMatch(
     capped[0],
     /any other wake still delivers/i,
@@ -363,21 +311,12 @@ test('a message that never settles stops being offered, and the line says so (#2
   );
   assert.match(capped[0], /a NEW message to this agent releases the batch/);
 
-  // STILL UNREAD — that is the difference between a ceiling and a drop.
-  // Nothing is lost, and the batch is released either by the pause expiring or
-  // by a new message arriving for this agent. (This comment said "any other
-  // wake still delivers it" until round 6 — the same false claim the assertion
-  // five lines above forbids, left behind in the commit that removed it.)
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
 
 test('a superseded turn does NOT spend one of a message s re-offers (#241 round 4)', () => {
-  // Three Discord messages interleaved with a pending mail turn is ordinary
-  // traffic in a coordinator's channel. Counting each supersede as a failed
-  // offer parked the mail and printed "something is failing every turn: check
-  // the journal for the refusal" — with three supersede lines above it and no
-  // refusal anywhere. One miscount, a false ceiling AND a false sentence.
+  // Three Discord messages interleaved with a pending mail turn is ordinary traffic in a coordinator's channel.
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -395,10 +334,6 @@ test('a superseded turn does NOT spend one of a message s re-offers (#241 round 
 });
 
 test('the ceiling is three offers PER WINDOW, not three ever (#241 round 4)', () => {
-  // Each failure re-sweeps synchronously through `release()`, so three offers
-  // can be spent in milliseconds. The flagship incident — the sentry OOM-killed
-  // and back seconds later — otherwise ended with the mail parked for good,
-  // which is the phase-2 behaviour this feature exists to replace.
   const { mail, waker, started, lines } = board();
   mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'look at #31'));
 
@@ -423,14 +358,7 @@ test('the ceiling is three offers PER WINDOW, not three ever (#241 round 4)', ()
   assert.equal(mail.unread('hamachi-engineer1').length, 1, 'and was never lost while paused');
 });
 
-// ── mailWakeEvents: the wiring #239 actually lived in ───────────────────────
-//
-// Its tests were deleted in round 3, when settling moved to `AgentSession` and
-// they became assertions at the wrong layer. Nothing replaced them, while the
-// doc comment above it still said it had been "EXTRACTED SO THEY CAN BE TESTED,
-// because this wiring is exactly where #239 lived … Fixing a path and leaving it
-// untested is the shape that produced the bug." Round 6 pointed out that the
-// newest code in it — the completion line — was the unpinned part.
+// ── mailWakeEvents ──────────────────────────────────────────────────────────
 
 const summary = (over = {}) => ({
   isError: false,
@@ -459,10 +387,6 @@ function wired() {
 }
 
 test('a finished mail wake logs its SUBTYPE, not just that it finished (#241 round 6)', () => {
-  // The grep this change's own description rests on is `mail wake turn — 34
-  // matches, ALL "success"`, and *success* is this field. Without it a turn that
-  // ended `error_max_turns` logs exactly what a clean one logs, which is the
-  // distinction the line exists to make.
   const { events, out } = wired();
   events.onDone(summary());
   assert.equal(out.log.length, 1);
@@ -499,7 +423,6 @@ test('a refusal WITH a retry queued says so, and still logs no completion', () =
 });
 
 test('the refusal block does not end in a blank line', () => {
-  // `err` appends its own newline and the block used to end in one too.
   const { events, out } = wired();
   events.onDone(summary({ apiError: 'x', apiErrorKind: 'billing_error' }));
   assert.doesNotMatch(out.err[0], /\n$/);
@@ -524,17 +447,6 @@ test('a stale token releases the session and says so', () => {
 });
 
 test('an async death RELEASES the session, or the agent goes deaf for good (#241 round 7)', () => {
-  // `onError` is the path this change is named for — "THE PATH THAT ATE FIVE
-  // MESSAGES ON 2026-08-24" — and it was the one branch of the three with no
-  // test. Its two lines are not interchangeable with `onNeedsRespawn`'s.
-  //
-  // `#consume`'s catch settles the turn but never clears `busy`, so after an
-  // asynchronous death the session reports `busy === true` for ever. Only
-  // `release()` takes it out of the pool — and with `isBusy` now
-  // `busy || turnPending`, a dead session left in the pool means the waker skips
-  // that agent for the life of the process. That is round 3's deafness arriving
-  // down the exact path this PR exists to fix, and a mutation dropping the
-  // `release()` passed the suite until this test.
   const { events, out } = wired();
   events.onError(new Error('connecting to control server: connection refused'));
 

@@ -1,49 +1,3 @@
-/**
- * Mail: one mechanism, two policies.
- *
- * A DM and a feed post are the same row. Storage, authorship stamping and
- * delivery are identical; the only differences are who may write and who may
- * read, and both are decided here so there is exactly one place to read the
- * policy from:
- *
- *              recipient    who may write    who may read
- *   DM         one agent    anyone           sender + recipient
- *   feed       `*`          posters only     every agent
- *
- * With one exception, and it is the load-bearing one: a DM to an agent whose
- * role is `host` may only be written by a coordinator. That is now the sole
- * access control on running commands on the VPS — see the predicate below.
- *
- * The write restriction exists from the first commit deliberately. On day one
- * the poster looks idle — Discord stays with the coordinator, so the feed's
- * only audience is the other crew — and that quiet is correct. Adding a write
- * restriction to a board that has already had five writers is far worse than
- * starting with one.
- *
- * `author` is never a parameter an agent controls. `deliver` is called from the
- * `sendMail` tool, which runs in this process and closes over the agent id of
- * the session it was built for (see mail-tool.ts); the field below is that
- * variable. Nothing in this module reads an author out of a message body, and
- * nothing should ever be added that does.
- *
- * Refusals are RETURNED, and the caller is expected to hand the answer back to
- * the sender rather than log it. That is the whole of Clawcius #30: while
- * sending was a file the daemon swept, a refusal could only be a journal line
- * the sender never saw, so a mistyped recipient looked exactly like a delivered
- * message. `deliver` did not change; what changed is that there is now somebody
- * on the other end of the return value.
- *
- * Read state lives in its own table rather than as a column, because the feed
- * has as many readers as there are agents. That makes "read" per (message,
- * reader) for DMs too, which costs one row and keeps the two policies sharing
- * a single delivery query instead of branching.
- *
- * Scope note: the tables live in the instance's own database, so today the
- * board is per-crew. The design's cross-crew feed needs one shared board
- * reachable from both containers — a topology change, not a schema one — and
- * nothing in phases 1 and 2 consumes it yet.
- */
-
 import type { DatabaseSync } from 'node:sqlite';
 import type { AgentRegistry } from './store.js';
 
@@ -78,19 +32,7 @@ export class MailStore {
   readonly #db: DatabaseSync;
   readonly #registry: AgentRegistry;
 
-  /**
-   * Fired once per accepted message, after it is committed.
-   *
-   * This is what makes mail wake anybody: without it the board is a table
-   * nobody looks at until an agent happens to run. It is set by the waker and
-   * fires synchronously inside `deliver`, so the subscriber must not throw —
-   * the caller is a directory sweep in the middle of a batch. daemon.ts wraps
-   * it for the same reason it wraps the status publisher.
-   *
-   * It carries the message rather than just the recipient because a feed post
-   * has no single recipient, and the subscriber needs the author to know who
-   * not to wake.
-   */
+  /** Fired once per accepted message, after it is committed. Synchronous inside `deliver`, so the subscriber must not throw. */
   onDelivered: (message: MailMessage) => void = () => {};
 
   constructor(registry: AgentRegistry) {
@@ -118,16 +60,7 @@ export class MailStore {
     `);
   }
 
-  /**
-   * Accept a message, or say why not.
-   *
-   * Refusals are returned rather than thrown, and `detail` is written to be
-   * read by the model that sent the message: it is what `sendMail` hands back,
-   * in the turn the send was attempted. Nothing is queued — there is nothing
-   * that would make a refused message deliverable later — so the sender being
-   * told is the entire remedy, and it is enough, because the sender is still
-   * running and can simply try again.
-   */
+  /** Accept a message, or say why not. */
   deliver(mail: OutgoingMail): DeliveryResult {
     const author = this.#registry.get(mail.author);
     if (!author) {
@@ -155,49 +88,6 @@ export class MailStore {
         return { accepted: false, detail: `unknown recipient "${mail.recipient}"` };
       }
       // ── The only access control left on running commands on the VPS ──────
-      //
-      // A DM to the host agent runs a Claude Code session on the host, with a
-      // shell and a scoped sudoers file. There is no longer a queue, an idle
-      // wait or an armed rollback deadline in front of that; the ops spool's
-      // whole scheduling apparatus is what phase 6 removed. This predicate is
-      // what took its place, so it is written here — in the one place mail
-      // policy lives — rather than in a system prompt, which is not a control
-      // at all against an agent that has been prompt-injected by something it
-      // read.
-      //
-      // Enforced AGAIN on the host, in ops/src/host-mailbox.ts, against the
-      // author column of the row it is about to act on. Two checks because
-      // they defend different things: this one keeps a well-behaved engineer's
-      // mistake out of the mail table, and the one on the host is what holds
-      // if anything ever writes to that table other than this method.
-      //
-      // ── What this does NOT hold against, stated plainly ──────────────────
-      //
-      // `author` now comes from a `sendMail` closure rather than from a
-      // directory name, so there is no longer a path on disk an agent can
-      // write into to be stamped as its coordinator (Clawcius #35, #31): a
-      // session cannot obtain another session's tool, and the board itself is
-      // outside every bind mount.
-      //
-      // The wake spool used to be the exception: `run/wake` was inside the
-      // crew's mount, a request there named the channel to wake, and nothing
-      // validated that name — so any process in the container could start a
-      // turn as its coordinator, holding the coordinator's `sendMail`. That
-      // spool is gone (CLAWSKY.md phase 4, Clawcius #39), and with it the last
-      // path from a shared filesystem into somebody else's identity.
-      //
-      // What is left is not nothing, and it is not a filesystem problem. Every
-      // agent of a crew still shares one container, one uid and one process
-      // table (Clawcius #31, and the rest of #35): a crewmate can read another
-      // session's transcript, and can kill or `docker exec` alongside it. It
-      // cannot *become* it — there is no longer any route by which a name a
-      // process writes down turns into a session holding that name's tools.
-      // Per-agent uids remain the thing that would close the rest.
-      //
-      // So the rule holds against a mistake, against another crew, and against
-      // anything reached through mail or through disk.
-      //
-      // Engineers ask their captain; the captain asks the host.
       if (recipient.role === 'host' && author.role !== 'coordinator') {
         return {
           accepted: false,
@@ -206,12 +96,7 @@ export class MailStore {
             `Ask ${author.crew}'s coordinator to file it.`,
         };
       }
-      // Crews talk to each other in public on the feed; within a crew, agents
-      // talk privately. Enforced here because it is the same boundary that
-      // stops an `@` reaching past a crew into someone's engineer, and a
-      // boundary asserted only in a system prompt is not a boundary. If a
-      // cross-crew DM is ever wanted — the host agent is the likely first case
-      // — this is the single predicate to relax.
+      // Crews talk to each other in public on the feed; within a crew, agents talk privately.
       if (recipient.crew !== author.crew) {
         return {
           accepted: false,
@@ -245,21 +130,6 @@ export class MailStore {
     };
   }
 
-  /**
-   * Everything waiting for one agent, oldest first. Does not mark anything.
-   *
-   * Two rules are baked into the query and neither is arbitrary:
-   *
-   * A feed post authored by the reader is not mail for the reader — the poster
-   * would otherwise read back its own broadcast on every check. A *DM* from
-   * the reader to itself is delivered, because that is what a scheduled wake
-   * will be: mail from an agent to itself, so there is still one inbox.
-   *
-   * Feed posts from before the agent existed are not delivered. Otherwise the
-   * first checkMail of a newly spawned agent hands it the entire history of
-   * the board, which is both unbounded and, since it is all context it was
-   * never part of, not obviously useful.
-   */
   unread(agentId: string): MailMessage[] {
     const agent = this.#registry.get(agentId);
     if (!agent) return [];
@@ -287,13 +157,7 @@ export class MailStore {
     }));
   }
 
-  /**
-   * Mark messages read by one agent.
-   *
-   * Separate from `unread` so a caller that fails to hand the mail over has
-   * not already marked it read — and one transaction, so a crash halfway
-   * through does not leave an agent believing it has seen half a batch.
-   */
+  /** Mark messages read by one agent. */
   markRead(agentId: string, ids: readonly number[]): void {
     if (ids.length === 0) return;
     const now = Date.now();

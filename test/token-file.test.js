@@ -1,13 +1,3 @@
-/**
- * The agent session's credential file.
- *
- * The behaviour worth pinning is not "it writes a file" — it is what happens
- * when a refresh FAILS, because that is where this repository has been wrong
- * before. Issue #176 is the waker turning a transient credential failure into a
- * permanent one, and on 2026-08-23 a token rotation did exactly that to a live
- * watch. So the tests below are mostly about the two failure branches.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -38,10 +28,6 @@ test('the token file is written 0600 and readable back', () => {
 });
 
 test('writing is atomic: no reader can observe a partial token', () => {
-  // `writeFileSync` to the final path truncates first, so a `git push` landing
-  // in that window reads an empty credential and fails with an authentication
-  // error that has nothing to do with authentication. Overwriting must be a
-  // rename, so the old token is served right up to the instant the new one is.
   const path = join(dir(), '.github-token');
   writeTokenFile(path, 'first');
   writeTokenFile(path, 'second-and-much-longer-than-the-first');
@@ -65,11 +51,7 @@ test('start() writes immediately, and a first-fetch failure does NOT stop startu
   assert.equal(readFileSync(path, 'utf8'), 'tok-1');
   ok.stop();
 
-  // AND A FIRST FETCH THAT FAILS MUST NOT THROW. Throwing took the whole daemon
-  // down — Discord, mail, reminders — into a five-second restart loop, on a
-  // network call. A misconfigured App degraded gracefully while a correct one
-  // that was briefly unreachable was fatal. No file simply means agents fall
-  // back to GITHUB_TOKEN.
+  // AND A FIRST FETCH THAT FAILS MUST NOT THROW.
   const logs = [];
   const bad = new TokenFileRefresher({
     path: join(dir(), 'installation-token'),
@@ -85,11 +67,6 @@ test('start() writes immediately, and a first-fetch failure does NOT stop startu
 });
 
 test('a transient refresh failure KEEPS the token and says so', async () => {
-  // THE #176 LESSON, applied on the way in. Deleting the file the moment a
-  // refresh throws converts a five-minute credential blip into an outage for
-  // every agent in the crew. The waker's version of this cost a live watch on
-  // 2026-08-23; a token rotation threw one 401 and the row was disarmed
-  // permanently with no retry.
   const path = join(dir(), '.github-token');
   const logs = [];
   let calls = 0;
@@ -115,9 +92,6 @@ test('a transient refresh failure KEEPS the token and says so', async () => {
 });
 
 test('a failure past the token life REMOVES the file rather than serving a corpse', async () => {
-  // A stale token is worse than an absent one. Git keeps working until the
-  // moment it does not, and then fails with a 401 that names nothing. An absent
-  // file fails immediately, and the helper's `cat` names the file in its error.
   const path = join(dir(), '.github-token');
   const logs = [];
   let calls = 0;
@@ -145,9 +119,6 @@ test('a failure past the token life REMOVES the file rather than serving a corps
 });
 
 test('neither the token nor a PEM path is ever logged', async () => {
-  // `github-app.ts` states the rule and #180 pinned it on the boot path. This
-  // is the same invariant on the refresh path, which is the one that runs for
-  // days after the boot check has stopped being able to say anything.
   const path = join(dir(), '.github-token');
   const logs = [];
   let calls = 0;
@@ -183,8 +154,6 @@ test('neither the token nor a PEM path is ever logged', async () => {
 });
 
 test('recovery: a refresh that succeeds after a removal writes the file again', async () => {
-  // The removal is not terminal. If it were, this module would be issue #176
-  // wearing a different hat.
   const path = join(dir(), '.github-token');
   let calls = 0;
   let clock = 1_000_000;
@@ -210,18 +179,6 @@ test('recovery: a refresh that succeeds after a removal writes the file again', 
 });
 
 test('the staleness clock tracks the TOKEN, not the write — with a CACHING provider', async () => {
-  // THE BUG EVERY OTHER TEST IN THIS FILE MISSED, and it missed it for one
-  // reason: every other test injects a provider that mints a fresh value on
-  // each call, which is the one thing the production provider never does.
-  //
-  // `appTokenProvider` is a cache. It returns the same token, without touching
-  // the network or the PEM, until five minutes before expiry. So for the first
-  // ~55 minutes of a token's life every tick rewrites identical bytes and
-  // succeeds whether or not the credential source is healthy. Stamping the
-  // clock on each successful write measured the age of the last provider CALL
-  // — never more than one interval — so "past its useful life" was never true
-  // while the token was actually dying, and the file served an expired
-  // credential for about 45 minutes.
   const path = join(dir(), 'installation-token');
   const logs = [];
   let clock = 0;
@@ -264,11 +221,6 @@ test('the staleness clock tracks the TOKEN, not the write — with a CACHING pro
 });
 
 test('a non-file at the destination is cleared rather than thrown over', async () => {
-  // The sandbox should not be able to reach this path at all now — the
-  // directory is refused inside any bind mount and is mounted read-only. This
-  // is the second layer: `renameSync` throws EISDIR onto a path holding a
-  // directory, `start()` does not catch, and `Restart=always` turned that into
-  // a permanent restart loop with the bot down until a human intervened.
   const d = dir();
   const path = join(d, 'installation-token');
   mkdirSync(path, { recursive: true });
@@ -279,10 +231,7 @@ test('a non-file at the destination is cleared rather than thrown over', async (
 });
 
 test('stop() takes the credential with it', async () => {
-  // A clean shutdown or a redeploy would otherwise leave a working installation
-  // token in a mounted directory for up to an hour with nothing refreshing it.
-  // The module argues an absent file beats a stale one; that has to apply to
-  // its own shutdown.
+  // A clean shutdown or a redeploy would otherwise leave a working installation token in a mounted directory for up to an hour with nothing refreshing it.
   const path = join(dir(), 'installation-token');
   const r = new TokenFileRefresher({ path, provider: async () => 'tok', log: silent });
   await r.start();
@@ -299,10 +248,6 @@ test('a failed write leaves no temp file holding a live token', () => {
 });
 
 test('the failure line promises a fallback only when there is one', async () => {
-  // `github-app.ts` spends a paragraph on this and #180 spent three rounds on
-  // it: a warning the reader watches get disproved is a warning they learn to
-  // skip. With no PAT the helper hands git an empty password, so "agents fall
-  // back to GITHUB_TOKEN" would be refuted by the next thing that happens.
   const dead = async () => {
     throw Object.assign(new Error('nope'), { code: 'ECONNRESET' });
   };
@@ -323,17 +268,10 @@ test('the failure line promises a fallback only when there is one', async () => 
   assert.match(withoutPat.join('\n'), /GITHUB_TOKEN is not set either/);
 });
 
-// ── the curl credential, and the one assertion whose absence would cost ─────
+// ── the curl credential ─────────────────────────────────────────────────────
 
 test('the netrc is scoped to exactly one machine, and that machine is api.github.com', () => {
-  // THE ONLY SAFETY PROPERTY A NETRC HAS IS ITS SCOPE. `machine api.github.com`
-  // attaches the credential to that host and nothing else — confirmed by hand
-  // including across `curl -L`, which does not carry it to a redirect target.
-  //
-  // A `default` entry, or a second `machine` line, silently hands the App token
-  // to any host an agent curls, and nothing downstream would notice: the file
-  // is still well-formed, curl still works, every test still passes. This is
-  // the assertion whose absence would cost something.
+  // THE ONLY SAFETY PROPERTY A NETRC HAS IS ITS SCOPE.
   const d = dir();
   writeCurlConfig(d, 'ghs_installation_token');
   const netrc = readFileSync(netrcPath(d), 'utf8');
@@ -360,9 +298,6 @@ test('the curl credential is 0600 and holds the token it was given', () => {
 });
 
 test('a refresh keeps the netrc in step with the token file', async () => {
-  // Drift between the two is the defect this module exists to prevent, one
-  // directory over: git pushing with this hour's token while curl posts with
-  // last hour's would be two credentials to reason about instead of one.
   const d = dir();
   const path = join(d, 'installation-token');
   let n = 0;
@@ -382,10 +317,7 @@ test('a refresh keeps the netrc in step with the token file', async () => {
 });
 
 test('giving up on the installation token falls back to the PAT rather than leaving nothing', async () => {
-  // FALLBACK AT THE WRITER. Curl cannot do the git helper's
-  // file-first/environment-second ordering — with no netrc it sends nothing and
-  // takes a 401 rather than falling back. So when the installation token is
-  // given up on, the netrc is rewritten with the PAT if there is one.
+  // FALLBACK AT THE WRITER.
   const d = dir();
   const path = join(d, 'installation-token');
   let clock = 1_000_000;
@@ -418,11 +350,7 @@ test('giving up on the installation token falls back to the PAT rather than leav
 });
 
 test('a path with a space still yields a usable curlrc', () => {
-  // The failure this quoting prevents is silent twice over: curl stops reading
-  // the parameter at the space, `netrc-optional` then means no error, and the
-  // agent gets a 401 from GitHub with nothing saying why — while every unrelated
-  // curl in the container prints an unquoted-whitespace warning, because
-  // CURL_HOME makes this file global.
+  // Unquoted, curl stops reading the parameter at the space and `netrc-optional` then means no error: a silent 401.
   const d = mkdtempSync(join(tmpdir(), 'clawsky tok-'));
   writeCurlConfig(d, 'ghs_tok');
   const curlrc = readFileSync(curlrcPath(d), 'utf8');
@@ -432,11 +360,7 @@ test('a path with a space still yields a usable curlrc', () => {
 });
 
 test('stop() clears the curl credential rather than replacing it with the PAT', async () => {
-  // stop() called onNoToken, which writes whichever credential is IN FORCE — so
-  // for an App-plus-PAT deployment a clean shutdown INSTALLED the PAT into the
-  // directory it exists to clear: an hour-lived credential swapped for one that
-  // never expires and that nothing removes. Which credential is in force is the
-  // running daemon's business; a stopped one leaves nothing.
+  // `onNoToken` writes whichever credential is in force; a clean shutdown must clear, not install the PAT.
   const d = dir();
   const path = join(d, 'installation-token');
   const r = new TokenFileRefresher({
@@ -456,11 +380,7 @@ test('stop() clears the curl credential rather than replacing it with the PAT', 
 });
 
 test('a failing curl write does not delete a healthy token or blame the provider', async () => {
-  // onToken sat inside #write's try, before the bookkeeping. So a throw from the
-  // SECOND consumer was attributed to the FIRST: a token that had been obtained
-  // and written was deleted, and the operator was told "could not obtain an
-  // installation token" — naming the wrong subsystem, in a module whose logging
-  // section is careful about exactly that.
+  // A throwing `onToken` is not the provider's fault and must not freeze the staleness clock.
   const d = dir();
   const path = join(d, 'installation-token');
   const logs = [];
@@ -484,12 +404,6 @@ test('a failing curl write does not delete a healthy token or blame the provider
   assert.doesNotMatch(logs.join('\n'), /fall back/);
   assert.doesNotMatch(logs.join('\n'), /could not obtain an installation token/);
 
-  // …and an hour on, the token file is still healthy. What this proves is that
-  // `#write` no longer THROWS, so the staleness branch is never reached at all —
-  // not that the clock advanced. It cannot have: the provider returns a constant,
-  // so `token !== #lastToken` is false and `#mintedAtMs` is deliberately not
-  // re-stamped, per the caching-provider comment. Right assertion, and the
-  // reason first attached to it was wrong.
   clock += 56 * 60_000;
   await r.refreshNow();
   assert.equal(readFileSync(path, 'utf8'), 'ghs_healthy', 'still healthy an hour on');
@@ -497,10 +411,7 @@ test('a failing curl write does not delete a healthy token or blame the provider
 });
 
 test('a throwing onNoToken cannot escape the tick', async () => {
-  // #tick runs as `void this.#tick()` from a timer, so a throw out of its catch
-  // is an unhandled rejection and Node turns that into an uncaught exception.
-  // From start() it would be a throw out of main()'s await — the daemon-wide
-  // restart loop this module deliberately stopped doing.
+  // #tick runs as `void this.#tick()` from a timer, so a throw out of its catch is an unhandled rejection and Node turns that into an uncaught exception.
   const d = dir();
   const r = new TokenFileRefresher({
     path: join(d, 'installation-token'),

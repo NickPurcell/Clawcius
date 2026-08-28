@@ -1,20 +1,3 @@
-/**
- * GitHub App installation tokens: that they are minted, cached, refreshed
- * before expiry, and — the one that matters — asked for per request.
- *
- * The defect this file exists to prevent is not a wrong token. It is a token
- * that was right when the daemon started and stopped being right while nothing
- * looked at it. `GitHubClient` is constructed once and used for days;
- * `ArmedWaker` DISARMS a watch whose poll throws rather than retrying it. So an
- * expired credential does not degrade a poll — an hour after startup it
- * permanently kills every armed watch in the crew, one mail each, and the crew
- * loses the mechanism it learns through.
- *
- * That failure has no test that could catch it after the fact, because by the
- * time it shows the rows are gone. It is only catchable here, as a property:
- * the client must hold a function, and must call it every time.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, createVerify } from 'node:crypto';
@@ -146,9 +129,6 @@ test('more than one installation is refused rather than guessed', async () => {
     appId: '1', privateKeyPath: pemOnDisk(), apiBase: 'https://api.github.com', fetchImpl,
   });
   // Picking one would silently choose a repository set nobody chose.
-  // The name must be the one an operator can grep for. It is read in the mail
-  // announcing that every watch has been disarmed, which is the worst possible
-  // moment to point at a key that does not exist.
   await assert.rejects(provider(), /set GITHUB_APP_INSTALLATION_ID to choose one/);
 });
 
@@ -164,20 +144,13 @@ test('a failed mint says the status and nothing else', async () => {
   await assert.rejects(provider(), (e) => {
     assert.match(e.message, /GitHub answered 401/);
     // The request carried the JWT. An error that echoes the request leaks the
-    // credential into a journal — see ops/src/host-agent.ts on values whose
-    // name is innocent.
+    // credential into a journal.
     assert.doesNotMatch(e.message, /eyJ|BEGIN|PRIVATE KEY|ghs_/);
     return true;
   });
 });
 
 test('a malformed expires_at falls back to an hour instead of minting every call', async () => {
-  // Round 2 of #178. Date.parse answers NaN on anything it cannot read, and NaN
-  // is never greater than anything — so the cache check was false forever and
-  // every call re-minted. Not a slow cache: a POST per poll per watch, and the
-  // rate limit it reaches throws, and a mint that throws is the permanent
-  // disarm this module exists to prevent. A field GitHub controls must not be
-  // able to reach that.
   let mints = 0;
   const fetchImpl = async (url) => {
     if (String(url).endsWith('/app/installations')) {
@@ -195,8 +168,6 @@ test('a malformed expires_at falls back to an hour instead of minting every call
   for (let i = 0; i < 5; i += 1) await provider();
   assert.equal(mints, 1, 'an unreadable expires_at must not defeat the cache');
 
-  // And the fallback is measured on the INJECTED clock, so a test can reach it
-  // faithfully rather than by luck.
   clock += 56 * 60_000;
   await provider();
   assert.equal(mints, 2, 'the one-hour fallback must still expire');
@@ -216,7 +187,7 @@ test('an installation id that is not digits is refused before it reaches a URL',
   }
 });
 
-// ── the regression that matters ─────────────────────────────────────────────
+// ── the token is asked for per request ──────────────────────────────────────
 
 test('GitHubClient asks the provider on EVERY request', async () => {
   let handed = 0;
@@ -258,13 +229,6 @@ test('a plain string still works, so the PAT path is unchanged', async () => {
 
 
 // ── checkAppConfig ──────────────────────────────────────────────────────────
-//
-// These exist because the lines this function replaced were wrong in three
-// consecutive reviews and no test ever noticed: they lived in `main()`, beside
-// a Discord client and a session pool, where nothing was going to assert on
-// them. The warning string is operator-facing output and SETUP.md tells the
-// operator it is the only place they learn what happened, so it is worth the
-// same scrutiny as a return value.
 
 /** An `access` that fails the way the real one does, with a `code`. */
 const accessFailing = (code) => () => {
@@ -288,8 +252,6 @@ test('checkAppConfig says nothing when the App is configured correctly', () => {
 });
 
 test('checkAppConfig reports BOTH faults in one boot', () => {
-  // The two used to share a branch, so a bad id suppressed the key check and
-  // the operator needed two restarts to learn two things knowable at the first.
   const { warning } = checkAppConfig(cfg({ installationId: '42\n' }), accessFailing('ENOENT'));
   assert.match(warning, /GITHUB_APP_INSTALLATION_ID must be digits only/);
   assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH is set but the key is not readable \(ENOENT\)/);
@@ -317,11 +279,6 @@ test('checkAppConfig never puts the PEM path in the warning', () => {
 });
 
 test('checkAppConfig promises a fallback only when there is one to fall back to', () => {
-  // THE ROUND-3 DEFECT, in its third costume. With no PAT the daemon prints, on
-  // the very next line, that watchPr will refuse to arm anything — so an
-  // unconditional "watches will arm and poll" was refuted by the sentence
-  // directly beneath it. A warning the reader watches get disproved is a
-  // warning they learn to skip.
   const withPat = checkAppConfig(cfg(), accessFailing('ENOENT')).warning;
   const withoutPat = checkAppConfig(cfg({ hasFallbackToken: false }), accessFailing('ENOENT'))
     .warning;
@@ -338,12 +295,11 @@ test('an empty installation id means unset, in both callers', () => {
   assert.equal(checkAppConfig(cfg({ installationId: '' }), accessOk).warning, null);
 });
 
-// ── the half-configured App, which used to say nothing at all ───────────────
+// ── the half-configured App ─────────────────────────────────────────────────
 
 test('a half-configured App names the variable that is missing', () => {
   // The shortest route to a broken App is typing the VARIABLE NAME wrong rather
-  // than its value, and it was the one route that produced complete silence —
-  // not even "authenticating as GitHub App", which sits behind the same guard.
+  // than its value, and it must not be silent.
   const noPath = checkAppConfig(cfg({ privateKeyPath: '' }), accessOk);
   assert.equal(noPath.usable, false);
   assert.match(noPath.warning, /GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_PATH is not/);
@@ -354,10 +310,6 @@ test('a half-configured App names the variable that is missing', () => {
 });
 
 test('an unset key path is never described as unreadable', () => {
-  // `access('')` answers ENOENT, which would have produced "GITHUB_APP_PRIVATE_
-  // KEY_PATH is set but the key is not readable" about a variable that is not
-  // set — the first four words false, which is the whole defect class this
-  // function was extracted to end.
   const { warning } = checkAppConfig({
     appId: '1', privateKeyPath: '', installationId: undefined, hasFallbackToken: true,
   });
@@ -379,11 +331,7 @@ test('no App configured at all is not a fault, and is not usable either', () => 
 // ── the real `access`, which nothing else exercises ─────────────────────────
 
 test('the default access check reads the real filesystem', () => {
-  // Every case above injects `access`, so `accessSync(path, R_OK)` — the only
-  // version that runs in production — would otherwise be asserted nowhere. A
-  // later change from R_OK to F_OK would pass the whole suite while making the
-  // boot check laxer than the read that follows it, which is exactly the drift
-  // `isInstallationIdValid` was extracted to prevent.
+  // Every case above injects `access`, so `accessSync(path, R_OK)` — the only version that runs in production — would otherwise be asserted nowhere.
   const real = pemOnDisk();
   assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).warning, null);
   assert.equal(checkAppConfig(cfg({ privateKeyPath: real })).usable, true);
@@ -398,11 +346,7 @@ test('the default access check reads the real filesystem', () => {
 // ── invisible characters, the class the three variables share ───────────────
 
 test('an App id with a stray character is caught at boot, not at the first mint', () => {
-  // `appId` was checked for PRESENCE and never for SHAPE, then went straight
-  // into the JWT as `iss`. A trailing \r does not fail here — it fails at the
-  // first mint with a 401, inside the poll's try, whose catch disarms the row.
-  // That is the permanent sweep the whole boot check exists to prevent, through
-  // the one variable of the three nothing was checking.
+  // `appId` goes straight into the JWT as `iss`.
   for (const bad of ['99\r', '99\n', ' 99', '99 ', '99\t']) {
     const { usable, warning } = checkAppConfig(cfg({ appId: bad }), accessOk);
     assert.equal(usable, false, JSON.stringify(bad));
@@ -411,10 +355,7 @@ test('an App id with a stray character is caught at boot, not at the first mint'
 });
 
 test('a client id is still a valid App id', () => {
-  // GitHub accepts the numeric App ID *or* a client ID as `iss`. Narrowing to
-  // digits would refuse a valid deployment, so this checks the failure mode
-  // rather than guessing GitHub's identifier alphabet — including the older
-  // form, which contains a dot.
+  // GitHub accepts the numeric App ID *or* a client ID as `iss`.
   for (const good of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
     const { usable, warning } = checkAppConfig(cfg({ appId: good }), accessOk);
     assert.equal(usable, true, good);
@@ -436,12 +377,6 @@ test('a key path may contain a space but not a control character', () => {
 });
 
 test('a zero-width character is caught too, and it is the worst case', () => {
-  // A trailing space can be found by moving a cursor; U+200B cannot be found at
-  // all. Web UIs insert zero-width characters into long identifiers so they can
-  // line-break, so "I copied the App ID off the page" is how one arrives — and
-  // the consequence is the same 401 at first mint, inside the catch that
-  // disarms every armed row. The prose above the regex claims "a character the
-  // operator cannot see"; these are the characters that claim is most about.
   const zeroWidth = {
     'U+200B ZERO WIDTH SPACE': '​',
     'U+00AD SOFT HYPHEN': '­',
@@ -476,12 +411,7 @@ test('the invisible-character check does not refuse ordinary values', () => {
 });
 
 test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
-  // The docstring calls its list "the whole of the claim", so the path check has
-  // to implement the whole of it. It excluded ALL whitespace via a comment about
-  // spaces being legal — true of U+0020 and of nothing else in the group. NBSP
-  // and the ideographic space fell through to "the key is not readable (ENOENT)",
-  // which is the message this function suppresses for `\r` for the same reason:
-  // it points at the visible half of a value whose problem is the invisible half.
+  // The path check has to implement the whole of the non-space-whitespace class.
   const nonSpaceWhitespace = {
     'U+00A0 NO-BREAK SPACE': ' ',
     'U+2007 FIGURE SPACE': ' ',
@@ -508,12 +438,6 @@ test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
 });
 
 test('both invisible-character messages name every group they catch', () => {
-  // The path message listed "a control character or a zero-width one" after the
-  // check had grown to catch non-space whitespace too, so an operator with an
-  // NBSP in their path was named by neither example and could reasonably read
-  // the warning as being about someone else's problem. The claim was true and
-  // the examples were narrower than the behaviour — the same defect as the
-  // docstring's, inverted.
   const nbsp = checkAppConfig(cfg({ privateKeyPath: '/k.pem ' }), accessOk).warning;
   assert.match(nbsp, /whitespace other than a plain space/);
   assert.match(nbsp, /control character/);
@@ -526,32 +450,12 @@ test('both invisible-character messages name every group they catch', () => {
 });
 
 test('the boundary of the invisible-character class is pinned, so widening it is loud', () => {
-  // WHAT THIS DOES AND DOES NOT DO, because the pull request that added the
-  // message tests claimed more than they delivered.
-  //
-  // The three `assert.match` checks above pin each message against being
-  // NARROWED — drop "zero-width" from the sentence and they fail. They do NOT
-  // pin it against the CHECK being widened: add a fourth group to `INVISIBLE`
-  // tomorrow and every one of them still passes while the message is once again
-  // narrower than the behaviour. That is the fifth-instance defect, one level up.
-  //
-  // A test cannot tie a prose sentence to a regex. What it can do is pin the
-  // BOUNDARY, so that widening the class fails HERE and whoever widens it is
-  // standing in this file, next to the comment telling them the message is the
-  // other half of the change. That is a tripwire rather than a proof, and it is
-  // the honest version of what was claimed.
   const notCaught = {
     'U+0301 COMBINING ACUTE ACCENT': '́',
     'U+FE0F VARIATION SELECTOR-16': '️',
     'U+E000 PRIVATE USE': '',
     'U+2800 BRAILLE PATTERN BLANK': '⠀',
   };
-  // BOTH REGEXES. The first version of this test fed only `appId`, so it
-  // guarded `INVISIBLE_OR_SPACE` while its failure message addressed someone
-  // who had widened `INVISIBLE` — the path regex, and the one this whole change
-  // is about. Widening `INVISIBLE` alone left the suite green. That is the
-  // test's prose being wider than the test's behaviour, which is the defect
-  // this file exists to catch, one level further up.
   const advice = (name) =>
     `${name} is outside the invisible-character class today. If you have just widened ` +
     'INVISIBLE or INVISIBLE_OR_SPACE to include it, that may well be right — and two ' +
@@ -567,53 +471,10 @@ test('the boundary of the invisible-character class is pinned, so widening it is
     );
   }
 
-  // U+180E is category Cf and IS caught, which is the boundary itself: the class
-  // is defined by what the characters ARE, not by a hand-listed set.
-  //
-  // `accessOk` IS LOAD-BEARING ON BOTH LINES — do not "harmonise" either with
-  // the `accessFailing('ENOENT')` that the other path tests in this file use.
-  // Under a failing `access` both assertions go green for the wrong reason,
-  // silently, by two different routes:
-  //
-  //   path:  if `INVISIBLE` stopped matching U+180E, control would fall through
-  //          to the `access` branch, and a failing one yields `usable: false`
-  //          — the answer this asserts, arrived at without the regex.
-  //   appId: the App ID check never reaches `access` at all. What protects that
-  //          line is `cfg()`'s default `privateKeyPath`, which a failing
-  //          `access` would fault into `usable: false` regardless of the App ID.
-  //
-  // Same conclusion, different mechanism. Stated separately because a reader who
-  // checks the appId line against the path's mechanism finds it does not apply,
-  // and could reasonably conclude the warning is over-broad there — which is
-  // exactly the edit that breaks it.
-  //
-  // NO DIRECTIONS. This is the third locator in this test to be written as
-  // "above" or "below" and the second to point the wrong way; the file moves and
-  // the direction does not move with it. Name things instead.
+  // U+180E is category Cf and IS caught, which is the boundary itself: the class is defined by what the characters ARE, not by a hand-listed set.
   assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
   assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
 });
-
-/**
- * `describeTokenShape`: the GITHUB_TOKEN half of the boot check (#185).
- *
- * WHAT IS PINNED HERE IS A DIAGNOSIS, NOT A VALIDATION. Nothing should ever
- * assert that a token was rejected, because nothing rejects one -- the value is
- * used unchanged and this only says what is in it. A test that began asserting
- * a refusal would be pinning a behaviour the brief ruled out.
- *
- * And the sharper half: it must not cry wolf. #185 assumed a trailing newline
- * caused a 401, and said outright that it could not confirm that. It does not
- * -- the header value is trimmed, and goes out identical to a clean token. So
- * a trailing newline is a case where the correct message says "this is not your
- * problem", and `every message agrees with the real header layer` below is what
- * keeps that honest. How often it arrives is a claim about a LOADER and is
- * deliberately made nowhere -- see the docstring.
- *
- * EVERY INVISIBLE CHARACTER BELOW IS WRITTEN AS AN ESCAPE, mechanically. A
- * literal one is invisible in the file, in a diff and to a reviewer -- which is
- * precisely the defect under test, and it would be absurd to reintroduce here.
- */
 
 // The characters with a real route into a token: a browser paste, a shell
 // heredoc, a Windows line ending, a BOM at the front of a file.
@@ -628,14 +489,8 @@ const SAMPLES = [
   ['zero-width non-joiner', '\u200c'],
   ['word joiner', '\u2060'],
   ['byte-order mark', '\ufeff'],
-  // NUL: unreachable from an environment block, and in the class, so it is
-  // here to pin the one outcome the matrix used to get wrong.
   ['NUL', '\u0000'],
-  // AND THE ONES OUTSIDE `INVISIBLE_OR_SPACE` ENTIRELY. Without these the
-  // agreement test is exhaustive over the characters it already looks at and
-  // blind to the rest -- which is how the THROWS row came to be true of the
-  // header layer and false of the function under test. Paste-from-a-document
-  // rather than paste-from-a-web-page: same route in, same failure.
+  // AND THE ONES OUTSIDE `INVISIBLE_OR_SPACE` ENTIRELY.
   ['right single quote', '\u2019'],
   ['en dash', '\u2013'],
   ['CJK', '\u65e5'],
@@ -684,20 +539,6 @@ test('every sample character is detected, wherever it sits', () => {
   }
 });
 
-/**
- * THE CLAIM THIS FILE EXISTS FOR.
- *
- * The message tells the operator which of three things is about to happen, and
- * that is its whole value: one says look at the journal, one says look at
- * GitHub, one says look somewhere else entirely. Getting the third wrong is the
- * expensive direction -- it invents a fault that is not there.
- *
- * Rather than restate the boundary, which would drift the moment the runtime
- * changed, this drives the REAL header layer and asserts the message agrees
- * with it, for every sample in every position. If undici ever stops trimming a
- * trailing newline, this fails and the prose gets fixed. That is the only way a
- * docstring making a claim about someone else's code stays true.
- */
 test('every message agrees with the real header layer', () => {
   const seen = new Set();
   for (const [name, ch] of SAMPLES) {
@@ -720,10 +561,6 @@ test('every message agrees with the real header layer', () => {
 });
 
 test('a trailing newline is reported as harmless, in those words', () => {
-  // #185 assumed a trailing newline caused a 401. It does not, and a message
-  // saying so would send an operator hunting a failure that is not happening.
-  // No claim about how often it arrives: that depends which loader wrote the
-  // variable, and this cannot be tested from inside a container.
   const out = describeTokenShape('ghp_abcdef\u000a');
   assert.match(out, /U\+000A/);
   assert.match(out, /NOT causing a failure/);
@@ -732,8 +569,6 @@ test('a trailing newline is reported as harmless, in those words', () => {
 });
 
 test('U+00A0 is the 401 case, not the throwing case', () => {
-  // The single case that makes "invisible" and "above U+00FF" different sets.
-  // A regression to "is it invisible" would still pass every other sample.
   const out = describeTokenShape('ghp_abc\u00a0def');
   assert.match(out, /U\+00A0/);
   assert.match(out, /401/);
@@ -751,12 +586,6 @@ test('a leading space is the 401 case, not the trimmed one', () => {
 });
 
 test('the worst outcome is named, not the first character found', () => {
-  // THE MILDER CHARACTER MUST COME FIRST or this proves nothing -- with the
-  // zero-width space at the front, "name the worst" and "name the first" agree
-  // and the test passes against either. It did, until a mutation run caught it.
-  //
-  // So: an embedded space (401) at position 5, a zero-width space (throws) at
-  // position 9. One of these is the fault and it is not the one found first.
   const out = describeTokenShape('ghp_ abc\u200b');
   assert.match(out, /U\+200B/);
   assert.match(out, /position 9 of 9\b/);
@@ -777,16 +606,6 @@ test('the position is 1-based, and the length is given beside it', () => {
 });
 
 test('counted by codepoint, not by UTF-16 unit', () => {
-  // An astral character is two UTF-16 units and one position, and getting that
-  // wrong moves every position after it -- the operator then counts along to a
-  // character that is fine.
-  //
-  // This fixture used to report the SPACE, with the emoji as inert padding. Once
-  // the filter widened past `INVISIBLE_OR_SPACE` the emoji became a hit in its
-  // own right, outranked the space, and started reporting itself. So the
-  // observable moved to the LENGTH, which is where the two countings diverge:
-  // eight codepoints, nine units. Index and length are read off the same spread,
-  // so pinning one pins both.
   assert.match(describeTokenShape('\u{1f600}ghp_abc'), /position 1 of 8\b/);
 });
 
@@ -821,9 +640,6 @@ test('never quotes the token, at any length', () => {
 });
 
 test('a character above U+00FF is diagnosed even though it is not invisible', () => {
-  // The gap round 1 found: the docstring claimed "any codepoint above U+00FF"
-  // while the detector only examined INVISIBLE_OR_SPACE, so these threw and said
-  // nothing -- producing the bare TypeError this whole change exists to replace.
   for (const [name, ch] of [
     ['right single quote', '\u2019'],
     ['left double quote', '\u201c'],
@@ -850,18 +666,6 @@ test('NUL throws wherever it sits, including trailing', () => {
   }
 });
 
-/**
- * The reason clause, which round 2 found false for four of the cases the suite
- * already exercised.
- *
- * `claimedOutcome` matches on "throws before anything is sent" -- a substring of
- * the SECOND sentence -- so the first sentence was asserted nowhere, and a
- * newline was being told it was a character above U+00FF. The classification was
- * right the whole time; only the reason was wrong, and no assertion looked at it.
- *
- * This looks at it, for every sample in every position, rather than pinning the
- * four cases that happened to be wrong.
- */
 test('the reason given is true of the character named', () => {
   let throwing = 0;
   for (const [name, ch] of SAMPLES) {
@@ -890,8 +694,6 @@ test('the reason given is true of the character named', () => {
 });
 
 test('a Windows line ending is not explained by a rule it does not satisfy', () => {
-  // The case round 2 quoted: the message names U+000D, says it is a Windows line
-  // ending, and then must not explain the failure with a rule about U+00FF.
   const out = describeTokenShape('ghp_\u000dabc');
   assert.match(out, /U\+000D/);
   assert.match(out, /Windows line ending/);
@@ -900,16 +702,6 @@ test('a Windows line ending is not explained by a rule it does not satisfy', () 
 });
 
 test('the paste-from-a-document characters are named, not just numbered', () => {
-  // U+200B is named as the paste-from-a-web-page artifact. These are the other
-  // half of the same story -- what a word processor substitutes as you type --
-  // and they are the exact characters the detector was silent about before the
-  // filter widened. A bare codepoint is a correct claim the operator then has
-  // to go and look up; the table exists to remove that step.
-  // SINGLE and DOUBLE must appear, not just LEFT and RIGHT. With both left
-  // entries reading "curly left quote", a table with U+2018 and U+201C swapped
-  // passed this test and then told the operator U+2018 stands in for a double
-  // quote. An assertion two entries can both satisfy does not discriminate
-  // between them, which is the whole defect this branch has been fixing.
   const family = [
     ['\u2018', /curly left single quote/],
     ['\u2019', /curly right single quote/],

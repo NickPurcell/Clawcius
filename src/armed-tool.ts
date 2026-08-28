@@ -1,126 +1,3 @@
-/**
- * `remindMe`, `scheduleRecurring` and `watchPr` — the three ways an agent arms
- * a condition — with `listArmed` and `disarm`, which are how it sees and
- * withdraws one.
- *
- * They are the same tool three times: something that will be true later, a note
- * about what to do when it is, and a row on disk so the promise outlives the
- * process. `remindMe` waits for a clock once; `scheduleRecurring` waits for it
- * over and over; `watchPr` waits for a stranger. All three produce mail, and
- * mail already wakes an idle agent.
- *
- * ── Why the repeat is a second tool and not a flag on the first ─────────────
- *
- * `remindMe` is unchanged and stays unchanged. It is the standard one-shot
- * timer and it is the right answer most of the time, so it keeps its whole
- * description to itself rather than sharing one with a mode it will never use.
- * A single tool with `repeat: true` would have made every caller read the
- * recurring half — the cron grammar, the timezone, the anchor — to arm a
- * fifteen-minute reminder, and would have made "is this thing going to keep
- * firing?" a question about an argument's value rather than about which tool
- * was called. `listArmed` says `reminder` or `schedule`, and that is a fact
- * about the row rather than a field inside it.
- *
- * ── What makes a repeat safe to have at all ─────────────────────────────────
- *
- * `remindMe` is one-shot on purpose: a standing repeat outlives its purpose and
- * nothing about it ever looks wrong. That argument is not answered by wanting
- * repeats — it is answered by making the repeat impossible to lose track of.
- * So a schedule appears in `listArmed` with when it last fired and when it
- * fires next, `disarm` stops it, and EVERY MAIL IT SENDS CARRIES THE ID THAT
- * WOULD STOP IT. The moment an agent decides a repeat is spent is the moment it
- * is reading one, not a later moment when it thinks to go looking.
- *
- * ── The owner is the closure, and there is no argument for it ───────────────
- *
- * Exactly as `sendMail` has no `from`, these have no `for`. `agentId` is a
- * variable in this process, captured when the tools are built for one session,
- * and it is what goes into the `owner` column. An agent cannot arm a reminder
- * for a colleague because there is no field in which to name one — not a field
- * that is validated and rejected, which is a thing a later change relaxes, but
- * no field at all. CLAWSKY.md, *Scheduling*: an agent may only schedule itself.
- *
- * That the check is structural rather than conditional is the point. There is
- * no branch here that could be got wrong, and a prompt-injected agent composing
- * the most persuasive possible tool call still arms a reminder for itself.
- *
- * ── watchPr refuses loudly rather than arming something inert ───────────────
- *
- * The waker polls GitHub, and the waker is a different process from the
- * container the agent runs in. A token in the agent's environment says nothing
- * about the waker's: they happen to share an env-file on this deployment, and
- * "happen to" is not something to build on. So `watchPr` checks for a usable
- * client and, if there is none, refuses in the turn the agent asked, naming the
- * variable and the unit file that would set it. An armed watch that can never
- * fire is worse than no watch, because the agent then waits for it.
- *
- * And the check is not a presence test. Arming performs the FIRST POLL, in the
- * tool call, synchronously: the pull request is fetched before the row is
- * written. That buys three things at once — a bad token fails as a 401 the
- * agent can read, a mistyped number fails as a 404, and the reviews and
- * comments already on the PR become the watermark, so the agent is told what
- * happens NEXT rather than handed the whole history of the thread.
- *
- * ── Everything a watch will deliver is external ─────────────────────────────
- *
- * The description says so, because the description is the only documentation an
- * agent is guaranteed to see, and because the framing has to be in the agent's
- * head before the first review body arrives rather than only around it.
- *
- * ── The second watch on one pull request is a refusal, not a second row ─────
- *
- * Clawcius #50, observed rather than imagined. A watch was armed on a pull
- * request, and a second was armed on the same pull request by an engineer
- * subagent working on it. Every event then arrived in the coordinator's inbox
- * twice, for as long as the PR stayed open, and nothing could be done about it
- * from inside a turn. The polling was correct throughout. There were simply
- * two rows.
- *
- * BOTH ROWS HAD THE SAME OWNER, which is the part worth writing down because
- * it does not look that way from the outside. A subagent has no tools of its
- * own: `mcpServers` is a session-level option (agent.ts), so a subagent
- * spawned inside a session calls the PARENT'S `watchPr`, closed over the
- * parent's agent id, and mail from its watch goes to the parent's inbox. The
- * incident was one agent arming twice across two of its own turns, which reads
- * as two agents and is not — and it is why deduplicating on the owner covers
- * what actually happened rather than a neighbouring case.
- *
- * So `watchPr` looks for an existing live watch by the same owner on the same
- * repo and number and REFUSES, naming the id of the one that already exists.
- *
- * Two *agents* watching one pull request is a genuinely different thing and is
- * not prevented. They each want their own mail, in their own inbox, and
- * neither can see the other's — `listArmed` says so in as many words rather
- * than letting an absence be read as proof.
- *
- * Refusing rather than returning "already watching, here it is" was a choice
- * between two defensible answers, and the deciding argument is that a success
- * is indistinguishable from a fresh arm when the result is skimmed — which is
- * how the mistake stayed invisible in the first place. Two more things follow
- * from it: a second call with a different `on` list would have to either apply
- * silently to the existing row or be silently dropped, and both are worse than
- * saying so; and nothing is lost by refusing, because the state the caller
- * wanted is already true. The id in the refusal is enough to `disarm` and
- * re-arm if the terms really need changing.
- *
- * The comparison on the repository is case-insensitive. GitHub does not
- * distinguish `NickPurcell/OJ` from `nickpurcell/oj`, and a duplicate that got
- * through on a capital letter would be this bug back with a better disguise.
- *
- * The check is made TWICE, and the second one is the one that is load-bearing:
- * immediately before the insert, with no `await` between them, because the
- * first runs before three round trips to GitHub and therefore answers a
- * question about a table as it was seconds ago. The early one is kept because
- * it is what makes a duplicate cost nothing. See the comment at the insert.
- *
- * ── This is not a throttle ──────────────────────────────────────────────────
- *
- * Nothing here delays, drops or coalesces a delivery, and nothing added here
- * ever should — see the header of armed-wake.ts. What is deduplicated is the
- * armed *condition*, at the moment it is armed, in a refusal the agent reads.
- * One watch still mails every event it sees, immediately.
- */
-
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import {
@@ -149,14 +26,7 @@ import { EXTERNAL_WARNING, REPO_NAME, type PullRequestSource } from './github.js
 /** A note is prose the agent writes to itself, not a payload. */
 const MAX_NOTE_CHARS = 4000;
 
-/**
- * How far back `listArmed` reaches for conditions that have already ended.
- *
- * A day, because the question a spent row answers is "did the thing I armed
- * this morning already happen, or am I about to arm it twice" — which is a
- * question about the current stretch of work, not about last month. Older rows
- * are counted rather than hidden, so the bound is visible in the output.
- */
+/** How far back `listArmed` reaches for conditions that have already ended. */
 const SPENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** A note in a listing is an identifier, not the note. */
@@ -165,61 +35,11 @@ const NOTE_PREVIEW_CHARS = 80;
 /** And past the cap it is an identifier only — enough to tell two apart. */
 const OVERFLOW_PREVIEW_CHARS = 32;
 
-/**
- * How many conditions `listArmed` renders before it starts counting instead.
- *
- * Nothing caps how many conditions an agent may arm, and the listing goes
- * whole into a context window: 200 active reminders measure 32KB. Every
- * neighbour already draws this line — `MAX_EXTERNAL_ITEMS`, the mail size
- * refusal, `MAX_NOTE_CHARS` — and the cost of not drawing it is paid by the
- * model rather than by whoever armed the two hundredth reminder.
- *
- * The rows are ordered soonest-first, so what is cut is what is furthest away.
- * Ended conditions get the smaller share because they are context rather than
- * the point.
- *
- * What is just past the cap is not cut to a number. The first draft said only
- * how many there were and advised disarming some to find the rest, which is
- * destructive advice for a read-only question, and a count is precisely the
- * shape of answer this whole change exists to stop giving — an absence that
- * cannot be acted on. So the next fifty are rendered one line each — id, kind,
- * and enough of the subject to tell two apart — with no moments and a shorter
- * preview: about a third of a full entry. A bare list of ids would have been
- * cheaper still and would not answer "which of these is the watch on OJ#13",
- * which is the question somebody scrolling actually has.
- *
- * PAST SEVENTY IT IS A COUNT AGAIN, and the output says exactly that. An
- * earlier draft of this comment claimed the id was there "for every condition
- * an agent holds", which is true to seventy and false above it; the cap it
- * described did not exist. It is stated precisely here because a limit is
- * useless if the prose around it implies there is none — that is how a reader
- * ends up trusting a listing that has quietly stopped being complete.
- *
- * Seventy rather than no limit at all: making the absolute claim true means
- * rendering every row, which is the unbounded listing this constant exists to
- * prevent. Something has to be the last one shown. Seventy live conditions on
- * one agent is already far past anything observed, they self-terminate, and the
- * count below them is honest about what it is not showing.
- *
- * Measured rather than estimated, because the first two numbers written here
- * were both wrong. Three armed — the ordinary case, and the only one most
- * agents will ever see — is 599 bytes. Twenty-five is 3.4KB. Two hundred armed
- * with two hundred ended is 6.6KB, against 4.3KB if the overflow were a bare
- * count and 33KB for the active half alone with no bound at all.
- */
 const MAX_LISTED_ACTIVE = 20;
 const MAX_LISTED_ENDED = 10;
 /** Past this the listing stops entirely; the count is still true. */
 const MAX_LISTED_COMPACT = 50;
 
-/**
- * The furthest ahead a reminder may be armed.
- *
- * Not a policy about how agents should work — it is a typo catcher. `inMinutes:
- * 1000000` is two years and reads exactly like `1000` at a glance, and the
- * failure mode is a row that sits in the table until somebody wonders what it
- * is. Refusing is visible; silently arming it is not.
- */
 const MAX_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 
 /** An ISO instant must carry a zone. The waker and the container do not share one. */
@@ -228,14 +48,7 @@ const ISO_WITH_ZONE = /(Z|[+-]\d{2}:?\d{2})$/i;
 /** A bare calendar date, which an anchor may be because a schedule has a zone. */
 const BARE_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
-/**
- * The largest `everyN` a schedule may have — a typo catcher, like `MAX_AHEAD_MS`.
- *
- * `everyN: 100` on a weekly cron is a job that runs twice in four years, which
- * is not a schedule anybody meant to write. What it is, almost always, is a
- * number that belonged in a different field. Refusing is visible; arming it is
- * a row nobody will see fire.
- */
+/** The largest `everyN` a schedule may have — a typo catcher, like `MAX_AHEAD_MS`. */
 const MAX_EVERY_N = 100;
 
 /** How many upcoming fires the arming receipt prints back. */
@@ -243,13 +56,7 @@ const PREVIEW_FIRES = 3;
 
 export type ArmedToolOptions = {
   store: ArmedStore;
-  /**
-   * How the waker reaches GitHub, or null if it cannot.
-   *
-   * Null is a supported state and is exactly what `watchPr` refuses on. It is
-   * the same object the waker polls with, so a client that arms a watch is a
-   * client that will poll it.
-   */
+  /** How the waker reaches GitHub, or null if it cannot. */
   github: PullRequestSource | null;
   /** Used when a `watchPr` call omits `repo`. Empty means the call must say. */
   defaultRepo: string;
@@ -273,29 +80,12 @@ function stamp(at: number): string {
   return zonedStamp(at, DEFAULT_TIMEZONE);
 }
 
-/**
- * The absolute instant beside a schedule-zone rendering, or nothing.
- *
- * The parenthetical exists so a reader can check the arithmetic on a time
- * shown in some other zone. Now that `stamp` is Pacific and Pacific is also
- * the default schedule zone, the pair collapsed into the same string twice --
- * `2026-08-24 09:00 PDT (2026-08-24 09:00 PDT)`. Two identical numbers teach
- * a reader that one of them is noise, which is how the useful one stops being
- * read on the day the zones differ.
- */
 function alsoIn(at: number, timeZone: string): string {
   const here = zonedStamp(at, DEFAULT_TIMEZONE);
   return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
 }
 
-/**
- * "in 3 minutes", "2 hours ago" — the useful half of a timestamp.
- *
- * `armed-wake.ts` has a one-directional cousin of this for saying how late a
- * fire was. Sharing them would mean exporting a formatting helper from the
- * waker to the tools for the sake of six lines, and the two want different
- * things: that one never says "ago", this one has to.
- */
+/** "in 3 minutes", "2 hours ago" — the useful half of a timestamp. */
 function relative(ms: number): string {
   const abs = Math.abs(ms);
   const [size, unit] =
@@ -309,15 +99,7 @@ function relative(ms: number): string {
   return ms >= 0 ? `in ${count}` : `${count} ago`;
 }
 
-/**
- * The refusal both duplicate checks return.
- *
- * One function so the two cannot drift into saying different things about the
- * same situation — from the agent's seat it *is* the same situation, and the
- * answer it needs is the id. `during` adds the one clause that differs: a watch
- * that appeared while this call was in flight is worth knowing about, because
- * from the caller's point of view it did not exist when it asked.
- */
+/** The refusal both duplicate checks return. `during` marks a watch that appeared while this call was in flight. */
 function alreadyWatching(existing: ArmedCondition, during = false) {
   const spec = existing.spec as Partial<PrWatchSpec>;
   const on = Array.isArray(spec.on) ? spec.on.join(', ') : '(unreadable)';
@@ -334,18 +116,7 @@ function alreadyWatching(existing: ArmedCondition, during = false) {
   );
 }
 
-/**
- * What a condition is waiting for, in one line.
- *
- * Every field is treated as possibly absent. `toCondition` only guarantees the
- * spec is an object — it parses JSON and checks the kind, not the shape — and
- * the promise it makes is that one unreadable row must not stop the others,
- * which the waker honours with a per-condition catch. A `join` on a missing
- * array here would throw out of the whole of `listArmed` and take an agent's
- * readable conditions down with the one that is not. Nothing writes such a row
- * today; a schema change is how one would appear, and that is exactly when
- * being able to list the table matters.
- */
+/** What a condition is waiting for, in one line. */
 function summarise(condition: ArmedCondition, previewChars = NOTE_PREVIEW_CHARS): string {
   if (condition.kind === 'pr-watch') {
     const spec = condition.spec as Partial<PrWatchSpec>;
@@ -369,14 +140,7 @@ function summarise(condition: ArmedCondition, previewChars = NOTE_PREVIEW_CHARS)
   return `reminder  ${quoted}`;
 }
 
-/**
- * When a schedule last fired, which is half of what makes it auditable.
- *
- * The other half is `dueAt`, which the caller already prints. An empty answer
- * is "not yet" rather than nothing at all: "never fired" and "fired an hour
- * ago" are different situations for a repeat somebody is deciding whether to
- * keep, and a blank line makes them look the same.
- */
+/** When a schedule last fired, which is half of what makes it auditable. */
 function history(condition: ArmedCondition): string {
   const seen = condition.seen as Partial<ScheduleSeen> | null;
   const fires = typeof seen?.fires === 'number' ? seen.fires : 0;
@@ -395,12 +159,7 @@ function history(condition: ArmedCondition): string {
   );
 }
 
-/**
- * The listing, exported so a test can read it rather than the SQL.
- *
- * Ids first on every line, because every line's purpose is to be the argument
- * to `disarm`.
- */
+/** The listing, exported so a test can read it rather than the SQL. */
 export function renderArmed(
   agentId: string,
   active: readonly ArmedCondition[],
@@ -431,11 +190,7 @@ export function renderArmed(
       // `isTimezone` because a row's spec is only guaranteed to be an object —
       // see `summarise`. An unreadable zone must cost this line, not the listing.
       const zone = typeof spec.timezone === 'string' && isTimezone(spec.timezone) ? spec.timezone : '';
-      // The same suppression `alsoIn` does, at the one site shaped as two lines
-      // rather than a parenthetical. In the default zone this rendered the line
-      // above it verbatim and then labelled it `local`, which reads as a claim
-      // that the first line was something else. And the default zone is the
-      // COMMON case, so this is where a reader met the duplication most often.
+      // The same suppression `alsoIn` does, at the one site shaped as two lines rather than a parenthetical.
       const localPrefix =
         zone && zonedStamp(condition.dueAt, zone) !== stamp(condition.dueAt)
           ? `${zonedStamp(condition.dueAt, zone)} local · `
@@ -562,22 +317,7 @@ function describeRemindMe(agentId: string): string {
   ].join('\n');
 }
 
-/**
- * `scheduleRecurring`, and the two things its description has to land.
- *
- * The first is that cron is the grammar and there is no other one. A model that
- * does not know that will write English into the field and read a refusal, so
- * the examples are the operator's own cases, spelled out, in the order he asked
- * for them.
- *
- * The second is that A SCHEDULE IS A NOTE, NOT AN ERRAND. Every mail it sends
- * arrives in the agent's inbox and stops there. It posts nothing, to Discord or
- * anywhere else, and it never will — an outward-facing action is a decision the
- * agent makes each time it wakes, with everything it knows at that moment. A
- * standing job that posts by itself is a thing that keeps talking after the
- * reason for it has gone, which is precisely the failure mode a repeat is
- * suspected of and has to be built not to have.
- */
+/** `scheduleRecurring`, and the two things its description has to land. */
 function describeScheduleRecurring(agentId: string): string {
   return [
     'Arrange for a note to arrive as mail on a repeating schedule — every week, every other',
@@ -670,14 +410,7 @@ function describeWatchPr(agentId: string, defaultRepo: string): string {
   ].join('\n');
 }
 
-/**
- * The tools, built for one session.
- *
- * Returned as definitions rather than a server so they can join the existing
- * `clawsky` MCP server alongside `checkMail` and `sendMail` — one server, one
- * place an agent looks — and so `test/armed.test.js` can call the handlers
- * directly, which is where the closure property is actually checked.
- */
+/** The tools, built for one session. */
 export function buildArmedTools(
   agentId: string,
   options: ArmedToolOptions,
@@ -846,16 +579,6 @@ export function buildArmedTools(
           }
         }
 
-        // The same horizon `remindMe` puts on `at`, and for the same reason,
-        // in both directions: an anchor years out is a typo far more often
-        // than an intention.
-        //
-        // It is also the cheap half of not freezing the process. `firstFire`
-        // refuses an unreasonable walk in arithmetic rather than by taking it,
-        // but the two bounds answer different questions — that one is about
-        // how much work the expression implies, this one is about whether the
-        // date is plausible at all — and `2020-01-01` should be refused for
-        // being wrong rather than for being expensive.
         if (Math.abs(anchorAt - now) > MAX_AHEAD_MS) {
           const past = anchorAt < now;
           return refuse(
@@ -888,12 +611,6 @@ export function buildArmedTools(
         anchorAt,
       };
 
-      // One duplicate check, not two. `watchPr` needs a second one immediately
-      // before its insert because three round trips to GitHub sit between its
-      // first check and its write; there is no `await` anywhere in this handler,
-      // and a single event loop cannot interleave synchronous statements. If
-      // anything asynchronous is ever added above this line, this check has to
-      // move down to sit against the `arm` call.
       const existing = options.store.findSchedule(agentId, spec, first.at);
       if (existing) {
         return refuse(
@@ -966,10 +683,6 @@ export function buildArmedTools(
     async ({ pr, repo, on }) => {
       const github = options.github;
       if (!github) {
-        // The loud refusal the brief asks for. It names the variable and the
-        // file, because "no token" from inside a container is otherwise an
-        // unfalsifiable claim — the agent can see its own GITHUB_TOKEN and has
-        // no way to look at the waker's.
         return refuse(
           'NOT ARMED — the waker process has no GitHub token, so a watch armed now could ' +
             'never fire. Your container having GITHUB_TOKEN says nothing about the waker: it ' +
@@ -999,16 +712,9 @@ export function buildArmedTools(
         return refuse(`Not armed — \`on\` must contain some of: ${WATCH_EVENTS.join(', ')}.`);
       }
 
-      // Before the network, because the cheapest place to notice a duplicate
-      // is before doing any work for it. `agentId` is the closure's: this asks
-      // whether *you* already watch it, which is the only question it can
-      // answer — see the header for why a colleague's watch is not this bug.
       const existing = options.store.findPrWatch(agentId, target, number);
       if (existing) return alreadyWatching(existing);
 
-      // The first poll, in the tool call. See the header: this is the token
-      // check, the existence check and the baseline, in one round trip that
-      // the agent gets the answer to.
       let seen: PrWatchSeen;
       let title: string;
       try {
@@ -1039,27 +745,6 @@ export function buildArmedTools(
       }
 
       // ── AND AGAIN, WITH NOTHING BETWEEN THIS AND THE INSERT ─────────────
-      //
-      // The check above happens before three round trips to GitHub, so it
-      // answers a question about a table as it was some seconds ago. Two calls
-      // that overlap in those awaits both find nothing and both write, which
-      // is the duplicate this tool exists to refuse, arrived at from the one
-      // direction the early check cannot see.
-      //
-      // Whether the SDK ever dispatches two tool calls from one session at
-      // once is not something this code can find out. What is known is that
-      // the mechanism behind #50 was a SUBAGENT — the one thing here that runs
-      // as separate work while sharing the parent's closure, and therefore the
-      // likeliest source of an overlap if one is possible at all.
-      //
-      // This pair of statements is the defence: `findPrWatch` and `arm` are
-      // both synchronous, with no `await` between them, and a single event
-      // loop cannot interleave two synchronous statements. That is also why
-      // this is not a `UNIQUE` index over a JSON column — the guarantee is
-      // already available for free at the only point that needs it.
-      //
-      // The early check stays. It is what makes a duplicate cost nothing: this
-      // one only ever fires after the network work has been paid for.
       const raced = options.store.findPrWatch(agentId, target, number);
       if (raced) return alreadyWatching(raced, true);
 

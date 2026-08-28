@@ -1,20 +1,3 @@
-/**
- * Where an agent's git credential comes from.
- *
- * This is a shell snippet handed to git through `GIT_CONFIG_VALUE_n`, which
- * means it is a string that nothing type-checks and no test would notice being
- * wrong until an agent's `git push` failed. #180 is the recent lesson on that:
- * four lines of operator-facing behaviour with no test around them were wrong in
- * five consecutive reviews.
- *
- * The branch that matters is the FALLBACK. A deployment can have an App
- * configured and unusable — a typo'd key path, a rotated key, a bad
- * installation id — in which case the daemon writes no credential file and the
- * PAT is still there and still valid. If the helper committed to the file at
- * spawn, every agent push would fail for a deployment that had a working
- * credential the whole time.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, execFile as execFileCb } from 'node:child_process';
@@ -144,16 +127,6 @@ test('the token never appears in the environment handed to the container', () =>
 });
 
 test('no helper when the App is configured but nothing will write the file', () => {
-  // FINDING 18, raised three rounds running. `gitEnv` emitted the file-first
-  // helper whenever `github.appId` was set, but the file is only written under
-  // `armedStore && app && appTokenOk` — and `armedStore` also needs
-  // `clawsky.enabled && armed.enabled`. So this deployment wrote no file, started
-  // no refresher (hence not even its "no usable credential" line), and with no PAT
-  // the helper handed git an EMPTY password.
-  //
-  // Empty is the less nameable failure of the two: git reports an auth failure
-  // against a credential it was given, where no helper at all makes it say it
-  // could not read a username.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-cred-'));
   configure({ token: '', appId: '123', githubTokenDir: root, armed: false });
   const keys = Object.keys(gitEnv())
@@ -164,7 +137,7 @@ test('no helper when the App is configured but nothing will write the file', () 
     'no writer means no helper — the two conditions must describe one deployment',
   );
 
-  // …and with armed watching ON, the file will be written, so the helper belongs.
+  // With armed watching ON the file will be written, so the helper belongs.
   configure({ token: '', appId: '123', githubTokenDir: root, armed: true });
   const on = Object.keys(gitEnv())
     .filter((k) => k.startsWith('GIT_CONFIG_KEY_'))
@@ -183,16 +156,7 @@ async function echoAuthServer() {
   return { server, port: server.address().port };
 }
 
-/**
- * ASYNC, and it has to be. `execFileSync` blocks the event loop, so a server
- * listening in THIS process can never accept the connection curl is waiting on
- * — curl waits for a reply that cannot be sent and the sync call waits for curl.
- * A deadlock rather than a slow test, and it presents as the whole file hanging
- * before a single assertion runs.
- *
- * The other tests here use `execFileSync` safely because the credential helper
- * they run talks to nothing.
- */
+/** ASYNC, and it has to be. */
 const curlAuth = async (port, curlHome) => {
   const { stdout } = await execFile(
     'curl',
@@ -203,15 +167,6 @@ const curlAuth = async (port, curlHome) => {
 };
 
 test('CURL_HOME reaches the agent, and a bare curl carries the credential', async () => {
-  // THE ONE LINK WITH NO TEST. `agent.ts` sets CURL_HOME; every other assertion
-  // is about file contents and cannot see whether the environment actually
-  // points at the directory. This file's header is the argument: it is a string
-  // nothing type-checks, and nothing would notice it being wrong until an agent
-  // got a 401 with no explanation.
-  //
-  // Offline, against a local server, so what is proved is that curl FOUND the
-  // .curlrc, found the netrc through it, and applied it — not that GitHub
-  // accepts anything.
   const root = mkdtempSync(join(tmpdir(), 'clawsky-curl-'));
   configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });
   writeCurlConfig(root, 'ghs_installation_token');
@@ -238,11 +193,7 @@ test('CURL_HOME reaches the agent, and a bare curl carries the credential', asyn
 });
 
 test('a directory whose name contains a space still authenticates', async () => {
-  // The quoting assertion in token-file.test.js is shape-only — it proves the
-  // file says the right thing, not that curl accepts it. This is the other half,
-  // and it is the half the shape assertion cannot reach: curl terminates an
-  // unquoted parameter at the first space, and `netrc-optional` then means the
-  // failure is a silent 401 rather than an error.
+  // The quoting assertion in token-file.test.js is shape-only — it proves the file says the right thing, not that curl accepts it.
   const root = mkdtempSync(join(tmpdir(), 'clawsky cred-'));
   assert.ok(root.includes(' '), 'the point of this test is the space');
   configure({ token: 'ghp_the_pat', appId: '123', githubTokenDir: root });

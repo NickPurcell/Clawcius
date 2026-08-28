@@ -1,18 +1,3 @@
-/**
- * A credential must not be an argument.
- *
- * `/proc/<pid>/cmdline` is world-readable, so anything in the argv of the
- * `docker exec` that runs a turn is legible to every local account on the host
- * for as long as that turn lasts — which is how the Discord and GitHub tokens
- * came to be readable by `clawcius-ops` and anyone else with a shell (#53).
- *
- * These tests run the real spawner against a fake `docker` on PATH, so what is
- * asserted is the argv a real process would have been given, not a helper's
- * opinion about it. The fake records its own arguments, and stats the env file
- * from the other side of the spawn — the mode that matters is the one the
- * exec'd process sees, not the one we intended.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -31,13 +16,7 @@ import { containerSpawner, sweepEnvFiles } from '../dist/container.js';
 const DISCORD_TOKEN = 'MTQ2NzA3MDE0NTM0.fake.discord-token-do-not-use';
 const GITHUB_TOKEN = 'ghp_fakefakefakefakefakefakefakefakefake';
 
-/**
- * A `docker` that records what it was handed and exits.
- *
- * It copies the env file rather than reading it later: the spawner unlinks it
- * when the child exits, which is the behaviour under test, so by the time the
- * assertions run there is deliberately nothing left to read.
- */
+/** A `docker` that records what it was handed and exits. */
 function fakeDocker() {
   const dir = mkdtempSync(join(tmpdir(), 'container-test-'));
   const out = join(dir, 'record');

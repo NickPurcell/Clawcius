@@ -1,49 +1,10 @@
-/**
- * A one-line status file the waker publishes so the ops executor can tell
- * whether this instance is mid-turn.
- *
- * The executor is a separate root process that recreates containers. Recreating
- * one while a session is running kills a live `docker exec` — from Discord that
- * is a person mid-conversation with an agent that stops replying and never
- * explains why. There is no IPC between the two processes and deliberately so
- * (the executor holds docker and systemctl; the waker is the thing being
- * restarted), so the handshake is a file: the waker says how many sessions are
- * live and when it last said it, and the executor decides.
- *
- * Two properties this has to have, and both are about the failure mode rather
- * than the happy path:
- *
- *   It is written on CHANGE, not only on a timer. A turn that starts one second
- *   after a periodic write would otherwise be invisible for a whole interval,
- *   which is exactly the window a `redeploy` would drive through.
- *
- *   It is ALSO written periodically, unchanged, because the timestamp is the
- *   liveness signal. A waker that has crashed leaves its last file on disk
- *   saying `liveCount: 0` forever, and a stale zero reads as "safe to destroy
- *   the container" — the most dangerous possible lie. The executor treats
- *   anything older than its own staleness threshold as busy, so the periodic
- *   write is what earns the file the right to be believed.
- *
- * Written by rename, never in place: the reader is a different process on a
- * different schedule, and a partial read of a half-written file parses as
- * malformed JSON. Malformed is treated as busy too, so a torn read is safe
- * rather than wrong — but it would still be noise in the executor's log every
- * time, and an atomic rename costs nothing.
- */
+/** A one-line status file the waker publishes so the ops executor can tell whether this instance is mid-turn. */
 
 import { mkdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { BUILD_INFO, type BuildInfo } from './build-info.js';
 
 export type WakerStatus = {
-  /**
-   * Which code wrote this file — compiled in at build time, not read from git
-   * at runtime, because the checkout and the `dist/` disagree exactly when it
-   * matters. The executor does not read this field; it is here because this
-   * file is one of the few things on the host that says what the waker is, and
-   * "is the running waker the commit I deployed?" should be answerable by
-   * `cat` rather than by comparing directory timestamps (Clawcius #90).
-   */
   build: BuildInfo;
   /** Instance name, matching the `instances:` key in ops-config.yaml. */
   instance: string;
@@ -56,11 +17,7 @@ export type WakerStatus = {
   at: number;
   /** Same instant, readable, because this file gets `cat`ed by people. */
   atIso: string;
-  /**
-   * What the waker believes its own publishing interval is. The executor does
-   * not have to trust it — its own `idleStaleSeconds` is the authority — but
-   * having it in the file means a mismatch is diagnosable from the file alone.
-   */
+  /** What the waker believes its own publishing interval is. */
   publishIntervalSeconds: number;
 };
 
@@ -108,28 +65,14 @@ export class WakerStatusPublisher {
     this.#timer = null;
   }
 
-  /**
-   * Call whenever a session is acquired or released.
-   *
-   * Cheap enough to call unconditionally — a write only happens when the count
-   * actually moved, so the hot path of "several messages into a live session"
-   * costs one integer comparison.
-   */
+  /** Call whenever a session is acquired or released. */
   noteChange(): void {
     if (!this.enabled) return;
     if (this.#options.liveCount() === this.#lastCount) return;
     this.publish();
   }
 
-  /**
-   * Remove the file on a clean shutdown.
-   *
-   * Absent is the honest state for a stopped waker, and the executor reads
-   * absent as busy — which is right, because a waker that is not running cannot
-   * tell you whether the container is in use. Leaving a final `liveCount: 0`
-   * behind would be a stale zero that happens to be true at the moment of
-   * writing and false forever after.
-   */
+  /** Remove the file on a clean shutdown. */
   removeOnShutdown(): void {
     if (!this.enabled) return;
     try {
@@ -163,10 +106,7 @@ export class WakerStatusPublisher {
       renameSync(temp, this.#options.path);
       this.#lastCount = liveCount;
     } catch (error) {
-      // Never throw out of here. This is telemetry for another process; the
-      // waker failing to write it must not take a Discord bot down. The cost of
-      // silence is that the executor sees a stale file and refuses to do
-      // anything destructive, which is the direction we want to fail in.
+      // Never throw out of here.
       process.stderr.write(`[waker-status] could not publish: ${String(error)}\n`);
       try {
         unlinkSync(temp);

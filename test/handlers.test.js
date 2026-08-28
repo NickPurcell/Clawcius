@@ -1,39 +1,3 @@
-/**
- * The Discord handler: who wakes the agent, and what the channel is told when a
- * turn cannot run.
- *
- * None of this could be tested before. `src/index.ts` was 870 lines whose module
- * body WAS the program — it opened the registry, built the wakers, registered
- * every gateway handler and ended in `await client.login(...)` — so importing it
- * started a Discord bot, and every decision in it could only be reasoned about.
- * Clawcius #131. The body is now `main()` in daemon.ts and the handlers are
- * `createHandlers(deps)`, which takes what they used to close over.
- *
- * The four things #131 names, and why each is worth a test rather than a read:
- *
- *   - `handleMessage` — which mentions are authorized, `alwaysOnChannelIds`,
- *     `allowedChannelIds`, the follow-up window. Four rules that interact, and
- *     the failure mode of every one of them is silence.
- *   - `deliver`'s catch — an `AtCapacityError` announces and every other failure
- *     stays quiet. The sentence has been tested since #133 (`atCapacityNotice`);
- *     WHICH errors reach it had not.
- *   - `onDone`'s API-error path: `respawnWillHandleIt`, `retryScheduled`, and
- *     that `announceOutage` fires EXACTLY ONCE across a respawn. That rule is
- *     not an aesthetic one — a duplicate was observed live on 2026-08-03, four
- *     identical messages in three seconds, which reads as a broken bot rather
- *     than a broken credential.
- *   - `onNeedsRespawn`'s replay-only-if-not-acted rule, which decides whether a
- *     turn's side effects get repeated.
- *
- * Nothing here calls `setConfig`. The handlers read the config object they were
- * handed rather than the module-level `config()`, so a test says what this
- * deployment is in the fixture below and nowhere else.
- *
- * Run against `dist/`, like every other test here: Node's type stripping does
- * not resolve a `.js` specifier to a `.ts` file, and testing the built output is
- * also what catches the stale-dist failure this repo keeps hitting.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -45,20 +9,7 @@ import { AtCapacityError } from '../dist/agent.js';
 const BOT = 'BOT-USER-ID';
 const CHANNEL = 'C-main';
 
-/**
- * Only the keys the handlers read.
- *
- * The same call `test/sessions.test.js` makes and for the same reason: a fixture
- * obliged to be a complete `AgentConfig` would be a second copy of
- * `agent-config.yaml` going quietly out of step with the real one. A handler
- * that starts reading a key not listed here gets a `TypeError` naming it rather
- * than a plausible default.
- *
- * `bundleDebounceMs: 0` disables bundling, so `handleMessage` hands a bundle
- * straight to `deliver` and a test can assert on it without driving timers. The
- * bundler's own debouncing is `test/`-covered nowhere else either, but it is not
- * what this file is about.
- */
+/** Only the keys the handlers read. */
 function configFixture(overrides = {}) {
   const discord = {
     allowedChannelIds: [],
@@ -82,8 +33,7 @@ function configFixture(overrides = {}) {
     agent: {
       model: 'a-model',
       // `!status` resolves the channel's role through this, so an absent key is
-      // a TypeError naming it rather than a plausible default — which is what
-      // this fixture is for, and which is how it caught the unguarded index.
+      // a TypeError naming it rather than a plausible default.
       modelByRole: overrides.modelByRole ?? {},
       maxTurns: 0,
       container: { name: 'clawcius-agent' },
@@ -135,13 +85,6 @@ function fakeRegistry(rows = {}) {
   };
 }
 
-/**
- * The handlers, wired to fakes, plus everything they wrote to.
- *
- * `sent` is what actually reached a Discord channel. It is the assertion that
- * matters for the announcement rules: a count of messages in a room, which is
- * what the 2026-08-03 duplicate was.
- */
 function harness(overrides = {}) {
   const config = configFixture(overrides.config ?? {});
   const sent = [];
@@ -185,15 +128,7 @@ function harness(overrides = {}) {
     alwaysOnChannels: new Set(config.agent.discord.alwaysOnChannelIds),
   });
 
-  /**
-   * What `handleMessage` buffered, before `deliver` reshapes it.
-   *
-   * `deliver` maps a `BufferedMessage` down to what a wake carries and drops
-   * `addressed` on the way — so the flag `handleMessage` computes is not visible
-   * from the other end, and asserting on it there would assert on `undefined`
-   * for every case and pass. It is read here instead, and the spy calls through
-   * so the delivery path is still exercised.
-   */
+  /** What `handleMessage` buffered, before `deliver` reshapes it. */
   const bundled = [];
   const addToBundler = handlers.bundler.add.bind(handlers.bundler);
   handlers.bundler.add = (channelId, buffered) => {
@@ -249,16 +184,6 @@ async function settle(times = 10) {
   for (let i = 0; i < times; i += 1) await Promise.resolve();
 }
 
-// `noRetryReason` IS PART OF THE SHAPE PRODUCTION EMITS, and leaving it out is
-// what let a real defect through 444 green tests. With `retryScheduled: false`
-// on an `authentication_failed` turn, `AgentSession` always sets a reason --
-// `credential-dead` once the one auth rung is spent. A fixture without it drove
-// `outageMessage`'s `default` branch, which is a summary shape the producer
-// cannot construct, so both auth tests below were asserting on a case that does
-// not occur while the case that does occur said the opposite thing.
-//
-// OJ #263 round 1. The messages were covered and the classifier was covered;
-// the JOIN between them was fixtured with something impossible.
 const authFailure = (overrides = {}) => {
   const base = {
     isError: false,
@@ -275,16 +200,6 @@ const authFailure = (overrides = {}) => {
   };
   return {
     ...base,
-    // DERIVED FROM THE PRODUCTION CLASSIFIER so this fixture cannot express a
-    // shape `AgentSession` never emits. Hard-coding it was worse than omitting
-    // it: a test overriding `apiErrorKind` inherited a reason belonging to a
-    // different kind, which is the same defect one level down.
-    //
-    // `retriesSpent` past every ladder because `retryScheduled: false` means the
-    // retries are done — that is what this fixture is for.
-    // `retryScheduled` IS `willRetry`, and production returns a null reason
-    // whenever it is true — so deriving one for a queued retry builds the very
-    // shape this derivation exists to rule out.
     noRetryReason:
       'noRetryReason' in overrides
         ? overrides.noRetryReason
@@ -450,11 +365,7 @@ test('a bare attachment in an always-on channel gets the other placeholder', asy
 });
 
 test('an always-on channel does not churn window state it never consults', async () => {
-  // The window is anchored to bot activity. An always-on channel wakes on every
-  // message anyway, so opening a window there each time would keep a second,
-  // invisible piece of state hot for a room that never reads it — and would then
-  // keep waking the agent for `followUpWindowSeconds` after the channel stopped
-  // being always-on, which is the version of this that bites.
+  // The window is anchored to bot activity.
   const { handlers, windows } = harness({
     config: { discord: { alwaysOnChannelIds: [CHANNEL], followUpWindowSeconds: 300 } },
   });
@@ -532,10 +443,6 @@ test('!stop with nothing running says so and does not create a session to stop',
 });
 
 test('!status reports the model this channel resolves to, not the default', async () => {
-  // Round 3 of #163. A Discord channel has no row until it has taken a turn, and
-  // `acquire` would resolve that case through `#identityFor`'s coordinator
-  // fallback — so `!status` has to use the same fallback or it reports one model
-  // while the next turn runs on another.
   const { handlers } = harness({ config: { modelByRole: { coordinator: 'a-cheaper-model' } } });
   const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
   await handlers.handleMessage(msg);
@@ -551,8 +458,7 @@ test('!status reports the default when the resolved role has no override', async
   const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
   await handlers.handleMessage(msg);
 
-  // An override exists, but not for the role this channel resolves to. The
-  // assertion that would have passed vacuously before the one above.
+  // An override exists, but not for the role this channel resolves to.
   assert.match(msg.replies[0], /Model: a-model/);
 });
 
@@ -621,14 +527,7 @@ test('a full pool is announced, with the numbers and the remedies', async () => 
 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /No session slot free — 4 of 4 are in use/);
-  // `idleTimeoutMinutes: 0` is NOT the shipped configuration any more — 30 is,
-  // since #249 — and the test below covers the sentence a real user now gets.
-  // This one keeps 0 because 0 is still supported and its refusal is a
-  // different, stronger claim: with nothing reclaiming a slot, the pool really
-  // cannot clear on its own.
   assert.match(sent[0], /will not clear on its own/);
-  // Clawcius #146: this is the sentence a user actually reads, and the whole
-  // point of the fix is that it reaches them here rather than only in a doc.
   assert.match(sent[0], /`!reset`/);
   assert.match(log, /could not wake/);
 });
@@ -772,11 +671,6 @@ test('the same auth failure AFTER a respawn is announced', async () => {
   });
 
   assert.equal(sent.length, 1);
-  // A DEAD CREDENTIAL NOW GETS ITS OWN SENTENCE, more actionable than the
-  // generic host line it replaced: the action is a re-login, and somebody
-  // standing in front of the machine should not have to infer that. Asserted as
-  // the FACT — they are sent to the host, and told what to do there — rather
-  // than as the old wording.
   assert.match(sent[0], /re-login on the host/);
   assert.match(sent[0], /could not authenticate/);
   assert.doesNotMatch(
@@ -787,12 +681,6 @@ test('the same auth failure AFTER a respawn is announced', async () => {
 });
 
 test('a dead transport drops the session, or the channel fails forever', async () => {
-  // The third event on that object, and the one whose failure mode is worst:
-  // a session whose child process is gone can never recover, so if it is left
-  // in the pool every later message in that channel acquires the same corpse.
-  // From Discord that is a channel that has silently stopped working until
-  // somebody restarts the unit — and `deliver`'s catch cannot help, because
-  // this arrives asynchronously long after `acquire` returned.
   const { handlers, sessions, sent } = harness();
   handlers.deliver(CHANNEL, buffered());
 
@@ -856,11 +744,6 @@ test('a respawn that also fails to authenticate stops, rather than respawning fo
 });
 
 test('a dead credential announces EXACTLY ONCE across the whole respawn cycle', async () => {
-  // The rule this file exists for. On 2026-08-03 this shipped as four identical
-  // warnings in three seconds, which reads as a broken bot rather than a broken
-  // credential. The sequence below is that incident: a wake fails to
-  // authenticate, the session is respawned, the respawned one fails the same
-  // way, and the channel should learn about it once.
   const { handlers, sessions, sent } = harness();
 
   const log = await captureStderr(async () => {
@@ -891,11 +774,6 @@ test('a dead credential announces EXACTLY ONCE across the whole respawn cycle', 
     `the channel must hear about a dead credential once, not ${sent.length} times: ` +
       JSON.stringify(sent),
   );
-  // A DEAD CREDENTIAL NOW GETS ITS OWN SENTENCE, more actionable than the
-  // generic host line it replaced: the action is a re-login, and somebody
-  // standing in front of the machine should not have to infer that. Asserted as
-  // the FACT — they are sent to the host, and told what to do there — rather
-  // than as the old wording.
   assert.match(sent[0], /re-login on the host/);
   assert.match(sent[0], /could not authenticate/);
   assert.doesNotMatch(
@@ -903,8 +781,6 @@ test('a dead credential announces EXACTLY ONCE across the whole respawn cycle', 
     /try again in a few minutes/i,
     'a dead credential must never be reported as an outage to wait out',
   );
-  // And the second round is still in the journal, which is where the detail
-  // belongs — the announcement is for the person in the channel.
   assert.match(log, /respawned session ALSO failed to authenticate/);
 });
 

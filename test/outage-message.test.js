@@ -1,34 +1,9 @@
-/**
- * What a human is told when a turn was refused and nothing is coming.
- *
- * THE DEFECT THESE PIN IS NOT A CRASH. It is a sentence. The operator met this,
- * twice, on 2026-08-23 at 23:07 and 23:10 PDT, against Anthropic 529s:
- *
- *     ⚠️ I could not run that turn — the API refused it (`server_error`).
- *        Retries are exhausted or would not help, so this needs a look at the host.
- *
- * Every clause of it failed them. `needs a look at the host` sent them to our
- * machine for a fault that was entirely upstream. `server_error` is the SDK's
- * token where the API's own words — "529 Overloaded … try again in a moment" —
- * were sitting unused on the same object. And `exhausted OR would not help`
- * covers both cases, so it states neither, and the two want opposite actions.
- *
- * So these assert on PROSE, deliberately, and against the three facts the
- * message has to carry rather than against its exact wording: whose fault it
- * is, whether they were heard, and what to do. Wording should be free to
- * improve; a branch that stops saying whose fault it is should not be.
- *
- * The negative assertions are the load-bearing half. It is easy to write a
- * message that says the right thing AND the wrong thing, and a reader acts on
- * whichever they read first.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { outageMessage, noRetryJournalReason } from '../dist/daemon.js';
 
-/** The 529 the operator actually hit, as the SDK reports it. */
+/** A 529, as the SDK reports it. */
 const OVERLOADED =
   '529 Overloaded — the API is temporarily unable to take new requests. ' +
   'This is usually temporary — try again in a moment.';
@@ -48,17 +23,11 @@ test('an exhausted transient blames upstream, and never sends them to the host',
   assert.match(text, /did not reach me/, 'must say whether they were heard');
   assert.match(text, /try again in a few minutes/i, 'must say what to do');
 
-  // THE ORIGINAL DEFECT, asserted as an absence. This is the clause that sent a
-  // human to inspect our machine while Anthropic was overloaded.
   assert.doesNotMatch(text, /look at the host/, 'a 529 is not a host problem');
   assert.doesNotMatch(text, /server_error/, 'the SDK token is not a fact anyone can act on');
 });
 
 test('an abandoned retry says the session was cleared, not that anything is broken', () => {
-  // Rungs were left and something on THIS side took them away — `!reset`,
-  // `!stop`, or a session dropped because its child process died. Confirmed as
-  // real from the host traces: two of nine refusals on 2026-08-24 took this
-  // exit, one of them within seconds of a `!reset`.
   const text = outageMessage(summary({ noRetryReason: 'abandoned' }));
 
   assert.match(text, /session was cleared/, 'must name what actually happened');
@@ -74,9 +43,6 @@ test('an abandoned retry says the session was cleared, not that anything is brok
 });
 
 test('a standing condition is the ONE branch that keeps the host sentence', () => {
-  // The sentence was never wrong. It was wrong unconditionally. `billing_error`
-  // and its kin reproduce exactly on a retry, and a human going to look is
-  // precisely the right response.
   const text = outageMessage({
     apiErrorKind: 'billing_error',
     apiError: 'Your credit balance is too low.',
@@ -92,9 +58,7 @@ test('a standing condition is the ONE branch that keeps the host sentence', () =
 });
 
 test('every branch tells them whether they were heard', () => {
-  // The operator's second complaint, and the one easiest to lose while fixing
-  // the first: their message was silently eaten. Whatever else a branch says,
-  // it must answer that.
+  // Whatever else a branch says, it must say the message did not get through.
   for (const reason of ['exhausted', 'abandoned', 'not-retryable']) {
     assert.match(
       outageMessage(summary({ noRetryReason: reason })),
@@ -106,9 +70,6 @@ test('every branch tells them whether they were heard', () => {
 
 test('a missing apiError does not produce a dangling sentence', () => {
   // `apiError` is the API's own text and there is no guarantee it arrives.
-  // Every branch has to read as a whole sentence without it — which is why the
-  // action lives in our half of the message rather than being borrowed from
-  // theirs.
   for (const reason of ['exhausted', 'abandoned', 'not-retryable']) {
     const text = outageMessage({ apiErrorKind: 'server_error', apiError: null, noRetryReason: reason });
     assert.doesNotMatch(text, /: *\n/, `${reason}: colon with nothing after it`);
@@ -118,11 +79,6 @@ test('a missing apiError does not produce a dangling sentence', () => {
 });
 
 test('the journal names the mechanism, and stops claiming a transient is permanent', () => {
-  // `not retrying — this one does not clear on its own` was printed for EVERY
-  // refusal with no retry queued. For a transient kind it is false by all three
-  // exits from `willRetry`: ladder spent, session closed, context cleared. A
-  // 529 clears on its own by definition — that is what puts it in
-  // `TRANSIENT_ERRORS` at all.
   assert.match(noRetryJournalReason({ noRetryReason: 'exhausted' }), /every retry was spent/);
   assert.match(noRetryJournalReason({ noRetryReason: 'abandoned' }), /retries left/);
   assert.match(
@@ -141,25 +97,13 @@ test('the journal names the mechanism, and stops claiming a transient is permane
 });
 
 test('an unknown reason falls back to the standing-condition wording, not to silence', () => {
-  // `noRetryReason` is optional on the type and older summaries will not carry
-  // it. The default branch has to be the conservative one: telling somebody to
-  // look when they need not is recoverable, and telling them to wait forever on
-  // a dead credential is not.
+  // `noRetryReason` is optional on the type and older summaries will not carry it.
   const text = outageMessage({ apiErrorKind: 'whatever', apiError: null, noRetryReason: undefined });
   assert.match(text, /look at the host/);
   assert.match(text, /did not reach me/);
 });
 
 // ── the classifier that decides which of the three a human is shown ─────────
-//
-// EXTRACTED BECAUSE IT WAS UNTESTABLE AND THEREFORE UNTESTED. Mutating it inside
-// `AgentSession` to answer `not-retryable` for everything passed the entire
-// suite — 437 green while every 529 would have been reported as a standing
-// condition needing a look at the host. The messages above were covered; the
-// thing that decides which message fires was not.
-//
-// That is the day's shape once more: the unit under test was smaller than the
-// unit that had to be correct.
 
 import { classifyRetry } from '../dist/agent.js';
 
@@ -186,10 +130,7 @@ test('a transient that spent every rung is `exhausted`, not `not-retryable`', ()
 });
 
 test('a closed session abandons a ladder that still had rungs', () => {
-  // The `!reset` case, confirmed from the host traces: `release()` closes the
-  // session, and a retry pending on it is dropped with rungs left. Correct
-  // behaviour — the human asked for a fresh session — but it is NOT exhaustion
-  // and must not be reported as one.
+  // The `!reset` case: `release()` closes the session, and a retry pending on it is dropped with rungs left.
   const { willRetry, noRetryReason } = classifyRetry(state({ closed: true }));
   assert.equal(willRetry, false);
   assert.equal(noRetryReason, 'abandoned', 'rungs were left; something took them away');
@@ -227,15 +168,6 @@ test('exhaustion and abandonment are distinguished at the boundary rung', () => 
 });
 
 test('a spent AUTH ladder is a dead credential, not a transient that ran out of time', () => {
-  // OJ #263 round 1, blocking. `retryPlanFor` returns THREE outcomes — null,
-  // transient, and auth with its single 2s rung — and branching on
-  // `delay === undefined` alone put a dead credential in the transient arm.
-  //
-  // The harm is specific: the operator is told the fault is Anthropic's and to
-  // wait a few minutes, while the host needs a re-login. Both false, and BOTH
-  // WERE TRUE BEFORE this change — the unconditional sentence it replaced is
-  // exactly right for a revoked token. For this one kind the change moved a
-  // true sentence to a false one, in the direction it exists to prevent.
   const spent = classifyRetry(
     state({ errorKind: 'authentication_failed', retriesSpent: 1 }),
   );
@@ -254,21 +186,12 @@ test('a spent AUTH ladder is a dead credential, not a transient that ran out of 
 });
 
 test('the auth ladder still retries on its one rung before it is called dead', () => {
-  // Guards the other side: `credential-dead` must not fire on the FIRST auth
-  // failure, which is the one a respawn is about to handle. Announcing then put
-  // the same warning in the channel twice per failure — observed on 2026-08-03
-  // as four identical messages in three seconds.
   const first = classifyRetry(state({ errorKind: 'authentication_failed', retriesSpent: 0 }));
   assert.equal(first.willRetry, true);
   assert.equal(first.noRetryReason, null);
 });
 
 test('classifyRetry returns the delay the session uses, so there is only one copy', () => {
-  // It used to be computed twice — once inside the classifier and once in
-  // `AgentSession` for the `setTimeout`. They agreed because both read the same
-  // fields in the same tick, but the whole argument for extracting this was
-  // that the copy reachable only through `AgentSession` is the one that drifts
-  // unobserved.
   assert.equal(classifyRetry(state({ retriesSpent: 0 })).delayMs, 5_000);
   assert.equal(classifyRetry(state({ retriesSpent: 2 })).delayMs, 45_000);
   assert.equal(classifyRetry(state({ retriesSpent: 3 })).delayMs, undefined);
@@ -280,10 +203,6 @@ test('classifyRetry returns the delay the session uses, so there is only one cop
 });
 
 test('the abandoned branch does not guarantee a resend will work', () => {
-  // OJ #263 round 1, non-blocking, and it is this PR's own standard applied one
-  // branch over: "Send it again and it will go through" is a promise the code
-  // cannot keep. The abandoned state means the API was still erroring when the
-  // ladder was taken away, so a resend seconds later hits the same wall.
   const text = outageMessage(summary({ noRetryReason: 'abandoned' }));
   assert.match(text, /Send it again\./, 'the action stands');
   assert.doesNotMatch(text, /will go through/, 'the guarantee does not');
@@ -298,15 +217,6 @@ test('a very long apiError is cut at a word boundary, not mid-word', () => {
 });
 
 test('the abandoned branch characterises no error kind, because it cannot', () => {
-  // OJ #263 round 2. `authentication_failed` is not in `TRANSIENT_ERRORS` but it
-  // HAS a plan, so an auth failure racing a `!reset` takes the abandoned exit —
-  // and the branch was calling it "a temporary API error" and "transient".
-  // Both false for a revoked token: the round-1 finding, one branch over.
-  //
-  // The fix is not a fifth branch. The characterisation was carrying no weight:
-  // the reader acts on "the session was cleared" and "send it again", and both
-  // are true whatever the kind was. A sentence that does not need to name the
-  // kind cannot be wrong about it.
   for (const kind of ['server_error', 'authentication_failed', 'rate_limit']) {
     const text = outageMessage({ apiErrorKind: kind, apiError: 'x', noRetryReason: 'abandoned' });
     assert.doesNotMatch(text, /temporary/i, `${kind}: claims the error was temporary`);
@@ -321,9 +231,6 @@ test('the abandoned branch characterises no error kind, because it cannot', () =
 });
 
 test('an auth failure racing a !reset really does reach the abandoned exit', () => {
-  // The reachability the finding rests on, pinned rather than asserted in prose:
-  // the auth rung is unspent, so `delay` is defined, and only `closed` makes
-  // `willRetry` false.
   const { willRetry, noRetryReason } = classifyRetry({
     errorKind: 'authentication_failed',
     failed: true,
