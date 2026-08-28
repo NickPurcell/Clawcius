@@ -51,6 +51,7 @@ switch_to() {   # switch_to <release dir>
   fi
   systemctl daemon-reload
   for u in $UNITS; do systemctl restart $u.service; done
+  [ $REPO = clawcius ] && docker kill -s HUP clawcius-agent >/dev/null 2>&1 || true
 }
 
 healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>

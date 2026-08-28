@@ -1,0 +1,2 @@
+# name|crews|command      run by bots/supervise.sh inside the crew's container, cwd = its run dir
+vidbot|clawcius|python3 "$BOTS_DIR/vidbot/vidbot.py" -c 307031296788398080 -c 1105739162230984735 --interval 6 --reconcile-interval 300 --max-bytes 10485760 --state ./state.json --log ./vidbot.log --health ./health.json

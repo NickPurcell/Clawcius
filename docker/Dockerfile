@@ -64,4 +64,4 @@ WORKDIR /var/lib/clawcius/workspaces
 # The container's only job is to stay up; the waker attaches with `docker exec`.
 # `sleep` never calls wait(), so it must not be pid 1: run-container.sh passes
 # --init, which makes Docker's tini pid 1 to reap orphans against --pids-limit.
-CMD ["sleep", "infinity"]
+CMD ["sh", "-c", "if [ -n \"$BOTS_DIR\" ]; then exec \"$BOTS_DIR/supervise.sh\"; else exec sleep infinity; fi"]
