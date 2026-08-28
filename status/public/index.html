@@ -1,58 +1,53 @@
 <!DOCTYPE html>
-<!--
-  The whole UI. Three files, no build step, no framework.
-
-  That is in keeping with the rest of the user's work (Boofers-Den is a vanilla
-  static site), but there is a security reason too: the Content-Security-Policy
-  this page is served under is `default-src 'none'` with no 'unsafe-inline',
-  which a bundler's runtime or a framework's style injection would break. There
-  is no inline script and no inline style in this file, on purpose, so that
-  header can stay as strict as it is.
-
-  Nothing here interpolates data into markup. Every value the server returns is
-  put on the page with textContent by app.js — see the comment at the top of
-  that file for why that is not negotiable.
--->
-<html lang="en" data-theme="dark">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
     <meta name="robots" content="noindex, nofollow" />
-    <title>agent status</title>
+    <title>Clawsky</title>
     <link rel="stylesheet" href="/style.css" />
     <script type="module" src="/app.js"></script>
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <span class="brand-name">agent status</span>
-      </div>
-
-      <nav class="tabs" id="tabs" aria-label="Views">
-        <a class="tab" href="#/overview" data-view="overview">Overview</a>
-        <a class="tab" href="#/clawsky" data-view="clawsky">Clawsky</a>
-        <a class="tab" href="#/oj" data-view="oj">Osmosis Jones</a>
-      </nav>
-
-      <div class="stream" id="stream-status" role="status" aria-live="polite">
+      <span class="brand">Clawsky</span>
+      <nav class="crews" id="crews" aria-label="Crew"></nav>
+      <span class="spacer"></span>
+      <span class="chip" id="snapshot" title="newest clawcius-agent snapshot">snapshot …</span>
+      <label class="toggle"><input type="checkbox" id="follow" checked /> follow</label>
+      <span class="stream" id="stream-status" role="status" aria-live="polite">
         <span class="stream-dot" aria-hidden="true"></span>
         <span class="stream-label">connecting…</span>
-      </div>
+      </span>
     </header>
 
-    <main id="main" class="main">
-      <p class="placeholder">Loading…</p>
-    </main>
+    <p class="banner" id="banner" hidden></p>
 
-    <footer class="footer">
-      <span id="footer-note"
-        >Read-only. Bound to loopback over TCP, reachable over the tailnet, and
-        served on a unix socket to each agent container.</span
-      >
-    </footer>
+    <section class="timeline" aria-label="Activity timeline">
+      <div class="tl-controls">
+        <span class="tl-ranges" id="ranges">
+          <button type="button" data-range="3600000">1h</button>
+          <button type="button" data-range="10800000">3h</button>
+          <button type="button" data-range="43200000">12h</button>
+          <button type="button" data-range="86400000">1d</button>
+          <button type="button" data-range="604800000">7d</button>
+        </span>
+        <span class="tl-nav">
+          <button type="button" id="pan-left" title="earlier">◀</button>
+          <button type="button" id="zoom-out" title="zoom out">−</button>
+          <button type="button" id="zoom-in" title="zoom in">+</button>
+          <button type="button" id="pan-right" title="later">▶</button>
+          <button type="button" id="now" title="jump to now">now</button>
+        </span>
+        <span class="tl-cursor-label" id="cursor-label"></span>
+      </div>
+      <div class="tl-grid">
+        <div class="tl-names" id="tl-names"></div>
+        <div class="tl-tracks" id="tl-tracks"></div>
+      </div>
+    </section>
 
-    <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+    <section class="lanes" id="lanes" aria-label="Lanes"></section>
   </body>
 </html>

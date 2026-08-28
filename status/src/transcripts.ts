@@ -1,54 +1,37 @@
 /**
- * Reading Claude Code transcripts off local disk. The on-disk shape:
+ * Claude Code transcripts off local disk:
  *
- *     <projectsRoot>/<slugified-cwd>/
- *       <sessionId>.jsonl                            the main transcript
- *       <sessionId>/subagents/agent-<id>.jsonl       one per directly spawned subagent
- *       <sessionId>/subagents/agent-<id>.meta.json   {agentType, description, toolUseId, parentAgentId?, spawnDepth, model?}
- *       <sessionId>/subagents/workflows/<runId>/     the same pair per subagent of that run, plus journal.jsonl
- *       <sessionId>/workflows/<runId>.json           {workflowName, summary, status, agentCount, durationMs, startTime, phases}
+ *     <projectsRoot>/<slugified-cwd>/<sessionId>.jsonl              the session
+ *     <projectsRoot>/<slug>/<sessionId>/subagents/agent-<id>.jsonl  one per subagent
+ *     ...agent-<id>.meta.json                                       {agentType, description, toolUseId, parentAgentId?}
+ *     ...subagents/workflows/<runId>/                               the same pair per workflow subagent
  *
- * Every line is one JSON object. Operational records (`queue-operation`,
- * `mode`, `ai-title`, `last-prompt`) have no `uuid`, so nothing may assume a
- * key exists. What is cached is an index per transcript — byte offset, length,
- * type and timestamp per line, never the content — extended by reading only
- * the appended tail, and rebuilt when the fingerprint of the first bytes changes.
+ * What is cached per transcript is an index (byte offset, length, type and
+ * timestamp per line), never content; it grows by reading only the appended
+ * tail and is rebuilt when the first bytes of the file change.
  */
 
 import { createReadStream, type Dirent } from 'node:fs';
 import { open, readdir, readFile, stat } from 'node:fs/promises';
-import { basename, join, resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import type { AgentRoot, ReadConfig, StatusConfig } from './config.js';
 
-// ── Untrusted-input handling ────────────────────────────────────────────────
-
 const SECRET_PATTERNS: readonly RegExp[] = [
-  // PEM private keys — the whole block, not just the header, or the payload
-  // would survive with only its label removed.
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  // GitHub: classic PATs, fine-grained PATs, OAuth/app/refresh/server tokens.
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  // Slack, all five token classes.
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/g,
-  // Anthropic.
   /\bsk-ant-[A-Za-z0-9_-]{10,}/g,
   /\bsk-[A-Za-z0-9]{32,}/g,
-  // Discord bot tokens: base64ish.base64ish.base64ish with a long tail.
   /\b[MNO][A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}/g,
-  // Authorization headers, whatever the scheme. Keeps the scheme so the reader
-  // can still see what kind of auth was in play.
   /\b(Authorization:\s*(?:Bearer|Basic|token))\s+\S+/gi,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
 ];
 
-/** Replace credential-shaped substrings with a marker. */
+/** Replace credential-shaped substrings with `[redacted]`, keeping an Authorization scheme. */
 export function redact(text: string): string {
   let out = text;
   for (const pattern of SECRET_PATTERNS) {
-    // The Authorization pattern has a capture group it wants to keep; the rest
-    // have none, and `$1` in a replacement with no group 1 is left literal, so
-    // the two cases have to be distinguished.
     out = out.replace(pattern, (match, group1: string | undefined) =>
       typeof group1 === 'string' ? `${group1} [redacted]` : '[redacted]',
     );
@@ -65,26 +48,21 @@ function metaText(value: unknown): string | null {
 }
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROJECT_SLUG_PATTERN = /^[A-Za-z0-9._-][A-Za-z0-9._-]{0,255}$/;
+const WORKFLOW_RUN_PATTERN = /^wf_[A-Za-z0-9_-]{1,120}$/;
 
 export function isValidSessionId(value: string): boolean {
   return SESSION_ID_PATTERN.test(value);
 }
 export function isValidSubagentId(value: string): boolean {
-  return SUBAGENT_ID_PATTERN.test(value);
-}
-const WORKFLOW_RUN_PATTERN = /^wf_[A-Za-z0-9_-]{1,120}$/;
-
-export function isValidWorkflowRunId(value: string): boolean {
-  return WORKFLOW_RUN_PATTERN.test(value);
+  return SESSION_ID_PATTERN.test(value);
 }
 export function isValidProjectSlug(value: string): boolean {
   if (value === '.' || value === '..') return false;
   return PROJECT_SLUG_PATTERN.test(value);
 }
 
-/** Resolve `parts` under `root` and refuse anything that escapes it. */
+/** Resolve `parts` under `root`; null for anything that escapes it. */
 export function resolveWithin(root: string, ...parts: string[]): string | null {
   const target = resolve(root, ...parts);
   if (target === root) return target;
@@ -93,18 +71,13 @@ export function resolveWithin(root: string, ...parts: string[]): string | null {
 
 // ── Index types ─────────────────────────────────────────────────────────────
 
-/** What we keep per transcript line. Never the content. */
+/** What is kept per transcript line. Never the content. */
 export type LineMeta = {
-  /** Byte offset of the line's first byte in the file. */
   offset: number;
-  /** Byte length of the line, excluding the trailing newline. */
   length: number;
-  /** `type` field, or `unknown` for a line without one. */
   type: string;
   /** Milliseconds since epoch, or null when the line has no usable timestamp. */
   ts: number | null;
-  uuid: string | null;
-  parentUuid: string | null;
   /** True when this line contains at least one tool_use block. */
   hasToolUse: boolean;
   /** True when this line's content is a tool_result rather than prose. */
@@ -116,45 +89,25 @@ export type SpawnRecord = {
   toolUseId: string;
   subagentType: string;
   description: string;
-  /** Model override on the spawn, when the caller named one. */
-  model: string | null;
-  spawnedAt: number | null;
-  /** uuid of the assistant line that made the call, for ordering. */
-  uuid: string | null;
   /** Filled in from the tool_result, which announces the id the runtime assigned. */
   agentId: string | null;
 };
 
-export type UsageTotals = {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
-  costUsd: number | null;
-};
-
 export type TranscriptIndex = {
   path: string;
-  /** Bytes consumed into the index — always a whole number of complete lines. */
+  /** Bytes folded into the index — always a whole number of complete lines. */
   indexedBytes: number;
-  /** Size and mtime at the last index, for staleness checks. */
   size: number;
   mtimeMs: number;
   /** First bytes of the file, to detect a rewrite masquerading as an append. */
   fingerprint: string;
   lines: LineMeta[];
+  /** Lines with a timestamp: what a lane pages through. */
+  stamped: number;
   spawns: SpawnRecord[];
   malformedLines: number;
   firstTs: number | null;
   lastTs: number | null;
-  assistantTurns: number;
-  userMessages: number;
-  toolCalls: number;
-  usage: UsageTotals;
-  /** Latest `gitBranch`/`cwd` seen, for the session header. */
-  cwd: string | null;
-  gitBranch: string | null;
-  model: string | null;
 };
 
 const FINGERPRINT_BYTES = 512;
@@ -177,28 +130,14 @@ function parseTimestamp(value: unknown): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-/** Sum a numeric field wherever it appears at the top level or in `message`. */
-const COST_KEYS = ['costUSD', 'costUsd', 'cost_usd', 'totalCostUsd', 'total_cost_usd'] as const;
-
-function extractCost(line: Record<string, unknown>): number | null {
-  for (const key of COST_KEYS) {
-    const value = line[key];
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-  }
-  return null;
-}
-
 const AGENT_ID_IN_RESULT = /\bagentId:\s*([0-9a-f]{8,})/;
 
 function contentBlocks(line: Record<string, unknown>): unknown[] {
   const message = asRecord(line['message']);
   if (!message) return [];
   const content = message['content'];
-  if (Array.isArray(content)) return content;
-  return [];
+  return Array.isArray(content) ? content : [];
 }
-
-// ── Index construction ──────────────────────────────────────────────────────
 
 function emptyIndex(path: string): TranscriptIndex {
   return {
@@ -208,23 +147,11 @@ function emptyIndex(path: string): TranscriptIndex {
     mtimeMs: 0,
     fingerprint: '',
     lines: [],
+    stamped: 0,
     spawns: [],
     malformedLines: 0,
     firstTs: null,
     lastTs: null,
-    assistantTurns: 0,
-    userMessages: 0,
-    toolCalls: 0,
-    usage: {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
-      costUsd: null,
-    },
-    cwd: null,
-    gitBranch: null,
-    model: null,
   };
 }
 
@@ -237,7 +164,6 @@ function foldLine(index: TranscriptIndex, raw: string, offset: number, length: n
     index.malformedLines += 1;
     return;
   }
-
   const line = asRecord(parsed);
   if (!line) {
     index.malformedLines += 1;
@@ -246,20 +172,16 @@ function foldLine(index: TranscriptIndex, raw: string, offset: number, length: n
 
   const type = asString(line['type']) ?? 'unknown';
   const ts = parseTimestamp(line['timestamp']);
-
-  const blocks = contentBlocks(line);
   let hasToolUse = false;
   let isToolResult = false;
 
-  for (const rawBlock of blocks) {
+  for (const rawBlock of contentBlocks(line)) {
     const block = asRecord(rawBlock);
     if (!block) continue;
     const blockType = asString(block['type']);
 
     if (blockType === 'tool_use') {
       hasToolUse = true;
-      index.toolCalls += 1;
-
       const name = asString(block['name']);
       if (name === 'Task' || name === 'Agent') {
         const input = asRecord(block['input']);
@@ -269,17 +191,12 @@ function foldLine(index: TranscriptIndex, raw: string, offset: number, length: n
             toolUseId,
             subagentType: asString(input['subagent_type']) ?? 'unknown',
             description: asString(input['description']) ?? '',
-            model: asString(input['model']),
-            spawnedAt: ts,
-            uuid: asString(line['uuid']),
             agentId: null,
           });
         }
       }
     } else if (blockType === 'tool_result') {
       isToolResult = true;
-
-      // Late-bind the agent id onto the spawn that produced this result.
       const toolUseId = asString(block['tool_use_id']);
       if (toolUseId) {
         const spawn = index.spawns.find((candidate) => candidate.toolUseId === toolUseId);
@@ -291,57 +208,16 @@ function foldLine(index: TranscriptIndex, raw: string, offset: number, length: n
     }
   }
 
-  index.lines.push({
-    offset,
-    length,
-    type,
-    ts,
-    uuid: asString(line['uuid']),
-    parentUuid: asString(line['parentUuid']),
-    hasToolUse,
-    isToolResult,
-  });
+  index.lines.push({ offset, length, type, ts, hasToolUse, isToolResult });
 
   if (ts !== null) {
+    index.stamped += 1;
     if (index.firstTs === null || ts < index.firstTs) index.firstTs = ts;
     if (index.lastTs === null || ts > index.lastTs) index.lastTs = ts;
   }
-
-  if (type === 'assistant') index.assistantTurns += 1;
-  if (type === 'user' && !isToolResult) index.userMessages += 1;
-
-  const message = asRecord(line['message']);
-  if (message) {
-    const model = asString(message['model']);
-    if (model) index.model = model;
-
-    const usage = asRecord(message['usage']);
-    if (usage) {
-      index.usage.inputTokens += numberOr(usage['input_tokens'], 0);
-      index.usage.outputTokens += numberOr(usage['output_tokens'], 0);
-      index.usage.cacheReadTokens += numberOr(usage['cache_read_input_tokens'], 0);
-      index.usage.cacheCreationTokens += numberOr(usage['cache_creation_input_tokens'], 0);
-    }
-  }
-
-  const cost = extractCost(line);
-  if (cost !== null) index.usage.costUsd = (index.usage.costUsd ?? 0) + cost;
-
-  const cwd = asString(line['cwd']);
-  if (cwd) index.cwd = cwd;
-  const branch = asString(line['gitBranch']);
-  if (branch) index.gitBranch = branch;
 }
 
-function numberOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
-}
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-/** Flatten a content block to plain text, for search and for rendering. */
+/** Flatten a content block to plain text. */
 function flattenBlockText(block: Record<string, unknown>, limit: number): string {
   const direct = block['content'] ?? block['text'];
   if (typeof direct === 'string') return direct.slice(0, limit);
@@ -365,7 +241,7 @@ function flattenBlockText(block: Record<string, unknown>, limit: number): string
 async function foldFrom(index: TranscriptIndex, path: string, fromByte: number): Promise<number> {
   return new Promise<number>((resolvePromise, rejectPromise) => {
     const stream = createReadStream(path, { start: fromByte });
-    // Buffers, not strings: offsets must be byte offsets for the page reader to seek with, and a chunk boundary can land inside a multi-byte character.
+    // Buffers, not strings: offsets are byte offsets, and a chunk boundary can land inside a multi-byte character.
     let pending: Buffer = Buffer.alloc(0);
     let consumed = fromByte;
 
@@ -414,33 +290,15 @@ export type SubagentMeta = {
   description: string | null;
   toolUseId: string | null;
   parentAgentId: string | null;
-  spawnDepth: number | null;
-  model: string | null;
 };
 
 export type SubagentRef = {
   agentId: string;
   path: string;
   meta: SubagentMeta | null;
-  size: number;
-  mtimeMs: number;
-  /** The workflow run this subagent belongs to, or null for a direct spawn. */
-  workflowRunId: string | null;
 };
 
-/** One recorded workflow run. Every field optional; a run in flight has none. */
-export type WorkflowRun = {
-  runId: string;
-  name: string | null;
-  summary: string | null;
-  status: string | null;
-  agentCount: number | null;
-  durationSeconds: number | null;
-  startedAt: string | null;
-  phases: Array<{ title: string | null; detail: string | null }>;
-};
-
-/** Cache of transcript indexes, keyed by path, with LRU eviction. */
+/** Transcript indexes keyed by path, LRU beyond the limit. */
 class IndexCache {
   #entries = new Map<string, TranscriptIndex>();
   #limit: number;
@@ -467,10 +325,6 @@ class IndexCache {
       this.#entries.delete(oldest.value);
     }
   }
-
-  get size(): number {
-    return this.#entries.size;
-  }
 }
 
 export class TranscriptStore {
@@ -494,14 +348,12 @@ export class TranscriptStore {
     return this.#config.agents;
   }
 
-  /** Index for a transcript, built or refreshed as needed. */
+  /** Index for a transcript, built or extended as needed. */
   async index(path: string): Promise<TranscriptIndex> {
     const info = await stat(path);
     const cached = this.#cache.get(path);
 
-    if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
-      return cached;
-    }
+    if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) return cached;
 
     if (cached && info.size >= cached.indexedBytes) {
       const fingerprint = await readFingerprint(path);
@@ -523,55 +375,37 @@ export class TranscriptStore {
     return fresh;
   }
 
-  /** Every session under an agent's root. */
-  async sessions(agent: AgentRoot): Promise<{ sessions: SessionRef[]; error: string | null }> {
-    let projectDirs: string[];
+  /** Every session transcript in one project directory under an agent's root. */
+  async sessionsIn(agent: AgentRoot, slug: string): Promise<SessionRef[]> {
+    if (!isValidProjectSlug(slug)) return [];
+    const dir = resolveWithin(agent.projectsRoot, slug);
+    if (!dir) return [];
+
+    let entries: Dirent[];
     try {
-      const entries = await readdir(agent.projectsRoot, { withFileTypes: true });
-      projectDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-    } catch (error) {
-      return { sessions: [], error: describeFsError(error, agent.projectsRoot) };
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
     }
 
     const sessions: SessionRef[] = [];
-    for (const slug of projectDirs) {
-      if (!isValidProjectSlug(slug)) continue;
-      const dir = resolveWithin(agent.projectsRoot, slug);
-      if (!dir) continue;
-
-      let files: string[];
-      try {
-        const entries = await readdir(dir, { withFileTypes: true });
-        files = entries
-          .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
-          .map((entry) => entry.name);
-      } catch {
-        continue;
-      }
-
-      for (const file of files) {
-        const sessionId = file.slice(0, -'.jsonl'.length);
-        if (!isValidSessionId(sessionId)) continue;
-        sessions.push({
-          agent: agent.id,
-          projectSlug: slug,
-          sessionId,
-          transcriptPath: join(dir, file),
-          sessionDir: join(dir, sessionId),
-        });
-      }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      const sessionId = entry.name.slice(0, -'.jsonl'.length);
+      // `agent-*.jsonl` beside a session is an older layout's subagent transcript, not a session.
+      if (!isValidSessionId(sessionId) || sessionId.startsWith('agent-')) continue;
+      sessions.push({
+        agent: agent.id,
+        projectSlug: slug,
+        sessionId,
+        transcriptPath: join(dir, entry.name),
+        sessionDir: join(dir, sessionId),
+      });
     }
-
-    return { sessions, error: null };
+    return sessions;
   }
 
-  /** Locate one session by id, across every project slug under the agent. */
-  async findSession(agent: AgentRoot, sessionId: string): Promise<SessionRef | null> {
-    if (!isValidSessionId(sessionId)) return null;
-    const { sessions } = await this.sessions(agent);
-    return sessions.find((candidate) => candidate.sessionId === sessionId) ?? null;
-  }
-
+  /** The subagent transcripts of one session, direct and workflow-run alike. */
   async subagents(session: SessionRef): Promise<SubagentRef[]> {
     const root = join(session.sessionDir, 'subagents');
     const refs: SubagentRef[] = [];
@@ -582,10 +416,8 @@ export class TranscriptStore {
     } catch {
       return [];
     }
+    await collectSubagents(root, entries, refs);
 
-    await this.#collectSubagents(root, entries, null, refs);
-
-    // `subagents/workflows/<runId>/` — one directory per workflow run.
     const workflowsDir = join(root, 'workflows');
     let runDirs: Dirent[] = [];
     try {
@@ -593,119 +425,17 @@ export class TranscriptStore {
     } catch {
       return refs;
     }
-
     for (const runDir of runDirs) {
-      if (!runDir.isDirectory()) continue;
-      // Validated against a shape, then resolved inside its root: this name
-      // reaches a path join, and it comes off a directory an agent can write into.
-      if (!isValidWorkflowRunId(runDir.name)) continue;
+      if (!runDir.isDirectory() || !WORKFLOW_RUN_PATTERN.test(runDir.name)) continue;
       const resolved = resolveWithin(workflowsDir, runDir.name);
       if (!resolved) continue;
-
       try {
-        await this.#collectSubagents(
-          resolved,
-          await readdir(resolved, { withFileTypes: true }),
-          runDir.name,
-          refs,
-        );
+        await collectSubagents(resolved, await readdir(resolved, { withFileTypes: true }), refs);
       } catch {
-        // A run directory that vanished between the two readdirs. The rest of
-        // the run's siblings still list.
+        // The run directory vanished between the two readdirs.
       }
     }
-
     return refs;
-  }
-
-  async #collectSubagents(
-    dir: string,
-    entries: Dirent[],
-    workflowRunId: string | null,
-    into: SubagentRef[],
-  ): Promise<void> {
-    for (const entry of entries) {
-      // `journal.jsonl` sits beside the agents in a run directory and is the run's own log, not a subagent.
-      if (!entry.isFile()) continue;
-      if (!entry.name.startsWith('agent-') || !entry.name.endsWith('.jsonl')) continue;
-
-      const agentId = entry.name.slice('agent-'.length, -'.jsonl'.length);
-      if (!isValidSubagentId(agentId)) continue;
-      const path = join(dir, entry.name);
-
-      let size = 0;
-      let mtimeMs = 0;
-      try {
-        const info = await stat(path);
-        size = info.size;
-        mtimeMs = info.mtimeMs;
-      } catch {
-        continue;
-      }
-
-      into.push({
-        agentId,
-        path,
-        meta: await readSubagentMeta(dir, entry.name),
-        size,
-        mtimeMs,
-        workflowRunId,
-      });
-    }
-  }
-
-  async workflowRuns(session: SessionRef): Promise<Map<string, WorkflowRun>> {
-    const dir = join(session.sessionDir, 'workflows');
-    const runs = new Map<string, WorkflowRun>();
-
-    let entries: Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return runs;
-    }
-
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      const runId = entry.name.slice(0, -'.json'.length);
-      if (!isValidWorkflowRunId(runId)) continue;
-      const path = resolveWithin(dir, entry.name);
-      if (!path) continue;
-
-      try {
-        const record = asRecord(JSON.parse(await readFile(path, 'utf8')) as unknown);
-        if (!record) continue;
-        runs.set(runId, {
-          runId,
-          name: metaText(record['workflowName']),
-          summary: metaText(record['summary']),
-          status: metaText(record['status']),
-          agentCount: numberOrNull(record['agentCount']),
-          durationSeconds: (() => {
-            const ms = numberOrNull(record['durationMs']);
-            return ms === null ? null : Math.max(0, Math.round(ms / 1000));
-          })(),
-          startedAt: (() => {
-            const ms = numberOrNull(record['startTime']);
-            return ms === null ? null : new Date(ms).toISOString();
-          })(),
-          phases: Array.isArray(record['phases'])
-            ? record['phases'].flatMap((raw) => {
-                const phase = asRecord(raw);
-                if (!phase) return [];
-                return [
-                  { title: metaText(phase['title']), detail: metaText(phase['detail']) },
-                ];
-              })
-            : [],
-        });
-      } catch {
-        // Unparseable or half-written. The run's agents still list, with the
-        // run id as their only label, which is the honest degradation.
-      }
-    }
-
-    return runs;
   }
 
   /** A page of a transcript, read back from disk by byte offset. */
@@ -727,19 +457,15 @@ export class TranscriptStore {
       for (let i = start; i < end; i += 1) {
         const meta = index.lines[i];
         if (!meta) break;
+        // A short page rather than a refused one: the client resumes at `nextFrom`.
         if (bytesRead > 0 && bytesRead + meta.length > this.#config.read.maxPageBytes) {
-          // Short page rather than a refused one. The client asks for the rest
-          // starting at `nextFrom`, so an enormous line does not become a wall
-          // the reader cannot page past.
           return { entries, total, nextFrom: i };
         }
-
         const buffer = Buffer.alloc(meta.length);
         await handle.read(buffer, 0, meta.length, meta.offset);
         bytesRead += meta.length;
         entries.push(renderLine(buffer.toString('utf8'), i, this.#config.read.maxBlockChars));
       }
-
       return { entries, total, nextFrom: end < total ? end : null };
     } finally {
       await handle.close();
@@ -747,26 +473,32 @@ export class TranscriptStore {
   }
 }
 
+async function collectSubagents(dir: string, entries: Dirent[], into: SubagentRef[]): Promise<void> {
+  for (const entry of entries) {
+    // `journal.jsonl` beside the agents of a workflow run is the run's log, not a subagent.
+    if (!entry.isFile() || !entry.name.startsWith('agent-') || !entry.name.endsWith('.jsonl')) continue;
+    const agentId = entry.name.slice('agent-'.length, -'.jsonl'.length);
+    if (!isValidSubagentId(agentId)) continue;
+    into.push({
+      agentId,
+      path: join(dir, entry.name),
+      meta: await readSubagentMeta(dir, entry.name),
+    });
+  }
+}
+
 async function readSubagentMeta(dir: string, jsonlName: string): Promise<SubagentMeta | null> {
   const metaPath = join(dir, jsonlName.replace(/\.jsonl$/, '.meta.json'));
   try {
-    const parsed = JSON.parse(await readFile(metaPath, 'utf8')) as unknown;
-    const record = asRecord(parsed);
+    const record = asRecord(JSON.parse(await readFile(metaPath, 'utf8')) as unknown);
     if (!record) return null;
     return {
       agentType: metaText(record['agentType']),
       description: metaText(record['description']),
       toolUseId: asString(record['toolUseId']),
       parentAgentId: asString(record['parentAgentId']),
-      spawnDepth:
-        typeof record['spawnDepth'] === 'number' && Number.isFinite(record['spawnDepth'])
-          ? record['spawnDepth']
-          : null,
-      model: asString(record['model']),
     };
   } catch {
-    // Absent for older sessions, and unparseable if it was caught mid-write.
-    // Either way the tree still builds from the parent's tool calls.
     return null;
   }
 }
@@ -781,14 +513,14 @@ export type RenderedBlock =
   | { kind: 'other'; label: string; text: string; truncated: boolean };
 
 export type RenderedLine = {
-  /** Line ordinal, so the client can anchor and resume. */
+  /** Line ordinal within its transcript. */
   n: number;
   type: string;
   role: string | null;
   ts: string | null;
-  uuid: string | null;
-  parentUuid: string | null;
-  /** Operational records (`queue-operation`, `mode`, …) carry a one-line summary. */
+  /** True for a user line nobody typed: a mail wake, a skill preamble, a resume prompt. */
+  isMeta: boolean;
+  /** Operational records (`system`, `queue-operation`, …) carry a one-line summary. */
   summary: string | null;
   blocks: RenderedBlock[];
 };
@@ -800,21 +532,12 @@ function truncate(text: string, limit: number): { text: string; truncated: boole
 }
 
 /** Turn one raw JSONL line into something the UI can draw. */
-function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine {
+export function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return {
-      n,
-      type: 'malformed',
-      role: null,
-      ts: null,
-      uuid: null,
-      parentUuid: null,
-      summary: 'unparseable line — skipped',
-      blocks: [],
-    };
+    return { n, type: 'malformed', role: null, ts: null, isMeta: false, summary: 'unparseable line', blocks: [] };
   }
 
   const line = asRecord(parsed) ?? {};
@@ -830,21 +553,17 @@ function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine
   } else if (Array.isArray(content)) {
     for (const rawBlock of content) {
       const block = asRecord(rawBlock);
-      if (!block) continue;
-      blocks.push(renderBlock(block, maxBlockChars));
+      if (block) blocks.push(renderBlock(block, maxBlockChars));
     }
   }
 
   if (blocks.length === 0) {
-    // The operational records — queue-operation, mode, ai-title, last-prompt — have no `message` at all.
     const operational =
       asString(line['operation']) ??
       asString(line['aiTitle']) ??
       asString(line['mode']) ??
       asString(line['content']);
     if (operational) summary = truncate(operational, 400).text;
-    const attachment = asRecord(line['attachment']);
-    if (!summary && attachment) summary = `attachment: ${asString(attachment['type']) ?? 'unknown'}`;
   }
 
   return {
@@ -852,8 +571,7 @@ function renderLine(raw: string, n: number, maxBlockChars: number): RenderedLine
     type,
     role: message ? asString(message['role']) : null,
     ts: asString(line['timestamp']),
-    uuid: asString(line['uuid']),
-    parentUuid: asString(line['parentUuid']),
+    isMeta: line['isMeta'] === true || line['isSynthetic'] === true,
     summary,
     blocks,
   };
@@ -868,22 +586,16 @@ function renderBlock(block: Record<string, unknown>, limit: number): RenderedBlo
   }
 
   if (kind === 'thinking' || kind === 'redacted_thinking') {
-    const { text, truncated } = truncate(
-      asString(block['thinking']) ?? '[redacted thinking]',
-      limit,
-    );
+    const { text, truncated } = truncate(asString(block['thinking']) ?? '[redacted thinking]', limit);
     return { kind: 'thinking', text, truncated };
   }
 
   if (kind === 'tool_use') {
-    // Input is shown as JSON. Stringify can throw on a cyclic structure, which
-    // JSON.parse cannot produce — but it can also throw on a BigInt, and being
-    // wrong here would take down a whole page for one odd tool call.
     let input = '';
     try {
-      input = JSON.stringify(block['input'], null, 2) ?? '';
+      input = JSON.stringify(block['input']) ?? '';
     } catch {
-      input = '[uninspectable tool input]';
+      input = '"[uninspectable tool input]"';
     }
     const { text, truncated } = truncate(input, limit);
     return {
@@ -906,15 +618,13 @@ function renderBlock(block: Record<string, unknown>, limit: number): RenderedBlo
     };
   }
 
-  // Images and anything added to the content-block vocabulary later. Named,
-  // not rendered — an unknown block type is not something to guess at.
   const { text, truncated } = truncate(flattenBlockText(block, limit), limit);
   return { kind: 'other', label: kind ?? 'block', text, truncated };
 }
 
 export function describeFsError(error: unknown, path: string): string {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  if (code === 'ENOENT') return `${path} does not exist yet`;
+  if (code === 'ENOENT') return `${path} does not exist`;
   if (code === 'EACCES' || code === 'EPERM') return `${path} is not readable by this service`;
   if (code === 'ENOTDIR') return `${path} is not a directory`;
   return `${path}: ${error instanceof Error ? error.message : String(error)}`;

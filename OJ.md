@@ -57,7 +57,7 @@ CI. A pull request touching those directories states how its tests were run.
 
 ## Documents
 
-`README.md`, `SETUP.md`, `CLAWSKY.md`, `status/README.md`, `squid/README.md`,
+`README.md`, `SETUP.md`, `status/README.md`, `squid/README.md`,
 `browser-cli/README.md`, `discord-cli/README.md`, `pr-cli/README.md`,
 `gws-cli/README.md` describe the current system and nothing else. A pull
 request that changes a behaviour one of them describes updates it in the same
