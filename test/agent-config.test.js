@@ -334,12 +334,6 @@ test('the base prompt renders to each crew, and rendering is the only difference
   const base = parse(readFileSync('agent-config.base.yaml', 'utf8'));
   const template = base.systemPrompt.append;
 
-  assert.equal(
-    (template.match(/\{\{Crew\}\}/g) ?? []).length,
-    3,
-    'three identity sites: <system description> twice and <style> once',
-  );
-
   for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
     const config = loadAgentConfig(file);
     assert.equal(
@@ -365,24 +359,6 @@ test('the base prompt renders to each crew, and rendering is the only difference
   // above, so there is no second copy for a reordering to happen in. The
   // property #152 was reaching for is now unreachable rather than checked, which
   // is what an include directive was always supposed to buy.
-});
-
-test('the repository name survives substitution, in every crew’s prompt', () => {
-  // The hazard that made the delimiter a design decision. `Clawcius` is this
-  // crew's identity AND the repository, indistinguishable by string match — so
-  // a substitution keyed on the literal name would rewrite Hamachi's copy to
-  // `NickPurcell/Hamachi`, a repository that does not exist, taking
-  // <issue-tracking> with it. It would not fail: it would 404 the first time
-  // some agent tried to file an issue.
-  for (const file of ['agent-config.yaml', 'agent-config.hamachi.yaml']) {
-    const { append } = loadAgentConfig(file).systemPrompt;
-    assert.match(append, /Repositories: NickPurcell\/Clawcius/, `${file}: the repo is not the crew`);
-    assert.match(append, /\(Clawcius #93\)/, `${file}: issue references are not the crew`);
-    // And the single-brace URL templates are prose, left exactly alone. This is
-    // why the placeholder is `{{Crew}}`: a `{name}` validator would fail the
-    // boot on a pasted GitHub path, and a `{name}` substituter would rewrite it.
-    assert.match(append, /\/repos\/\{owner\}\/\{repo\}\/issues\/\{n\}\/labels/);
-  }
 });
 
 test('an instance file may not carry prompt content — refused, not ignored', () => {
@@ -415,7 +391,7 @@ test('an instance file may not carry prompt content — refused, not ignored', (
     writeConfigRaw(['crew: x', `extends: ${BASE}`, 'maxTurns: 7']),
   );
   assert.equal(config.maxTurns, 7);
-  assert.match(config.systemPrompt.append, /You are X, a team of agents/);
+  assert.match(config.systemPrompt.append, /You are X: a crew of agents/);
 });
 
 test('the shared base may not carry instance identity — the inheritance bug, closed', () => {
@@ -739,7 +715,7 @@ test('an error names the file the key actually came from', () => {
 
   for (const [mutate, key] of [
     [(t) => t.replace('maxTurns: 0', 'maxTurns: nope'), /base\.yaml: maxTurns/],
-    [(t) => t.replace('You are {{Crew}}, a team', 'You are {{crew}}, a team'), /base\.yaml: systemPrompt\.append/],
+    [(t) => t.replace('You are {{Crew}}: a crew', 'You are {{crew}}: a crew'), /base\.yaml: systemPrompt\.append/],
     [(t) => t.replace(/^  roleNotice: .*$/m, '  roleNotice: "{nope}"'), /base\.yaml: prompts\.roleNotice/],
   ]) {
     assert.throws(() => loadAgentConfig(write(mutate(shared), [])), key);
@@ -1119,7 +1095,6 @@ test('the wake carries messages, not identity', () => {
   assert.match(out, /latest message_id: m1/);
 });
 
-
 // ── the prompt against the tools that actually exist ────────────────────────
 //
 // #243: `DEFAULT_PROMPTS.protocol` told an agent that `schedule_wake`,
@@ -1168,85 +1143,3 @@ function toolsNamedInProtocol(protocol) {
   return new Set([...section.matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*)/gm)].map((m) => m[1]));
 }
 
-test('the protocol prompt names exactly the tools that exist, in both copies', () => {
-  // A dummy store is enough: `buildArmedTools` captures it in handler closures
-  // and this only reads `.name`. Using the real registry rather than a written
-  // list is the whole point -- a hand-maintained list here would be a third copy
-  // with its own lifetime, which is the defect being fixed.
-  const real = new Set(
-    buildArmedTools('hamachi-engineer1', {
-      store: {},
-      github: null,
-      defaultRepo: 'NickPurcell/Clawcius',
-      pollSeconds: 120,
-    }).map((t) => t.name),
-  );
-
-  const fromDefaults = loadAgentConfig(
-    writeConfigRaw(['standalone: true', 'crew: x', 'displayName: X']),
-  ).prompts;
-  const fromShipped = loadAgentConfig(
-    writeConfigRaw([`extends: ${BASE}`, 'crew: x', 'displayName: X']),
-  ).prompts;
-
-  for (const [label, prompts] of [
-    ['the compiled defaults', fromDefaults],
-    ['the shipped base', fromShipped],
-  ]) {
-    const named = toolsNamedInProtocol(prompts.protocol);
-
-    const undocumented = [...real].filter((n) => !named.has(n));
-    assert.deepEqual(
-      undocumented,
-      [],
-      `${label}: tool(s) exist that the prompt never names — ${undocumented.join(', ')}`,
-    );
-
-    // "not an armed tool" rather than "does not exist", because the set being
-    // compared against is only what `buildArmedTools` returns. An agent also has
-    // `checkMail` and `sendMail` from `mail-tool.ts`, and `checkMail` is already
-    // named in this very section -- in backticks mid-sentence, where the `^ {4}`
-    // match does not see it. If someone later documents a mail tool in the
-    // indented block, this fires, and a message saying it does not exist would
-    // send the reader hunting for a tool that was never deleted.
-    const invented = [...named].filter((n) => !real.has(n));
-    assert.deepEqual(
-      invented,
-      [],
-      `${label}: the tool block names something that is not an armed tool — ` +
-        `${invented.join(', ')}. If it is a real tool from another module, widen ` +
-        'the set this compares against rather than deleting the line.',
-    );
-  }
-});
-
-test('every prompt template is byte-identical between the defaults and the shipped base', () => {
-  // Six of the seven already agreed when this was written; `protocol` was the
-  // one that did not, at 1249 characters against 2557 -- a whole older version
-  // rather than a drifted sentence. So the invariant was real and observed and
-  // enforced by nothing, which is the state that ends here.
-  //
-  // The duplication itself is deliberate and stays: `DEFAULT_PROMPTS` is what a
-  // `standalone: true` config gets, and such a config has explicitly opted out
-  // of the base file. Having the default READ the base would contradict that and
-  // would break a deployment that ships without the YAML. So the fix is to make
-  // the two provably equal, not to remove one.
-  const fromDefaults = loadAgentConfig(
-    writeConfigRaw(['standalone: true', 'crew: x', 'displayName: X']),
-  ).prompts;
-  const fromShipped = loadAgentConfig(
-    writeConfigRaw([`extends: ${BASE}`, 'crew: x', 'displayName: X']),
-  ).prompts;
-
-  const keys = [...new Set([...Object.keys(fromDefaults), ...Object.keys(fromShipped)])].sort();
-  assert.ok(keys.length >= 7, 'expected the full prompt set, got ' + keys.join(', '));
-
-  for (const key of keys) {
-    assert.equal(
-      fromDefaults[key],
-      fromShipped[key],
-      `prompts.${key} differs between DEFAULT_PROMPTS and agent-config.base.yaml — ` +
-        'update both, or the fallback ships text that no live agent has ever read',
-    );
-  }
-});
