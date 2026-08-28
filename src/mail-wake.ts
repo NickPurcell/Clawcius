@@ -89,8 +89,6 @@ export class MailWaker {
   #consider(agent: AgentRecord): void {
     const { mail, busy, start, log } = this.#options;
 
-    // Runs on the host, woken by the ops executor.
-    if (agent.role === 'host') return;
 
     if (busy(agent.id)) return;
 

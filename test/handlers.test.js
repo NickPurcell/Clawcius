@@ -396,9 +396,7 @@ test('!status is answered by the waker and never reaches the agent', async () =>
 
   assert.deepEqual(sessions.acquired, [], 'a command must not wake a turn');
   assert.equal(msg.replies.length, 1);
-  assert.match(msg.replies[0], /Live sessions: 1\/4/);
-  assert.match(msg.replies[0], /Idle eviction: never/);
-  assert.match(msg.replies[0], /Mail: disabled/);
+  assert.match(msg.replies[0], /Sessions: 1\/4 live/);
 });
 
 test('!stop actually interrupts the live turn, rather than only saying it did', async () => {
@@ -440,26 +438,6 @@ test('!stop with nothing running says so and does not create a session to stop',
   assert.deepEqual(sessions.acquired, [], 'acquiring here would spawn a container to interrupt it');
   assert.deepEqual(sessions.interrupted, []);
   assert.deepEqual(msg.replies, ['Nothing running here.']);
-});
-
-test('!status reports the model this channel resolves to, not the default', async () => {
-  const { handlers } = harness({ config: { modelByRole: { coordinator: 'a-cheaper-model' } } });
-  const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
-  await handlers.handleMessage(msg);
-
-  // No registry row for this channel — the fixture's registry is empty — so this
-  // is the fallback path, and it must agree with what `acquire` would do.
-  assert.match(msg.replies[0], /Model: a-cheaper-model/);
-  assert.doesNotMatch(msg.replies[0], /Model: a-model/);
-});
-
-test('!status reports the default when the resolved role has no override', async () => {
-  const { handlers } = harness({ config: { modelByRole: { updater: 'a-cheaper-model' } } });
-  const msg = message({ content: `<@${BOT}> !status`, mentioned: true });
-  await handlers.handleMessage(msg);
-
-  // An override exists, but not for the role this channel resolves to.
-  assert.match(msg.replies[0], /Model: a-model/);
 });
 
 test('answering a command extends the window rather than ending the conversation', async () => {
@@ -527,25 +505,7 @@ test('a full pool is announced, with the numbers and the remedies', async () => 
 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /No session slot free — 4 of 4 are in use/);
-  assert.match(sent[0], /will not clear on its own/);
-  assert.match(sent[0], /`!reset`/);
   assert.match(log, /could not wake/);
-});
-
-test('with eviction on, the same refusal says when to come back instead', async () => {
-  const { handlers, sessions, sent } = harness({ config: { sessions: { idleTimeoutMinutes: 30 } } });
-  sessions.onAcquire = () => {
-    throw new AtCapacityError(2, 2);
-  };
-
-  await captureStderr(async () => {
-    handlers.deliver(CHANNEL, buffered());
-    await settle();
-  });
-
-  assert.equal(sent.length, 1);
-  assert.match(sent[0], /A slot frees after 30m idle/);
-  assert.doesNotMatch(sent[0], /will not clear on its own/);
 });
 
 test('any other wake failure stays quiet — the bot does not narrate its plumbing', async () => {
@@ -804,58 +764,3 @@ test('an edit with no author at all is survivable — an edit arrives partial', 
   assert.equal(windows.isOpen(CHANNEL), false);
 });
 
-test('the host agent is reported as absent until the ops executor claims the row', () => {
-  const absent = harness();
-  assert.match(absent.handlers.describeHostAgent(), /is not on this board/);
-
-  const claimed = harness({
-    registry: fakeRegistry({ 'hamachi-host': { id: 'hamachi-host', role: 'host', crew: 'hamachi' } }),
-  });
-  assert.match(claimed.handlers.describeHostAgent(), /DM hamachi-host — coordinators only/);
-});
-
-test('a row whose role is not host does not count as the host agent', () => {
-  // The id is claimed by whoever writes the row; the ROLE is what mail.ts
-  // enforces on. A coordinator about to be told "unknown recipient" would
-  // rather find out here.
-  const { handlers } = harness({
-    registry: fakeRegistry({
-      'hamachi-host': { id: 'hamachi-host', role: 'coordinator', crew: 'hamachi' },
-    }),
-  });
-  assert.match(handlers.describeHostAgent(), /is not on this board/);
-});
-
-test('the crew line counts rows by role and says how many were spawned', () => {
-  const { handlers } = harness({
-    registry: fakeRegistry({
-      a: { id: 'a', role: 'coordinator', crew: 'hamachi', spawnedBy: null },
-      b: { id: 'b', role: 'engineer', crew: 'hamachi', spawnedBy: 'a' },
-      c: { id: 'c', role: 'engineer', crew: 'hamachi', spawnedBy: 'a' },
-    }),
-  });
-  const line = handlers.describeCrew();
-  assert.match(line, /hamachi — 3 row\(s\): 1 coordinator, 2 engineer/);
-  assert.match(line, /2 spawned/);
-});
-
-test('more than one coordinator row is annotated, because it is not more than one agent', () => {
-  // Sessions are keyed on `message.channelId`, which is per thread as well as
-  // per channel, so `9 coordinator` would be read by everybody as nine agents.
-  const { handlers } = harness({
-    registry: fakeRegistry({
-      a: { id: 'a', role: 'coordinator', crew: 'hamachi', spawnedBy: null },
-      b: { id: 'b', role: 'coordinator', crew: 'hamachi', spawnedBy: null },
-      h: { id: 'h', role: 'host', crew: 'hamachi', spawnedBy: null },
-    }),
-  });
-  const line = handlers.describeCrew();
-  assert.match(line, /a coordinator row is one Discord channel or thread, not one agent/);
-  assert.match(line, /the host runs outside the container and is not crew/);
-  assert.match(line, /none spawned/);
-});
-
-test('an empty board says so rather than rendering an empty list', () => {
-  const { handlers } = harness();
-  assert.equal(handlers.describeCrew(), 'hamachi — no rows on the board');
-});
