@@ -6,7 +6,7 @@ Documentation=file:/home/npurcell/clawcius/SETUP.md
 # rules must be in place before any container can send a packet.
 After=docker.service
 Requires=docker.service
-Before=clawcius-container.service hamachi-container.service
+Before=clawcius-container.service
 
 [Service]
 Type=oneshot
