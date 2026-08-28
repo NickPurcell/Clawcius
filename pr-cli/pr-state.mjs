@@ -1,95 +1,16 @@
 #!/usr/bin/env node
 /**
- * Answer the questions agents actually have about a pull request, rather than
- * the fields that resemble them.
- *
- * ── Why this is a script and not a table ─────────────────────────────────
- *
- * On 2026-08-23 four agents read five different fields that were TRUE, that
- * they read CORRECTLY, and that answered a question adjacent to the one they
- * had (Clawcius #216). Between them: ~2h investigating an intruder that was the
- * author's own tooling, one wasted review round, one nearly-published set of
- * fixes for things that were not broken, and one unnecessary chase.
- *
- * A reference table would have helped with those five. The sixth field will
- * mislead the same way, and nobody consults a table before reading a value that
- * has already given them a confident answer. A document that only works if you
- * doubt yourself first does not work.
- *
- * SO THE HEURISTIC IS HERE, WHERE SOMEBODY EDITING THIS IS STANDING:
- *
- *   A field that could NOT answer your question would have returned nothing and
- *   sent you looking. The dangerous ones are the ones that DO answer —
- *   plausibly, right type, right shape — because a confident answer terminates
- *   the search. "I got a clean answer" is the moment to be suspicious, not the
- *   moment to stop.
- *
- * The difference between a rule and an intention is whether you can rerun it in
- * seconds. That is why this is executable.
- *
- * ── The four questions, and the fields that look like them ───────────────
- *
- *   is a round running / queued / finished
- *       NOT "an OJ comment exists" — the acknowledgement is a comment, posted
- *       ~1s after pickup. Findings are identified structurally, by their footer.
- *       NOT `labels: []` either — OJ consumes `oj:review` at pickup, so absence
- *       means queued-and-taken OR running, never "nobody asked".
- *
- *   did the review see THIS code
- *       The footer sha is the only place a round names the commit it read, and
- *       it is ~150 chars from the end of the comment — outside the 1200-char
- *       window watchPr mail truncates at, in 4 of 4 rounds measured (OJ#23).
- *       Read from the API, never from the mail.
- *
- *   can this merge, and if not, why
- *       NOT `mergeable`, which only says git can combine the trees. It was
- *       `true` on #207 for the entire time the PR was `blocked`. The field that
- *       answers the question is `mergeable_state`.
- *
- *   is an approval still valid
- *       `dismiss_stale_reviews_on_push` is FALSE on ruleset OJ1, so GitHub keeps
- *       counting an approval after the branch moves. An approval can therefore
- *       be satisfied and be for code nobody approved.
- *
- * ── Two things that will look like mistakes in this file, and are not ────
- *
- * 1. IT READS `/rulesets`, NOT `/branches/{branch}/protection`. The obvious
- *    endpoint for "what is blocking this pull request" answers **403 —
- *    `Resource not accessible by integration`** — for THIS App, because it does
- *    not hold `Administration: read`. That is a property of the App's
- *    permissions and not of the endpoint, and the distinction is load-bearing:
- *    a future crew whose App does hold that scope will find the note "wrong",
- *    and if it reads as a fact about the endpoint they will drop this whole
- *    warning with it. `/rulesets` needs no such scope and is the reason this
- *    works today. So the natural call is the one WE cannot make, and anyone who
- *    "simplifies" back to it gets a permission error and concludes something
- *    about permissions rather than about endpoints.
- *
- *    That is #216 reappearing inside the API surface itself, which is why the
- *    warning is here rather than in a commit message nobody will read.
- *
- * 2. THERE ARE TWO IDENTITIES ON ONE PULL REQUEST, and they are not a bug.
- *    Commits are authored by the user `hamachi`; the pull request is opened by
- *    `hamachi-bot[bot]`, the App. The self-approval rule keys on the PULL
- *    REQUEST author, which is why the App cannot approve its own PR (422) and
- *    why an approval has to come from outside the crew entirely.
- *
- *    Related and NOT the same thing: ruleset OJ1 sets
- *    `require_extra_approval_for_unattributed_changes: true`. It should not
- *    fire — a `users.noreply.github.com` address resolves to a real login, so
- *    GitHub returns an `author` object rather than `null`, and unattributed
- *    means no linked account. That is verified for the commits and NOT verified
- *    against GitHub's exact predicate for the rule. **If an approval lands and
- *    the PR stays blocked, this is the first thing to check.**
+ * Answer the questions agents have about a pull request: is a review round
+ * running, queued or finished; did the last round read the code on the branch
+ * now; can it merge, and if not why; and is each approval still for the head.
  *
  * Usage:  pr-cli/pr-state <pr> [--repo owner/name] [--json]
  *
- * From inside an agent container, where this directory is mounted read-only:
- *     /home/npurcell/clawcius/pr-cli/pr-state <pr>
- *
- * Reads through bare `curl`, which the daemon has already authenticated via
- * netrc. Do NOT add an Authorization header: an explicit one REPLACES the
- * netrc credential and authenticates as the account rather than as the App.
+ * Reads through bare `curl`, which is authenticated via netrc. Do not add an
+ * Authorization header: an explicit one replaces the netrc credential and
+ * authenticates as the account rather than as the App. Reads `/rulesets`, not
+ * `/branches/{branch}/protection`, which is 403 for an App without
+ * `Administration: read`.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -99,16 +20,12 @@ const DEFAULT_REPO = 'NickPurcell/Clawcius';
 const OJ_BOT = 'osmosis-jones-agent[bot]';
 const REVIEW_LABEL = 'oj:review';
 
-/** OJ's findings footer — the only place a round names the commit it read. */
+/** The findings footer, the only place a round names the commit it read. */
 export const FOOTER = /<sub>OJ\s*·\s*round\s*(\d+)\s*·\s*head\s*`([0-9a-f]+)`/;
 
 /**
- * OJ comments that are FINDINGS, structurally.
- *
- * The acknowledgement is also a comment by OJ, is 151 characters long, and is
- * posted about one second after pickup. Counting it is how "a round finished"
- * gets reported for a round that has barely started — the dangerous direction,
- * because it invites acting on findings that do not exist yet.
+ * OJ comments that are findings, structurally: the acknowledgement is also a
+ * comment by OJ and carries no footer.
  */
 export function parseFindings(comments) {
   return comments
@@ -119,26 +36,9 @@ export function parseFindings(comments) {
 }
 
 /**
- * OJ declining a round, which unlabels exactly like a pickup and posts no
- * footer — so without this it falls through to RUNNING and stays there forever.
- *
- * `agent-config.base.yaml`'s `<habits>` documents it: "a comment beginning
- * `OJ is not reviewing this:` … is a refusal with its reason in it, drafts and
- * forks being skipped by configuration, and no acknowledgement is coming."
- *
- * An agent reads "picked up, running" and waits for findings that were declined
- * an hour ago. That is Clawcius#88's eight-hour wait with a tool vouching for
- * it, which is worse than the wait without one. OJ round 1, finding 3.
- *
- * Searched over comments AND review bodies, for the same reason `parseFindings`
- * is: if finding 5's premise holds for findings it holds for refusals.
+ * OJ declining a round: it unlabels like a pickup and posts no footer. Not
+ * anchored hard at `^`, since OJ's system comments may open with an emoji.
  */
-// NOT anchored hard at `^`. OJ's other system comment — the acknowledgement —
-// opens with an emoji, and `<habits>` describes it without mentioning that. If a
-// refusal ever carries a prefix the same way, a hard anchor never matches and the
-// round reads RUNNING forever, which is the exact bug the DECLINED state was
-// added to fix. The cost of being wrong is that failure; the cost of the
-// hardening is four characters. Round 2, finding 5.
 const DECLINED = /^\W*OJ is not reviewing this:\s*(.*)/;
 
 export function parseDeclines(comments) {
@@ -152,14 +52,10 @@ export function parseDeclines(comments) {
 /**
  * Did the last round read the code that is on the branch now?
  *
- * EXACT   the reviewed commit IS the head
+ * EXACT    the reviewed commit IS the head
  * ANCESTOR the head has moved on; commits since it are unreviewed
- * VOID    the reviewed commit is not in the head's history at all — a rebase,
- *         an amend, a force-push or a squash happened mid-round, and the
- *         findings describe a tree nobody has. This is the state that cost
- *         Clawcius #202 a round: four already-fixed items reported outstanding,
- *         which looks exactly like diligence from outside.
- * UNKNOWN the sha is not in this clone, so no honest claim is available.
+ * VOID     the reviewed commit is not in the head's history at all
+ * UNKNOWN  the sha is not in this clone
  */
 export function classifyReviewedSha(sha, head, isAncestorFn) {
   if (!sha) return 'NONE';
@@ -171,27 +67,15 @@ export function classifyReviewedSha(sha, head, isAncestorFn) {
 
 /**
  * Approvals, each flagged with whether it is for the code on the branch now.
- *
- * `dismiss_stale_reviews_on_push` is FALSE on ruleset OJ1, so GitHub keeps
- * counting an approval after the branch moves. "Approved" and "somebody
- * approved this code" are therefore different claims, and only the first is a
- * field.
+ * GitHub keeps counting an approval after the branch moves when
+ * `dismiss_stale_reviews_on_push` is false.
  */
 export function approvalsFor(reviews, head) {
-  // ONE PER REVIEWER, FROM THEIR LATEST REVIEW, which is how GitHub counts.
-  // Filtering `state === 'APPROVED'` across all reviews miscounts in both
-  // directions (OJ round 1, finding 4): approve-then-request-changes reported 1
-  // where GitHub counts 0 — overstating in the direction of "ready" — and
-  // approving twice after a push reported 2 where GitHub counts 1, printing two
-  // lines for one person, one stale and one not.
-  //
-  // Re-approving after a push is ordinary here, not an edge case: it is what a
-  // human does when the branch moves under their review.
+  // One per reviewer, from their latest review, which is how GitHub counts.
   const latest = new Map();
   for (const r of reviews) {
-    // Reviews arrive oldest-first, and only these states supersede: a COMMENTED
-    // review does not retract an approval, which is why it cannot simply be the
-    // last review of any kind.
+    // Reviews arrive oldest-first; only these states supersede — a COMMENTED
+    // review does not retract an approval.
     if (r.state !== 'APPROVED' && r.state !== 'CHANGES_REQUESTED' && r.state !== 'DISMISSED') continue;
     if (r.user?.login) latest.set(r.user.login, r);
   }
@@ -201,113 +85,26 @@ export function approvalsFor(reviews, head) {
       by: r.user?.login,
       at: r.submitted_at,
       sha: r.commit_id,
-      // THREE STATES, because the datum can be absent and a boolean cannot say so.
-      //
-      // `stale: commit_id !== head` was TRUE when `commit_id` was null, so every
-      // reader had to remember `&& a.sha`. Round 3 of #218 added that at two
-      // sites and round 4 found two more that had not got it — the tool printed
-      // three consecutive lines taking three positions on whether a stale
-      // approval existed. A third and fourth guard would have left the fifth.
-      //
-      // The field answered "does commit_id differ from head" while every reader
-      // was asking "is this approval for code that has been superseded". Those
-      // are different questions, which is this tool's entire subject. It answers
-      // the second now, and `unknown` is a value rather than something each
-      // caller reconstructs from a second field.
-      // `!r.commit_id`, not `== null`: an empty string is not a sha, and treating
-      // it as one classified it 'stale' and printed `STALE: approved , head is …`
-      // with a hole in it. The readers this replaced used falsy tests, so `""`
-      // landed in the unknown bucket; narrowing to `== null` silently moved it.
-      // No evidence GitHub returns `""` here — it returns a sha or null — so this
-      // is a bucket restored rather than a bug fixed.
+      // Three states: `unknown` when commit_id is absent (`!r.commit_id`, so an
+      // empty string counts as absent).
       coverage: !r.commit_id ? 'unknown' : r.commit_id === head ? 'current' : 'stale',
     }));
 }
 
 /**
- * WHY a stale approval went stale: the author's own pushes, or somebody else's.
+ * Why a stale approval went stale: `spent` when only authors already on the
+ * branch pushed after it, `overtaken` when a new author appeared, `null` when
+ * it cannot tell (no commits either side, or an author with no login).
  *
- * ── THE QUESTION THIS ANSWERS ───────────────────────────────────────────────
- *
- * `STALE` says an approval is for a commit that is no longer the head. It does
- * NOT say who moved the head, and those are different situations with opposite
- * responses:
- *
- *   SPENT      you pushed after your own approval landed. Nothing is wrong;
- *              you have simply consumed it, and the fix is to ask for another
- *              round. This is the overwhelmingly common case here and it is
- *              currently indistinguishable from the alarming one.
- *   OVERTAKEN  somebody ELSE moved the branch under a reviewer. Their approval
- *              is attached to code they read and somebody else has replaced —
- *              worth looking at before asking for a re-review, because the
- *              question is what changed and by whom, not "please look again".
- *
- * ── WHY NOT CALL THE SECOND ONE `VOID` ──────────────────────────────────────
- *
- * Because `VOID` already means something else in this file — `classifyReviewedSha`
- * returns it for a ROUND whose commit is not in the head's history at all,
- * usually a force-push or rebase. Two meanings for one word in one tool is the
- * exact defect this file exists to prevent: a term that answers a question
- * adjacent to the one being asked. `#216` is four agents doing that with five
- * fields, and it would be an odd thing for this file to reproduce internally.
- *
- * ── WHAT IT USES, AND THE TRAP IT WALKED INTO FIRST ─────────────────────────
- *
- * The commits either side of the approval's timestamp, and who AUTHORED them.
- * GitHub's REST API does not report who PUSHED a commit on the pull-request
- * endpoints, so authorship is the available proxy — and a good one, because a
- * rebase preserves the original author, which is the case that matters.
- *
- * `spent` is "no author appeared who was not already writing this branch".
- *
- * THE FIRST VERSION COMPARED AGAINST `pr.user.login` AND WAS WRONG ON EVERY
- * PULL REQUEST THIS CREW OPENS. It printed `OVERTAKEN: somebody else pushed`
- * for a commit I had just pushed myself. The reason is fact 2 in this file's
- * own header, thirty lines from the top:
- *
- *   > Commits are authored by the user `hamachi`; the pull request is opened
- *   > by `hamachi-bot[bot]`, the App.
- *
- * Two identities on one pull request, documented here, in the file I was
- * editing — and I still compared the PR author to the commit authors and got a
- * confident, plausible, false answer. That is #216 happening inside the tool
- * written to stop #216, which is worth leaving in the comment rather than
- * quietly fixing: the field answered "did the App push this" while the question
- * was "did whoever owns this branch push this".
- *
- * ── WHERE IT GIVES UP ───────────────────────────────────────────────────────
- *
- * `null` when it cannot tell: no commits after the approval, no commits before
- * it to establish who owns the branch, or an author GitHub did not resolve to a
- * login. A caller prints nothing rather than guessing, for the same reason
- * `coverage` has an `unknown` bucket — an absent datum is not a negative one.
+ * Authorship is the proxy for who pushed: the REST API does not report the
+ * pusher, and a rebase preserves the author. Compared among commit authors,
+ * not against `pr.user.login`: the pull request is opened by the App and the
+ * commits are authored by the user.
  */
 export function whyStale(approval, commits) {
   if (!approval?.at) return null;
-  // AUTHOR date, not committer date, and this is the whole of finding 3. The
-  // comment below argues that authorship is a good proxy BECAUSE a rebase
-  // preserves it — and the split was being made on the committer date, which a
-  // rebase rewrites on every commit it touches. So after a rebase every commit
-  // sorted after the approval, `before` came back empty, and the function gave
-  // up before authorship was ever consulted. The paragraph was arguing for a
-  // robustness the code did not have.
-  //
-  // THE TRADE, STATED PROPERLY — and the first version of this paragraph got it
-  // wrong in the reassuring direction, which is worth leaving visible in the
-  // comment that fixed a different reassuring error.
-  //
-  // It claimed "a NEW author still lands in `owners` as absent". It does not.
-  // `owners` is built from `before`, and `before` is selected by AUTHOR date, so
-  // a stranger's commit authored before the approval joins `owners` however late
-  // it actually lands. Work authored at 09:00, landed at 12:00, approval at
-  // 11:00, owner pushes at 12:30 — this reports `spent`, on a branch a new
-  // author pushed to after the approval.
-  //
-  // The route needs a cherry-pick, a `git am`, or a sibling branch merged in
-  // rather than an ordinary push, so the exposure is small; and `git commit
-  // --amend` preserves the author date too, which is not exotic here — after an
-  // amend and a force-push this gives up rather than answering. Those are the
-  // costs of reading rebases correctly, which is the far commoner case.
+  // Author date, not committer date: a rebase rewrites the committer date on
+  // every commit it touches.
   const dateOf = (c) => c.commit?.author?.date ?? c.commit?.committer?.date;
 
   const before = commits.filter((c) => {
@@ -323,38 +120,16 @@ export function whyStale(approval, commits) {
   const login = (c) => c.author?.login;
   if ([...before, ...after].some((c) => !login(c))) return null;
 
-  // Who was already writing this branch when the approval landed. Anyone else
-  // turning up afterwards is the case worth flagging.
+  // Who was already writing this branch when the approval landed.
   const owners = new Set(before.map(login));
   return after.every((c) => owners.has(login(c))) ? 'spent' : 'overtaken';
 }
 
 /**
- * Does a ruleset ref pattern match this branch?
- *
- * `conditions.ref_name.include` and `.exclude` hold fnmatch patterns against the
- * FULL ref, so `refs/heads/*` is the ordinary way to say "every branch" and a
- * literal comparison misses it entirely.
- *
- * `*` is translated to `.*`, which CROSSES `/` — so `refs/heads/*` also matches
- * `refs/heads/a/b`. Whether GitHub's fnmatch does the same for `ref_name` is not
- * checkable offline and only differs on a base ref containing a slash, so it is
- * left as an open question (#238) rather than guessed at.
- *
- * WHAT IS NOT OPEN is the size of the fix, and an earlier version of this comment
- * got it wrong in a way that would have caused the damage. It said "one character
- * (`[^/]*`) and a test". It is not:
- *
- *   under any fnmatch where `*` stops at `/`, `**` is the form that crosses it —
- *   that is the entire reason the second form exists. A blanket
- *   star-to-`[^/]*` replace rewrites BOTH, so the edit that fixes `*` breaks
- *   `**`, and breaks it in the UNDER-matching direction: a ruleset targeting
- *   `refs/heads/**` is dropped, taking the `ruleset` line, the "of N required"
- *   and `explainMergeState`'s honest `required` with it.
- *
- * Today `**` works by accident, because `.*.*` and `.*` are the same language.
- * So: handle `**` before `*` (and `?` is the same class), and test both — do not
- * make the one-character edit and a passing test for `*` alone.
+ * Does a ruleset ref pattern match this branch? `conditions.ref_name` holds
+ * fnmatch patterns against the full ref, so `refs/heads/*` means every branch.
+ * `*` becomes `.*`, which crosses `/`; `**` is the same language, so any
+ * narrowing of `*` must handle `**` first.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -365,75 +140,22 @@ export function refPatternMatches(pattern, branch) {
   return rx.test(full) || rx.test(branch);
 }
 
-/**
- * Why a pull request cannot merge, in words, from `mergeable_state`.
- *
- * FINDING 1 OF OJ ROUND 1, and the sharpest thing said about this tool. The
- * approval clause used to be gated on `ruleset.required` being TRUTHY, never on
- * whether approvals were actually short — so every `blocked` PR in a repo with a
- * ruleset got "needs N, has M" as its EXPLANATION, including when M >= N, which
- * is exactly when approvals are NOT the reason.
- *
- * `blocked` also covers a failing required check, CODEOWNERS, a second rule, and
- * `require_extra_approval_for_unattributed_changes` — the one this file's own
- * header flags as unverified and says to check first. So the tool pointed at the
- * SATISFIED condition and away from the flagged one: a confident, wrong,
- * adjacent answer on the line answering question three of four, which is #216
- * committed by the instrument built to prevent it.
- *
- * Extracted from `main()` rather than fixed in place, because OJ's structural
- * point outlives this bug: every misreport it found was in `main()`, the part
- * with no tests, printing the sentences a reader acts on. A fix that stayed
- * there would have been untested for the same reason the bug was.
- */
+/** Why a pull request cannot merge, in words, from `mergeable_state`. */
 export function explainMergeState(state, approvals, ruleset) {
   const required = ruleset?.required;
   const stale = approvals.filter((a) => a.coverage === 'stale');
   switch (state) {
     case 'clean':
-      // GitHub's own verdict, plus the thing GitHub does not count as blocking.
-      // `dismiss_stale_reviews_on_push` is false on OJ1, so an approval survives
-      // the branch moving under it and `clean` can mean "approved, for code that
-      // is no longer here". Observed on #228: green check, approval for
-      // 629a41fb, head e7e2d52. Saying only "nothing blocking" there would be
-      // this function's own finding-1 defect a third time.
-      // UNKNOWN reaches this line too. `nothing blocking` is true of GitHub and
-      // answers "does GitHub block" when the reader asked "has anyone read this
-      // code" — which is this file's own header defect, and the reason the
-      // tri-state was worth doing is that the third sentence is now expressible.
-      //
-      // EVERY BUCKET, not the first non-empty one. The previous version returned
-      // on `stale` and phrased each branch as though its bucket were the whole
-      // set. Both directions were reachable and both were false:
-      //
-      //   stale + current   -> "the approval is STALE", while an approval that
-      //                        DOES cover this head existed — which under
-      //                        `required: 1` is the answer to the question asked
-      //   current + unknown -> "the approval …is UNKNOWN", naming the wrong one
-      //
-      // The JSON was honest in both; only the sentence was not, which is the
-      // narrower form of this file's own header defect. OJ round 2 on #235.
-      //
-      // The gate answers MAY I merge. It does not answer SHOULD I.
+      // `clean` is GitHub's verdict, and GitHub still counts an approval whose
+      // branch moved when dismiss_stale_reviews_on_push is false, so every
+      // coverage bucket is reported.
       const unknown = approvals.filter((a) => a.coverage === 'unknown');
-      // COUNTED, not inferred by subtraction. `current` produces "N DOES cover
-      // this head" — the one assertion in this message a reader acts on by
-      // merging — and deriving it from the absence of the other two meant any
-      // coverage value that was neither counted as covering. Only reachable
-      // through a hand-built caller today, but it is the strongest claim here
-      // and it should not rest on a subtraction.
+      // Counted, not inferred by subtraction.
       const current = approvals.filter((a) => a.coverage === 'current').length;
       if (stale.length === 0 && unknown.length === 0) return 'nothing blocking';
 
-      // The dismissal clause READS `dismissStaleOnPush` rather than asserting it:
-      // it hardcoded "is false" and said so against a ruleset that set it true and
-      // against a read that established nothing. Only shown when something is
-      // stale, since it is the setting that lets a stale approval keep counting.
-      // `it` / `them` follows the count for the same reason the footnote's does:
-      // the headline three words earlier says `2 STALE`, and a singular pronoun
-      // under it reads as though one of the two were the relevant one. OJ named
-      // the footnote at :791; this is the same sentence defect at a site it did
-      // not name, and fixing one and not the other is how the next round finds it.
+      // Reads `dismissStaleOnPush` rather than asserting it; shown only when
+      // something is stale.
       const them = stale.length === 1 ? 'it' : 'them';
       const dismissal =
         stale.length === 0
@@ -458,21 +180,8 @@ export function explainMergeState(state, approvals, ruleset) {
         `${said.join(', and ')}. ` +
         (current > 0
           ? `${current} DOES cover this head`
-          : // THE CONSEQUENCE, not just the fact. This clause was dropped in the
-            // bucket rewrite along with the assertion that pinned it — and it is
-            // this tool's whole subject: the gate answers MAY I merge, not
-            // SHOULD I. It belongs only here, where nothing is known to cover
-            // the head; in the `N DOES cover` case the old code warned wrongly.
-            //
-            // AND IT SPLITS ON UNKNOWN, which is #235 round 4's finding against
-            // the restored clause. `no review has read` is a claim about the
-            // world; with an UNKNOWN approval in hand, only a claim about
-            // KNOWLEDGE is available. An approval with an absent `commit_id` may
-            // have read exactly this head — that is the entire content of
-            // UNKNOWN, and the reason three rounds went into stopping this tool
-            // collapsing it into STALE. Saying it anyway, on the line a reader
-            // acts on, would collapse it again in the last clause of the same
-            // sentence.
+          : // Nothing is known to cover the head; with an UNKNOWN approval only a
+            // claim about knowledge is available.
             (unknown.length > 0
               ? 'None is KNOWN to cover this head and the UNKNOWN one(s) may or may not, ' +
                 'so whether this code has been reviewed cannot be settled from here'
@@ -488,18 +197,8 @@ export function explainMergeState(state, approvals, ruleset) {
     case 'draft':
       return 'it is a draft';
     case 'blocked':
-      // THREE branches, not two, and the third is round 2's finding 1. With
-      // `required` unknown the two-branch version fell through to "it is NOT the
-      // approval count" — asserting the negative from an absence. Zero approvals
-      // on a PR needing one, which is the commonest blocked state here, reported
-      // as definitely not about approvals: round 1's finding with the sign
-      // flipped, and worse, because that one pointed at a condition that was met
-      // while this one points away from the condition that is the whole answer.
-      //
-      // `required` is unknown whenever the `/rulesets` read throws, no active
-      // ruleset governs this base ref, or the repo uses classic branch
-      // protection and has no rulesets at all — none exotic, and the README
-      // offers a cross-repo example where the last is possible.
+      // `required` is unknown when the `/rulesets` read threw, no active ruleset
+      // governs the base ref, or the repo uses classic branch protection.
       if (required == null) {
         return (
           'branch protection — and the required approval count could not be read, so ' +
@@ -522,32 +221,12 @@ export function explainMergeState(state, approvals, ruleset) {
 }
 
 /**
- * One request. The body on stdout, and the one header we need appended after a
- * sentinel by curl itself.
- *
- * TWO OBVIOUS IMPLEMENTATIONS ARE WRONG IN THIS CONTAINER, both silently
- * elsewhere, which is why this note is longer than the function:
- *
- *   `-D -` and split on the first blank line.  Egress is through Squid, which
- *   emits its own block first — `HTTP/1.1 200 Connection established`, blank
- *   line, then `HTTP/2 200`. So the first boundary is the PROXY's and the body
- *   slice starts at `HTTP/2 200`. Outside a proxied network there is no such
- *   block and the same code works, so this is a bug that passes wherever it is
- *   likely to be written.
- *
- *   `-D /dev/stderr` and read the two streams apart.  curl SEGFAULTS — gVisor,
- *   status null and signal SIGSEGV, with both streams empty.
- *
- * `--write-out %header{link}` needs curl >= 7.84 (this image has 7.88) and asks
- * curl for the single value rather than reconstructing it from a transcript. No
- * boundary to find, no second stream, no temp file — which keeps the property
- * that this tool writes nothing anywhere, since it runs from a read-only mount.
- *
- * ON AN OLDER CURL IT DEGRADES SILENTLY, and that is worth knowing rather than
- * guarding: the literal `%header{link}` is emitted, the regex misses, and
- * pagination reverts to page 1 — which is the defect this whole function exists
- * to fix. Only reachable if the tool ever runs outside this image, so it is a
- * line here rather than a version check that would run on every call.
+ * One request: the body, plus the `link` header appended after a sentinel by
+ * curl's `--write-out %header{link}` (curl >= 7.84). `-D -` is wrong behind
+ * Squid, which emits its own `200 Connection established` block first, and
+ * `-D /dev/stderr` segfaults curl under gVisor. On an older curl the literal
+ * `%header{link}` is emitted, the regex misses, and pagination reverts to
+ * page 1.
  */
 const SENTINEL = '\n@@pr-state-link@@';
 
@@ -574,67 +253,20 @@ function api(path, repo) {
 }
 
 /**
- * A paginated list endpoint: page 1 plus the LAST page.
- *
- * `per_page=100` fixes the default-30 trap and not the one behind it. These
- * endpoints are oldest-first with no `direction`, so on a busy pull request the
- * newest events — which is every question this tool asks — are on the last page,
- * and a bare `curl` discards the `Link` header that says so.
- *
- * The failure was silent and in the dangerous direction: with rounds 5-6 past
- * item 100, `roundState` reads an OLD pickup as current, finds that round's
- * findings after it, and reports FINISHED for a round that is running — the
- * exact mistake this file's tests name. It then checks the sha of a round from
- * four pushes ago. Both answers look completely normal.
- *
- * This is not a new rule. `agent-config.base.yaml` states it in `<habits>`
- * ("Newest last, and if the response has a rel=\"last\" link the newest are on
- * that page") and `src/github.ts` `#getAll` already implements it. This took the
- * first half of a two-part rule the repository states in two places.
- *
- * Middle pages are deliberately not fetched, and here is the whole of that
- * assumption rather than a promise that it is written down somewhere else — an
- * earlier version of this paragraph pointed at a statement "at the call site"
- * that did not exist:
- *
- *   comments and reviews  every question is about the newest, or about the full
- *                         set of reviews, which does not reach 200 on a pull
- *                         request a person is looking at.
- *
- *   the TIMELINE          the diluted one. Label events are a few per round
- *                         among commits, comment refs and cross-references, so
- *                         past ~200 events the current round's
- *                         `labeled`/`unlabeled` can sit in a skipped middle page
- *                         while the last page is full of something else, and
- *                         `roundState` falls back to an ancient round silently.
- *                         If that ever bites, `/issues/{n}/events` carries the
- *                         labellings undiluted — `<habits>` warns against it
- *                         because it omits comments, and this script already
- *                         fetches those separately, so the warning does not
- *                         apply here.
+ * A paginated list endpoint: page 1 plus the LAST page. These endpoints are
+ * oldest-first with no `direction`, so the newest events are on the last page.
+ * Middle pages are not fetched: every question is about the newest comments,
+ * or the full set of reviews, which does not reach 200. Past ~200 timeline
+ * events the current round's label events can sit in a skipped middle page.
  */
 function apiList(path, repo) {
-  // ONE IMPLEMENTATION. These were line-for-line duplicates differing only in
-  // the return shape — same URL construction, same guard, same error string,
-  // same `rel="last"` regex — so the next fix to any of that could land in one
-  // copy and miss the other.
   return apiListSayingIfTruncated(path, repo).items;
 }
 
 /**
- * `apiList`, plus whether the middle was skipped.
- *
- * `apiList` fetches page 1 and the LAST page and deliberately drops what is
- * between them; its doc comment enumerates the callers that is safe for, and
- * why. `whyStale` is not one of them and cannot be added to the list: it splits
- * the commits either side of a timestamp, so page 1 (oldest) and the last page
- * (newest) both come back populated and it returns a VERDICT drawn from an
- * incomplete set rather than declining to answer.
- *
- * Measured by OJ on a 210-commit branch with a third party's commit on the
- * skipped page: the full list says `overtaken`, page-1-plus-last says `spent`.
- * The alarming answer becoming the calm one is the wrong direction to be wrong
- * in, so this reports the truncation and the caller gives up instead.
+ * `apiList`, plus whether a middle page was skipped: `whyStale` splits commits
+ * either side of a timestamp, so an incomplete list would yield a verdict
+ * rather than declining.
  */
 function apiListSayingIfTruncated(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
@@ -671,13 +303,10 @@ function isAncestor(sha, head) {
 }
 
 /**
- * Round state from the TIMELINE, read backwards.
- *
- * The label is a request queue and OJ consumes it on pickup, so its presence or
- * absence is not the state. `labeled` with no later `unlabeled` is a request
- * still queued; `labeled` then `unlabeled` by OJ is a round that started at that
- * timestamp — and whether it FINISHED is a separate question answered by
- * findings, not by the acknowledgement comment.
+ * Round state from the timeline, read backwards. The label is a request queue
+ * and OJ consumes it on pickup, so its presence is not the state: `labeled`
+ * with no later `unlabeled` is queued; `labeled` then `unlabeled` by OJ is a
+ * round that started then, and whether it finished is answered by findings.
  */
 export function roundState(timeline, findings, declines = []) {
   let lastLabeled = null;
@@ -728,10 +357,7 @@ export function main() {
   // `mergeable` is computed asynchronously and is null on a cold read. Ask once
   // more rather than reporting "unknown" for a value that arrives in a second.
   if (pr.mergeable === null && !pr.merged) {
-    // Guarded, and it re-reads only a cosmetic field. `sleep` is a separate
-    // binary and this shelled out to it unguarded: on a minimal image a missing
-    // `sleep` took down the whole report AFTER the expensive reads had already
-    // succeeded, to refresh one value the report can honestly print as null.
+    // Guarded: `sleep` is a separate binary, and it re-reads only a cosmetic field.
     try {
       execFileSync('sleep', ['2']);
       pr = api(`/pulls/${number}`, repo);
@@ -745,19 +371,8 @@ export function main() {
   const timeline = apiList(`/issues/${number}/timeline?per_page=100`, repo);
   const reviews = apiList(`/pulls/${number}/reviews?per_page=100`, repo);
 
-  // STRUCTURAL, not "a comment by OJ exists": findings carry the footer, the
-  // acknowledgement does not. That distinction is the whole point — the ack is
-  // posted about one second after pickup and is 151 characters long.
-  // FINDING 5. `verdictMode: comment` in the footer implies other modes, and
-  // `src/armed.ts` already treats OJ's REVIEWS as a carrier of its words. If a
-  // round's findings ever ride a review body instead of an issue comment, a
-  // comments-only search returns nothing and the round reads as RUNNING forever
-  // (finding 3's failure by another route). `reviews` is already fetched for the
-  // approvals, so looking there too is free.
-  //
-  // OJ raised this as a question rather than a defect — its posting path is not
-  // in this repository and neither of us can check it. Covering both is cheaper
-  // than being right about which.
+  // Findings carry the footer; the acknowledgement does not. Searched over
+  // comments and review bodies both.
   const carriers = [
     ...comments,
     ...reviews.map((r) => ({ user: r.user, created_at: r.submitted_at, body: r.body, html_url: r.html_url })),
@@ -766,41 +381,11 @@ export function main() {
 
   const latest = findings[findings.length - 1] ?? null;
   const round = roundState(timeline, findings, parseDeclines(carriers));
-  // Computed ONCE. Both the JSON and the text path called this, so `git` was
-  // spawned twice for one answer.
   const verdict = latest ? classifyReviewedSha(latest.sha, head, isAncestor) : 'NONE';
   const bare = approvalsFor(reviews, head);
 
-  // FETCHED ONLY IF SOMETHING NEEDS IT. `whyStale` is asked about stale
-  // approvals and a fresh pull request has none, so an unconditional read added
-  // one or two HTTP round trips to every invocation for an answer nobody wanted.
-  // This file makes the same point about `git` at the `merge-base` call.
-  //
-  // `truncated` is fatal rather than cosmetic here: see
-  // `apiListSayingIfTruncated`. An incomplete list yields a confident wrong
-  // verdict in the reassuring direction, so it yields no verdict at all.
-  // WHAT THIS ASKS, IN ONE CONDITION EITHER SIDE, because it has been wrong in
-  // both directions and each mistake had a different shape.
-  //
-  // TOO NARROW first: `bare.some((a) => a.coverage === 'stale')`. `roundsSpent`
-  // counts over every approval ever cast rather than over the one-per-reviewer
-  // set, so on approve-A / push-B / re-approve-B — the #241 shape the history
-  // line exists for — the only surviving approval is `current`, nothing looked
-  // stale, no commits were fetched, and the line went quiet exactly when the
-  // branch was back in the good state and a person was most likely to ask how
-  // many rounds it took.
-  //
-  // THEN TOO WIDE: replacing it with the reviews-wide test alone fetched for a
-  // reader that cannot exist. Both consumers sit inside the else-branch of
-  // `approvals.length === 0`, so on approve-A / push-B / then-request-changes
-  // nothing displays the answer — one or two HTTP round trips spent on a pull
-  // request with an outstanding change request, which is not a rare state.
-  //
-  // So: something must survive to display it, AND some approval must be off the
-  // head. The old first disjunct is gone rather than kept alongside — a stale
-  // entry in `bare` IS an approved review with a truthy `commit_id` off the
-  // head, so it was a strict subset of the second test and could never decide
-  // the answer, while reading as though it could.
+  // Fetched only when something can display it: a live approval exists and
+  // some approval is off the head. A truncated list yields no verdict.
   const needsCommits =
     bare.length > 0 &&
     reviews.some((r) => r.state === 'APPROVED' && r.commit_id && r.commit_id !== head);
@@ -811,21 +396,8 @@ export function main() {
 
   const approvals = bare.map((a) => (a.coverage === 'stale' ? { ...a, why: why0(a) } : a));
 
-  // TWO COUNTS, TWO POPULATIONS, AND THEY ARE NOT THE SAME QUESTION.
-  //
-  // `spentApprovals` sits in the `merge` block beside `staleApprovals` as a
-  // decomposition of it, so it MUST count the same set: `approvalsFor`'s
-  // one-per-reviewer latest-review list. Counting raw `reviews` instead
-  // reported `spentApprovals: 1` on a branch with zero live approvals and an
-  // outstanding change request — overstating in the direction of "this was
-  // fine, just ask again", which is verbatim the miscount `approvalsFor`'s own
-  // comment says #218 round 1 finding 4 fixed. It also produced `2` beside a
-  // `staleApprovals: 1`, which is 2 of 1.
-  //
-  // `roundsSpent` is the other question — "how many times has this branch been
-  // round the loop" — and it genuinely wants every approval ever cast, so it is
-  // computed over `reviews` and stays on the text path where that is what is
-  // being said.
+  // `spentApprovals` decomposes `staleApprovals`, so it counts the same
+  // one-per-reviewer set; `roundsSpent` counts every approval ever cast.
   const spentApprovals = approvals.filter((a) => a.why === 'spent').length;
   const roundsSpent = truncated
     ? 0
@@ -835,23 +407,7 @@ export function main() {
 
   let ruleset = null;
   try {
-    // EVERY governing ruleset, and the strictest requirement among them.
-    //
-    // Round 2's finding 2, and it became load-bearing because finding 1's fix
-    // depends on `required` being non-null to stay honest. Three defects in the
-    // first version, each silent:
-    //
-    //   `refs/heads/*` matched nothing. `ref_name.include` holds fnmatch
-    //   patterns, not just literals and the two aliases, and a wildcard is one
-    //   of the commonest ways to target a ruleset. An unmatched pattern dropped
-    //   the ruleset, which lost the `ruleset` line, lost "of N required" beside
-    //   the approvals, and landed in finding 1's wrong sentence.
-    //
-    //   `exclude` was not read, so `include: ['~ALL']` with
-    //   `exclude: ['refs/heads/main']` was reported as governing main.
-    //
-    //   `.find()` took the first match while GitHub applies ALL of them and the
-    //   effective requirement is the strictest.
+    // Every governing ruleset, and the strictest requirement among them.
     const list = api(`/rulesets?includes_parents=true`, repo);
     const base = pr.base?.ref;
     const governs = (r) => {
@@ -870,18 +426,8 @@ export function main() {
       : [];
     for (const summary of governing) {
       const full = api(`/rulesets/${summary.id}`, repo);
-      // NO `continue` when there is no pull_request rule. A ruleset that enforces
-      // required status checks and nothing else is an ordinary configuration: it
-      // governs the branch, it was read successfully, and it requires ZERO
-      // approvals. Skipping it left `ruleset` null, which the finding-1 fix then
-      // reports as "the required approval count could not be read" — the one
-      // thing that is not true — and drops the `ruleset` line entirely, so the
-      // reader is not even told one exists. That is also the configuration where
-      // `blocked` most likely DOES mean a required check.
-      //
-      // The distinction to keep is between "the read failed" (unknown) and "the
-      // read succeeded and there is no approval rule" (zero). Round 2 had this
-      // right by accident, via `?? 0` on an optional chain.
+      // No `continue` when there is no pull_request rule: a ruleset that governs
+      // the branch and has no approval rule requires zero, which is not "unread".
       const rule = (full.rules ?? []).find((r) => r.type === 'pull_request');
       const here = {
         name: full.name,
@@ -896,10 +442,6 @@ export function main() {
           ? { ...here, dismissStaleOnPush: here.dismissStaleOnPush || (ruleset?.dismissStaleOnPush ?? false) }
           : { ...ruleset, dismissStaleOnPush: ruleset.dismissStaleOnPush || here.dismissStaleOnPush };
     }
-    // AFTER the loop, once. Inside it, every iteration re-suffixed the name it
-    // was already holding: `OJ1 (strictest of 2) (strictest of 2)`. Cosmetic, and
-    // on the printed line — and the multi-ruleset path was the only new code this
-    // round with no test, which is round 1 finding 1's pattern exactly.
     if (ruleset && governing.length > 1) {
       ruleset.name = `${ruleset.name} (strictest of ${governing.length})`;
     }
@@ -917,34 +459,15 @@ export function main() {
     merged: pr.merged,
     round,
     reviewSawThisCode: latest ? { round: latest.round, sha: latest.sha, verdict } : null,
-    // `why` and `staleApprovals` are in the JSON as well as the text, because a
-    // scripted consumer reading `mergeable_state === 'clean'` would otherwise get
-    // exactly the adjacent-answer field this tool exists to annotate, unannotated.
+    // `why` and the counts are in the JSON too, so a scripted consumer reading
+    // `mergeable_state` gets the annotation.
     merge: {
       mergeable: pr.mergeable,
       mergeable_state: pr.mergeable_state,
       why,
       staleApprovals: approvals.filter((a) => a.coverage === 'stale').length,
-      // Sibling of `staleApprovals` for the same reason it is here: a consumer
-      // reading `staleApprovals: 1` cannot tell whether somebody moved the
-      // branch under a reviewer or the author simply pushed again.
       spentApprovals,
-      // SIBLING OF `spentApprovals`, for the reason `unknownCoverageApprovals`
-      // is a sibling of `staleApprovals`: "0 stale is not the same as 0 unread".
-      // `staleApprovals: 1, spentApprovals: 0` reads naturally as "not spent, so
-      // somebody moved the branch under a reviewer" — and it is also what you
-      // get when the author did not resolve to a login, and when the commit list
-      // was truncated. Two of those three are the tool declining to answer, and
-      // reading them as the alarming one sends a consumer chasing an intruder
-      // who is not there, which is #216's actual bill. With both counts present
-      // the residue — stale minus spent minus overtaken — is honestly unknown.
       overtakenApprovals: approvals.filter((a) => a.why === 'overtaken').length,
-      // Sibling of `staleApprovals` — NAMED, not "the above", because two fields
-      // have since been inserted between them and "the above" now points at
-      // `overtakenApprovals`, whose own comment cites this one as its precedent.
-      // A relative reference in a list that grows is a claim that decays on its
-      // own. Without this field a scripted consumer reading `staleApprovals: 0`
-      // gets the unannotated adjacent field — 0 stale is not the same as 0 unread.
       unknownCoverageApprovals: approvals.filter((a) => a.coverage === 'unknown').length,
     },
     approvals,
@@ -991,10 +514,7 @@ export function main() {
   if (approvals.length === 0) {
     say('approvals', `none${ruleset?.required ? ` of ${ruleset.required} required` : ''}`);
   } else {
-    // THE ROUND COUNT, before the per-approval lines. A branch that has been
-    // approved four times and pushed four times looks identical, line by line,
-    // to one that has been approved once — every line says STALE and none of
-    // them says how often this has happened. #241 spent five.
+    // How many times this branch has been round the loop.
     const everApproved = reviews.filter((r) => r.state === 'APPROVED').length;
     if (roundsSpent > 0) {
       say(
@@ -1010,15 +530,7 @@ export function main() {
             ? `commit_id absent, so whether it covers ${head.slice(0, 8)} is unknown`
             : a.coverage === 'stale'
               ? `STALE: approved ${a.sha.slice(0, 8)}, head is ${head.slice(0, 8)}` +
-                // WHY it went stale, when that is knowable. "You spent it" and
-                // "somebody else moved the branch under them" want opposite
-                // responses and read identically without this.
-                // "SPENT by your own pushes" claimed more than the function
-                // computes. `spent` is "no author appeared who was not already
-                // writing this branch" — on a branch two people had touched
-                // before the approval, a push by the second reads back as
-                // yours, which is the false-reassurance direction. This says
-                // what it knows.
+                // Why it went stale, when that is knowable.
                 (a.why === 'spent'
                   ? ' — SPENT: no new author has pushed since'
                   : a.why === 'overtaken'
@@ -1030,10 +542,6 @@ export function main() {
     }
     const staleCount = approvals.filter((a) => a.coverage === 'stale').length;
     if (staleCount > 0 && ruleset?.dismissStaleOnPush === false) {
-      // COUNTED, not "the stale one". The headline four lines above says
-      // `2 STALE` for the same input, and a singular footnote under it reads as
-      // though one of the two were somehow the relevant one. It survived two
-      // rounds because the README sample happens to have exactly one approval.
       say(
         '',
         `dismiss_stale_reviews_on_push is FALSE — GitHub still counts ${
@@ -1052,8 +560,6 @@ export function main() {
   console.log('');
 }
 
-// Only when this module IS the entry point. Launched through the `pr-state`
-// shim beside it, argv[1] is the shim rather than this file, so the shim calls
-// `main()` itself — otherwise the tool would exit silently having done nothing,
-// which is a failure mode this file exists to argue against.
+// Only when this module is the entry point; launched through the `pr-state`
+// shim, argv[1] is the shim and the shim calls `main()` itself.
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) main();

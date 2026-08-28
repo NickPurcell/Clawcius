@@ -41,11 +41,7 @@ def get_token():
 
 
 def get_guild_id(override=None):
-    """The single server this CLI operates against.
-
-    Fixed configuration rather than mutable state, so it does not have the
-    hidden-state problem that a switchable context would.
-    """
+    """The single server this CLI operates against."""
     guild = override or os.environ.get("DISCORD_GUILD_ID") or _read_file().get("guild_id")
     if not guild:
         raise ValidationError(

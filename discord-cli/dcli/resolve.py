@@ -1,9 +1,4 @@
-"""Turning human-typed names into snowflake IDs, and validating IDs locally.
-
-Local validation matters for agent callers: rejecting a malformed ID here costs
-one fast turn, where letting it reach Discord costs a round trip and returns an
-opaque 400.
-"""
+"""Turning human-typed names into snowflake IDs, and validating IDs locally."""
 
 import json
 import re
@@ -68,11 +63,7 @@ def resolve_channel(client, guild_id, channel):
 
 
 def list_channels(client, guild_id, refresh=False):
-    """Text channels in the configured guild, cached briefly on disk.
-
-    The cache is a pure lookup accelerator with a short TTL -- it never changes
-    what a command does, only how fast it resolves a name.
-    """
+    """Text channels in the configured guild, cached briefly on disk."""
     if not refresh:
         cached = _read_cache(guild_id)
         if cached is not None:

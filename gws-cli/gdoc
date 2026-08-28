@@ -2,25 +2,10 @@
 """
 gdoc — read and edit Google Docs from the command line.
 
-No third-party dependencies, deliberately. This mirrors discord-cli: the tool
-is bind-mounted read-only into the agent container and must work the moment it
-lands, with no install step. An earlier version leaned on google-auth inside a
-virtualenv in the container's home directory, which a VPS migration deleted
-along with everything else there. Stdlib-only survives that.
-
-That constraint means signing the service-account JWT by hand — RSA PKCS#1
-v1.5, which Python's big integers do natively. See rsa_sign_sha256 below.
-
-It also sidesteps a trap: google-api-python-client's httplib2 transport ignores
-http_proxy/https_proxy, and the agent container has no direct route out, DNS
-included. The symptom is "unable to find the server at oauth2.googleapis.com"
-on a host where curl works. urllib reads the proxy environment by default, so
-this simply works.
-
-Authenticates as a *service account*, not as a person: there is no browser here
-to complete an OAuth consent screen. The account is its own Google identity
-with an empty Drive and sees nothing until a document is shared with its
-address, exactly like sharing with a colleague. `gdoc whoami` prints it.
+Stdlib only: the service-account JWT is signed by hand (RSA PKCS#1 v1.5, see
+rsa_sign_sha256) and urllib reads the proxy environment. Authenticates as a
+service account, which sees nothing until a document is shared with its
+address; `gdoc whoami` prints it. Exits 1 on any error.
 
 Credentials are looked for at, in order:
   $GWS_SA_KEY
@@ -106,12 +91,10 @@ def der_ints(sequence: bytes) -> list[int]:
 
 
 def rsa_private_params(pem: str) -> tuple[int, int]:
-    """
-    Pull (modulus, private exponent) out of a PKCS#8 or PKCS#1 RSA PEM.
+    """Pull (modulus, private exponent) out of a PKCS#8 or PKCS#1 RSA PEM.
 
-    Google issues PKCS#8 ("BEGIN PRIVATE KEY"), which wraps the PKCS#1
-    RSAPrivateKey in an OCTET STRING. PKCS#1 ("BEGIN RSA PRIVATE KEY") is
-    accepted too, since keys converted by hand are common enough.
+    Google issues PKCS#8, which wraps the PKCS#1 RSAPrivateKey in an OCTET
+    STRING; PKCS#1 is accepted too.
     """
     body = "".join(
         line for line in pem.strip().splitlines() if not line.startswith("-----")
@@ -145,12 +128,7 @@ SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
 def rsa_sign_sha256(message: bytes, modulus: int, exponent: int) -> bytes:
-    """
-    RSASSA-PKCS1-v1_5 signature over SHA-256.
-
-    Deterministic, which is what makes it testable: the same input must produce
-    the byte-identical signature any other correct implementation produces.
-    """
+    """RSASSA-PKCS1-v1_5 signature over SHA-256. Deterministic."""
     size = (modulus.bit_length() + 7) // 8
     tail = SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
     if size < len(tail) + 11:

@@ -1,8 +1,6 @@
 """Thin HTTP client for the Discord REST API, with rate-limit handling.
 
-Standard library only, so the tool runs anywhere python3 does with no install
-step. Rate limiting lives here rather than at the call sites, so adding a new
-command never means remembering to handle 429s.
+Standard library only. Rate limiting lives here rather than at the call sites.
 """
 
 import json
@@ -40,13 +38,7 @@ class Client:
         return self._send(method, _url(path, params), payload, "application/json")
 
     def request_multipart(self, method, path, body, content_type, params=None):
-        """Send a pre-encoded multipart body (see upload.build_multipart).
-
-        Uploads need a different Content-Type and a body that is not JSON, but
-        they need exactly the same rate-limit and error handling as everything
-        else -- hence the shared _send below rather than a second copy of the
-        retry loop that would drift out of step with it.
-        """
+        """Send a pre-encoded multipart body (see upload.build_multipart)."""
         return self._send(method, _url(path, params), body, content_type)
 
     def _send(self, method, url, payload, content_type):
@@ -124,11 +116,7 @@ class Client:
         return self.get(f"/guilds/{guild_id}/channels")
 
     def send_message(self, channel_id, content, reply_to=None, files=None):
-        """Post a message, with attachments when `files` is non-empty.
-
-        `files` is what upload.load_files returns. With attachments the content
-        may legitimately be empty -- a picture is a message.
-        """
+        """Post a message, with attachments when `files` is non-empty."""
         payload = {"content": content or ""}
         if reply_to:
             # fail_if_not_exists=False degrades to a plain message rather than

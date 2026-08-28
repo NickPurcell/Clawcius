@@ -2,17 +2,8 @@
 
     python3 browser-cli/test_status_sock.py
 
-Written because Osmosis Jones pointed out, reviewing #88, that the service side
-of that change got 17 tests and the half that runs in the container got none —
-and this is the half that runs in the container.
-
-Unlike `test_browse.py` these are not dependency-free by necessity; they are
-dependency-free because nothing here needs a browser. The forwarder is stdlib
-sockets, so the interesting cases can be driven end to end against a real unix
-socket in a temp directory: bind a server, forward to it, assert bytes arrive.
-
-Same convention as `test_browse.py`: `npm test` runs `node --test`, so this is
-not wired into it. Run it by hand when touching `status-sock`.
+The forwarder is stdlib sockets, so it is driven end to end against a real
+unix socket in a temp directory.
 """
 
 import contextlib
@@ -44,9 +35,7 @@ SCRIPT = str(Path(__file__).with_name("status-sock"))
 def non_loopback_address():
     """An IPv4 address of this host that is not 127.0.0.0/8, or None.
 
-    Used to prove the bridge is NOT reachable off loopback. A test that only
-    inspects a string cannot tell a loopback bind from a wildcard one; actually
-    trying to connect from another local address can.
+    Used to prove the bridge is not reachable off loopback.
     """
     try:
         addr = socket.gethostbyname(socket.gethostname())
@@ -141,19 +130,8 @@ class ForwarderTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "/echo-path")
 
     def test_the_bridge_is_not_reachable_from_a_non_loopback_address(self):
-        """The real guard on the wildcard bind.
-
-        This container sits on `clawcius-internal` with other containers. If
-        `status-sock` bound 0.0.0.0 it would offer the whole status page — both
-        crews' boards and every transcript — to every one of them, which is the
-        one thing this tool must not do.
-
-        THE PREVIOUS VERSION OF THIS TEST WAS HOLLOW. It bound its *own* socket
-        to 127.0.0.1 and asserted on that socket's getsockname(), never invoking
-        `status-sock` at all, so it passed with `bind()` mutated to the
-        wildcard. Osmosis Jones demonstrated that with `sed`. This one drives
-        the real tool and probes it from a real non-loopback address, and has
-        been checked to go red under the same mutation.
+        """The bridge must not be reachable off loopback: a wildcard bind would
+        offer the whole status page to every container on the network.
         """
         addr = non_loopback_address()
         if addr is None:
@@ -173,10 +151,8 @@ class ForwarderTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         reported_host, reachability = result.stdout.split()
 
-        # Two independent assertions on the same property. The first catches a
-        # wildcard bind via the URL the tool publishes (which is now read back
-        # off the socket, not rebuilt from a literal); the second catches it by
-        # actually trying to reach the port from off-loopback.
+        # Two independent assertions on the same property: the URL the tool
+        # publishes, and an actual connect from off-loopback.
         self.assertEqual(
             reported_host, "127.0.0.1", "STATUS_URL must report a loopback bind"
         )
@@ -306,10 +282,8 @@ class ResolutionTest(unittest.TestCase):
             del os.environ["STATUS_SOCKET"]
 
     def test_state_directory_builds_the_default(self):
-        # STATE_DIRECTORY reaches the container by a longer route than it looks
-        # — systemd sets it for the waker, agent.ts spreads process.env into the
-        # session, container.ts forwards it through `docker exec --env-file`. It
-        # is present for an agent turn and absent from a plain `docker exec`.
+        # STATE_DIRECTORY is present for an agent turn and absent from a plain
+        # `docker exec`.
         os.environ.pop("STATUS_SOCKET", None)
         os.environ["STATE_DIRECTORY"] = "/var/lib/hamachi"
         try:
@@ -324,10 +298,7 @@ class ResolutionTest(unittest.TestCase):
 class GlobFallbackTest(unittest.TestCase):
     """The last resort, for the contexts STATE_DIRECTORY does not reach.
 
-    The real glob is over `/var/lib/*/run/status.sock`, which a test cannot
-    create, so `glob.glob` is patched. That is enough: what is worth pinning is
-    the decision logic — one match is used, several is a refusal rather than a
-    guess, none falls through to an error naming everywhere it looked.
+    `glob.glob` is patched: a test cannot create /var/lib/*/run/status.sock.
     """
 
     def setUp(self):

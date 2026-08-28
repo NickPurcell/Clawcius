@@ -6,89 +6,13 @@ browse — drive a headless Chromium from the command line, for the agent.
     browse text       https://example.com
     browse probe      https://example.com
 
-The point is the PNG. An agent can read an image file directly, so a screenshot
-on disk is legible to the thing that asked for it — this is output, not a
-debugging artefact. Clawcius #11 is the whole argument: `status/` was built end
-to end without anyone looking at it, and the one real defect was found by the
-operator sending a picture back.
+Every command reports the URL it finished on and the status it finished with.
+Every navigation and every host contacted is appended to a JSONL log; `--log`
+and BROWSE_LOG move it. Data on stdout, diagnostics on stderr.
 
-`text` is the second reason this exists. WebFetch returns the HTML the server
-sent; anything rendered by JavaScript afterwards is invisible to it. `text`
-returns what a person would actually see.
-
-`probe` is the third, and it is the one that stops a lie. A redirect to a login
-page renders beautifully and means nothing, so every command reports the URL it
-finished on and the status it finished with, and `probe` reports only that.
-
--- Dependencies ------------------------------------------------------------
-
-This tool breaks the rule discord-cli and gws-cli keep. Those are stdlib-only
-on purpose: they are bind-mounted read-only into the container and the mount is
-the install. That is not available here. Chromium is 400 MB of native binary
-and cannot be a Python file, so `browse` needs two things baked into the image:
-
-    pip3 install playwright==1.62.0
-    playwright install --with-deps chromium     # into PLAYWRIGHT_BROWSERS_PATH
-
-Both are in `docker/Dockerfile`. An edit to this file takes effect on the next
-mount; an edit to the Dockerfile takes effect on the next image rebuild, which
-is an operator action. If chromium is missing, this exits 2 and says so rather
-than failing somewhere further in.
-
--- The navigation log ------------------------------------------------------
-
-Every invocation, every navigation and every distinct host the page pulled from
-is appended to a JSONL file with a timestamp, line-buffered so a killed process
-still leaves the record. `--log` moves it; `BROWSE_LOG` moves it for good.
-
-This is not for debugging.
-
-The proxy stopped being a containment boundary on 2026-08-01, when egress went
-default-allow — `squid/squid.conf` §5 says so in as many words: it is now a
-kill switch for named destinations and nothing more. A browser widens what
-"the agent reached a page" can mean, because a page fetches whatever it likes,
-from wherever it likes, on the agent's behalf, and none of that appears in
-anything the agent typed. A screenshot of one URL can contact thirty hosts.
-That second-order reach is what this file records, and only a record kept at
-the time can supply it.
-
-The trade is the one the project already made for the host agent: no rollback,
-but a full record. So it is written always and in full, line-buffered, before
-the process can exit — a run killed mid-page still leaves the hosts it had
-already contacted on disk, and a log that cannot be opened refuses the run
-rather than browsing unlogged.
-
-BE PRECISE ABOUT WHAT THIS IS EVIDENCE OF. It is a complete record of what
-*this tool* contacted. It is NOT a record of what the agent reached, and it is
-not an enforcement boundary standing in for one:
-
-  * `--log` is an ordinary flag and BROWSE_LOG an ordinary variable, so the
-    party being recorded picks the destination. `--log /dev/null` browses
-    silently.
-  * the file lives in the workspace, which the agent owns read-write.
-  * `curl` exists. An agent that wanted no record would not reach for `browse`.
-
-What it gives you is a durable, fail-closed record of where a COOPERATING
-agent's browser went, which is worth the volume mount and is genuinely the
-evidence a later decision about egress would want. It is not proof that
-nothing else happened, and a decision not to narrow egress should not be taken
-on the belief that it is.
-
--- Why --no-sandbox is not a red flag here ---------------------------------
-
-See CHROMIUM_ARGS below. Short version: the container is the sandbox.
-
--- Design rules, following discord-cli -------------------------------------
-
-  * No mutable context. Every command names its URL explicitly.
-  * Output format follows the TTY: text for humans, JSON for pipes and agents.
-  * Data on stdout, diagnostics on stderr. `browse text URL > page.txt`
-    produces a file containing the page and nothing else — which is why `text`
-    and `html` do not switch themselves to JSON when stdout is not a terminal,
-    the way `screenshot` and `probe` do. See main().
-  * Exit codes are a contract (see below) and are not reassigned once released.
-  * One browser at a time, refused rather than queued. A prompt is a hang and
-    so is a queue.
+Exit codes: 0 ok, 1 the page would not load, 2 chromium or playwright missing
+or would not start, 3 bad arguments, 4 another browse holds the lock, 5 an
+unexpected exception in browse.
 """
 
 from __future__ import annotations
@@ -118,43 +42,18 @@ VALIDATION_ERROR = 3
 BUSY = 4             # another browse holds the single-browser lock
 INTERNAL_ERROR = 5   # a bug in browse: unexpected exception, with a traceback
 
-# 5 is its own code rather than being folded into BROWSER_ERROR, which is the
-# cheaper option and the wrong one. Every other code tells the caller something
-# true about the world it can act on; an unexpected exception tells it only
-# that this tool is broken, and retrying, changing the URL or rebuilding the
-# image will not help. Reusing 2 would have made *that* code lie instead, and
-# without this the default was worse again: an unhandled exception left a
-# traceback and exit 1, which the contract defines as "the page would not
-# load". The code easiest to reach by accident must not be the one that lies.
-
 # -- chromium flags ---------------------------------------------------------
 #
-# --no-sandbox is normally the flag you stop and argue about, and here it is
-# not one. Chromium's own sandbox needs user namespaces and seccomp filters
-# that gVisor does not offer a nested process, so with it on, chromium dies at
-# startup under runsc. What it would have bought is already bought, one layer
-# out and more thoroughly: this whole container is a gVisor sandbox on a
-# network with no gateway, so a compromised renderer escapes into a place that
-# was already assumed hostile. Turning it off here does not widen anything.
-# Leave it, and do not "fix" it by giving the container SYS_ADMIN.
-#
-# --disable-dev-shm-usage is not a tuning knob, it is required. /dev/shm is
-# 64 MB in this container (Docker's default) and chromium puts its renderer
-# shared memory there; without this flag it does not report a small tmpfs, it
-# crashes the tab with a blank page or ERR_FAILED. This flag moves that to
-# /tmp, which has room.
-#
-# --disable-gpu: there is no GPU and no X server. Without it chromium spends
-# startup time probing for both and logs the failures.
+# --no-sandbox: chromium's own sandbox needs user namespaces and seccomp
+# filters that gVisor does not give a nested process; the container is the
+# sandbox. --disable-dev-shm-usage: /dev/shm is 64 MB here and chromium
+# crashes the tab without it. --disable-gpu: there is no GPU and no X server.
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
 ]
 
-# Named viewports, because "does it work on a phone" is the question that has
-# never once been checked (Clawcius #11) and nobody should have to remember
-# that an iPhone 14 is 390 points wide.
 VIEWPORTS = {
     "phone": (390, 844),
     "tablet": (820, 1180),
@@ -162,29 +61,13 @@ VIEWPORTS = {
     "wide": (1920, 1080),
 }
 
-# The largest viewport either dimension may be asked for. Not a policy, an
-# allocation guard: a full-page shot allocates roughly width*height*4 bytes,
-# so a fat-fingered 100000 is an OOM in a 2 GB container rather than an error.
+# An allocation guard: a full-page shot allocates roughly width*height*4
+# bytes, so a fat-fingered 100000 is an OOM in a 2 GB container.
 MAX_VIEWPORT = 16384
 
-# How a failed request is described. Used only for the prose on stderr — every
-# problem is recorded in full either way, and the JSON ships `resource_type`
-# and makes no claim at all.
-#
-# The split is not "serious" versus "ignorable", and reading it that way was a
-# bug. It is: which of them can you SEE in the screenshot?
-#
-# A missing stylesheet or font is visible in the picture — unstyled text is
-# obviously unstyled. A failed data request is not, and that makes it the more
-# dangerous of the two for a tool whose whole purpose is a screenshot that can
-# be trusted. A dashboard whose /api/items returns 500 does not render the
-# finished page minus some telemetry; it renders a spinner, an empty table or
-# "Something went wrong", and it renders that perfectly.
-#
-# An analytics beacon and a single-page app's data fetch are the same
-# `resource_type` and cannot be told apart from the request alone, so no
-# attempt is made to. Both are reported as content, and what is said about
-# them is conditional, because that is the honest strength of the claim.
+# Which failed subresources change how the page looks, and which carry the
+# content it displays. Used only for the prose on stderr; the JSON ships
+# `resource_type` and makes no claim.
 RENDERING_TYPES = frozenset(
     {"document", "stylesheet", "image", "font", "script", "media"}
 )
@@ -239,12 +122,8 @@ def note(message):
 
 
 class Audit:
-    """Append-only JSONL. See the module header for why this is not optional.
-
-    Line-buffered and never batched: if this process is killed mid-page, the
-    hosts it had already contacted are on disk. A log flushed at exit would
-    lose exactly the runs worth auditing.
-    """
+    """Append-only JSONL, line-buffered so a process killed mid-page leaves
+    the hosts it had already contacted on disk."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -260,12 +139,8 @@ class Audit:
             )
 
     def event(self, name, /, **fields):
-        # `name` is positional-ONLY, and that slash is load-bearing. Callers
-        # pass arbitrary field names through **fields, and one of them is
-        # `kind`; without the slash, `event("subresource_problem", kind=...)`
-        # raises "got multiple values for argument 'kind'" from inside a
-        # Playwright event listener, which surfaces as a TypeError on the next
-        # unrelated page call. Found that way, so it is written down here.
+        # `name` is positional-only: callers pass arbitrary field names through
+        # **fields, and one of them is `kind`.
         record = dict(fields)
         # Framing last: the log's own fields are not overridable by a caller.
         record.update({"ts": now_iso(), "pid": os.getpid(), "event": name})
@@ -273,8 +148,7 @@ class Audit:
 
     def saw_host(self, url, kind="subresource"):
         """One line the first time each distinct host is contacted, then a
-        count. Every request would make the log unreadable and no more
-        complete: the set of hosts is the thing being audited."""
+        count."""
         try:
             parsed = urlparse(url)
         except ValueError:
@@ -294,82 +168,23 @@ class Audit:
 
 # -- process hygiene --------------------------------------------------------
 #
-# A leaked browser process is this project's favourite bug: OJ #9 was a
-# surviving child holding a session id for three days. Under a 2 GB container
-# cap a leaked chromium is not untidy, it is the next task failing to allocate.
-#
-# So: close in `finally`, and then check. Everything below is descendant-scoped
-# on purpose. A crew shares this container and this uid, so "kill every
-# chromium owned by uid 1000" would kill a colleague's browser mid-page.
-#
-# Measured on 2026-08-16, before any of this existed: every single invocation
-# left exactly two `chrome-headless` processes behind as ZOMBIES, reparented to
-# pid 1. Not a memory leak — a zombie holds no pages, and MemAvailable came
-# back every time — but a PID leak, and this container runs with
-# --pids-limit=512. Two per run is the tool becoming unusable after a couple of
-# hundred screenshots, in a way that would present as some unrelated fork
-# failing weeks later.
-#
-# The cause is structural. Chromium's browser process spawns helpers; when the
-# Playwright node driver exits, those helpers are orphaned and reparented to
-# pid 1. Whether anything ever reaps them THERE depends on how the container
-# was created, and this file cannot know which container it is running in.
-#
-# WHAT PID 1 IS DEPENDS ON THE CONTAINER, AND BOTH ANSWERS EXIST ON THIS HOST.
-# The image's CMD is `sleep infinity` (docker/Dockerfile), which never calls
-# wait(). A container started without --init has that at pid 1: nothing reaps,
-# and every orphan is a zombie for the life of the container. Since Clawcius
-# #86 `docker/run-container.sh` passes --init, so a container it CREATED has
-# Docker's tini at pid 1 instead, and tini does reap.
-#
-# Measured, not assumed. In `hamachi-agent` on 2026-08-18, recreated since #86:
-# /proc/1/comm is `docker-init` and the zombie count is 0. On 2026-08-17
-# `clawcius-agent` had not been recreated and still reported HostConfig.Init
-# null — a run flag applies at creation, so the script changing did not change
-# a container that already existed (#84). `ops/src/verify.ts` builds its
-# throwaway with a bare `docker run` and passes no --init at all.
-#
-#     cat /proc/1/comm      # `docker-init` or `sleep` — that is the answer,
-#                           # for THIS container, and no comment can be it
-#
-# So the paragraph above is history in one container and current in another.
-# Read the command, the way `docker/run-container.sh` asks you to after #106:
-# it prints the container's real HostConfig.Init rather than describing what
-# the script would have passed.
-#
-# The mechanism here is PR_SET_CHILD_SUBREAPER: it makes THIS process the
-# reparenting target for its orphaned descendants instead of pid 1, so they
-# become our children and we can wait() them. Verified supported under
-# gVisor/runsc. Without it a process simply cannot reap another process's
-# children, and no amount of care in `finally` would help.
-#
-# IT STAYS EVEN WHERE tini MAKES IT REDUNDANT. This is a decision, not an
-# oversight, and the reasons are in ascending order of how much they matter:
-#
-#   - it reaps SYNCHRONOUSLY, within the run, so `browse` can say what it
-#     reaped (the `reaped` and `leaked_children` events) and the log stays a
-#     complete account of the run. tini reaps silently and afterwards; nothing
-#     in the log would ever mention it.
-#   - it does not depend on a flag in a script in another directory surviving a
-#     future edit, nor on this container having been recreated since #86.
-#   - deleting it would make this tool's correctness a property of how its
-#     container happened to be created. That is precisely the property #86 and
-#     #106 spent their review rounds making visible instead of assumed, and
-#     re-importing it here to save sixty lines is the wrong trade.
-#
-# It costs one prctl and one WNOHANG loop, and it is correct in both worlds.
+# Chromium's helpers are orphaned when the Playwright driver exits. Everything
+# here is descendant-scoped: a crew shares this container and this uid, so
+# killing every chromium owned by the uid would kill a colleague's browser
+# mid-page. PR_SET_CHILD_SUBREAPER makes this process the reparenting target
+# for its orphaned descendants, so they can be wait()ed here whatever pid 1
+# does.
 
 PR_SET_CHILD_SUBREAPER = 36
 
 
 def become_subreaper():
-    """Adopt our own orphaned descendants so we can reap them. See above."""
+    """Adopt our own orphaned descendants so we can reap them."""
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         return libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
     except (OSError, AttributeError):
-        # Not fatal. Zombies accumulate as they did before, which is a slow
-        # problem, where refusing to run at all is an immediate one.
+        # Not fatal: zombies accumulate instead.
         return False
 
 
@@ -407,11 +222,8 @@ def descendants(root):
 def drain_zombies(deadline_s=2.0):
     """wait() every exited child until none is left.
 
-    Bounded, because chromium's helpers exit a beat after the browser does and
-    an immediate WNOHANG sweep would miss them, leaving exactly the zombies
-    this exists to prevent. ChildProcessError means there is nothing left to
-    wait for at all, which is the normal exit and returns at once — the
-    deadline is only ever spent while a child is genuinely still running.
+    Bounded: chromium's helpers exit a beat after the browser does, and an
+    immediate WNOHANG sweep would miss them.
     """
     reaped, end = [], time.monotonic() + deadline_s
     while True:
@@ -432,11 +244,8 @@ def drain_zombies(deadline_s=2.0):
 def reap(before, audit):
     """Leave no descendant of this run behind, alive or dead.
 
-    Loud about the live ones on purpose. A process that outlived close() is a
-    bug worth chasing, and one cleaned up silently is one nobody chases. The
-    zombies are noted in the log but not on stderr: they are expected, they are
-    the reason drain_zombies exists, and a warning on every successful run is a
-    warning nobody reads.
+    Survivors are killed and warned about on stderr; zombies are only noted in
+    the log.
     """
     reaped = drain_zombies()
     survivors = [p for p in descendants(os.getpid()) if p not in before]
@@ -456,22 +265,11 @@ def reap(before, audit):
 
 @contextlib.contextmanager
 def single_browser_lock():
-    """One browser per container, refused rather than queued.
-
-    Chromium's resident set is a large fraction of this container's 2 GB, so
-    two at once is not slow, it is an OOM kill somewhere unrelated. Refusing is
-    the honest failure: the caller learns immediately and can retry, where a
-    queue would look like a hang with no way to tell how long.
+    """One browser per container, refused rather than queued: two chromiums
+    at once is an OOM kill in a 2 GB container.
     """
-    # ACQUISITION ONLY inside this try. The `yield` is deliberately outside it.
-    #
-    # It used to be inside, and that made every OSError raised by the command
-    # body — which runs at the yield — come back out as "cannot take the
-    # browser lock", with a hint pointing at /tmp and exit 3 for "bad
-    # arguments". A screenshot to an unwritable path reported the lock as
-    # broken and sent the reader to the wrong file entirely. Both the pre-flight
-    # mkdir and playwright's own `page.screenshot(path=...)` write from Python
-    # and raise OSError, so this was the common case, not an exotic one.
+    # Acquisition only inside this try. The `yield` is outside it, so an
+    # OSError raised by the command body is not reported as a lock failure.
     fd = None
     acquired = False
     try:
@@ -499,13 +297,8 @@ def single_browser_lock():
             "set BROWSE_LOCK to a writable path.",
         )
     finally:
-        # Every way out of the block above that did NOT acquire closes the fd,
-        # and there are two of them. The BUSY path leaks without this: it
-        # raises BrowseError, which is not an OSError, so the handler above
-        # does not see it and the release below is never reached — measured at
-        # one fd per refused attempt. It holds no flock and the process is
-        # about to exit, so nothing breaks; it is still a close() before a
-        # raise, in a file whose comments take leaks this seriously.
+        # The BUSY path raises BrowseError, not OSError, so it reaches here with
+        # the fd open and no flock.
         if not acquired and fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
@@ -521,15 +314,8 @@ def single_browser_lock():
 def proxy_settings():
     """Chromium does not read http_proxy the way urllib does, so pass it.
 
-    gws-cli's header records the same class of bug from the other side:
-    httplib2 ignores the proxy environment and fails with "unable to find the
-    server" on a host where curl works. The agent container has no route out
-    except this proxy — DNS included — so getting this wrong does not degrade,
-    it fails totally and confusingly.
-
-    NO_PROXY matters as much. Squid denies 127.0.0.0/8 outright (squid.conf
-    §4), so a loopback page sent through the proxy is refused even though it is
-    served three inches away.
+    NO_PROXY too: Squid denies 127.0.0.0/8, so a loopback page sent through
+    the proxy is refused.
     """
     server = (
         os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -559,8 +345,7 @@ def chromium(audit):
         )
 
     # Before the launch, so every process the launch creates reparents to us
-    # rather than to pid 1 — which reaps or does not depending on how this
-    # container was created, and we do not check. See the process-hygiene block.
+    # rather than to pid 1.
     subreaper = become_subreaper()
     if not subreaper:
         audit.event("subreaper_unavailable")
@@ -613,16 +398,9 @@ class Load:
 
 
 def _record_problem(load, audit, url, reason, kind, resource_type=None):
-    """A blocked subresource must be visible in the output.
-
-    A page whose CSS was refused renders as unstyled text and looks like a bug
-    in the page. That is the failure mode worth spending code on: not the
-    screenshot that fails, the screenshot that succeeds and misleads.
-    """
-    # One entry per URL. A 404 stylesheet reports twice — once as the HTTP
-    # response and again as ERR_ABORTED when the browser gives up on it — and
-    # counting that as two broken resources overstates how broken the page is.
-    # First reason wins: the HTTP status says more than "aborted".
+    """A blocked subresource must be visible in the output."""
+    # One entry per URL: a 404 stylesheet reports twice, as the HTTP response
+    # and again as ERR_ABORTED. First reason wins.
     if any(p["url"] == url for p in load.problems):
         return
     entry = {"url": url, "reason": reason, "kind": kind,
@@ -640,11 +418,9 @@ def navigate(page, url, args, audit, load):
 
     page.on("framenavigated", on_navigated)
 
-    # Two different shapes of failure, and a page can produce either. A CONNECT
-    # that Squid refuses never becomes an HTTP response at all — it surfaces
-    # here as net::ERR_TUNNEL_CONNECTION_FAILED — while a plain-HTTP denial
-    # comes back as a 403 the browser is perfectly happy with. Catching only
-    # one of them would leave half of "the page is missing things" invisible.
+    # A CONNECT that Squid refuses never becomes an HTTP response (it surfaces
+    # as net::ERR_TUNNEL_CONNECTION_FAILED); a plain-HTTP denial comes back as
+    # a 403. Both listeners are needed.
     page.on(
         "requestfailed",
         lambda r: _record_problem(
@@ -656,12 +432,9 @@ def navigate(page, url, args, audit, load):
     def on_response(response):
         if response.status < 400:
             return
-        # Skip the MAIN document only. Its status is already reported as
-        # `status`, so recording it again would be noise — but `resource_type
-        # != "document"` was the wrong way to say that, because a sub-frame's
-        # navigation is a "document" too. It silently dropped a 403 served
-        # into an iframe, which is precisely the plain-HTTP denial this
-        # listener exists to catch. Ask which frame requested it instead.
+        # Skip the main document only; its status is already reported as
+        # `status`. A sub-frame's navigation is a "document" too, so ask which
+        # frame requested it.
         request = response.request
         if request.resource_type == "document" and request.frame == page.main_frame:
             return
@@ -734,18 +507,7 @@ def _marker(entry):
 def warn_about_problems(load, show_redirect=True):
     """Same information as the JSON, on stderr, for the text-mode caller.
 
-    SAY ONLY WHAT WAS CHECKED. An earlier version split these in two and had
-    the negative branch announce that "the rendering above should be complete"
-    whenever nothing visual had failed. That was worse than the warning
-    fatigue it was written to fix: it turned the single case this tool exists
-    to catch — the screenshot that succeeds and misleads — into the one where
-    the tool actively tells the reader to stop worrying. A warning an agent
-    learns to skip and a reassurance an agent learns to trust are the same
-    defect with the sign flipped.
-
-    So there is no all-clear here. Each group speaks only for itself, the
-    content group's claim is conditional because it has to be, and a failure
-    that fits neither group gets no interpretation at all.
+    Each group speaks only for itself; there is no all-clear.
     """
     if not load.problems:
         return
@@ -783,10 +545,8 @@ def parse_viewport(spec):
     if "x" in spec:
         width, _, height = spec.partition("x")
         if width.isdigit() and height.isdigit():
-            # Both bounds are real. `isdigit()` is true of "0", and a 0x0
-            # viewport is not a validation error deeper in, it is a playwright
-            # exception with a traceback; MAX_VIEWPORT stops a typo asking for
-            # a several-gigabyte bitmap.
+            # `isdigit()` is true of "0", and MAX_VIEWPORT stops a typo asking
+            # for a several-gigabyte bitmap.
             if 0 < int(width) <= MAX_VIEWPORT and 0 < int(height) <= MAX_VIEWPORT:
                 return spec, (int(width), int(height))
             raise BrowseError(
@@ -802,14 +562,7 @@ def parse_viewport(spec):
 
 
 def guard_write(path, action):
-    """Run a write, and name the file the caller asked for if it fails.
-
-    Both the pre-flight `mkdir` and playwright's own `page.screenshot(path=…)`
-    write from Python and raise OSError. Without this the caller gets a
-    traceback and exit 5 — "a bug in browse" — for what is plainly a bad
-    argument, and before the lock's scope was fixed it got something worse:
-    "cannot take the browser lock", pointing at /tmp.
-    """
+    """Run a write, and name the file the caller asked for if it fails."""
     try:
         return action()
     except OSError as exc:
@@ -834,9 +587,8 @@ def cmd_screenshot(args, audit):
             f"--scale {args.scale} is out of range", VALIDATION_ERROR,
             "use a factor between 0 and 4; 1 is normal, 2 is retina density.",
         )
-    # Deduplicated, keeping the order given. `--viewport phone --viewport
-    # phone` otherwise renders the page twice into the same filename, which
-    # costs a page load to produce a file it already had.
+    # Deduplicated, keeping the order given: a repeated viewport would render
+    # the page twice into the same filename.
     viewports = list(
         dict(parse_viewport(v) for v in (args.viewport or ["desktop"])).items()
     )
@@ -987,19 +739,8 @@ AUTO_JSON_COMMANDS = frozenset({"screenshot", "probe"})
 
 
 def wants_json(command, output_flag, stdout_isatty):
-    """Resolve `--output auto`.
-
-    `auto` means JSON into a pipe for the commands whose output is a RECORD,
-    and never for the two whose output is a DOCUMENT.
-
-    `browse text URL > page.txt` is the single most likely thing anyone will
-    type, and under a plain isatty() rule a redirect looks like a pipe, so it
-    wrote a JSON object with the page inside an escaped string field. That is
-    the opposite of what this tool is for, and of what the README promised.
-    The page is not a projection of a record that JSON would frame usefully; it
-    IS the payload, and there is nothing for the wrapper to add that stderr is
-    not already saying. `--output json` still gets the wrapper, with
-    `final_url`, `status` and `blocked` alongside the text.
+    """Resolve `--output auto`: JSON into a pipe for the commands whose output
+    is a record, never for the two whose output is a document.
     """
     if output_flag in ("json", "text"):
         return output_flag == "json"
@@ -1100,10 +841,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 130
     except Exception:
-        # The traceback still goes to stderr in full — this is a bug report and
-        # truncating it would only make the bug harder to fix. What changes is
-        # the exit code, so a caller branching on it is not told "the page
-        # would not load" about a fault in this tool.
+        # The traceback goes to stderr in full; the exit code says the fault is
+        # in this tool, not that the page would not load.
         traceback.print_exc()
         note(f"error: internal error in browse (exit {INTERNAL_ERROR}) — "
              "the traceback above is a bug, please report it.")
