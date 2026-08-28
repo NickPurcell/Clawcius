@@ -1,0 +1,9 @@
+[Unit]
+Description=Deploy %i when a crew writes a request file
+
+[Path]
+PathChanged=/var/lib/hamachi/run/deploy-%i
+Unit=deploy@%i.service
+
+[Install]
+WantedBy=multi-user.target

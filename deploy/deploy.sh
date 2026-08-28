@@ -1,0 +1,99 @@
+#!/bin/bash
+# deploy.sh <clawcius|oj> [ref]   — build the tip of origin/<ref> into a release, switch to it,
+# restart the services, check they came up, revert if they did not. Idempotent: an already
+# deployed sha is a no-op. Runs as root (deploy@.service, or Hamachi via sudo).
+set -euo pipefail
+
+REPO=${1:?usage: deploy.sh <clawcius|oj> [ref]}
+REF=${2:-main}
+ROOT=/srv/$REPO
+BUILD_USER=hamachi
+NODE_BIN=/home/npurcell/.local/share/node/bin
+KEEP=5
+case $REPO in
+  clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_CREWS="clawcius hamachi" ;;
+  oj)       UNITS="oj";                              CREWS="";                DM_CREWS="hamachi" ;;
+  *) echo "unknown repo $REPO" >&2; exit 2 ;;
+esac
+
+exec 9>/run/lock/deploy-$REPO.lock; flock -w 600 9
+log() { echo "deploy[$REPO]: $*"; }
+as_builder() { runuser -u $BUILD_USER -- env PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" "$@"; }
+
+# A request file from a crew names a ref; the timer deploys main.
+REQUEST=/var/lib/hamachi/run/deploy-$REPO
+if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$REQUEST"; fi
+
+as_builder git -C $ROOT/src fetch -q --prune origin
+SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+CURRENT=$(readlink -f $ROOT/current 2>/dev/null || true)
+if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then exit 0; fi
+log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
+
+# Build in a new directory; nothing that is running is touched until the switch.
+RELEASE=$ROOT/releases/$SHA
+if [ ! -d "$RELEASE" ]; then
+  as_builder git -C $ROOT/src worktree add -q --detach "$RELEASE" "$SHA"
+fi
+as_builder bash -c "cd '$RELEASE' && npm ci --silent && npm run build --silent"
+if [ $REPO = clawcius ]; then
+  as_builder bash -c "cd '$RELEASE/status' && npm ci --silent && npm run build --silent"
+fi
+
+switch_to() {   # switch_to <release dir>
+  ln -sfn "$1" $ROOT/current.new && mv -T $ROOT/current.new $ROOT/current
+  if [ $REPO = clawcius ]; then
+    install -m 0644 -o root -g root "$1"/systemd/*.service "$1"/systemd/*.timer "$1"/systemd/*.path /etc/systemd/system/ 2>/dev/null || true
+    install -d -m 0755 /usr/local/lib/clawcius
+    install -m 0755 -o root -g root "$1"/docker/netguard.sh /usr/local/lib/clawcius/netguard.sh
+  else
+    install -m 0644 -o root -g root "$1"/systemd/oj.service /etc/systemd/system/
+  fi
+  systemctl daemon-reload
+  for u in $UNITS; do systemctl restart $u.service; done
+}
+
+healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>
+  local sha=$1 deadline=$((SECONDS + 90))
+  while [ $SECONDS -lt $deadline ]; do
+    sleep 5; local ok=1
+    for u in $UNITS; do
+      [ "$(systemctl show -p ActiveState --value $u.service)" = active ] || ok=0
+      [ "$(systemctl show -p NRestarts --value $u.service)" = 0 ] || ok=0
+    done
+    for c in $CREWS; do
+      grep -q "\"commit\": *\"$sha\"" /var/lib/$c/waker-status.json 2>/dev/null || ok=0
+      [ $(( $(date +%s) - $(stat -c %Y /var/lib/$c/waker-status.json 2>/dev/null || echo 0) )) -lt 60 ] || ok=0
+    done
+    [ $ok = 1 ] && return 0
+  done
+  return 1
+}
+
+for u in $UNITS; do systemctl reset-failed $u.service 2>/dev/null || true; done
+switch_to "$RELEASE"
+if healthy "$SHA"; then
+  OK=true; REASON="live"
+else
+  OK=false; REASON="failed the health check"
+  if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
+    log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="failed the health check; reverted to ${CURRENT##*/}"
+  fi
+fi
+
+# Prune old releases; keep the current, the previous, and the newest few.
+ls -1dt $ROOT/releases/* | grep -v -e "$RELEASE" -e "${CURRENT:-none}" | tail -n +$KEEP | while read -r old; do
+  as_builder git -C $ROOT/src worktree remove --force "$old" || rm -rf "$old"
+done
+
+NOW=$(date +%s%3N)
+printf '{"repo":"%s","ref":"%s","sha":"%s","previous":"%s","ok":%s,"reason":"%s","at":%s}\n' \
+  "$REPO" "$REF" "$SHA" "${CURRENT##*/}" "$OK" "$REASON" "$NOW" > $ROOT/deploy-result.json
+SUBJECT="deploy $REPO ${SHA:0:8}: $REASON"
+BODY="$REPO at $REF (${SHA:0:8}) $REASON. $(date -u +%FT%TZ)"
+for crew in $DM_CREWS; do
+  DB=/var/lib/$crew/$crew.db; OWNER=$(stat -c %U $DB)
+  runuser -u "$OWNER" -- sqlite3 "$DB" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$SUBJECT', '$BODY', $NOW FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
+done
+log "$SUBJECT"
+[ $OK = true ]
