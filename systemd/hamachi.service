@@ -1,56 +1,35 @@
 [Unit]
-Description=Hamachi — second Clawcius-architecture sandbox, SimpleTestServer
-Documentation=file:/home/npurcell/clawcius/SETUP.md
-After=network-online.target docker.service hamachi-container.service
+Description=Hamachi — the operator's crew, running on the host
+Documentation=file:/srv/clawcius/current/SETUP.md
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service hamachi-container.service
-
-# Never give up on a crash loop. [Unit] directives: in [Service] systemd
-# ignores them and keeps the default of 5 starts per 10s.
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
 [Service]
 Type=notify
+# READY=1 is sent by systemd-notify from a child process.
 NotifyAccess=all
-
-# npurcell owns the checkout and the state directory and is in the docker group.
-User=npurcell
-Group=npurcell
-
-WorkingDirectory=/home/npurcell/clawcius
-EnvironmentFile=/home/npurcell/clawcius/.env.hamachi
-
-# Without this the process resolves agent-config.yaml relative to
-# WorkingDirectory and comes up as a second copy of the main instance.
-Environment=AGENT_CONFIG_PATH=/home/npurcell/clawcius/agent-config.hamachi.yaml
-
-# The Agent SDK spawns Claude Code invoking bare `node`; systemd's default PATH
-# excludes ~/.local, so without this every spawn dies with ENOENT.
+# Hamachi is the operator's hands: its own account, sudo without a password (deploy/hamachi.sudoers).
+User=hamachi
+Group=hamachi
+WorkingDirectory=/srv/clawcius/current
+EnvironmentFile=/etc/clawcius/hamachi.env
+Environment=AGENT_CONFIG_PATH=/srv/clawcius/current/agent-config.hamachi.yaml
+# systemd's default PATH excludes the node install; the SDK spawns a bare `node`.
 Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
-
 Restart=always
 RestartSec=5
+# The waker pings only while the Discord gateway is healthy.
 WatchdogSec=90
-
-# /var/lib/hamachi: this instance's own DB, workspaces and agent-home.
+# /var/lib/hamachi: the DB, workspaces and Claude login for this crew.
 StateDirectory=hamachi
 StateDirectoryMode=0750
-
-# MemoryHigh throttles first; MemoryMax is the hard stop. The agent itself is
-# bound by the container's --memory and --pids-limit; these cover the waker.
-# Each live session holds a standing `docker exec` client in this cgroup, so
-# TasksMax scales with sessions.maxConcurrent.
-MemoryHigh=2G
-MemoryMax=3G
-TasksMax=256
-
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-RemoveIPC=true
-
+# The agent sessions run in this cgroup now, not in a container.
+MemoryHigh=6G
+MemoryMax=8G
+TasksMax=2048
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hamachi

@@ -28,8 +28,10 @@ docker network inspect "$EGRESS" >/dev/null 2>&1 \
 
 # squid.conf is baked into the image, so rebuild on every up; the layer cache
 # makes this about a second when the config has not changed.
-cp ../squid/squid.conf ./squid.conf
-docker build -q -f Dockerfile.squid -t clawcius-squid:latest . >/dev/null
+# Build context in a temp dir: the deployed checkout is read-only to this user.
+CTX=$(mktemp -d); trap 'rm -rf "$CTX"' EXIT
+cp ../squid/squid.conf Dockerfile.squid "$CTX"/
+docker build -q -f "$CTX/Dockerfile.squid" -t clawcius-squid:latest "$CTX" >/dev/null
 
 # Squid straddles both networks: reachable from the agent, and the only thing
 # on that side with a route out.

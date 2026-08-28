@@ -1,6 +1,6 @@
 [Unit]
 Description=Clawcius — wakes a sandboxed Claude Code agent on Discord mentions
-Documentation=file:/home/npurcell/clawcius/SETUP.md
+Documentation=file:/srv/clawcius/current/SETUP.md
 After=network-online.target docker.service
 Wants=network-online.target
 # Every agent turn is a `docker exec`; without the daemon there is no agent.
@@ -21,8 +21,8 @@ NotifyAccess=all
 User=npurcell
 Group=npurcell
 
-WorkingDirectory=/home/npurcell/clawcius
-EnvironmentFile=/home/npurcell/clawcius/.env
+WorkingDirectory=/srv/clawcius/current
+EnvironmentFile=/etc/clawcius/clawcius.env
 
 # The Agent SDK spawns Claude Code invoking bare `node`; systemd's default PATH
 # excludes ~/.local, so without this every spawn dies with ENOENT.

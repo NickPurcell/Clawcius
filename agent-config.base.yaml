@@ -287,8 +287,8 @@ discord:
   bundleMaxWaitMs: 10000
 
 paths:
-  discordCli: /home/npurcell/clawcius/discord-cli/discord
-  skillsDir: /home/npurcell/clawcius/.claude
+  discordCli: /srv/clawcius/current/discord-cli/discord
+  skillsDir: /srv/clawcius/current/.claude
 
 clawsky:
   enabled: true

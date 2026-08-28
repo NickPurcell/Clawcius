@@ -8,7 +8,7 @@ Type=oneshot
 User=npurcell
 Group=npurcell
 SupplementaryGroups=docker
-ExecStart=/home/npurcell/clawcius/docker/snapshot.sh
+ExecStart=/srv/clawcius/current/docker/snapshot.sh
 
 # Type=oneshot has no start timeout by default, so a wedged `docker commit`
 # would leave a start job that never completes and never fails.
