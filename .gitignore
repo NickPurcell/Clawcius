@@ -1,40 +1,21 @@
-# No trailing slash, deliberately. `node_modules/` matches a directory only, so
-# a *symlink* named node_modules — which is how a git worktree borrows the real
-# tree's install — slips past it and is committed by the next `git add -A`.
-# NickPurcell/OJ shipped exactly that on 2026-08-16: the blob was an absolute
-# path on one machine, so once checked out there the link pointed at itself,
-# every `tsc` died with "too many levels of symbolic links", and `npm run build`
-# exited 216 printing NOTHING — which meant `npm test` never reached the runner
-# while a stale `dist/` went on answering green. Restore the slash and this
-# comes back. See Clawcius #60.
+# No trailing slash: `node_modules/` matches only a directory, and a worktree's
+# node_modules is a symlink.
 node_modules
 dist/
 
-# Written by scripts/build-info.mjs immediately before every `tsc`, in all three
-# packages. Untracked deliberately: a tracked copy would be rewritten by every
-# build, so every build would leave the tree dirty — and a dirty tree is what
-# stops `git pull` on the host (ops/src/build.ts), and would also make every
-# artefact report itself as built from a dirty tree, forever. Listed one path
-# per package rather than as a bare basename, so a fourth package is a visible
-# omission instead of a silent inclusion.
+# Written by scripts/build-info.mjs before every `tsc`; a tracked copy would
+# leave the tree dirty after every build. One path per package, so a new
+# package is a visible omission.
 src/build-info.ts
 status/src/build-info.ts
 ops/src/build-info.ts
 
-# Per-instance env files each carry a bot token. The negation keeps the
-# template tracked — without it, adding .env.* silently untracks the one file
-# here that is meant to be committed.
+# Per-instance env files carry a bot token; the negation keeps the template tracked.
 .env
 .env.*
 !.env.example
 
-# Private keys — the GitHub App PEM lives untracked at the repo root, and this
-# repository is public. `.env.*` above catches the env files; nothing caught a
-# `.pem` until 2026-08-23, when the App key was placed there and the only thing
-# standing between it and a public commit was nobody typing `git add -A`.
-#
-# Deliberately broad. A key that is ignored by a rule too wide costs nothing;
-# a key that is committed to a public repo cannot be un-published, only revoked.
+# Private keys. The repository is public, so the rule is broad on purpose.
 *.pem
 *.key
 *.p12
@@ -46,6 +27,5 @@ ops/src/build-info.ts
 *.db-wal
 *.db-shm
 
-# OAuth client secrets never belong in the tree; a copy of the one that used
-# to sit here lives in the migration backup on the VPS.
+# OAuth client secrets
 client_secret_*.json

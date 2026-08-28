@@ -4,77 +4,41 @@ Documentation=file:/home/npurcell/clawcius/status/README.md
 After=network-online.target
 Wants=network-online.target
 
-# Deliberately NOT After=docker.service or Requires= anything.
-#
-# The whole value of this unit is that it keeps working when the thing it is
-# watching does not. It reads transcripts off local disk; it never talks to the
-# agent containers, the Docker daemon, or Discord. A status page that goes down
-# with the stack it monitors is a status page you cannot use at the one moment
-# you need it.
-#
-# It does not depend on tailscaled either. `tailscale serve` is a separate,
-# host-level configuration that proxies INTO this service; if tailscaled is
-# down the page is simply unreachable, which is the intended failure mode.
+# Not ordered after docker or the agent units: this page reads transcripts off
+# local disk and has to keep working when the stack it watches is down.
 
-# Same reasoning as the bot unit: never give up on a crash loop. [Unit]
-# directives, not [Service] — systemd ignores them there with a warning and
-# leaves the default of 5 starts per 10s.
+# Never give up on a crash loop. [Unit] directives: in [Service] systemd
+# ignores them and keeps the default of 5 starts per 10s.
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
 [Service]
 Type=simple
 
-# Runs as npurcell for one reason: file permissions. Each instance's
-# agent-home is created by that instance's StateDirectory (mode 0750, owned by
-# npurcell), so npurcell can read the transcripts and a fresh service account
-# could not. This service needs no credentials of any kind — unlike the bot, it
-# does not authenticate to Anthropic, Discord or GitHub — so if you ever do
-# tighten the directory permissions, a dedicated read-only user with a
-# supplementary group is a straightforward change here.
+# npurcell owns each instance's agent-home (StateDirectory, mode 0750), so it
+# is the user that can read the transcripts. No credentials are involved.
 User=npurcell
 Group=npurcell
 
 WorkingDirectory=/home/npurcell/clawcius/status
 
-# No EnvironmentFile. There are no secrets in this service and adding one here
-# would be the first step towards there being some.
+# No EnvironmentFile: this service holds no secrets.
 Environment=STATUS_CONFIG_PATH=/home/npurcell/clawcius/status/status-config.yaml
 
-# Absolute path to node for the same reason the bot unit needs one: systemd
-# hands services a minimal PATH that excludes ~/.local, so a bare `node` here
-# dies with ENOENT at boot and works fine when you test it from a login shell.
+# systemd's default PATH excludes ~/.local, so a bare `node` dies with ENOENT.
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
 
 Restart=always
 RestartSec=5
 
-# ── Resource limits ───────────────────────────────────────────────────────
-# Measured, not guessed. On 2026-08-09, after indexing every session and all 14
-# subagent transcripts of the largest session on this host (~4.5 MB of JSONL in
-# total), RSS settled at 150 MB. Most of that is V8 heap that has not been
-# collected rather than retained index — the indexes themselves are tens of
-# kilobytes, since they hold offsets and per-line metadata and never message
-# bodies — but the ceiling has to cover what the process actually occupies, not
-# what it logically needs.
-#
-# So: 256M throttles, 512M is the hard stop. The first draft of this file said
-# 192M/384M, written before the measurement, and 192M would have sat under the
-# observed steady state — a throttle that engages during normal operation is
-# worse than no throttle, because it turns a working page into a slow one for
-# no reason.
-#
-# If this ever climbs materially above 150 MB in steady state, the cache
-# discipline in transcripts.ts has regressed. Look there before raising this.
+# Steady-state RSS is about 150 MB, mostly uncollected V8 heap; a throttle
+# below that would engage during normal operation. If it climbs, the cache
+# discipline in transcripts.ts has regressed.
 MemoryHigh=256M
 MemoryMax=512M
 TasksMax=32
 
-# ── Hardening ─────────────────────────────────────────────────────────────
-# Much stricter than the bot unit, and it can afford to be: this process reads
-# files and writes a socket. It runs no containers, spawns no children, and has
-# no bwrap or gVisor nesting to accommodate — the constraints documented in
-# clawcius.service simply do not apply here.
+# Strict: this process reads files and writes a socket, and spawns nothing.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -91,147 +55,45 @@ RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
 
-# NOT MemoryDenyWriteExecute. It belongs in a list like this one and it was in
-# it, until the unit was loaded for the first time on 2026-08-10 and the
-# service core-dumped on SIGTRAP in a restart loop — while a stale manual `node
-# dist/index.js` from the day before still held :8477, so `curl /healthz`
-# answered cheerfully and the crash looked like it was not happening.
-#
-# V8 compiles JavaScript at runtime and needs pages that are writable and then
-# executable. MemoryDenyWriteExecute forbids exactly that transition, so Node
-# cannot start under it at all — this is not tunable, it is what a JIT is.
-# The same applies to any JIT runtime, so do not add it to the waker units
-# either; they have never carried it, which is why they run.
+# No MemoryDenyWriteExecute: V8 needs writable-then-executable pages, and Node
+# cannot start under it.
 RemoveIPC=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# ProtectHome=read-only, not true: the working directory and the config live
-# under /home/npurcell. `true` makes /home an empty tmpfs and the unit fails to
-# start with a WorkingDirectory error that does not obviously say why.
+# read-only, not true: the working directory and the config are under /home.
 ProtectHome=read-only
 
-# ProtectSystem=strict makes the whole filesystem read-only, which suits a
-# service that never writes. The transcript roots still have to be readable, and
-# under strict they are — read access is unaffected — but naming them here is
-# what documents the actual data dependency of this unit.
-#
-# ADD A LINE HERE when you add an agent instance to status-config.yaml.
+# The roots this unit reads: one transcript root per instance in
+# status-config.yaml, plus the `oj:` block's state directory.
 ReadOnlyPaths=/var/lib/clawcius/agent-home
 ReadOnlyPaths=/var/lib/hamachi/agent-home
 ReadOnlyPaths=-/var/lib/oj
 
-# The Clawsky boards — each instance's CLAWCIUS_DB_PATH. This is where the
-# AGENTS are; without them the page can only list the directories under the
-# transcript roots, which is the bug in Clawcius #14. Opened readOnly, which
-# SQLite enforces; the waker owns these files and is writing to them live.
-#
-# `-` PREFIXED, and it is not optional. A path without it that does not exist
-# fails the namespace setup and the unit never starts — and with
-# StartLimitIntervalSec=0 and Restart=always above, it never stops trying
-# either. These name files that a DIFFERENT service creates: a board comes into
-# existence when that instance's waker first constructs its AgentRegistry, so
-# on a host where a waker has never run, or after a board is renamed, this
-# would take down the one service whose whole argument is that it keeps working
-# when the thing it watches does not. registry.ts has a carefully written
-# message for a board that is not there; without the dash, systemd refuses to
-# start the process before that branch can ever run.
+# The Clawsky boards, opened readOnly. `-` prefixed: a different service
+# creates these files, and without the dash a missing path fails namespace
+# setup and the unit retries forever.
 ReadOnlyPaths=-/var/lib/clawcius/clawcius.db
 ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
 
-# ── The agent-facing unix sockets ─────────────────────────────────────────
-#
-# THIS IS THE ONE THING THIS UNIT WRITES, and it is two socket files.
-#
-# The agent containers are on `clawcius-internal`, a docker network with no
-# gateway: measured from inside, 172.17.0.1:8477 and 172.31.250.1:8477 are both
-# "Network is unreachable", and squid is the only route out. So the page was
-# unreachable from the containers, which the operator wants fixed.
-#
-# It is fixed with a unix socket per instance, in the run directory that
-# docker/run-container.sh already bind-mounts read-write into each container,
-# and NOT by widening the bind address. Every loopback check above and in the
-# code is untouched; the set of TCP endpoints serving this page is exactly what
-# it was. The address filter below is likewise unchanged and still correct — it
-# governs AF_INET/AF_INET6, and AF_UNIX was already in
-# RestrictAddressFamilies because the process needs it regardless.
-#
-# ProtectSystem=strict is what makes these lines necessary: it makes the whole
-# filesystem read-only, so without them `listen()` on the socket path fails
-# with EROFS. THIS IS THE MOST LIKELY WAY FOR THE FEATURE TO SILENTLY NOT WORK,
-# because the failure is deliberately not fatal — the service still comes up
-# and serves on TCP, and only the agents notice. `curl --unix-socket` from the
-# host, or the `sockets` array in /healthz, is how you check.
-#
-# `-` PREFIXED, for the same reason spelled out at length for the boards above:
-# a path that does not exist fails the namespace setup, and with
-# StartLimitIntervalSec=0 and Restart=always this unit would then retry forever
-# without ever starting. These directories are created by
-# docker/run-container.sh's `mkdir -p "$STATE_RUN"` — a DIFFERENT component,
-# running at a different time — so on a host where no container has ever been
-# started they legitimately do not exist yet.
-#
-# The directory, not the socket path. systemd needs to make the directory
-# writable so the service can CREATE the socket in it; naming the socket file
-# would be naming something that does not exist until this service creates it.
-#
-# What this grants, stated plainly: this service can create, and delete,
-# anything in these two directories. Clawcius #65 records that nothing else has
-# used them since both spools retired — that is no longer true, and #65 should
-# be read alongside this line rather than acted on without it.
-#
-# ADD A LINE HERE when you add an agent instance with a `socketPath` in
-# status-config.yaml.
+# The only thing this unit writes: one unix socket per instance, in the run
+# directory run-container.sh bind-mounts into that container. Under
+# ProtectSystem=strict listen() would otherwise fail with EROFS, and that
+# failure is not fatal — the page still serves on TCP and only the agents
+# notice. The directory, not the socket path: the socket does not exist before
+# this service creates it. `-` prefixed: run-container.sh creates these
+# directories. One line per instance with a `socketPath` in status-config.yaml.
 ReadWritePaths=-/var/lib/clawcius/run
 ReadWritePaths=-/var/lib/hamachi/run
 
-# ── The boards are in WAL, and that interacts with the line above ─────────
-#
-# A reader of a WAL database needs the `-shm` wal-index. If one exists it can
-# be mapped read-only; if it does NOT, SQLite has to create it, which needs
-# write access to the directory the board is in — and ProtectSystem=strict
-# makes that directory read-only. (PrivateTmp=true above does give this service
-# a writable /tmp of its own. That does not help: the `-shm` has to be created
-# beside the board, not somewhere else.)
-#
-# While any writer holds a board open the `-shm` exists and the registry reads
-# fine. When the last one closes cleanly SQLite deletes `-wal` and `-shm`, and
-# the registry becomes unreadable until a writer is back. Measured on
-# 2026-08-16, not inferred.
-#
-# "Any writer", not "the waker": ops/src/host-mailbox.ts holds a Board open for
-# the ops daemon's lifetime on every instance with a `board:` block. Only the
-# two wakers hold them today, so a `systemctl stop clawcius` is what produces
-# this state as deployed — the page still reports the observation rather than
-# concluding which service is missing.
-#
-# That state is reported on the page. It is NOT worked around here, and
-# specifically there is no ReadWritePaths= line FOR A BOARD: a writable path to
-# the board would put a second writer next to the one that owns it. If this is
-# ever worth fixing, a dedicated read-only account with a supplementary group,
-# or taking the board out of WAL, are the two changes that do not make this
-# service a writer to a board — and both belong to the operator, not here.
-#
-# This unit used to say, in this spot, that it had no ReadWritePaths= at all
-# and that "the whole claim of this unit is that it writes nothing". That
-# sentence is no longer true, and the two ReadWritePaths= lines in "The
-# agent-facing unix sockets" section ABOVE are why. It is corrected rather than
-# deleted because the reasoning it carried still holds for the boards, which is
-# the case it was actually written about.
-#
-# Note that the transcript views are unaffected either way. They are read off
-# disk and never go through SQLite.
+# No ReadWritePaths= for a board: a WAL reader needs the `-shm` beside the
+# board and cannot create it under ProtectSystem=strict, so a board with no
+# writer open is unreadable while that is so. The page reports that state;
+# a writable path here would make this service a second writer.
 
-# ── Network ───────────────────────────────────────────────────────────────
-# This service accepts connections on loopback and makes none of its own. The
-# address filter enforces that at the kernel level, which is a second,
-# independent guarantee alongside the loopback bind in the code: even a
-# compromised process here cannot reach the internet or the LAN.
-#
-# `localhost` covers 127.0.0.0/8 and ::1. Nothing else is permitted — note that
-# this also means the service cannot reach the tailnet itself, which is correct:
-# traffic flows the other way, from `tailscale serve` into this socket.
+# Accepts loopback connections and makes none of its own; `localhost` covers
+# 127.0.0.0/8 and ::1. AF_UNIX is for the sockets above.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 IPAddressDeny=any
 IPAddressAllow=localhost

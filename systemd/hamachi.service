@@ -5,9 +5,8 @@ After=network-online.target docker.service hamachi-container.service
 Wants=network-online.target
 Requires=docker.service hamachi-container.service
 
-# Same reasoning as the main unit: never give up on a crash loop. These belong
-# in [Unit] — systemd ignores them in [Service] with a warning, leaving the
-# default of 5 starts per 10s before stopping the unit permanently.
+# Never give up on a crash loop. [Unit] directives: in [Service] systemd
+# ignores them and keeps the default of 5 starts per 10s.
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
@@ -15,31 +14,19 @@ StartLimitBurst=0
 Type=notify
 NotifyAccess=all
 
-# Runs as npurcell for the same load-bearing reason as the main instance: the
-# agent authenticates with this user's OAuth login, and those credentials live
-# in this user's home. A dedicated service account would have no login and
-# every turn would fail on auth.
-#
-# Note both instances therefore share one credential. A fresh process reads it
-# correctly, which is what the respawn-on-stale-token path relies on —
-# `deliver`'s `onNeedsRespawn` in src/daemon.ts, which moved out of src/index.ts
-# in Clawcius #131; but a re-login on the host is still a single point of
-# failure for both.
+# npurcell owns the checkout and the state directory and is in the docker group.
 User=npurcell
 Group=npurcell
 
 WorkingDirectory=/home/npurcell/clawcius
 EnvironmentFile=/home/npurcell/clawcius/.env.hamachi
 
-# Selects this instance's behaviour. Without it the process would resolve
-# agent-config.yaml relative to WorkingDirectory and quietly come up as a
-# second copy of the main deployment — same container name, same workspaces,
-# same channel. This one line is what makes the two instances distinct.
+# Without this the process resolves agent-config.yaml relative to
+# WorkingDirectory and comes up as a second copy of the main instance.
 Environment=AGENT_CONFIG_PATH=/home/npurcell/clawcius/agent-config.hamachi.yaml
 
-# The Agent SDK spawns Claude Code invoking bare `node`, and systemd hands
-# services a minimal PATH that excludes ~/.local — without this the bot starts
-# and every agent spawn dies with ENOENT.
+# The Agent SDK spawns Claude Code invoking bare `node`; systemd's default PATH
+# excludes ~/.local, so without this every spawn dies with ENOENT.
 Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
@@ -48,35 +35,14 @@ Restart=always
 RestartSec=5
 WatchdogSec=90
 
-# Creates and chowns /var/lib/hamachi. Separate from the main instance's state
-# directory: this holds its own SQLite database — registry, mail and armed
-# conditions — its own per-channel workspaces, and its own agent-home.
-#
-# It held a wake spool at run/wake too, which is what this comment said until
-# 2026-08-16. The agent asked to be woken by dropping a JSON file there; it now
-# calls `remindMe`, a tool the waker builds per session. The directory is left
-# on disk and is inert, and `<stateDir>/run` is still the one part of this tree
-# bind-mounted read-write into the container.
+# /var/lib/hamachi: this instance's own DB, workspaces and agent-home.
 StateDirectory=hamachi
 StateDirectoryMode=0750
 
-# Below the main instance, but no longer starved: the old 600M/900M ceiling was
-# rationing a 3.4 GB VM the instance shared with everything else. On the 12 GB
-# VPS the ceiling is for stopping a runaway.
-#
-# These are not the primary session bound. The agent runs in `hamachi-agent`, so
-# that container's --memory (3g) and --pids-limit (512) give first.
-#
-# They are not independent of it either. Each live session holds a standing
-# host-side `docker exec` client in THIS cgroup, plus a per-session SDK message
-# stream and in-process MCP mail servers in the bot's heap, so both ceilings
-# scale with sessions.maxConcurrent — just not dominantly.
-#
-# That is worth more attention here than on instance 1: this instance went 1 -> 10
-# on 2026-08-20, the largest jump of the two, against the smaller TasksMax of the
-# two units. Neither unit was resized. This is NOT a claim that 256 is now too
-# small — nobody has measured a `docker exec` client's threads or RSS — it is a
-# note that TasksMax is the thing to measure first if this unit starts refusing.
+# MemoryHigh throttles first; MemoryMax is the hard stop. The agent itself is
+# bound by the container's --memory and --pids-limit; these cover the waker.
+# Each live session holds a standing `docker exec` client in this cgroup, so
+# TasksMax scales with sessions.maxConcurrent.
 MemoryHigh=2G
 MemoryMax=3G
 TasksMax=256
