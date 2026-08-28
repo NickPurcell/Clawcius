@@ -38,8 +38,16 @@ export function isInstallationIdValid(id: string | undefined): boolean {
   return id === undefined || id === '' || /^\d+$/.test(id);
 }
 
-const INVISIBLE = /[^\S ]|[\u0000-\u001F\u007F\p{Cf}]/u;
-const INVISIBLE_OR_SPACE = /[\s\u0000-\u001F\u007F\p{Cf}]/u;
+/** Anything an HTTP header or a JWT claim cannot carry as typed. */
+const NOT_PRINTABLE_ASCII = /[^\x21-\x7e]/;
+
+/** Whitespace other than a plain space, a control character, or a format character such as U+200B. */
+const INVISIBLE_IN_PATH = /[^\S ]|\p{Cc}|\p{Cf}/u;
+
+/** 1-based position of the first character `stray` matches, or 0 when none does. Counted by codepoint. */
+function strayAt(value: string, stray: RegExp): number {
+  return [...value].findIndex((ch) => stray.test(ch)) + 1;
+}
 
 type Minted = { token: string; expiresAtMs: number };
 
@@ -132,103 +140,12 @@ export function staticTokenProvider(token: string): TokenProvider {
   return async () => token;
 }
 
-/** What a given character will actually cause. Worst last. */
-type Outcome = 'tolerated' | 'rejected' | 'throws';
-
-/** Names for the characters that actually arrive, so the operator does not have to look up a codepoint to find out what to delete. */
-const CHARACTER_NAMES: Record<number, string> = {
-  0x0000: '(a NUL)',
-  0x0009: '(a tab)',
-  0x000a: '(a newline)',
-  0x000d: '(a carriage return, as a Windows line ending leaves)',
-  0x0020: '(a space)',
-  0x00a0: '(a non-breaking space)',
-  0x00ad: '(a soft hyphen)',
-  0x200b: '(a zero-width space, which web pages insert into long identifiers)',
-  0x200c: '(a zero-width non-joiner)',
-  0x200d: '(a zero-width joiner)',
-  0x2060: '(a word joiner)',
-  0xfeff: '(a byte-order mark, as a UTF-8 BOM leaves at the front of a file)',
-  0x2018: "(a curly left single quote, as a document substitutes for ')",
-  0x2019: "(a curly right single quote, as a document substitutes for ')",
-  0x201c: '(a curly left double quote, as a document substitutes for ")',
-  0x201d: '(a curly right double quote, as a document substitutes for ")',
-  0x2013: '(an en dash, as a document substitutes for -)',
-  0x2014: '(an em dash, as a document substitutes for --)',
-  0x2026: '(an ellipsis, as a document substitutes for ...)',
-};
-
-/** Names the worst invisible or non-ASCII character in a token and what the header layer will do with it, or null when the token is clean. */
+/** Names the position of the first character a token cannot contain, or null when it is clean. Never quotes the token. */
 export function describeTokenShape(token: string): string | null {
-  if (!token) return null;
-
-  const chars = [...token];
-  // The maximal suffix of characters the header layer trims. Only these four;
-  // U+00A0 is not HTTP whitespace and is not trimmed.
-  let trailingFrom = chars.length;
-  while (trailingFrom > 0 && /[\t\n\r ]/.test(chars[trailingFrom - 1]!)) trailingFrom--;
-
-  const hits = chars
-    .map((ch, i) => ({ ch, i, code: ch.codePointAt(0)! }))
-    // Anything above U+00FF is rejected by the header layer too, so it is a hit alongside INVISIBLE_OR_SPACE.
-    .filter(({ ch, code }) => INVISIBLE_OR_SPACE.test(ch) || code > 0xff)
-    .map((hit) => {
-      const trailing = hit.i >= trailingFrom;
-      const outcome: Outcome =
-        hit.code > 0xff ? 'throws'
-        : // NUL is never trimmed -- it is not in the [\t\n\r ] run undici strips --
-          // and is rejected wherever it sits, so it gets no trailing exemption.
-          hit.code === 0x00 ? 'throws'
-        : hit.code === 0x0a || hit.code === 0x0d ? (trailing ? 'tolerated' : 'throws')
-        : trailing ? 'tolerated'
-        : 'rejected';
-      return { ...hit, outcome };
-    });
-  if (hits.length === 0) return null;
-
-  // Name the character responsible for the WORST outcome, not the first one
-  // found: a token with a trailing newline and an embedded zero-width space has
-  // one problem, and it is not the newline.
-  const rank: Record<Outcome, number> = { tolerated: 0, rejected: 1, throws: 2 };
-  const worst = hits.reduce((a, b) => (rank[b.outcome] > rank[a.outcome] ? b : a));
-
-  const hex = `U+${worst.code.toString(16).toUpperCase().padStart(4, '0')}`;
-  const name = CHARACTER_NAMES[worst.code];
-  const named = name ? `${hex} ${name}` : hex;
-  // 1-based, with the length beside it, so "position 40 of 40" reads as "at the
-  // end" without the operator counting anything.
-  const where = `position ${worst.i + 1} of ${chars.length}`;
-
-  const sameOutcome = hits.filter((h) => h.outcome === worst.outcome).length;
-  const rest = sameOutcome > 1 ? ` ${sameOutcome} characters in the value are of this kind.` : '';
-
-  const cannotBeSent =
-    worst.code > 0xff
-      ? 'A character above U+00FF cannot go into an HTTP header at all.'
-      : 'An HTTP header value cannot contain a newline, a carriage return or a ' +
-        'NUL at any position.';
-
-  const symptom: Record<Outcome, string> = {
-    tolerated:
-      'Trailing whitespace is trimmed from the header before the request is sent, ' +
-      'so this is NOT causing a failure and removing it will not fix one — it is ' +
-      'reported only so that it can be ruled out.',
-    rejected:
-      'The header is still built and sent, so wherever this token is the credential ' +
-      'GitHub answers 401, and the failure is indistinguishable from a revoked or ' +
-      'mistyped token.',
-    throws:
-      `${cannotBeSent} Wherever this ` +
-      'token is the credential for a request from THIS process, the request throws ' +
-      'before anything is sent — so it surfaces as GitHub being unreachable rather ' +
-      'than as an authentication problem, and a watch polling with it fails every ' +
-      'time and is disarmed once it has used up its retries.',
-  };
-
-  return (
-    `GITHUB_TOKEN contains ${named} at ${where}.${rest} ${symptom[worst.outcome]} ` +
-    'The value is being used unchanged — this is a diagnosis, not a refusal.'
-  );
+  const at = strayAt(token, NOT_PRINTABLE_ASCII);
+  if (at === 0) return null;
+  const kind = /\s/.test([...token][at - 1]!) ? 'whitespace' : 'a non-printable or non-ASCII character';
+  return `GITHUB_TOKEN has ${kind} at position ${at} of ${[...token].length}; it is used unchanged.`;
 }
 
 /** Whether the App configuration is usable, with the warning to print when it is not. */
@@ -260,25 +177,12 @@ export function checkAppConfig(
     );
   }
 
-  // The app id is sent as the JWT `iss`, so its shape matters too.
-  if (input.appId && INVISIBLE_OR_SPACE.test(input.appId)) {
-    faults.push(
-      'GITHUB_APP_ID contains an invisible character — whitespace, a control character, ' +
-        'or a zero-width one such as U+200B, which a web UI inserts into long ' +
-        'identifiers and no editor shows you. It is sent as the JWT `iss`, so GitHub ' +
-        'answers 401 at the first mint rather than here',
-    );
-  }
+  const idStray = strayAt(input.appId, NOT_PRINTABLE_ASCII);
+  if (idStray > 0) faults.push(`GITHUB_APP_ID has a stray character at position ${idStray}`);
 
-  // Spaces are legal in a path, so this is the narrower test of the two. A
-  // trailing \r would otherwise surface as ENOENT below, which is true but
-  // sends the operator to stare at a path that looks correct.
-  if (input.privateKeyPath && INVISIBLE.test(input.privateKeyPath)) {
-    faults.push(
-      'GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character — whitespace other ' +
-        'than a plain space, a control character, or a zero-width one. Nothing in ' +
-        'the value itself shows it',
-    );
+  const pathStray = strayAt(input.privateKeyPath, INVISIBLE_IN_PATH);
+  if (pathStray > 0) {
+    faults.push(`GITHUB_APP_PRIVATE_KEY_PATH has a stray character at position ${pathStray}`);
   }
 
   if (!isInstallationIdValid(input.installationId)) {
@@ -288,7 +192,7 @@ export function checkAppConfig(
     );
   }
 
-  if (input.privateKeyPath && !INVISIBLE.test(input.privateKeyPath)) {
+  if (input.privateKeyPath && pathStray === 0) {
     try {
       access(input.privateKeyPath);
     } catch (error) {
