@@ -18,7 +18,7 @@ import type {
   ScheduleSeen,
   ScheduleSpec,
 } from './armed.js';
-import { isTimezone, parseCron, planNextFire, zonedStamp } from './schedule.js';
+import { parseCron, planNextFire, zonedStamp } from './schedule.js';
 import type { AgentRegistry } from './store.js';
 import { alsoIn, stamp } from './armed-util.js';
 
@@ -343,40 +343,8 @@ export class ArmedWaker {
     const seen = condition.seen as ScheduleSeen | null;
     const now = Date.now();
 
-    const disarmUnreadable = (reason: string): void => {
-      this.#options.store.disarm(condition.id);
-      this.#deliver(
-        condition,
-        `Schedule ${condition.id} DISARMED — this build cannot read it`,
-        [
-          `The schedule you armed on ${stamp(condition.armedAt)} cannot be read by the process ` +
-            `that fires it: ${reason}.`,
-          '',
-          'It is disarmed rather than left in the table, because a schedule that throws on ' +
-            'every tick is a schedule that will never fire and would look like one that simply ' +
-            'has nothing to say — the failure would be in the journal and nowhere you can see. ' +
-            'Arm it again once the cause is fixed; nothing else about it was lost.',
-          '',
-          'Your note on it was:',
-          '',
-          spec.note,
-        ].join('\n'),
-      );
-    };
-
     const parsed = parseCron(spec.cron);
-    if (!parsed.ok) {
-      disarmUnreadable(`its expression \`${spec.cron}\` — ${parsed.error}`);
-      return;
-    }
-    if (!isTimezone(spec.timezone)) {
-      disarmUnreadable(
-        `its timezone "${spec.timezone}", which this process cannot resolve. That is a property ` +
-          'of the build rather than of the schedule — the zone was valid when the row was armed, ' +
-          'and an ICU downgrade is the usual reason it stops being',
-      );
-      return;
-    }
+    if (!parsed.ok) throw new Error(`schedule ${condition.id}: ${parsed.error}`);
 
     const plan = planNextFire(parsed.fields, spec.timezone, spec.everyN, condition.dueAt, now);
     const { subject, body } = composeScheduleMail(condition, now, plan);
@@ -526,8 +494,7 @@ export class ArmedWaker {
     if (owner.status !== 'live') {
       log(
         `${condition.owner} is dead — its ${condition.kind} was delivered to the inbox and will ` +
-          'NOT wake it. Mail does not resurrect (mail-wake.ts); CLAWSKY.md says a wake should. ' +
-          'It keeps, and whoever resurrects the agent hands it over as the first turn.',
+          'not wake it; mail does not resurrect',
       );
       return;
     }

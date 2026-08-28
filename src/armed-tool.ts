@@ -70,19 +70,14 @@ function relative(ms: number): string {
   return ms >= 0 ? `in ${count}` : `${count} ago`;
 }
 
-/** The refusal for a pull request this agent already watches. `during` marks a watch that appeared while this call was in flight. */
-function alreadyWatching(existing: ArmedCondition, during = false) {
+/** The refusal for a pull request this agent already watches. */
+function alreadyWatching(existing: ArmedCondition) {
   const spec = existing.spec as PrWatchSpec;
   return refuse(
     `Not armed — you are already watching ${spec.repo}#${spec.pr}: that is watch ` +
       `${existing.id}, armed ${stamp(existing.armedAt)}, on ${spec.on.join(', ')}. A second watch would ` +
       'mail you every event on that pull request twice until it merges or closes. Nothing ' +
-      `was written. If you want different terms, disarm(${existing.id}) and arm again; ` +
-      'listArmed() shows the rest.' +
-      (during
-        ? ' (That watch was armed while this call was fetching the pull request, so it was ' +
-          'not there when you asked — something else in this session armed it.)'
-        : ''),
+      `was written. If you want different terms, disarm(${existing.id}) and arm again.`,
   );
 }
 
@@ -474,8 +469,8 @@ export function buildArmedTools(
         return refuse(
           'NOT ARMED — the waker process has no GitHub token, so a watch armed now could ' +
             'never fire. Your container having GITHUB_TOKEN says nothing about the waker: it ' +
-            'is a different process. Set GITHUB_TOKEN in the EnvironmentFile named by ' +
-            'clawcius.service or hamachi.service and restart the unit. Nothing was armed.',
+            "is a different process. Set GITHUB_TOKEN in the crew's waker service and " +
+            'restart it. Nothing was armed.',
         );
       }
 
@@ -499,9 +494,6 @@ export function buildArmedTools(
       if (events.length === 0) {
         return refuse(`Not armed — \`on\` must contain some of: ${WATCH_EVENTS.join(', ')}.`);
       }
-
-      const existing = options.store.findPrWatch(agentId, target, number);
-      if (existing) return alreadyWatching(existing);
 
       let seen: PrWatchSeen;
       let title: string;
@@ -532,9 +524,9 @@ export function buildArmedTools(
         );
       }
 
-      // ── AND AGAIN, WITH NOTHING BETWEEN THIS AND THE INSERT ─────────────
-      const raced = options.store.findPrWatch(agentId, target, number);
-      if (raced) return alreadyWatching(raced, true);
+      // Checked after the await, with nothing between this and the insert: a second call can have armed it meanwhile.
+      const existing = options.store.findPrWatch(agentId, target, number);
+      if (existing) return alreadyWatching(existing);
 
       const armed = options.store.arm(
         agentId,
@@ -578,9 +570,7 @@ export function buildArmedTools(
         return refuse(`Not disarmed — "${String(id)}" is not a condition id. See listArmed().`);
       }
 
-      // `agentId` is the closure's, and it is the whole of the check. The
-      // store does the comparison against the stored owner in the statement
-      // that writes; this reads its answer and says it out loud.
+      // The store compares against the stored owner in the statement that writes; `agentId` is the closure's.
       const outcome = options.store.disarmFor(agentId, target);
       if (outcome.disarmed) {
         return ok(
@@ -588,24 +578,9 @@ export function buildArmedTools(
             'It will not fire. The row is kept, inactive, as the record that it existed.',
         );
       }
-      if (outcome.reason === 'not-yours') {
-        return refuse(
-          `NOT DISARMED — condition ${target} belongs to ${outcome.owner}, not to you. An ` +
-            'agent can only withdraw what it armed itself; this is enforced against the ' +
-            'stored owner, not by asking. If it needs stopping, mail ' +
-            `${outcome.owner} and ask it to disarm ${target}. listArmed() shows yours.`,
-        );
-      }
-      if (outcome.reason === 'already-inactive') {
-        return refuse(
-          `Not disarmed — condition ${target} has already ended (${outcome.condition.kind}, ${summarise(outcome.condition)}` +
-            `${outcome.condition.firedAt ? `, at ${stamp(outcome.condition.firedAt)}` : ''}). ` +
-            'It was firing nothing to begin with.',
-        );
-      }
       return refuse(
-        `Not disarmed — there is no condition ${target}. If you expected one, listArmed() ` +
-          'shows what you have and what has ended in the last day.',
+        `Not disarmed — there is no armed condition ${target} of yours. listArmed() shows ` +
+          'what you have; a colleague\'s condition can only be disarmed by the colleague.',
       );
     },
     { alwaysLoad: true },

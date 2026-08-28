@@ -105,7 +105,7 @@ export class TokenFileRefresher {
       const token = await this.#opts.provider();
       writeSecretFile(tokenFilePath(this.#opts.dir), token);
       writeCurlConfig(this.#opts.dir, token);
-      // A caching provider hands back the same token until it has to mint, so the age that matters is the token's, not the write's.
+      // A caching provider hands back the same token for most of its life, so the age that matters is the token's, not the write's.
       if (token !== this.#token) {
         this.#token = token;
         this.#freshAt = this.#now();

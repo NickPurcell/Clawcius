@@ -886,43 +886,8 @@ test('a schedule belongs to one agent, and a crewmate can neither see nor stop i
   assert.doesNotMatch(said(await theirs.listArmed.handler({}, {})), /mine alone/);
   const refused = await theirs.disarm.handler({ id: armed.id }, {});
   assert.equal(refused.isError, true);
-  assert.match(said(refused), /belongs to hamachi-engineer1/);
   assert.equal(store.listFor('hamachi-engineer1').length, 1, 'and it is still armed afterwards');
   registry.close();
-});
-
-test('a schedule this build cannot read is disarmed and says so — expression OR timezone', () => {
-  // Both halves of the spec.
-  for (const [label, spec] of [
-    ['expression', { cron: '0 9 * * * L', timezone: LA }],
-    ['timezone', { cron: '0 9 * * 1', timezone: 'Mars/Olympus_Mons' }],
-  ]) {
-    const { registry, mail, store } = board();
-    const due = Date.now() - 1000;
-    store.arm(
-      'hamachi-engineer1',
-      'schedule',
-      due,
-      { note: 'from the future', ...spec, everyN: 1, anchorAt: due },
-      { lastFiredAt: null, fires: 0, missed: 0 },
-    );
-
-    const loop = waker(registry, mail, store);
-    loop.tick();
-    loop.tick();
-    loop.tick();
-
-    const delivered = mail.unread('hamachi-engineer1');
-    assert.equal(delivered.length, 1, `${label}: told once, not once per tick`);
-    assert.match(delivered[0].subject, /DISARMED/, label);
-    assert.match(delivered[0].body, /from the future/, `${label}: the note comes back with it`);
-    assert.equal(
-      store.listFor('hamachi-engineer1').length,
-      0,
-      `${label}: disarmed rather than left throwing every tick`,
-    );
-    registry.close();
-  }
 });
 
 // ── everything an agent is shown is PT, and says so ─────────────────────────
