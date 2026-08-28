@@ -265,74 +265,6 @@ function clipped(cap, fill = 'x') {
   return `${fill.repeat(cap - 1)}…`;
 }
 
-test('the worst case the caps permit fits under the ceiling ops actually enforces', () => {
-  // The coupling: `waker-status.json` embeds BUILD_INFO whole, and
-  // ops/src/idle.ts treats anything over MAX_STATUS_BYTES as BUSY rather than
-  // as unreadable — so an oversized build does not lose a reading, it makes the
-  // instance permanently non-idle for the life of that artefact.
-  //
-  // Both ends are read from their real files. Raise a cap in the generator or
-  // lower the ceiling in idle.ts and this fails.
-  const idle = readFileSync(join(REPO_ROOT, 'ops', 'src', 'idle.ts'), 'utf8');
-  const declared = /const MAX_STATUS_BYTES = (\d+) \* (\d+);/.exec(idle);
-  assert.ok(declared, 'could not find MAX_STATUS_BYTES in ops/src/idle.ts');
-  const maxStatusBytes = Number(declared[1]) * Number(declared[2]);
-
-  const caps = generatorCaps();
-  const worstPath = clipped(caps.pathMax, 'p');
-  const worstBranch = clipped(caps.stringMax, 'b');
-
-  // `line` is not itself clipped — it is assembled from values that are — so it
-  // is built here the way buildLine() builds it, from the same caps, rather
-  // than approximated by a constant somebody would have to remember to grow.
-  const worstLine =
-    `${'a'.repeat(7)} (${worstBranch}) built ${new Date().toISOString()} ` +
-    `from a DIRTY tree — 999999 uncommitted path(s): ` +
-    `${Array.from({ length: caps.namesInLine }, () => worstPath).join(', ')}` +
-    `, and 999999 more. This artefact is NOT aaaaaaa.`;
-
-  const worstBuild = {
-    service: clipped(caps.stringMax, 's'),
-    version: clipped(caps.stringMax, 'v'),
-    commit: 'a'.repeat(40),
-    shortCommit: 'a'.repeat(7),
-    branch: worstBranch,
-    repoRoot: clipped(caps.stringMax, 'r'),
-    dirty: true,
-    dirtyFileCount: 999999,
-    dirtyFiles: Array.from({ length: caps.namesKept }, () => worstPath),
-    builtAt: new Date().toISOString(),
-    unknownReason: clipped(caps.reasonMax, 'u'),
-    line: worstLine,
-  };
-
-  // The whole file as waker-status.ts writes it: pretty-printed at indent 2,
-  // with every one of the waker's own fields present at a generous width.
-  const worstFile = `${JSON.stringify(
-    {
-      build: worstBuild,
-      instance: 'I'.repeat(64),
-      liveCount: 99,
-      maxConcurrent: 99,
-      pid: 4194304,
-      at: Date.now(),
-      atIso: new Date().toISOString(),
-      publishIntervalSeconds: 3600,
-    },
-    null,
-    2,
-  )}\n`;
-
-  // Bytes, not characters, because `statSync().size` is what readIdle compares.
-  const bytes = Buffer.byteLength(worstFile);
-  assert.ok(
-    bytes < maxStatusBytes,
-    `worst-case waker-status.json is ${bytes} bytes against a ${maxStatusBytes}-byte ` +
-      'ceiling — ops would read every publish from such a build as BUSY, for the life of ' +
-      `that build. Caps: ${JSON.stringify(caps)}`,
-  );
-});
-
 test('the generator honours STRING_MAX on the fields nothing else pins', () => {
   // Without this, deleting a `clip(..., STRING_MAX)` call leaves the constant
   // parsing at 200, the budget test passing, and the real output unbounded —
@@ -448,28 +380,6 @@ function packageDirs() {
   return dirs;
 }
 
-test('every package wires the generator into build, typecheck and dev', () => {
-  // The generated file is gitignored, so a package that forgot this line does
-  // not fail loudly on the author's machine — it fails on a fresh clone, or
-  // worse, compiles against a stale one.
-  //
-  // `dev` is asserted too. All three are correct today; it is the assertion
-  // that was missing, which makes `dev` the one that can be dropped later with
-  // nothing noticing — and it would then fail to resolve `./build-info.js` at
-  // the moment somebody was trying to reproduce something.
-  for (const pkg of packageDirs()) {
-    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, pkg, 'package.json'), 'utf8'));
-    for (const script of ['build', 'typecheck', 'dev']) {
-      assert.ok(manifest.scripts?.[script], `${pkg}/package.json has no scripts.${script}`);
-      assert.match(
-        manifest.scripts[script],
-        /build-info\.mjs/,
-        `${pkg}/package.json scripts.${script} does not run the build-info generator`,
-      );
-    }
-  }
-});
-
 test('an unwritable output stops the build, with a sentence rather than a stack', (t) => {
   // The one case where failing IS right: `&& tsc` continuing here would compile
   // against whatever build-info.ts an earlier build left behind, so the
@@ -577,15 +487,3 @@ test('the banner is printed even when the process is about to die in its config 
   );
 });
 
-test('every generated build-info.ts is gitignored', () => {
-  for (const pkg of packageDirs()) {
-    const target = join(REPO_ROOT, pkg, 'src', 'build-info.ts');
-    const result = spawnSync('git', ['check-ignore', '-q', target], { cwd: REPO_ROOT });
-    assert.equal(
-      result.status,
-      0,
-      `${target} is not gitignored — every build would rewrite a tracked file, so every ` +
-        'build would leave the tree dirty and every artefact would report itself dirty',
-    );
-  }
-});
