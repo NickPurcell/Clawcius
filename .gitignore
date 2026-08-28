@@ -8,7 +8,6 @@ dist/
 # package is a visible omission.
 src/build-info.ts
 status/src/build-info.ts
-ops/src/build-info.ts
 
 # Per-instance env files carry a bot token; the negation keeps the template tracked.
 .env
