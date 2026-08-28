@@ -1026,10 +1026,7 @@ test('the arming tools join the clawsky server rather than starting a second one
   const { registry, mail, store } = board();
 
   const servers = buildMailServer(
-    mail,
-    'hamachi-engineer1',
-    'hamachi-host',
-    buildArmedTools('hamachi-engineer1', {
+    mail, 'hamachi-engineer1', buildArmedTools('hamachi-engineer1', {
       store,
       github: null,
       defaultRepo: 'NickPurcell/Clawcius',

@@ -53,7 +53,6 @@ function describeSendMail(agentId: string): string {
 export function buildMailTools(
   mail: MailStore,
   agentId: string,
-  _hostId: string,
 ): SdkMcpToolDefinition<any>[] {
   const checkMail = tool(
     'checkMail',
@@ -102,14 +101,13 @@ export function buildMailTools(
 export function buildMailServer(
   mail: MailStore,
   agentId: string,
-  hostId: string,
   extra: SdkMcpToolDefinition<any>[] = [],
 ): Record<string, McpServerConfig> {
   return {
     clawsky: createSdkMcpServer({
       name: 'clawsky',
       version: '0.1.0',
-      tools: [...buildMailTools(mail, agentId, hostId), ...extra],
+      tools: [...buildMailTools(mail, agentId), ...extra],
       alwaysLoad: true,
     }),
   };

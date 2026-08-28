@@ -40,3 +40,6 @@ discord:
   # match nothing and the setting would appear not to work at all.
   alwaysOnChannelIds:
     - '1467070145343258628'  # test channel (SimpleTestServer)
+# Hamachi runs its sessions on the host, as the hamachi account, not in a container.
+container:
+  enabled: false

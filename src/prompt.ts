@@ -31,7 +31,8 @@ export function buildSystemPrompt(identity: PromptIdentity): Options['systemProm
     { id: identity.id, crew: identity.crew, role: identity.role },
   );
 
-  const layered = [protocol, roleNotice, config().agent.systemPrompt.append.trim()]
+  const append = render(config().agent.systemPrompt.append, { cli: config().agent.paths.discordCli });
+  const layered = [protocol, roleNotice, append]
     .filter(Boolean)
     .join('\n\n');
 

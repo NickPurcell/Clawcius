@@ -8,8 +8,7 @@ export type AgentRole =
   | 'engineer'
   | 'researcher'
   | 'poster'
-  | 'updater'
-  | 'host';
+  | 'updater';
 
 export const AGENT_ROLES: readonly AgentRole[] = [
   'coordinator',
@@ -17,13 +16,8 @@ export const AGENT_ROLES: readonly AgentRole[] = [
   'researcher',
   'poster',
   'updater',
-  'host',
 ];
 
-/** The host agent's id in a given crew. */
-export function hostAgentId(crew: string): string {
-  return `${crew}-host`;
-}
 
 export function isAgentRole(value: string): value is AgentRole {
   return (AGENT_ROLES as readonly string[]).includes(value);
