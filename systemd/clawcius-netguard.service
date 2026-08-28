@@ -1,6 +1,6 @@
 [Unit]
 Description=Clawcius sandbox network guard (host + inter-sandbox isolation)
-Documentation=file:/home/npurcell/clawcius/SETUP.md
+Documentation=file:/srv/clawcius/current/SETUP.md
 
 # The DOCKER-USER chain exists only once the daemon has created it, and the
 # rules must be in place before any container can send a packet.
@@ -16,7 +16,7 @@ RemainAfterExit=yes
 # own user must not be able to edit them.
 User=root
 
-ExecStart=/home/npurcell/clawcius/docker/netguard.sh
+ExecStart=/usr/local/lib/clawcius/netguard.sh
 
 # No ExecStop: stopping this unit must not tear the rules down.
 

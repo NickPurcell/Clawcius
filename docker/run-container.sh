@@ -25,7 +25,7 @@ done
 # container from instance 1's image, env file and state dir.
 NAME=${CLAWCIUS_CONTAINER:-clawcius-agent}
 IMAGE=${CLAWCIUS_IMAGE:-clawcius-agent:latest}
-ENV_FILE=${CLAWCIUS_ENV_FILE:-/home/npurcell/clawcius/.env}
+ENV_FILE=${CLAWCIUS_ENV_FILE:-/etc/clawcius/clawcius.env}
 MEMORY=${CLAWCIUS_CONTAINER_MEMORY:-2g}
 
 # Paths are mirrored host->container: Claude Code derives its transcript
@@ -37,18 +37,15 @@ WORKSPACES=$CLAWCIUS_STATE/workspaces
 # The daemon serves it to the sandbox, so it sits outside every read-write
 # mount and is mounted :ro below; the sandbox must not be able to replace it.
 GITHUB_TOKEN_DIR=${CLAWCIUS_GITHUB_TOKEN_DIR:-$CLAWCIUS_STATE/github-token}
-BOTS=${CLAWCIUS_BOTS_DIR:-$(cd "$(dirname "$0")/.." && pwd)/bots}
+# The deployed checkout, mounted whole so `current` resolves inside the container after a deploy.
+REPO=${CLAWCIUS_REPO_DIR:-/srv/clawcius}
+BOTS=$REPO/current/bots
 CREW=${CLAWCIUS_CREW:-${NAME%-agent}}
 # The container's only read-write window onto the host filesystem.
 # clawcius-status listens on a unix socket here, `$CLAWCIUS_STATE/run/status.sock`,
 # which is how the page is reachable from a network with no gateway. Mirrored
 # host->container because status-config.yaml names the socket by its host path.
 STATE_RUN=$CLAWCIUS_STATE/run
-SKILLS=/home/npurcell/clawcius/.claude
-DISCORD_CLI=/home/npurcell/clawcius/discord-cli
-GWS_CLI=/home/npurcell/clawcius/gws-cli
-BROWSER_CLI=/home/npurcell/clawcius/browser-cli
-PR_CLI=/home/npurcell/clawcius/pr-cli
 
 # BROWSE_LOG (set on the container below) lives under $WORKSPACES rather than
 # browse's default under $HOME, so the record of what `browse` contacted
@@ -57,7 +54,7 @@ PR_CLI=/home/npurcell/clawcius/pr-cli
 
 # Google Workspace service account key, mounted only if it exists: a missing
 # file passed to `docker run -v` is created as an empty directory.
-GWS_KEY=${GWS_KEY:-/home/npurcell/clawcius/secrets/gws-service-account.json}
+GWS_KEY=${GWS_KEY:-/etc/clawcius/gws-service-account.json}
 
 # The agent's Claude home, owned entirely by this instance and kept on the
 # state dir so --recreate does not log it out. The host's ~/.claude is not
@@ -255,13 +252,8 @@ docker run -d \
   -v "$WORKSPACES:$WORKSPACES:rw" \
   -v "$STATE_RUN:$STATE_RUN:rw" \
   -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \
-  -v "$SKILLS:$SKILLS:ro" \
-  -v "$DISCORD_CLI:$DISCORD_CLI:ro" \
-  -v "$GWS_CLI:$GWS_CLI:ro" \
-  -v "$BROWSER_CLI:$BROWSER_CLI:ro" \
-  -v "$PR_CLI:$PR_CLI:ro" \
+  -v "$REPO:$REPO:ro" \
   -v "$GITHUB_TOKEN_DIR:$GITHUB_TOKEN_DIR:ro" \
-  -v "$BOTS:$BOTS:ro" \
   -e BOTS_DIR="$BOTS" -e CREW="$CREW" \
   -e BROWSE_LOG="$WORKSPACES/.browse/navigation.jsonl" \
   "${GWS_MOUNT[@]}" \

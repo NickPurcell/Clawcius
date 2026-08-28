@@ -924,7 +924,7 @@ test('githubTokenDir is refused inside OR equal to any other bind mount', () => 
     '/var/lib/clawcius/workspaces', // equal to a read-write mount
     '/var/lib/clawcius/run',
     '/var/lib/clawcius/agent-home',
-    '/home/npurcell/clawcius/.claude', // equal to a read-only mount BOTH crews share
+    '/srv/clawcius/current/.claude', // equal to a read-only mount BOTH crews share
     '/var/lib/clawcius/workspaces/tok', // inside one
   ];
   for (const dir of refused) {

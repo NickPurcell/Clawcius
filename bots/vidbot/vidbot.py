@@ -788,7 +788,7 @@ def build_parser():
     ap.add_argument("--workdir", default="/tmp",
                     help="Where to stage downloads. Default /tmp.")
     ap.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
-    ap.add_argument("--cli", default="/home/npurcell/clawcius/discord-cli/discord")
+    ap.add_argument("--cli", default="/srv/clawcius/current/discord-cli/discord")
     ap.add_argument("--log", default=None, help="Log file. Default stderr.")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--report-failures", action="store_true",

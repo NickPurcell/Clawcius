@@ -1,6 +1,6 @@
 [Unit]
 Description=Clawcius agent container stack (gVisor sandbox + Squid egress proxy)
-Documentation=file:/home/npurcell/clawcius/SETUP.md
+Documentation=file:/srv/clawcius/current/SETUP.md
 After=docker.service
 Requires=docker.service
 
@@ -13,11 +13,11 @@ RemainAfterExit=yes
 User=npurcell
 Group=npurcell
 SupplementaryGroups=docker
-WorkingDirectory=/home/npurcell/clawcius
+WorkingDirectory=/srv/clawcius/current
 
 # Idempotent: up.sh creates what is missing, recreates Squid and reuses the agent container.
-ExecStart=/home/npurcell/clawcius/docker/up.sh
-ExecStop=/home/npurcell/clawcius/docker/down.sh
+ExecStart=/srv/clawcius/current/docker/up.sh
+ExecStop=/srv/clawcius/current/docker/down.sh
 
 # Two containers under gVisor take a while to come up.
 TimeoutStartSec=180

@@ -1,6 +1,6 @@
 [Unit]
 Description=Clawcius status page — read-only agent observability, loopback only
-Documentation=file:/home/npurcell/clawcius/status/README.md
+Documentation=file:/srv/clawcius/current/status/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -20,10 +20,10 @@ Type=simple
 User=npurcell
 Group=npurcell
 
-WorkingDirectory=/home/npurcell/clawcius/status
+WorkingDirectory=/srv/clawcius/current/status
 
 # No EnvironmentFile: this service holds no secrets.
-Environment=STATUS_CONFIG_PATH=/home/npurcell/clawcius/status/status-config.yaml
+Environment=STATUS_CONFIG_PATH=/srv/clawcius/current/status/status-config.yaml
 
 # systemd's default PATH excludes ~/.local, so a bare `node` dies with ENOENT.
 ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js

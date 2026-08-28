@@ -49,7 +49,7 @@ RUN groupadd -g ${AGENT_GID} agent \
 # Paths mirror the host: Claude Code derives its transcript directory from cwd,
 # so a workspace mounted anywhere else would start a new session instead of
 # resuming.
-RUN mkdir -p /var/lib/clawcius/workspaces /home/npurcell/clawcius \
+RUN mkdir -p /var/lib/clawcius/workspaces /srv/clawcius \
     && chown -R ${AGENT_UID}:${AGENT_GID} /var/lib/clawcius
 
 # The agent's own Claude home, bind-mounted read-write from the instance's
