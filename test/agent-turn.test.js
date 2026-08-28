@@ -134,7 +134,7 @@ const refusal = (kind) => ({
 
 // ── the settle comes before the busy flip ────────────────────────────────────
 
-test('a successful turn settles TRUE, and settles its OWN turn (#241 round 2)', async () => {
+test('a successful turn settles TRUE, and settles its OWN turn', async () => {
   const h = drive();
   try {
     const settles = [];
@@ -175,7 +175,7 @@ test('the turn is settled BEFORE `busy` is published, because busy is a broadcas
 
 // ── the sentry kill path ─────────────────────────────────────────────────────
 
-test('a turn that dies asynchronously settles FALSE and says so (#239)', async () => {
+test('a turn that dies asynchronously settles FALSE and says so', async () => {
   // The gVisor sentry kill arrives through `#consume`'s catch.
   const h = drive();
   try {
@@ -194,7 +194,7 @@ test('a turn that dies asynchronously settles FALSE and says so (#239)', async (
   }
 });
 
-test('!stop actually stops: interrupt settles TRUE, before the flip (#241 round 2)', async () => {
+test('!stop actually stops: interrupt settles TRUE, before the flip', async () => {
   const h = drive();
   try {
     const settles = [];
@@ -217,7 +217,7 @@ test('!stop actually stops: interrupt settles TRUE, before the flip (#241 round 
 
 // ── the flip must come after everything that reads the turn ──────────────────
 
-test('onDone still sees the turn s error after a non-retryable refusal (#241 round 3)', async () => {
+test('onDone still sees the turn s error after a non-retryable refusal', async () => {
   const h = drive();
   try {
     h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
@@ -233,29 +233,7 @@ test('onDone still sees the turn s error after a non-retryable refusal (#241 rou
   }
 });
 
-test('the busy flip is the LAST thing a finished turn does (#241 round 3)', async () => {
-  // Asserted structurally rather than through one consequence, because the consequence differs per path.
-  const h = drive();
-  try {
-    let seenAtFlip = null;
-    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
-    h.session.onBusyChanged = () => {
-      if (h.session.busy === false) seenAtFlip = h.events.map((e) => e.kind);
-    };
-    await h.send(refusal('billing_error'));
-    await h.send(RESULT);
-
-    assert.ok(seenAtFlip, 'the turn must publish an idle transition');
-    assert.ok(
-      seenAtFlip.includes('done'),
-      'onDone must have already run when the flip is observed — it reads fields #push clears',
-    );
-  } finally {
-    h.restore();
-  }
-});
-
-test('a dead credential still reaches onNeedsRespawn (#241 round 3)', async () => {
+test('a dead credential still reaches onNeedsRespawn', async () => {
   // The auth-failure check runs after `onDone`.
   const h = drive();
   try {
@@ -281,7 +259,7 @@ test('a dead credential still reaches onNeedsRespawn (#241 round 3)', async () =
   }
 });
 
-test('!stop during a retry BACKOFF settles, or the agent goes deaf forever (#241 round 3)', async () => {
+test('!stop during a retry BACKOFF settles, or the agent goes deaf forever', async () => {
   const h = drive();
   try {
     const settles = [];

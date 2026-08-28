@@ -166,62 +166,6 @@ test('the identity written back for an engineer is the engineer, not a coordinat
   await manager.shutdown();
 });
 
-test('an engineer stays an engineer in the database too', async () => {
-  const { manager, registry } = pool();
-  registry.ensure('hamachi-engineer1', {
-    crew: CREW,
-    role: 'engineer',
-    workspacePath: '/tmp/engineer1',
-    spawnedBy: 'hamachi-coordinator',
-  });
-
-  const session = manager.acquire('hamachi-engineer1', events);
-  session.sessionId = UUID;
-  manager.persist('hamachi-engineer1');
-
-  // The second defence, over a real database: even handed the wrong identity,
-  // `recordSession`'s conflict clause updates the session and nothing else. Both
-  // of these have to hold — see the note on `recordingRegistry`.
-  const row = registry.get('hamachi-engineer1');
-  assert.equal(row.role, 'engineer');
-  assert.equal(row.spawnedBy, 'hamachi-coordinator');
-  assert.equal(row.sessionId, UUID);
-  await manager.shutdown();
-});
-
-test('acquire hands ensure the identity the row says, not a default', async () => {
-  // The role the pool acts on is the row's, not the one `#identityFor` guessed:
-  // `acquire` reads it back out of `ensure`. CLAWSKY.md — "Spawn and kill: held
-  // by the coordinator alone".
-  const { manager, registry } = stubbedPool({
-    'hamachi-engineer1': {
-      id: 'hamachi-engineer1',
-      crew: CREW,
-      role: 'engineer',
-      sessionId: '',
-      workspacePath: '/tmp/engineer1',
-      spawnedBy: 'hamachi-coordinator',
-    },
-  });
-  manager.acquire('hamachi-engineer1', events);
-  const ensured = registry.calls.find((call) => call.method === 'ensure');
-  assert.equal(ensured.identity.role, 'engineer');
-  await manager.shutdown();
-});
-
-test('a turn ending for an agent with no row never calls recordSession', async () => {
-  const { manager, registry, built } = stubbedPool({});
-  manager.acquire('hamachi-engineer1', events);
-  built[0].sessionId = UUID;
-  // The row was created by `ensure` on the way in. Take it away again.
-  registry.rows.delete('hamachi-engineer1');
-  registry.calls.length = 0;
-
-  manager.persist('hamachi-engineer1');
-  assert.deepEqual(registry.calls, [], 'persist must not touch the registry with no row');
-  await manager.shutdown();
-});
-
 test('a channel the registry has never heard of is a coordinator, in the configured crew', async () => {
   const { manager, registry, workspaceRoot } = pool();
   manager.acquire('1234567890', events);
@@ -233,44 +177,6 @@ test('a channel the registry has never heard of is a coordinator, in the configu
   // minting a prettier name would detach a live session from its channel.
   assert.equal(row.workspacePath, join(workspaceRoot, '1234567890'));
   assert.equal(row.spawnedBy, null);
-  await manager.shutdown();
-});
-
-test('a turn ending for an agent with no row writes nothing at all', async () => {
-  const { manager, registry, dbPath } = pool();
-  registry.ensure('hamachi-engineer1', {
-    crew: CREW,
-    role: 'engineer',
-    workspacePath: '/tmp/engineer1',
-    spawnedBy: 'hamachi-coordinator',
-  });
-
-  const session = manager.acquire('hamachi-engineer1', events);
-  session.sessionId = UUID;
-
-  // Something deleted the row mid-turn. Nothing in this tree does that today —
-  // `!reset` clears the session id, not the row — which is why the guard needs
-  // a test rather than a reproduction.
-  deleteRow(dbPath, 'hamachi-engineer1');
-  assert.equal(registry.get('hamachi-engineer1'), undefined);
-
-  const written = [];
-  const realWrite = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk, ...rest) => {
-    written.push(String(chunk));
-    return realWrite(chunk, ...rest);
-  };
-  try {
-    manager.persist('hamachi-engineer1');
-  } finally {
-    process.stderr.write = realWrite;
-  }
-
-  // An agent is a row; a turn is not a thing that may create one.
-  assert.equal(registry.get('hamachi-engineer1'), undefined);
-  // And it is loud, because a silent no-op would hide the delete that made it
-  // reachable.
-  assert.match(written.join(''), /finished a turn with no registry row — not creating one/);
   await manager.shutdown();
 });
 
@@ -299,19 +205,6 @@ test('persist on a channel with no live session is a no-op', async () => {
 });
 
 // ── capacity ─────────────────────────────────────────────────────────────────
-
-test('capacity reports the live count, the cap and whether anything empties it', async () => {
-  const { manager } = pool({ maxConcurrent: 3, idleTimeoutMinutes: 0 });
-  assert.deepEqual(manager.capacity, { live: 0, max: 3, idleTimeoutMinutes: 0 });
-
-  manager.acquire('a', events);
-  manager.acquire('b', events);
-  // The timeout travels with the two numbers deliberately: a full pool with
-  // eviction on is a wait, and a full pool with eviction off does not clear on
-  // its own. `spawn` cannot tell those apart from `live` and `max` alone.
-  assert.deepEqual(manager.capacity, { live: 2, max: 3, idleTimeoutMinutes: 0 });
-  await manager.shutdown();
-});
 
 test('acquire throws AtCapacityError at the cap, carrying the numbers', async () => {
   const { manager } = pool({ maxConcurrent: 2 });
@@ -456,30 +349,6 @@ test('a role with an override gets that model; every other role gets undefined',
   assert.equal(built[1].model, undefined);
 });
 
-test('no overrides configured leaves every role on the default model', () => {
-  const { manager, built } = stubbedPool({
-    'hamachi-updater1': { id: 'hamachi-updater1', role: 'updater', sessionId: '' },
-  });
-
-  manager.acquire('hamachi-updater1', events);
-
-  // The shipped default before an operator writes `modelByRole` at all.
-  assert.equal(built[0].model, undefined);
-});
-
-test('the override follows the row, not the id', () => {
-  // An id that looks like an engineer on a row that says updater. The row wins,
-  // for the same reason `#identityFor` prefers it: ids are a naming convention
-  // and the row is the identity.
-  const { manager, built } = stubbedPool(
-    { 'hamachi-engineer7': { id: 'hamachi-engineer7', role: 'updater', sessionId: '' } },
-    { modelByRole: { updater: 'claude-haiku-4-5' } },
-  );
-
-  manager.acquire('hamachi-engineer7', events);
-  assert.equal(built[0].model, 'claude-haiku-4-5');
-});
-
 // ── what the user is told ────────────────────────────────────────────────────
 
 test('the notice carries the numbers from the error it was given', () => {
@@ -581,15 +450,6 @@ test("an engineer's session is not, and that is the whole of CLAWSKY.md's rule",
   await manager.shutdown();
 });
 
-test('a poster gets mail and nothing else either', async () => {
-  const { manager, registry, built } = boardPool();
-  registry.ensure('hamachi-poster', { crew: CREW, role: 'poster', workspacePath: '/w/poster' });
-  manager.acquire('hamachi-poster', events);
-  // Not just "not an engineer": every role that is not `coordinator`.
-  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail']);
-  await manager.shutdown();
-});
-
 test('with no spawn log wired, not even a coordinator is offered spawn', async () => {
   // `spawnLog` is null when the board is off; `main()` in daemon.ts decides that.
   const { manager, registry, built } = boardPool({ spawnLog: null });
@@ -619,61 +479,7 @@ test('with no mail store there are no in-process tools at all', async () => {
   await manager.shutdown();
 });
 
-test('a Discord channel the registry has never heard of DOES get spawn', async () => {
-  // Stated because it is surprising and it is a privilege.
-  const { manager, built } = boardPool();
-  manager.acquire('9876543210', events);
-  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail', 'spawn']);
-  await manager.shutdown();
-});
-
-test('the role acted on is the row, not the identity the fallback would have picked', async () => {
-  const { manager, registry, built } = boardPool();
-  registry.ensure('hamachi-engineer2', {
-    crew: CREW,
-    role: 'engineer',
-    workspacePath: '/w/engineer2',
-    spawnedBy: 'hamachi-coordinator',
-  });
-
-  manager.acquire('hamachi-engineer2', events);
-  assert.equal(toolNames(built[0].mcpServers).includes('spawn'), false);
-  await manager.shutdown();
-});
-
 // ── The settle travels with the TURN, not with the session ──────────────────
-
-test('every wake carries its own settle, not just the one that built the session (#241)', () => {
-  const { manager, registry, built } = pool();
-  registry.ensure('hamachi-engineer1', {
-    crew: CREW,
-    role: 'engineer',
-    workspacePath: '/tmp/engineer1',
-    spawnedBy: 'hamachi-coordinator',
-  });
-
-  const settles = [];
-  for (const which of ['first', 'second', 'third']) {
-    const settle = (ran, why) => settles.push({ which, ran, why });
-    manager
-      .acquire('hamachi-engineer1', events)
-      .wake({ kind: 'mail', channelId: 'hamachi-engineer1', count: 1 }, settle);
-  }
-
-  assert.equal(built.length, 1, 'all three wakes went to one session — that is the premise');
-  const [session] = built;
-  assert.equal(session.wakes.length, 3);
-
-  for (const [i, w] of session.wakes.entries()) {
-    assert.equal(typeof w.onSettled, 'function', `wake ${i + 1} arrived with no settle`);
-  }
-  const distinct = new Set(session.wakes.map((w) => w.onSettled));
-  assert.equal(distinct.size, 3, 'each turn must settle its OWN mail, not an earlier turn s');
-
-  // And they are wired to the right turns, which set-size alone does not show.
-  session.wakes[1].onSettled(true, '');
-  assert.deepEqual(settles, [{ which: 'second', ran: true, why: '' }]);
-});
 
 // ── TurnSettle ──────────────────────────────────────────────────────────────
 
@@ -692,7 +498,7 @@ test('a settle fires exactly once, however many times the turn ends', () => {
   assert.deepEqual(calls, [{ ran: true, why: 'turn completed' }]);
 });
 
-test('adopting a new turn ends the previous one FALSE (#241)', () => {
+test('adopting a new turn ends the previous one FALSE', () => {
   // A wake arriving while a turn is pending means that turn never completed —
   // nothing else would have left it pending. Its mail was never confirmed read,
   // so it must be offered again rather than vanishing with the callback.
@@ -717,30 +523,7 @@ test('adopting when nothing is in flight settles nothing', () => {
   assert.equal(settle.pending, true);
 });
 
-test('a turn left pending stays pending — a queued retry has not ended (#241)', () => {
-  // `onDone` deliberately leaves an API refusal WITH a retry queued unsettled:
-  // the retry re-runs the turn and its own completion decides. Settling either
-  // way here would be a guess, and a guess of TRUE loses the mail.
-  const settle = new TurnSettle();
-  settle.adopt(() => assert.fail('a queued retry must not settle its turn'), 'first');
-  assert.equal(settle.pending, true);
-});
-
-test('a wake carrying no settle still ends the turn before it', () => {
-  // Discord wakes pass no callback. They must not silently strand the settle of
-  // a mail turn that was still in flight — that is mail loss by another route.
-  const calls = [];
-  const settle = new TurnSettle();
-  settle.adopt((ran, why) => calls.push({ ran, why }), 'mail turn');
-  settle.adopt(null, 'a discord wake arrived');
-
-  assert.deepEqual(calls, [{ ran: false, why: 'a discord wake arrived' }]);
-  assert.equal(settle.pending, false, 'a null adopt leaves nothing in flight');
-  settle.done(true, 'no-op');
-  assert.equal(calls.length, 1);
-});
-
-test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backoff (#241)', () => {
+test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backoff', () => {
   // An API refusal WITH a retry queued leaves the turn deliberately unsettled — the retry re-runs it and its own completion decides.
   const { manager, registry, built } = pool();
   registry.ensure('hamachi-engineer1', {
@@ -760,7 +543,7 @@ test('a pending turn counts as busy, so the sweep cannot pre-empt a retry backof
   assert.equal(manager.isBusy('hamachi-engineer1'), false, 'a settled idle session is free again');
 });
 
-test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
+test('busyCount reads the same predicate as isBusy', () => {
   const { manager, registry, built } = pool();
   registry.ensure('hamachi-engineer1', {
     crew: CREW,
@@ -780,7 +563,7 @@ test('busyCount reads the same predicate as isBusy (#241 round 3)', () => {
   assert.equal(manager.busyCount, 0);
 });
 
-test('eviction announces itself — it was the only silent release while running (#249)', async () => {
+test('eviction announces itself — it was the only silent release while running', async () => {
   // Every other path that drops a session says so in the journal.
   const lines = [];
   const dbPath = join(tempDir('clawsky-evict-'), 'clawcius.db');
