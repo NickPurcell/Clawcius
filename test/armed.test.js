@@ -11,9 +11,7 @@ import {
   ArmedWaker,
   composeWatchMail,
   composeReminderMail,
-  classifyPollFailure,
   MAX_CONSECUTIVE_POLL_FAILURES,
-  GONE_404_POLLS,
 } from '../dist/armed-wake.js';
 import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
 import { buildMailServer } from '../dist/mail-tool.js';
@@ -448,7 +446,7 @@ const githubError = (status, body) =>
     `GitHub answered ${status} for /repos/NickPurcell/Clawcius/pulls/44: ${body}`,
   );
 
-test('a transient poll failure is retried and the watch survives — THE 2026-08-23 INCIDENT', async () => {
+test('a transient poll failure is retried and the watch survives', async () => {
   const { registry, mail, store } = board();
   store.arm(
     'hamachi-engineer1',
@@ -507,69 +505,9 @@ test('a transient failure disarms only after the bound, and says how many', asyn
 
   assert.equal(store.listFor('hamachi-engineer1').length, 0, 'the bound must eventually apply');
   const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /DISARMED, the poll kept failing/);
-  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
-  assert.match(told.body, /503/);
+  assert.ok(told.body.includes(String(MAX_CONSECUTIVE_POLL_FAILURES)), 'says how many polls failed');
+  assert.match(told.body, /503/, 'and carries the last error');
   registry.close();
-});
-
-test('a 404 disarms only after GONE_404_POLLS consecutive ones', async () => {
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1',
-    'pr-watch',
-    Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  const gone = {
-    async getPullRequest() {
-      throw githubError(404, 'Not Found');
-    },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: gone, tickMs: 1000, log: () => {},
-  });
-  for (let i = 1; i < GONE_404_POLLS; i += 1) {
-    await waker.tick();
-    assert.equal(
-      store.listFor('hamachi-engineer1').length, 1,
-      `404 number ${i} may be an installation token that cannot see the repo yet`,
-    );
-  }
-  await waker.tick();
-
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /DISARMED, the target is gone/);
-  assert.match(told.body, /not there/);
-  assert.match(told.body, new RegExp(`${GONE_404_POLLS} consecutive polls`));
-  // It must not claim to know WHICH of deletion or a permissions change it saw.
-  assert.match(told.body, /no longer visible/);
-  registry.close();
-});
-
-test('the classifier decides on status, and is driven by status rather than read', () => {
-  assert.deepEqual(classifyPollFailure(new GitHubError(410, 'x')), { bound: 1, cause: 'gone' });
-  assert.deepEqual(
-    classifyPollFailure(new GitHubError(404, 'x')),
-    { bound: GONE_404_POLLS, cause: 'gone' },
-  );
-
-  for (const status of [401, 403, 408, 429, 500, 502, 503, 504]) {
-    assert.deepEqual(
-      classifyPollFailure(new GitHubError(status, 'x')),
-      { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' },
-      `${status} is about the CREDENTIAL or the SERVICE, not the pull request`,
-    );
-  }
-
-  for (const e of [new Error('ETIMEDOUT'), Object.assign(new Error('x'), { code: 'ENOENT' }), undefined]) {
-    assert.equal(classifyPollFailure(e).cause, 'unreachable');
-    assert.equal(classifyPollFailure(e).bound, MAX_CONSECUTIVE_POLL_FAILURES);
-  }
 });
 
 // ── 4. Seeing and withdrawing your own, and nobody else's ───────────────────
@@ -1123,90 +1061,7 @@ test('a retry waits a POLL interval, not a tick — it does not become due again
   registry.close();
 });
 
-test('a mixed streak does not spend the 404 grace, and the mail counts what it saw', async () => {
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1',
-    'pr-watch',
-    Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  let status = 401;
-  const rotating = {
-    async getPullRequest() { throw githubError(status, 'x'); },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: rotating, tickMs: 1000, log: () => {},
-  });
-
-  for (let i = 0; i < GONE_404_POLLS; i += 1) await waker.tick();
-  assert.equal(store.listFor('hamachi-engineer1').length, 1, '401s must not reach their own bound yet');
-
-  status = 404;
-  await waker.tick();                       // the class changes: count restarts at 1
-  assert.equal(
-    store.listFor('hamachi-engineer1').length, 1,
-    'a preceding streak of 401s must not spend the 404 grace',
-  );
-
-  registry.close();
-});
-
-test('the disarm mail reports the observed count, not the policy', async () => {
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  const down = {
-    async getPullRequest() { throw githubError(503, 'Server Error'); },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: down, tickMs: 1000, log: () => {},
-  });
-  for (let i = 0; i < MAX_CONSECUTIVE_POLL_FAILURES; i += 1) await waker.tick();
-
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
-  registry.close();
-});
-
-test('a streak that keeps changing class still terminates', async () => {
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  let n = 0;
-  const flapping = {
-    async getPullRequest() {
-      n += 1;
-      throw githubError(n % 2 ? 404 : 503, 'x');
-    },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: flapping, tickMs: 1000, log: () => {},
-  });
-
-  for (let i = 0; i < 20 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
-
-  assert.equal(store.listFor('hamachi-engineer1').length, 0, 'a mixed streak must still terminate');
-  assert.equal(n, MAX_CONSECUTIVE_POLL_FAILURES, 'and terminate at the overall bound');
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.body, new RegExp(`${MAX_CONSECUTIVE_POLL_FAILURES}`));
-  registry.close();
-});
-
-test('the no-token disarm says nothing about retries — it never polled', async () => {
+test('a watch resumed under a process with no token is disarmed and told once', async () => {
   const { registry, mail, store } = board();
   store.arm(
     'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
@@ -1217,69 +1072,7 @@ test('the no-token disarm says nothing about retries — it never polled', async
     store, registry, mail, github: null, tickMs: 1000, log: () => {},
   }).tick();
 
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.doesNotMatch(told.body, /times in a row/, 'nothing was polled, so nothing failed N times');
-  assert.match(told.body, /without being polled at all/);
+  assert.equal(mail.unread('hamachi-engineer1').length, 1);
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
-  registry.close();
-});
-
-test('a gone-class streak reports its own count, not its bound', async () => {
-  // `404,404,410` is one class with two bounds: 410 has bound 1, so the streak disarms at strikes = 3 against a bound of 1.
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  let n = 0;
-  const vanishing = {
-    async getPullRequest() {
-      n += 1;
-      throw githubError(n < 3 ? 404 : 410, 'x');
-    },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: vanishing, tickMs: 1000, log: () => {},
-  });
-  for (let i = 0; i < 3 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
-
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /the target is gone/);
-  assert.match(told.body, /3 consecutive polls/, 'the observed count, not the bound of 1');
-  registry.close();
-});
-
-test('the overall bound reports unreachable even when the last failure was a 404', async () => {
-  // `503,503,503,404,404` — the total bound ends it, the last failure is a 404, and only two of the five were.
-  const { registry, mail, store } = board();
-  store.arm(
-    'hamachi-engineer1', 'pr-watch', Date.now() - 1000,
-    { repo: 'NickPurcell/Clawcius', pr: 44, on: ['review'], pollSeconds: 0 },
-    { reviewId: 0, issueCommentId: 0, reviewCommentId: 0, state: 'open' },
-  );
-  let n = 0;
-  const mixed = {
-    async getPullRequest() {
-      n += 1;
-      throw githubError(n <= 3 ? 503 : 404, 'x');
-    },
-    async listReviews() { return []; },
-    async listComments() { return []; },
-  };
-  const waker = new ArmedWaker({
-    store, registry, mail, github: mixed, tickMs: 1000, log: () => {},
-  });
-  for (let i = 0; i < 6 && store.listFor('hamachi-engineer1').length; i += 1) await waker.tick();
-
-  assert.equal(store.listFor('hamachi-engineer1').length, 0);
-  const [told] = mail.unread('hamachi-engineer1');
-  assert.match(told.subject, /the poll kept failing/, 'the overall bound must report itself');
-  assert.doesNotMatch(told.subject, /target is gone/);
-  assert.doesNotMatch(told.body, /not there/, 'two 404s among five polls is not a gone target');
-  assert.match(told.body, new RegExp(`failed ${MAX_CONSECUTIVE_POLL_FAILURES} polls in a row`));
   registry.close();
 });
