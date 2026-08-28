@@ -22,6 +22,7 @@ import {
   zonedStamp,
 } from './schedule.js';
 import { EXTERNAL_WARNING, REPO_NAME, type PullRequestSource } from './github.js';
+import { alsoIn, ok, refuse, stamp } from './armed-util.js';
 
 /** A note is prose the agent writes to itself, not a payload. */
 const MAX_NOTE_CHARS = 4000;
@@ -54,27 +55,6 @@ export type ArmedToolOptions = {
   /** Seconds between polls of a watched pull request. */
   pollSeconds: number;
 };
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }], isError: false };
-}
-
-function refuse(text: string) {
-  // `isError` for the same reason `sendMail` sets it: the model reads the text
-  // either way, and this is what stops a refusal being mistaken for a receipt
-  // when the result is skimmed.
-  return { content: [{ type: 'text' as const, text }], isError: true };
-}
-
-/** PT and labelled. Same format `renderMail` uses. */
-function stamp(at: number): string {
-  return zonedStamp(at, DEFAULT_TIMEZONE);
-}
-
-function alsoIn(at: number, timeZone: string): string {
-  const here = zonedStamp(at, DEFAULT_TIMEZONE);
-  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
-}
 
 /** "in 3 minutes", "2 hours ago" — the useful half of a timestamp. */
 function relative(ms: number): string {

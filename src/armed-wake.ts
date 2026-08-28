@@ -18,25 +18,9 @@ import type {
   ScheduleSeen,
   ScheduleSpec,
 } from './armed.js';
-import {
-  DEFAULT_TIMEZONE,
-  isTimezone,
-  parseCron,
-  planNextFire,
-  zonedStamp,
-} from './schedule.js';
+import { isTimezone, parseCron, planNextFire, zonedStamp } from './schedule.js';
 import type { AgentRegistry } from './store.js';
-
-/** The Pacific instant beside a schedule-zone one, or nothing when identical. */
-function alsoIn(at: number, timeZone: string): string {
-  const here = zonedStamp(at, DEFAULT_TIMEZONE);
-  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
-}
-
-/** PT and labelled. Same format `renderMail` uses. */
-function stamp(at: number): string {
-  return zonedStamp(at, DEFAULT_TIMEZONE);
-}
+import { alsoIn, stamp } from './armed-util.js';
 
 function minutes(ms: number): string {
   const m = Math.round(ms / 60_000);
