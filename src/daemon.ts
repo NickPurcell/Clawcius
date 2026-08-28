@@ -526,23 +526,9 @@ export async function main(): Promise<void> {
 
       {
         tokenFileRefresher = new TokenFileRefresher({
-          path: tokenFilePath(config.agent.container.githubTokenDir),
+          dir: config.agent.container.githubTokenDir,
           provider: appProvider,
           log: (message) => process.stderr.write(`${message}\n`),
-          hasFallbackToken: Boolean(config.github.token),
-          // Keep the REST credential in step with the git one. Written here
-          // rather than by a second timer so there is one provider, one cache
-          // and one moment at which the crew's credential changes.
-          onToken: (token) => writeCurlConfig(config.agent.container.githubTokenDir, token),
-          // FALLBACK AT THE WRITER, which is where it has to live.
-          onStop: () => removeCurlConfig(config.agent.container.githubTokenDir),
-          onNoToken: () => {
-            if (config.github.token) {
-              writeCurlConfig(config.agent.container.githubTokenDir, config.github.token);
-            } else {
-              removeCurlConfig(config.agent.container.githubTokenDir);
-            }
-          },
         });
         if (await tokenFileRefresher.start()) {
           process.stderr.write(
