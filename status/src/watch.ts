@@ -1,51 +1,3 @@
-/**
- * Noticing that something changed.
- *
- * The page is meant to be left open on a second monitor, so it has to update
- * itself. What it must never do is *lie* about being up to date — a stream that
- * has silently died looks exactly like a host where nothing is happening, and
- * on a page whose whole job is telling you whether agents are alive, that is
- * the worst bug available. Hence the heartbeat in `index.ts`, and hence the
- * belt-and-braces below.
- *
- * ── Why fs.watch is not trusted on its own ────────────────────────────────
- *
- * `fs.watch(dir, { recursive: true })` is the obvious answer and it is not
- * sufficient. The specific reason on this host comes first, because it is the
- * one that is not hypothetical:
- *
- *   - The agents write their transcripts from INSIDE a gVisor container, into
- *     a bind mount whose host side is what we watch. SETUP.md § 6b records
- *     that the waker hit exactly this and found "gVisor's gofer does not
- *     reliably deliver inotify for writes made inside the sandbox", which is
- *     why it runs a 5s sweep alongside its own fs.watch. Nothing about this
- *     service's position in that topology is different.
- *
- * And the generic reasons, which would apply on any host:
- *
- *   - Recursive watching is emulated on some platforms and was only added for
- *     Linux in Node 20. It works here (Node 22), but it is one runtime bump
- *     away from being a different implementation.
- *
- *   - inotify watches are a finite per-user kernel resource
- *     (`fs.inotify.max_user_watches`, commonly 8192 or 65536, and a recursive
- *     watch consumes one per directory). Exhausting it does not raise anything
- *     useful — events simply stop arriving.
- *
- *   - A directory created after the watch was established may or may not be
- *     covered, depending on implementation. Every new session creates one, so
- *     this is not a hypothetical.
- *
- *   - A root that does not exist yet cannot be watched at all, and a brand-new
- *     agent instance legitimately has no projects directory until its first
- *     turn.
- *
- * So: watch when we can, and additionally rescan on a slow timer that cannot
- * miss anything. The timer is cheap because subscribers only ever receive
- * "something under this root changed" — the expensive work of deciding what
- * changed happens when a client actually asks.
- */
-
 import { watch, type FSWatcher } from 'node:fs';
 import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
@@ -92,10 +44,7 @@ export class RootWatcher {
     if (this.#rescanSeconds > 0) {
       this.#rescanTimer = setInterval(() => {
         for (const target of this.#targets) {
-          // Reattach anything that was not watchable before. This is how a
-          // brand-new agent instance starts streaming without a restart of
-          // this service: its projects directory appears, and the next rescan
-          // picks it up.
+          // Reattach anything that was not watchable before.
           if (!this.#watchers.has(target.scope)) this.#attach(target);
           this.#emit({ scope: target.scope, path: '', at: Date.now(), fromRescan: true });
         }
@@ -120,7 +69,6 @@ export class RootWatcher {
     return () => this.#listeners.delete(listener);
   }
 
-  /** Roots that could not be watched, and why. For /healthz. */
   get unwatched(): ReadonlyMap<string, string> {
     return this.#unwatched;
   }
@@ -165,18 +113,6 @@ export class RootWatcher {
     }
   }
 
-  /**
-   * Coalesce a burst into one event.
-   *
-   * One agent turn appends several lines and rewrites a sidecar; naively
-   * forwarding each would send a dozen SSE frames for a single message and
-   * make the client re-fetch a dozen times. The debounce restarts on each
-   * event, which is right here in a way it would not be for the waker's
-   * message bundler: there is no ceiling, because unlike a user waiting for a
-   * reply, nobody is harmed by a busy agent's update landing after it stops
-   * being busy — and a continuously-writing agent still shows as running from
-   * its mtime.
-   */
   #schedule(scope: string, path: string): void {
     this.#pendingPath.set(scope, path);
     const existing = this.#timers.get(scope);
@@ -210,39 +146,6 @@ export class RootWatcher {
 
 // ── The board ───────────────────────────────────────────────────────────────
 
-/**
- * Noticing that the BOARD changed, which is a different problem.
- *
- * `RootWatcher` above watches directories, and the board is a single SQLite
- * file in neither of them — so until this existed `/api/clawsky` refreshed only
- * when some unrelated transcript happened to change. Mail delivery usually
- * causes one, because it wakes an agent, but the host agent is documented as
- * having no transcripts under any projects root at all: a DM to or from
- * `<crew>-host` could leave the page stale under a header correctly reporting
- * "live". A page whose data source is not watched is a stale page that looks
- * current, which is Clawcius #14's complaint wearing different clothes.
- *
- * ── Polled, not watched, and the reason is not inotify ──────────────────────
- *
- * `fs.watch` would work here — unlike the transcript roots, the board is
- * written by a host process rather than from inside gVisor, so events would
- * actually arrive. It is still the wrong instrument. The board is in WAL mode,
- * so every touch of `last_active_at` writes the `-wal` file, and the waker
- * touches it on every turn: watching the directory means an event per write,
- * where what the page needs to know is whether the TABLES changed. Those are
- * not the same question, and one is a proxy for the other only by luck.
- *
- * So this asks the database instead. Four integers — the newest mail id, the
- * mail row count, the agent row count and the newest `last_active_at` — which
- * is exact rather than indicative, cheap enough to run on a timer, and covers
- * the cases a file watch would miss for the same reason it covers the ones it
- * would over-report: a row deleted and another inserted changes the count pair,
- * and a `-wal` write that changed nothing this page shows changes none of them.
- *
- * Read-only and open-per-poll, exactly as `registry.ts` and `mail.ts` are, and
- * failing the same way: an unreadable board yields no fingerprint and simply
- * does not fire. The page is already able to say it could not read the board.
- */
 export class BoardWatcher {
   #boards: Array<{ scope: string; dbPath: string }>;
   #seconds: number;
@@ -294,13 +197,7 @@ export class BoardWatcher {
   }
 }
 
-/**
- * Four integers that change when anything this page renders changes, or null
- * when the board cannot be read.
- *
- * Counts as well as maxima on purpose: a maximum alone cannot see a deletion,
- * and `MAX(id)` alone cannot see a row deleted and reinserted.
- */
+/** Four integers that change when anything this page renders changes, or null when the board cannot be read. */
 function fingerprint(dbPath: string): string | null {
   let db: DatabaseSync | undefined;
   try {
@@ -322,7 +219,6 @@ function fingerprint(dbPath: string): string | null {
     try {
       db?.close();
     } catch {
-      /* nothing useful to do about a failed close */
     }
   }
 }

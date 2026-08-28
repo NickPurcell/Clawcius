@@ -1,73 +1,4 @@
-/**
- * clawcius-status — a read-only window onto the agents running on this host.
- *
- * ── The security model, in one place ───────────────────────────────────────
- *
- * This service has no authentication, and that is a deliberate design, not an
- * omission. Authentication is delegated to the network:
- *
- *   1. It binds to LOOPBACK ONLY. Never 0.0.0.0, and the bind address is
- *      validated twice — once in the config loader, once here immediately
- *      before `listen`. The property this buys is the failure mode:
- *      `tailscale serve` proxies from localhost, so if tailscaled dies the page
- *      becomes UNREACHABLE rather than becoming PUBLIC. A page bound to
- *      0.0.0.0 and merely firewalled has the opposite failure mode, and you
- *      find out about it from a stranger.
- *
- *      It ALSO listens on unix domain sockets, one per configured instance, so
- *      that the agent containers can reach it — they are on a network with no
- *      gateway and could not otherwise. This does not weaken (1): a unix
- *      socket has no address and no port, the TCP surface is unchanged, and
- *      the reachability comes from a bind mount rather than from routing.
- *
- *      IT DOES WIDEN WHAT AN AGENT CAN SEE, and by more than it first looks.
- *      There is no scoping by listener, so an agent reaching any socket
- *      reaches every route for every configured instance: both crews' boards
- *      (`/api/clawsky`), every session (`/api/agents/<id>/sessions`), the FULL
- *      message-by-message transcript of any of them
- *      (`/api/agents/<id>/sessions/<sid>/transcript`, parent or subagent), and
- *      the OJ worker snapshot (`/api/oj`).
- *
- *      That is a different grant, not merely a larger one. A transcript is
- *      everything an agent ever saw — file contents, tool output — not just
- *      what it wrote to another agent; and cross-crew transcripts have no path
- *      into either container without this socket, so it creates the access
- *      rather than exposing it. Note that point (5) below is load-bearing here
- *      and is weaker cover for transcripts than it would be for a board.
- *
- *      Agreed with the operator, twice — the second time after Osmosis Jones
- *      found the first description incomplete. See the note on
- *      `AgentRoot.socketPath` in config.ts for both quotes and for why no
- *      per-crew scoping is to be added.
- *
- *   2. It is READ-ONLY. Every route is GET or HEAD; anything else is refused
- *      before routing. Nothing here writes, deletes, or spawns a process, and
- *      no request parameter reaches a shell — there is no shell. The agent
- *      registry is a live SQLite database owned by another process, so it is
- *      opened in SQLite's readonly mode: that half of the claim is enforced by
- *      the library rather than by there happening to be no INSERT in the file.
- *      See `registry.ts`.
- *
- *   3. Ids from URLs are validated against a strict pattern AND resolved
- *      inside their configured root, independently. See `transcripts.ts`.
- *
- *   4. Every string that reaches the browser is treated as hostile. Transcripts
- *      contain whatever a user typed into Discord, whatever a web page said,
- *      and — once Osmosis Jones runs — whatever text was in a pull request
- *      opened by a stranger on the internet. The API returns JSON, the client
- *      builds DOM nodes with `textContent`, and there is no `innerHTML` with
- *      data anywhere in `public/`. Rendering that content unescaped would be
- *      XSS regardless of the page being private.
- *
- *   5. Credential-shaped strings are redacted server-side on the way out. That
- *      is a mitigation and not a guarantee — see the comment on the pattern
- *      list in `transcripts.ts`.
- */
-
-// FIRST, and it must stay first. This prints which commit this artefact was
-// built from, as a side effect of being imported, so that the line comes out
-// even when a later import or the config loader ends the process. See
-// build-banner.ts.
+// FIRST, and it must stay first.
 import './build-banner.js';
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -97,14 +28,6 @@ const reachTargets = targetsFor(config);
 
 const PUBLIC_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
-/**
- * Static assets, by exact name.
- *
- * An allowlist rather than "serve whatever is under public/". There is no
- * user-supplied path arithmetic to get wrong, no dotfile to leak, and adding a
- * file to the UI is a one-line change — which is a fair trade for a category
- * of bug this service simply does not have.
- */
 const ASSETS: Record<string, { file: string; type: string }> = {
   '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
   '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
@@ -112,14 +35,7 @@ const ASSETS: Record<string, { file: string; type: string }> = {
   '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
 };
 
-/**
- * Content-Security-Policy, as tight as a page with no third-party anything can
- * be. `default-src 'none'` means an injection that got past the DOM-building
- * discipline in app.js still has nowhere to send what it found.
- *
- * No 'unsafe-inline' anywhere: the HTML carries no inline script and no inline
- * style, specifically so this header can say so.
- */
+/** Content-Security-Policy, as tight as a page with no third-party anything can be. */
 const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy':
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
@@ -151,14 +67,6 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
   send(response, status, 'application/json; charset=utf-8', JSON.stringify(payload));
 }
 
-/**
- * Error bodies say what went wrong without saying where anything lives.
- *
- * Paths are already visible on this page — it is an observability tool for the
- * person who owns the host — but an error path is reachable with a malformed
- * URL, and echoing a resolved filesystem path back to whoever sent one is a
- * habit worth not having.
- */
 function fail(response: ServerResponse, status: number, message: string): void {
   sendJson(response, status, { error: message });
 }
@@ -175,14 +83,6 @@ const watcher = new RootWatcher(
 );
 watcher.start();
 
-/**
- * The boards, which no directory watch covers.
- *
- * Separate from `RootWatcher` because it answers a different question with a
- * different instrument — see the header on `BoardWatcher`. Its events go to the
- * same subscribers, so a change on the board refreshes the page exactly as a
- * transcript write does.
- */
 const boardWatcher = new BoardWatcher(
   config.agents
     .filter((agent) => agent.boardDb !== null)
@@ -207,18 +107,6 @@ const publishChange = (event: ChangeEvent): void => {
 watcher.subscribe(publishChange);
 boardWatcher.subscribe(publishChange);
 
-/**
- * The heartbeat.
- *
- * This is what makes a dead stream visible AS DEAD instead of as a quiet host.
- * The client tracks the interval between heartbeats and marks the page stale
- * when two go missing, so a reader can always tell "nothing is happening" from
- * "this page stopped being told what is happening".
- *
- * Sent as an SSE comment (`: …`) rather than an event, so no client-side
- * handler is needed for it to keep proxies from closing an idle connection —
- * which matters here because `tailscale serve` is exactly such a proxy.
- */
 const heartbeat = setInterval(() => {
   const frame = `: heartbeat ${Date.now()}\n\nevent: heartbeat\ndata: ${JSON.stringify({
     at: Date.now(),
@@ -241,13 +129,6 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
   const now = Date.now();
   const path = url.pathname;
 
-  // The front page: every crew agent on this host, with its crew role.
-  //
-  // The top-level key is `instances` and it used to be `agents`, which was the
-  // conflation the page was built on — a configured transcript root called an
-  // agent, so "Agents on this host" rendered two cards named after containers.
-  // The agents are inside, in `instances[].agents`, and they come from the
-  // registry.
   if (path === '/api/overview') {
     const instances = [];
     for (const agent of store.agents) {
@@ -261,13 +142,6 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
     return;
   }
 
-  // The board, across every instance: who is on it, and every DM and post.
-  //
-  // Showing all DMs reverses CLAWSKY.md's "sender + recipient" row, which is a
-  // decision the operator took and which is recorded there rather than only
-  // here. See the header of `mail.ts` for why it is not a contradiction: that
-  // rule constrains what one AGENT may read, and it is enforced in `checkMail`
-  // where agents read.
   if (path === '/api/clawsky') {
     sendJson(response, 200, {
       generatedAt: new Date(now).toISOString(),
@@ -285,36 +159,14 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
   const parts = path.split('/').filter((part) => part.length > 0);
   if (parts[0] === 'api' && parts[1] === 'agents' && typeof parts[2] === 'string') {
     const agent = store.agent(parts[2]);
-    // Same 404 whether the id is malformed or simply not configured. There is
-    // nothing to enumerate here, but the habit costs nothing.
+    // Same 404 whether the id is malformed or simply not configured.
     if (!agent) return fail(response, 404, 'no such agent');
 
-    // The instance's roster: its registry agents, each with every session it
-    // has had, plus whatever no registry row claims. Still reached at
-    // `/sessions` because that is where the sessions are — they now arrive
-    // grouped by the agent that had them rather than as one flat list of
-    // files (Clawcius #14).
     if (parts[3] === 'sessions' && parts.length === 4) {
       sendJson(response, 200, await buildRoster(store, agent, config, now));
       return;
     }
 
-    // Every subagent this instance has run, grouped by `subagent_type`. Flat
-    // and cross-session on purpose — the session view already draws the tree,
-    // and the thing it cannot do is find a transcript when you do not know
-    // which run it belonged to (Clawcius #22).
-    //
-    // `?slug=` narrows it to one transcript directory, which is one agent's.
-    // That is where subagents live now that they are off the front page: a
-    // drill-down from the agent that spawned them, which is whose work they
-    // are. UNSCOPED IS STILL A ROUTE AND THE INSTANCE PAGE STILL LINKS IT —
-    // that is the guarantee against re-losing a population the way #80 did,
-    // and the filter is applied to the results of the same full walk rather
-    // than by looking in fewer places.
-    //
-    // A malformed slug is rejected rather than ignored. Ignoring it would
-    // serve the whole instance under a heading naming one agent, which is the
-    // page telling a specific lie instead of refusing.
     if (parts[3] === 'subagents' && parts.length === 4) {
       const slug = url.searchParams.get('slug');
       if (slug !== null && !isValidProjectSlug(slug)) {
@@ -339,10 +191,7 @@ async function handleApi(url: URL, response: ServerResponse): Promise<void> {
       }
 
       if (parts[5] === 'transcript' && parts.length === 6) {
-        // `subagent` selects a child transcript instead of the parent's. It is
-        // validated here and then joined under the session directory, which
-        // `resolveWithin` has already confined — two checks, neither relying
-        // on the other.
+        // `subagent` selects a child transcript instead of the parent's.
         const subagent = url.searchParams.get('subagent');
         let target = session.transcriptPath;
 
@@ -389,9 +238,6 @@ function handleEvents(request: IncomingMessage, response: ServerResponse): void 
   response.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     Connection: 'keep-alive',
-    // Both matter behind a proxy: without them an intermediary may buffer the
-    // stream and deliver nothing until it closes, which looks precisely like a
-    // dead stream — the state the heartbeat exists to distinguish.
     'Cache-Control': 'no-cache, no-transform',
     'X-Accel-Buffering': 'no',
     ...SECURITY_HEADERS,
@@ -420,45 +266,13 @@ async function handleAsset(pathname: string, response: ServerResponse): Promise<
     const body = await readFile(join(PUBLIC_DIR, asset.file));
     send(response, 200, asset.type, body);
   } catch {
-    // Only reachable if the deployment is missing files it shipped with —
-    // worth saying plainly rather than as a bare 404 among the URL typos.
     fail(response, 500, `asset ${asset.file} is missing from the deployment`);
   }
 }
 
-/**
- * Outcome of every configured unix socket, filled in at boot and then read
- * only by `/healthz`.
- *
- * A socket that could not be bound is a warning rather than a boot failure
- * (see `bindUnixSockets`), which makes this the only place the state is
- * visible. Without it "the agents cannot reach the page" is a thing you
- * diagnose by strace; with it, it is a field in a JSON document.
- */
 let socketOutcomes: SocketOutcome[] = [];
 
-/**
- * `/healthz` — what this process is, and what it can currently reach.
- *
- * `build` is the compiled-in identity of this artefact. It is the same string
- * the boot banner printed, available to anything that can make a request rather
- * than only to whoever was reading the journal at the time. Note that the two
- * verification channels are not equivalent: the host agent CANNOT make an HTTP
- * request by design (`ops/src/host-agent.ts`), so the journal line is the one
- * that has to stand on its own, and this is a convenience on top of it.
- *
- * `reach` is probed on every request rather than remembered from boot. A
- * snapshot taken at startup and served for three weeks is the same category of
- * defect as the stale `dist/` that all of this is for: a sentence that was true
- * when it was written and is printed in a state nobody has checked. Each entry
- * carries its own `checkedAt` so it cannot be mistaken for a standing fact.
- *
- * `ok` deliberately stays true when a path is unreachable. This service is
- * still healthy — it is answering, watching and streaming — and flipping it
- * would make a systemd health check restart a process that is doing its job
- * about a directory that a restart cannot create. The unreachable entries are
- * the report; `ok` is about the process.
- */
+/** `/healthz` — what this process is, and what it can currently reach. */
 async function handleHealth(response: ServerResponse): Promise<void> {
   const reach = await probeAll(reachTargets);
   sendJson(response, 200, {
@@ -475,43 +289,25 @@ async function handleHealth(response: ServerResponse): Promise<void> {
     reach,
     unreachable: reach.filter((result) => !result.ok).length,
     // One entry per configured socket, listening or not, with the reason.
-    // Reported even when every socket is healthy: "which of these is the
-    // one my container mounts" is the first question when it is not.
     sockets: socketOutcomes.map((outcome) =>
       outcome.listening
         ? // `dropped` is connections refused because the per-socket
-          // maxConnections cap was already reached. Non-zero means a
-          // container is opening far more than it needs — which, before the
-          // cap existed, is what could exhaust the process's descriptors and
-          // silently stop the TCP listener answering.
+          // maxConnections cap was already reached.
           { path: outcome.path, listening: true, dropped: outcome.dropped }
         : { path: outcome.path, listening: false, reason: outcome.reason },
     ),
   });
 }
 
-/**
- * The one request listener, shared by every listener socket.
- *
- * Named and hoisted out of `createServer` because there is now more than one
- * server object: the TCP listener plus one per configured unix socket. They
- * are the same process, the same routes and the same transcript store, and
- * nothing here asks which socket a request arrived on — see `socket.ts` for
- * why that is deliberate and what it costs.
- */
 const handleRequest = (request: IncomingMessage, response: ServerResponse): void => {
-  // Read-only, enforced before anything looks at the path. There is no route
-  // that mutates, so this is redundant today; it is here so that it stays
-  // true if someone adds one without thinking about it.
+  // Read-only, enforced before anything looks at the path.
   const method = request.method ?? 'GET';
   if (method !== 'GET' && method !== 'HEAD') {
     send(response, 405, 'text/plain; charset=utf-8', 'read-only service', { Allow: 'GET, HEAD' });
     return;
   }
 
-  // The base is a placeholder — only the path and query are used, never the
-  // host — but URL parsing needs one and a malformed request line should 400
-  // rather than throw out of the request handler.
+  // The base is a placeholder: only the path and query are used, never the host.
   let url: URL;
   try {
     url = new URL(request.url ?? '/', 'http://localhost');
@@ -521,7 +317,6 @@ const handleRequest = (request: IncomingMessage, response: ServerResponse): void
   }
 
   if (url.pathname === '/healthz') {
-    // Async because it re-probes the filesystem; see `handleHealth`.
     handleHealth(response).catch((error: unknown) => {
       console.error('[status] /healthz failed:', error);
       if (!response.headersSent) fail(response, 500, 'internal error');
@@ -537,10 +332,6 @@ const handleRequest = (request: IncomingMessage, response: ServerResponse): void
 
   if (url.pathname.startsWith('/api/')) {
     handleApi(url, response).catch((error: unknown) => {
-      // Last line of defence. An unhandled rejection in a request handler
-      // would otherwise take the process down under Node's default policy,
-      // and one bad transcript should not stop the page telling you about the
-      // other nineteen.
       console.error('[status] request failed:', error);
       if (!response.headersSent) fail(response, 500, 'internal error');
       else response.end();
@@ -556,9 +347,7 @@ const handleRequest = (request: IncomingMessage, response: ServerResponse): void
 
 const server = createServer(handleRequest);
 
-// The second loopback check, immediately before the bind that would matter.
-// The config loader already rejects a non-loopback host; this catches the case
-// where a future refactor builds the listen options from somewhere else.
+// Loopback is also enforced by the config loader; this is the check at the bind itself.
 if (!isLoopback(config.server.host)) {
   throw new Error(
     `refusing to bind ${config.server.host}: this service is loopback-only by design`,
@@ -570,15 +359,6 @@ server.listen(config.server.port, config.server.host, () => {
     `[status] listening on http://${config.server.host}:${config.server.port} ` +
       `(loopback only — expose with: tailscale serve --bg ${config.server.port})`,
   );
-  // What this process can reach, NOT what it was configured with.
-  //
-  // The line that used to be here was `${agent.id}: ${agent.projectsRoot}` —
-  // the config file read back to itself. It would print identically on a host
-  // where the directory had been renamed, which is the whole objection to it.
-  // See reach.ts, including what this deliberately does not cover (#72).
-  //
-  // Not awaited: the listener is already up and nothing serving depends on the
-  // answer. A hung mount delays this report and nothing else.
   console.log(`[status]   this process is ${processIdentity()}`);
   void probeAll(reachTargets).then((results) => {
     for (const result of results) {
@@ -597,27 +377,15 @@ server.listen(config.server.port, config.server.host, () => {
       );
     }
   }).catch((error: unknown) => {
-    // `probe` cannot reject today — every fs call in it is inside a try — so
-    // this is not covering a live path. It is here because the whole argument
-    // of this change is that the identity line must survive a process that is
-    // about to die, and an unhandled rejection under Node's default policy is
-    // one of the ways it dies. The guarantee should be structural, not
-    // contingent on nobody later adding an `await` outside a `try`. The two
-    // request-path promises forty lines up already say exactly this.
     console.error('[status] boot reachability report failed:', error);
   });
 
   for (const [scope, reason] of watcher.unwatched) {
-    // A warning, not a failure: the rescan timer covers it, and a root that
-    // does not exist yet is the normal state of a new instance.
     console.warn(`[status]   not watching ${scope}: ${reason} (falling back to rescan)`);
   }
 });
 
-// The unix sockets, after the TCP listener rather than before it, so that a
-// slow probe of a stale socket cannot delay the listener that everything else
-// depends on. Nothing awaits this; it settles into `socketOutcomes` and is
-// reported on /healthz from then on.
+// The unix sockets, after the TCP listener, so a slow probe of a stale socket cannot delay it.
 const socketPaths = config.agents
   .map((agent) => agent.socketPath)
   .filter((path): path is string => path !== null);
@@ -632,11 +400,6 @@ void bindUnixSockets(socketPaths, handleRequest).then((outcomes) => {
     }
   }
 }).catch((error: unknown) => {
-  // Same reasoning as the reachability report above, and added at the same
-  // time: `bindUnixSockets` resolves every failure into a `SocketOutcome` and
-  // does not reject today, so this is not a live path either. It is here
-  // because leaving one of the two boot promises bare while adding a handler
-  // to the other would make the argument for the first one untrue.
   console.error('[status] binding unix sockets failed:', error);
   console.error('[status] the TCP listener is unaffected; no container can reach the page.');
 });
@@ -651,9 +414,7 @@ function shutdown(signal: string): void {
   // `systemctl restart` take a moment rather than a TimeoutStopSec.
   for (const stream of streams) stream.end();
   streams.clear();
-  // Close the unix listeners too, and unlink what we created. A socket file
-  // left behind is what the stale-socket handling in socket.ts exists to
-  // recover from; not leaving one is cheaper than recovering from it.
+  // Close the unix listeners too, and unlink what we created.
   for (const outcome of socketOutcomes) {
     if (!outcome.listening) continue;
     outcome.server.close();

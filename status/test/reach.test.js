@@ -1,20 +1,3 @@
-/**
- * reach.ts — what this process can actually reach.
- *
- * The point of every one of these is the difference between a statement about
- * `status-config.yaml` and a statement about the world. The old boot banner
- * printed the configured path and nothing else, which reads the same on a host
- * where the path was renamed; these assert that each way a path can be unusable
- * produces a distinguishable sentence with an errno in it, and — for the two
- * cases where the config is not merely absent but wrong — that it says what was
- * found instead.
- *
- * A board is probed as a FILE here. Whether it can be QUERIED is a different
- * question, answered by `describeBoardError` in registry.ts, and #72 is the gap
- * between them: a readable file in WAL mode with no `-shm` is unqueryable by
- * this service. That is deliberately not duplicated in reach.ts.
- */
-
 import { strict as assert } from 'node:assert';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -146,9 +129,6 @@ test('a dangling symlink is ENOENT rather than a confident "readable"', async ()
 });
 
 test('a directory this process may not read says EACCES and prints the mode and owner', async (t) => {
-  // Root can read anything, so this case cannot be produced as root. Skipping
-  // is stated rather than silently passing: a green run under root has NOT
-  // checked this, and that is the difference between a test and a decoration.
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     t.skip('running as root — mode 0000 is not a permission failure for uid 0');
     return;
@@ -163,8 +143,7 @@ test('a directory this process may not read says EACCES and prints the mode and 
     const result = await probe({ scope: 'clawcius', what: 'projects root', path: root, kind: 'directory' });
     assert.equal(result.ok, false);
     assert.match(result.detail, /EACCES: it exists and this process is not permitted to read it/);
-    // The fix for this on this host is always a group, and that conversation
-    // starts with the mode and the owning uid.
+    // Reported with the mode and the owning uid.
     assert.match(result.detail, /mode 0000, owned by uid \d+/);
   } finally {
     chmodSync(join(dir, 'projects'), 0o700);

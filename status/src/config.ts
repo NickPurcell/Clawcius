@@ -1,34 +1,8 @@
-/**
- * Status page configuration, loaded from `status-config.yaml`.
- *
- * Same split as the waker: everything describing *what this service watches*
- * is version-controllable YAML, and there are no secrets here at all — this
- * process reads files and serves HTML, it authenticates to nothing.
- *
- * The validation is deliberately noisy. A status page whose roots are wrong
- * does not crash: it renders an empty, cheerful "no agents" and looks exactly
- * like a healthy host with nothing running. That is the worst possible failure
- * for an observability tool, so anything structurally wrong fails the boot
- * with the offending key named, and anything merely *absent on disk* is
- * reported in the UI as a broken root rather than silently skipped.
- */
-
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
 import { parse } from 'yaml';
 
-/**
- * One agent instance to watch.
- *
- * `projectsRoot` is the `projects/` directory inside that instance's
- * CLAUDE_CONFIG_DIR. On this deployment the containers are started by
- * `docker/run-container.sh`, which mounts `$CLAWCIUS_STATE_DIR/agent-home` at
- * `/home/agent/.claude-agent` and sets CLAUDE_CONFIG_DIR to that path — so the
- * host-side transcripts for instance `X` are at
- * `/var/lib/X/agent-home/projects`. The defaults below encode exactly that,
- * but nothing here assumes it: a root is just a directory of
- * `<slugified-cwd>/<sessionId>.jsonl`.
- */
+/** One agent instance to watch. */
 export type AgentRoot = {
   /** Stable, URL-safe id. Used in links and in the SSE payloads. */
   id: string;
@@ -36,143 +10,25 @@ export type AgentRoot = {
   label: string;
   /** Absolute path to the instance's `projects/` directory. */
   projectsRoot: string;
-  /**
-   * The instance's board database — its `CLAWCIUS_DB_PATH` — or null.
-   *
-   * This is where the agents are. Without it the page can only list the
-   * directories under `projectsRoot`, which is what it used to do and which
-   * counted `/tmp` scratch paths as agents (Clawcius #14). Opened READ-ONLY;
-   * see `registry.ts`.
-   *
-   * Optional rather than required, and absent is shown on the page rather than
-   * being a boot failure. An instance legitimately without a board is a real
-   * configuration — CLAWSKY.md § Topology keeps Osmosis Jones off the board on
-   * purpose, since its workers read pull requests written by strangers.
-   */
   boardDb: string | null;
-  /**
-   * Absolute path to a unix domain socket to ALSO serve this page on, or null.
-   *
-   * This is how the page becomes reachable from inside that instance's agent
-   * container, and it is deliberately not a second TCP port. The agent
-   * containers are on `clawcius-internal`, a network with no gateway: from
-   * inside, `172.17.0.1:8477` and `172.31.250.1:8477` are both "Network is
-   * unreachable", and squid is the only route out. The obvious fix — bind the
-   * HTTP server somewhere the container can route to — would trade away the
-   * exact property the loopback bind exists to buy, so it is not on the table.
-   *
-   * A unix socket is not on any network. It has no address family that a
-   * remote host can name, `IPAddressDeny=any` does not apply to it and does
-   * not need to, and the TCP listener is untouched: after this change the set
-   * of TCP endpoints serving this page is byte for byte what it was before.
-   * The reachability comes from the FILESYSTEM instead, via the one read-write
-   * bind mount `docker/run-container.sh` already gives each container
-   * (`$CLAWCIUS_STATE/run`, see Clawcius #65).
-   *
-   * PER INSTANCE, which is why it lives on the agent entry rather than under
-   * `server:`. Each container mounts only its own instance's run directory, so
-   * instance `X` can only reach a socket under `/var/lib/X/run`. One socket
-   * under `server:` would be reachable by exactly one crew.
-   *
-   * WHAT IT DOES NOT DO is scope the page. Every listener serves the same
-   * process and the same routes, so an agent that can reach any socket can
-   * reach EVERY route, for EVERY configured instance:
-   *
-   *   - `/api/clawsky`                                 both crews' boards,
-   *                                                    DMs and feed posts
-   *   - `/api/agents/<id>/sessions`                    every session of every
-   *                                                    configured instance
-   *   - `/api/agents/<id>/sessions/<sid>/transcript`   the full, message-by-
-   *     (and `?subagent=…`)                            message transcript of
-   *                                                    any of them
-   *   - `/api/oj`                                      the OJ worker snapshot
-   *
-   * TWO THINGS MAKE THAT A DIFFERENT GRANT RATHER THAN A BIGGER ONE, and they
-   * are the reason this list is spelled out instead of summarised:
-   *
-   *   1. A TRANSCRIPT IS EVERYTHING AN AGENT EVER SAW — file contents, tool
-   *      output, what the operator told it, what its subagents did — not just
-   *      what it chose to write to another agent. The board is messages; this
-   *      is the whole conversation, including things nobody composed.
-   *   2. CROSS-CREW TRANSCRIPTS HAVE NO PATH INTO EITHER CONTAINER TODAY.
-   *      `docker/run-container.sh` mounts only `$CLAWCIUS_STATE/*`, so this
-   *      socket CREATES the access rather than exposing something already
-   *      reachable. Within a crew it is different — CLAWSKY.md notes a crew
-   *      shares one container and one uid — but across crews there is no
-   *      existing route.
-   *
-   * And the caveat that goes with the larger set: credential redaction is "a
-   * mitigation and not a guarantee" (see the security-model block at the top
-   * of index.ts, point 5). That caveat was written about transcript content,
-   * so it is weaker cover here than it would be for a board of messages, not
-   * stronger.
-   *
-   * THIS IS DECIDED, NOT OVERLOOKED, AND IT WAS ASKED TWICE. The first version
-   * of this note named only the other crew's board, and the operator agreed to
-   * that description on 2026-08-17:
-   *
-   *     "I want you to be able to debug it, seeing other agents when you do
-   *      that is fine."
-   *
-   * Osmosis Jones caught that the description was materially incomplete — the
-   * same listener serves transcripts and `/api/oj`, which is the larger and
-   * different set enumerated above — and blocked #88 on it. The real grant was
-   * put to the operator again, and agreed:
-   *
-   *     "I say accept as is! Fine to have that visibility as a dev agent"
-   *
-   * The narrow disclosure was SUPERSEDED, not supplemented; there were not two
-   * different conversations. Recorded at this length because a later reader
-   * inheriting only the first version would be inheriting a grant nobody made.
-   *
-   * So DO NOT ADD per-crew filtering here, or read-scoping by which socket a
-   * request arrived on, or a flag to turn it off. That is the isolation that
-   * was declined, twice, and it would make the page lie about what it can see.
-   *
-   * Null — the default — means no socket for that instance and is exactly the
-   * behaviour that shipped before this existed.
-   */
   socketPath: string | null;
 };
 
 export type LivenessConfig = {
-  /**
-   * Newest transcript write within this many seconds ⇒ "running".
-   *
-   * Tuned to how Claude Code actually writes: a line lands per message, and a
-   * long tool call (a build, a clone, an npm install) can go minutes without
-   * one. Too tight and every agent doing real work flickers to "idle".
-   */
+  /** Newest transcript write within this many seconds ⇒ "running". */
   runningSeconds: number;
-  /**
-   * Beyond `runningSeconds` but within this ⇒ "idle" — plausibly just waiting
-   * for someone to speak to it. Beyond it ⇒ "stale", which is the interesting
-   * state: a wedged agent and an agent nobody has messaged for a day look
-   * identical from the outside, and this is the line between them.
-   */
+  /** Beyond `runningSeconds` but within this ⇒ "idle" — plausibly just waiting for someone to speak to it. */
   idleSeconds: number;
 };
 
 export type OjConfig = {
-  /**
-   * Root of Osmosis Jones's per-PR worker directories,
-   * `<workersRoot>/<owner>__<repo>__<pr>`.
-   *
-   * OJ is not running yet. Everything about this section is written to be
-   * absent-tolerant: a missing root is reported as "no OJ data yet", not as an
-   * error, because that is the true state of the world today and will be again
-   * every time OJ is stopped.
-   */
   workersRoot: string;
   /** Optional JSON state file. Missing is normal; malformed is reported. */
   stateFile: string;
 };
 
 export type ServerConfig = {
-  /**
-   * Loopback only. See the bind check in `index.ts` — this is not a
-   * preference, and a non-loopback value is rejected at startup.
-   */
+  /** Loopback only. */
   host: string;
   port: number;
 };
@@ -180,43 +36,10 @@ export type ServerConfig = {
 export type ReadConfig = {
   /** Transcript lines returned per page by the transcript endpoint. */
   pageSize: number;
-  /**
-   * Hard ceiling on the bytes one page request may read off disk.
-   *
-   * A single JSONL line can be enormous — a tool result holding a whole file,
-   * a base64 image. Paging by line count alone therefore does not bound the
-   * response, so the reader stops early once it has read this much and reports
-   * a short page.
-   */
+  /** Hard ceiling on the bytes one page request may read off disk. */
   maxPageBytes: number;
-  /**
-   * Characters of message text kept per content block before truncation.
-   * The UI is a transcript reader, not an archive; the JSONL on disk is the
-   * archive.
-   */
+  /** Characters of message text kept per content block before truncation. */
   maxBlockChars: number;
-  /**
-   * How many indexed TRANSCRIPTS to hold in memory at once.
-   *
-   * Named for sessions and counts transcripts, and that gap is what made the
-   * old default of 64 look comfortable: one session is its own transcript plus
-   * one per subagent, so the session on this host with 103 subagents needs 104
-   * entries, not one. The name is kept because it is in the deployed YAML;
-   * this comment is the correction.
-   *
-   * The failure when it is too small is a cliff, not a slope. `buildSessionDetail`
-   * walks every transcript of a session in order, so a session larger than the
-   * cache evicts exactly what the next pass asks for first — a cyclic scan
-   * through a too-small LRU has a hit rate of approximately zero. Measured on
-   * this host at 103 subagents against a 64-entry cache: warm rebuilds went
-   * from 107ms to 786ms, and the page rebuilds on every change event. At 256
-   * it was 183ms. It is the limit that costs the time, not the bytes.
-   *
-   * Indexes are small next to what they describe — 103 of them measured at
-   * about 5 MB of heap — so headroom here is cheap and running out of it is
-   * not. Size it above the largest session's subagent count, with room; the
-   * service logs a warning naming the session when one does not fit.
-   */
   maxCachedSessions: number;
 };
 
@@ -227,66 +50,9 @@ export type StatusConfig = {
   oj: OjConfig;
   read: ReadConfig;
   watch: {
-    /**
-     * Coalescing window for filesystem events.
-     *
-     * An agent turn writes several lines in quick succession and each one is
-     * an inotify event; without this the SSE stream becomes a firehose that
-     * costs more to render than the data is worth.
-     */
     debounceMs: number;
-    /**
-     * Seconds between SSE heartbeat comments.
-     *
-     * Without a heartbeat a dead stream is indistinguishable from a quiet one
-     * — the page would sit there looking live while showing hours-old data.
-     * The client marks the connection dead if it misses two of these, so this
-     * value is also the resolution of "is this page still telling the truth".
-     */
     heartbeatSeconds: number;
-    /**
-     * Rescan interval, seconds. 0 disables.
-     *
-     * Called a fallback everywhere else in this codebase, but on THIS
-     * deployment it is very likely the primary mechanism, and the default is
-     * set accordingly.
-     *
-     * The reason is in SETUP.md § 6b: the waker watches a bind-mounted
-     * directory written from inside the gVisor container, and found that
-     * "gVisor's gofer does not reliably deliver inotify for writes made inside
-     * the sandbox" — which is why it carries a 5s sweep alongside its
-     * `fs.watch`. This service is in exactly that topology. The agents write
-     * their transcripts inside the sandbox to `/home/agent/.claude-agent`; we
-     * watch the host side of that same mount at
-     * `/var/lib/<instance>/agent-home`. Assuming inotify works here, when the
-     * one other component on this host that tried it documented that it does
-     * not, would be choosing to be wrong.
-     *
-     * fs.watch is still set up, because when it does fire the update is
-     * instant and free. It is simply not trusted alone — and it has its own
-     * independent failure modes regardless of gVisor: recursive watching is
-     * emulated on some platforms, inotify watches are a finite per-user
-     * resource (`fs.inotify.max_user_watches`) that fails silently when
-     * exhausted, and a directory created after the watch was established may
-     * never be reported.
-     */
     rescanSeconds: number;
-    /**
-     * Seconds between board polls. 0 disables.
-     *
-     * The board is a single SQLite file in none of the watched directories, so
-     * without this `/api/clawsky` refreshes only when some unrelated transcript
-     * changes — and the host agent is documented as writing no transcripts
-     * under any projects root, so a DM to or from it could leave the page stale
-     * under a header correctly saying "live".
-     *
-     * A separate key from `rescanSeconds` rather than sharing it, because
-     * setting a directory rescan to 0 should not silently stop the board being
-     * read; they are different mechanisms watching different things. See
-     * `BoardWatcher` in watch.ts for why this polls a fingerprint rather than
-     * using fs.watch, which would work here and would still be the wrong
-     * instrument.
-     */
     boardPollSeconds: number;
   };
 };
@@ -310,9 +76,7 @@ const DEFAULTS: StatusConfig = {
       id: 'hamachi',
       label: 'Hamachi',
       projectsRoot: '/var/lib/hamachi/agent-home/projects',
-      // Named for the instance, not for the variable. `CLAWCIUS_DB_PATH` in
-      // .env.hamachi is /var/lib/hamachi/hamachi.db — ops-config.yaml records
-      // that the obvious guess, clawcius.db, was wrong here.
+      // `CLAWCIUS_DB_PATH` in .env.hamachi: named for the instance, not the variable.
       boardDb: '/var/lib/hamachi/hamachi.db',
       socketPath: '/var/lib/hamachi/run/status.sock',
     },
@@ -329,16 +93,12 @@ const DEFAULTS: StatusConfig = {
     pageSize: 60,
     maxPageBytes: 2_000_000,
     maxBlockChars: 20_000,
-    // 2.5x the largest session on this host (104 transcripts). See the comment
-    // on the field: below the size of one session this degrades sharply rather
-    // than gradually.
+    // Below the transcript count of one session this degrades sharply, not gradually.
     maxCachedSessions: 256,
   },
   watch: {
     debounceMs: 400,
     heartbeatSeconds: 15,
-    // 10s, not 60s: see the comment on this field. The waker uses 5s for the
-    // same reason; a status page can afford to be half as eager.
     rescanSeconds: 10,
     // Same cadence as the rescan. The query is four integers.
     boardPollSeconds: 10,
@@ -377,12 +137,6 @@ function section(raw: unknown, path: string): Record<string, unknown> {
   return raw;
 }
 
-/**
- * Agent ids appear in URLs and are used to select a configured root. They are
- * therefore held to the same shape the request validator enforces — if the two
- * ever disagree, a legally-configured agent becomes permanently unreachable
- * with a 400 and no obvious cause. Fail at boot instead.
- */
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 function agents(raw: unknown): AgentRoot[] {
@@ -415,34 +169,22 @@ function agents(raw: unknown): AgentRoot[] {
     const projectsRoot = str(entry['projectsRoot'], `${path}.projectsRoot`, '');
     if (!projectsRoot) throw new ConfigError(`${path}.projectsRoot`, 'is required');
     if (!isAbsolute(projectsRoot)) {
-      // Relative roots would resolve against the service's working directory,
-      // which under systemd is not the one you had in mind when you wrote it.
+      // A relative root would resolve against the service's working directory.
       throw new ConfigError(`${path}.projectsRoot`, 'must be an absolute path');
     }
 
-    // The board is opened by name and read-only, and a relative path would
-    // resolve against the service's working directory — which under systemd is
-    // not the one whoever wrote the line had in mind.
     const boardDb = str(entry['boardDb'], `${path}.boardDb`, '');
     if (boardDb && !isAbsolute(boardDb)) {
       throw new ConfigError(`${path}.boardDb`, 'must be an absolute path');
     }
 
-    // Same absolute-path rule as the two above, and for a sharper reason: a
-    // relative socket path resolves against the service's working directory,
-    // which under ProtectSystem=strict is read-only — so the bind fails with
-    // EROFS somewhere that looks nothing like "this line is wrong".
+    // Absolute, and unique per instance: a container only mounts its own run directory.
     const rawSocket = str(entry['socketPath'], `${path}.socketPath`, '');
     if (rawSocket && !isAbsolute(rawSocket)) {
       throw new ConfigError(`${path}.socketPath`, 'must be an absolute path');
     }
     const socketPath = rawSocket ? resolve(rawSocket) : null;
 
-    // Two instances sharing one socket path is always a mistake, and a quiet
-    // one: whichever agent is listed second finds the first already listening,
-    // so the page comes up, the log says one socket was skipped as "in use by
-    // a live server", and the second crew's container reaches a socket that is
-    // not in a directory it has mounted. Name it at boot instead.
     if (socketPath) {
       const owner = seenSockets.get(socketPath);
       if (owner !== undefined) {
@@ -458,9 +200,7 @@ function agents(raw: unknown): AgentRoot[] {
     return {
       id,
       label: str(entry['label'], `${path}.label`, id),
-      // resolve() also normalises away any `..` in the configured value, so
-      // the traversal guard in transcripts.ts compares against a canonical
-      // prefix rather than something like `/var/lib/x/../..`.
+      // resolve() normalises `..` away, so the traversal guard in transcripts.ts compares against a canonical prefix.
       projectsRoot: resolve(projectsRoot),
       boardDb: boardDb ? resolve(boardDb) : null,
       socketPath,
@@ -568,11 +308,6 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
     );
   }
 
-  // The bind address is a security property, not a tuning knob, so it is
-  // checked here as well as at listen time. `tailscale serve` proxies from
-  // localhost; binding anywhere else publishes every transcript on this host
-  // to whatever interface you named, and the page has no authentication of its
-  // own because it is not supposed to need any.
   if (!isLoopback(config.server.host)) {
     throw new Error(
       `status-config.yaml: server.host must be a loopback address, got "${config.server.host}". ` +
@@ -586,18 +321,9 @@ export function loadStatusConfig(configPath?: string): StatusConfig {
   return config;
 }
 
-/**
- * Loopback check.
- *
- * Deliberately an allowlist of the forms that are actually loopback rather
- * than a denylist of `0.0.0.0`: `::`, an empty string and a bare `*` all bind
- * every interface too, and a denylist would have to enumerate them correctly
- * forever.
- */
+/** Loopback check. */
 export function isLoopback(host: string): boolean {
   if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
-  // 127.0.0.0/8 in full — 127.0.0.1 is the conventional one but the whole /8
-  // is loopback, and someone separating services onto 127.0.0.2 is doing
-  // something reasonable.
+  // The whole 127.0.0.0/8, not just 127.0.0.1.
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }

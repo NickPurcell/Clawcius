@@ -1,13 +1,3 @@
-/**
- * Clawsky: the board's mail, read-only.
- *
- * A DM and a feed post are one table and the recipient is what separates them,
- * so most of what is worth pinning here is that separation, the fact that
- * nothing about a message is taken from its text, and that bodies — which
- * carry quoted external content by design — are redacted and bounded on the
- * way out.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -136,17 +126,6 @@ test('bodies are redacted on the way out, like transcript text', () => {
   assert.match(message.body, /Authorization: Bearer \[redacted\]/);
 });
 
-/**
- * The ceiling is per list, and that is not a detail.
- *
- * It used to take the newest N rows of `mail` and partition them afterwards,
- * so a burst of DMs could push every post out of the window and the feed would
- * render empty. The page's empty-feed copy is a POSITIVE claim — "posts are
- * possible, none has been written" — so the ceiling would not have degraded
- * the view, it would have made it state something false.
- *
- * Six DMs newer than the only post, with room for two of each.
- */
 test('a burst of DMs cannot push the posts out of the feed', () => {
   const messages = [{ author: 'hamachi-poster', recipient: FEED, subject: 'shipped', body: 'PR merged' }];
   for (let i = 0; i < 6; i += 1) {
@@ -171,10 +150,7 @@ test('sender counts come from the whole table, not from the returned window', ()
 
   const snapshot = readMail(board({ messages }), 20_000, 2);
   assert.equal(snapshot.dms.length, 2, 'the window is doing its job');
-  // Counted with GROUP BY over all six. Tallying the two returned rows would
-  // print "2 sent" beside an agent that sent six, and print it confidently.
-  // A Map, not an object literal — an agent id of `constructor` would answer
-  // a function to `?? 0` from a `{}`.
+  // Counted with GROUP BY over all six.
   assert.equal(snapshot.sentByAuthor.get('hamachi-host'), 6);
 });
 
@@ -226,15 +202,7 @@ test('an unconfigured board is not an error', () => {
   assert.deepEqual(snapshot.dms, []);
 });
 
-/**
- * The empty feed has to be explainable, not just empty.
- *
- * Only a `poster` may write to the feed (`src/mail.ts`), and no crew has one
- * today — a coordinator can spawn one and none has. `posterCount` is what lets
- * the page say the feed CANNOT have posts rather than that it happens to have
- * none — a checkable statement instead of a reassuring one, and one that stops
- * being made the moment a poster exists.
- */
+/** The empty feed has to be explainable, not just empty. */
 test('posterCount is what makes an empty feed explainable', () => {
   const config = statusConfig();
   const agent = {
@@ -271,24 +239,6 @@ test('a crew with a poster and no posts is a different statement', () => {
   assert.deepEqual(clawsky.feed, []);
 });
 
-/**
- * The gate on every positive statement the Clawsky page makes.
- *
- * `posterCount: 0` has two meanings — "this crew has no poster" and "the
- * registry could not be read" — and only the first licenses the copy the page
- * prints under an empty feed:
- *
- *   "Empty, and that is correct… this crew has none… Nothing is broken and
- *    nothing needs enabling."
- *
- * Under an unreadable board that is three claims, none of them known, printed
- * directly beneath a warning row explaining that the board could not be read.
- * And it is not a rare state: it is the one this page names itself, since mail
- * goes dark at exactly the moments the roster does (Clawcius #72).
- *
- * So the decision is a field on the wire rather than a shape the client
- * happens to draw, and it is asserted here.
- */
 test('a board that cannot be read is not reported as a board with nothing on it', () => {
   const config = statusConfig();
   const path = join(mkdtempSync(join(tmpdir(), 'status-mail-')), 'notadb.db');
@@ -311,8 +261,6 @@ test('a board with no boardDb at all is also not readable', () => {
 
   assert.equal(clawsky.boardReadable, false);
   assert.equal(clawsky.registryConfigured, false);
-  // No error, because nothing failed — it was never configured. Still not a
-  // licence to say the feed is empty.
   assert.equal(clawsky.mailError, null);
 });
 
