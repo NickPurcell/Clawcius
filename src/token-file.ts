@@ -2,21 +2,14 @@ import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path';
 import type { TokenProvider } from './github-app.js';
 
-/** How long before a written token is treated as too old to keep serving. */
+/** An installation token lives an hour; one this old is treated as dead. */
 const STALE_AFTER_MS = 55 * 60_000;
 
 /** How often to ask the provider for the current token. */
 export const REFRESH_INTERVAL_MS = 5 * 60_000;
 
-/** Write the token so that no reader can ever observe a partial one. */
-export function writeTokenFile(path: string, token: string): void {
-  writeSecretFile(path, token);
-}
-
-/** Atomic, 0600, and never observable half-written. See `writeTokenFile`. */
+/** Atomic, 0600, and never observable half-written. */
 export function writeSecretFile(path: string, contents: string): void {
-  // 0700 rather than the default 0755, so the directory's mode does not depend
-  // on whether the daemon or `run-container.sh` created it first.
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const existing = statSync(path, { throwIfNoEntry: false });
   if (existing && !existing.isFile()) rmSync(path, { recursive: true, force: true });
@@ -26,7 +19,6 @@ export function writeSecretFile(path: string, contents: string): void {
     writeFileSync(tmp, contents, { mode: 0o600 });
     renameSync(tmp, path);
   } finally {
-    // A failed rename would otherwise leave a 0600 file holding a live token that nothing cleans up.
     rmSync(tmp, { force: true });
   }
 }
@@ -66,67 +58,41 @@ export function removeCurlConfig(githubTokenDir: string): void {
 }
 
 export type TokenFileOptions = {
-  readonly path: string;
+  /** The directory the container mounts: the token file, the netrc and the curlrc live here. */
+  readonly dir: string;
   readonly provider: TokenProvider;
   readonly log: (message: string) => void;
-  /** Called with every token actually written, so a second consumer can be kept in step without a second provider and a second cache. */
-  readonly onToken?: (token: string) => void;
-  /** Called when the written token is given up on, for the same reason. */
-  readonly onNoToken?: () => void;
-  /** Called on `stop()`, to clear rather than replace. See `stop()`. */
-  readonly onStop?: () => void;
-  /** Whether a PAT exists to fall back TO. */
-  readonly hasFallbackToken?: boolean;
   readonly now?: () => number;
   readonly intervalMs?: number;
 };
 
-/** Keeps one file, shared by the whole crew, holding a currently-valid installation token. */
+/** Keeps the token file and the netrc in `dir` holding a currently-valid installation token, or absent. */
 export class TokenFileRefresher {
   readonly #opts: TokenFileOptions;
   readonly #now: () => number;
   #timer: ReturnType<typeof setInterval> | null = null;
-  #mintedAtMs = 0;
-  #lastToken: string | null = null;
-  #written = false;
+  #token: string | null = null;
+  /** When `#token` was first obtained; 0 while nothing is on disk. */
+  #freshAt = 0;
 
   constructor(opts: TokenFileOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
   }
 
+  /** Writes once now, then every interval. Answers whether a token is on disk. */
   async start(): Promise<boolean> {
     await this.#tick();
-    // Reported rather than assumed: the caller announces the file to the
-    // operator and must not announce one that is not there.
-    const wrote = this.#written;
-    this.#timer = setInterval(() => {
-      void this.#tick();
-    }, this.#opts.intervalMs ?? REFRESH_INTERVAL_MS);
+    this.#timer = setInterval(() => void this.#tick(), this.#opts.intervalMs ?? REFRESH_INTERVAL_MS);
     this.#timer.unref?.();
-    return wrote;
+    return this.#freshAt > 0;
   }
 
   /** Stop refreshing, and take the credential with you. */
   stop(): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = null;
-    this.#written = false;
-    this.#lastToken = null;
-    try {
-      this.#opts.onStop?.();
-    } catch (error) {
-      const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
-      this.#opts.log(
-        `[token-file] could not remove the curl credential on shutdown (${code}); ` +
-          'a usable token may remain on disk. Shutdown continues.',
-      );
-    }
-    try {
-      rmSync(this.#opts.path, { force: true });
-    } catch {
-      // Shutdown is not a place to throw. The next start overwrites it anyway.
-    }
+    this.#remove();
   }
 
   /** Visible for tests: run one refresh without waiting for the interval. */
@@ -134,64 +100,44 @@ export class TokenFileRefresher {
     await this.#tick();
   }
 
-  async #write(): Promise<void> {
-    const token = await this.#opts.provider();
-    writeTokenFile(this.#opts.path, token);
-    if (token !== this.#lastToken) {
-      this.#lastToken = token;
-      this.#mintedAtMs = this.#now();
-    }
-    this.#written = true;
-
+  async #tick(): Promise<void> {
     try {
-      this.#opts.onToken?.(token);
+      const token = await this.#opts.provider();
+      writeSecretFile(tokenFilePath(this.#opts.dir), token);
+      writeCurlConfig(this.#opts.dir, token);
+      // A caching provider hands back the same token for most of its life, so the age that matters is the token's, not the write's.
+      if (token !== this.#token) {
+        this.#token = token;
+        this.#freshAt = this.#now();
+      }
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
+      const ageMs = this.#now() - this.#freshAt;
+      if (this.#freshAt > 0 && ageMs < STALE_AFTER_MS) {
+        this.#opts.log(
+          `[token-file] refresh failed (${code}); the token on disk is ` +
+            `${Math.round(ageMs / 60_000)} minute(s) old and stays in use`,
+        );
+        return;
+      }
+      this.#remove();
       this.#opts.log(
-        `[token-file] the git credential is current, but the curl credential could not ` +
-          `be written (${code}); it is UNCHANGED — REST keeps using whatever was last ` +
-          'written there, or nothing if there never was any. There is no fallback: with ' +
-          'no netrc curl sends nothing and takes a 401.',
+        `[token-file] no installation token (${code}); nothing at ` +
+          `${tokenFilePath(this.#opts.dir)} until a refresh succeeds`,
       );
     }
   }
 
-  async #tick(): Promise<void> {
+  /** Runs from a timer and on shutdown, so it must not throw. */
+  #remove(): void {
+    this.#token = null;
+    this.#freshAt = 0;
     try {
-      await this.#write();
+      rmSync(tokenFilePath(this.#opts.dir), { force: true });
+      removeCurlConfig(this.#opts.dir);
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String(error.code) : 'failed';
-      const ageMs = this.#now() - this.#mintedAtMs;
-
-      if (this.#written && ageMs < STALE_AFTER_MS) {
-        this.#opts.log(
-          `[token-file] refresh failed (${code}); the token on disk is ` +
-            `${Math.round(ageMs / 60_000)} minute(s) old and still in use. Retrying.`,
-        );
-        return;
-      }
-
-      // Past its life and unrefreshable. An absent file fails immediately and
-      // legibly; a stale one fails later, as a 401 that names nothing.
-      this.#written = false;
-      try {
-        rmSync(this.#opts.path, { force: true });
-      } catch {
-        // `#tick` runs as `void this.#tick()` from a timer, so a throw out of this catch would be an uncaught exception.
-      }
-      try {
-        this.#opts.onNoToken?.();
-      } catch {
-        // Same reason as the `rmSync` catch above.
-      }
-      this.#opts.log(
-        `[token-file] could not obtain an installation token (${code}); there is no ` +
-          `usable credential at ${this.#opts.path}. ` +
-          (this.#opts.hasFallbackToken
-            ? 'Agents fall back to GITHUB_TOKEN until a refresh succeeds; retrying.'
-            : 'GITHUB_TOKEN is not set either, so agent git operations will fail ' +
-              'until a refresh succeeds; retrying.'),
-      );
+      this.#opts.log(`[token-file] could not remove the credential (${code}); a usable token may remain on disk`);
     }
   }
 }

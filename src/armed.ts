@@ -45,8 +45,6 @@ export type ScheduleSeen = {
   fires: number;
   /** Occurrences that passed with nothing running, over the schedule's life. */
   missed: number;
-  /** Whether `missed` is a total or a floor — see `SchedulePlan.skippedExact`. */
-  missedExact?: boolean;
 };
 
 /** Watermarks, so a poll reports what is new rather than everything. */
@@ -75,12 +73,8 @@ export type ArmedCondition = {
   seen: ArmedSeen | null;
 };
 
-/** What `disarmFor` did, as a value rather than a thrown error or a log line. */
-export type DisarmOutcome =
-  | { disarmed: true; condition: ArmedCondition }
-  | { disarmed: false; reason: 'missing' }
-  | { disarmed: false; reason: 'not-yours'; owner: string }
-  | { disarmed: false; reason: 'already-inactive'; condition: ArmedCondition };
+/** What `disarmFor` did. A refusal does not say whether the row was missing, spent, or somebody else's. */
+export type DisarmOutcome = { disarmed: true; condition: ArmedCondition } | { disarmed: false };
 
 export type ReminderCondition = ArmedCondition & { kind: 'reminder'; spec: ReminderSpec };
 export type PrWatchCondition = ArmedCondition & {
@@ -202,27 +196,6 @@ export class ArmedStore {
     return rows.map(toCondition).filter((c): c is ArmedCondition => c !== null);
   }
 
-  spentFor(owner: string, since: number): { recent: ArmedCondition[]; older: number } {
-    const rows = this.#db
-      .prepare(
-        `SELECT ${COLUMNS} FROM armed_conditions
-          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) >= ?
-          ORDER BY fired_at DESC, id DESC`,
-      )
-      .all(owner, since) as Array<Record<string, unknown>>;
-    const older = this.#db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM armed_conditions
-          WHERE active = 0 AND owner = ? AND COALESCE(fired_at, armed_at) < ?`,
-      )
-      .get(owner, since) as { n: number };
-
-    return {
-      recent: rows.map(toCondition).filter((c): c is ArmedCondition => c !== null),
-      older: Number(older.n),
-    };
-  }
-
   findPrWatch(owner: string, repo: string, pr: number): ArmedCondition | null {
     for (const condition of this.listFor(owner)) {
       if (condition.kind !== 'pr-watch') continue;
@@ -256,12 +229,8 @@ export class ArmedStore {
     return row ? toCondition(row) : null;
   }
 
-  /** Push a still-armed condition's next look further out. */
+  /** Push a condition's next look further out, and record what it has seen. */
   reschedule(id: number, dueAt: number, seen: ArmedSeen | null = null): void {
-    if (seen === null) {
-      this.#db.prepare('UPDATE armed_conditions SET due_at = ? WHERE id = ?').run(dueAt, id);
-      return;
-    }
     this.#db
       .prepare('UPDATE armed_conditions SET due_at = ?, seen = ? WHERE id = ?')
       .run(dueAt, JSON.stringify(seen), id);
@@ -273,22 +242,16 @@ export class ArmedStore {
       .run(Date.now(), id);
   }
 
+  /** The owner check is in the statement that writes. */
   disarmFor(owner: string, id: number): DisarmOutcome {
     const existing = this.get(id);
-    if (!existing) return { disarmed: false, reason: 'missing' };
-    if (existing.owner !== owner) {
-      return { disarmed: false, reason: 'not-yours', owner: existing.owner };
-    }
-    if (!existing.active) return { disarmed: false, reason: 'already-inactive', condition: existing };
-
     const firedAt = Date.now();
     const result = this.#db
       .prepare(
         'UPDATE armed_conditions SET active = 0, fired_at = ? WHERE id = ? AND owner = ? AND active = 1',
       )
       .run(firedAt, id, owner);
-    if (Number(result.changes) === 0) return { disarmed: false, reason: 'missing' };
-
+    if (!existing || Number(result.changes) === 0) return { disarmed: false };
     return { disarmed: true, condition: { ...existing, active: false, firedAt } };
   }
 }

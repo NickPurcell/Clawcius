@@ -7,7 +7,6 @@ import {
   type PrReview,
   type PullRequestSource,
   type PullRequestState,
-  GitHubError,
 } from './github.js';
 import type { MailStore } from './mail.js';
 import type {
@@ -19,25 +18,9 @@ import type {
   ScheduleSeen,
   ScheduleSpec,
 } from './armed.js';
-import {
-  DEFAULT_TIMEZONE,
-  isTimezone,
-  parseCron,
-  planNextFire,
-  zonedStamp,
-} from './schedule.js';
+import { parseCron, planNextFire, zonedStamp } from './schedule.js';
 import type { AgentRegistry } from './store.js';
-
-/** The Pacific instant beside a schedule-zone one, or nothing when identical. */
-function alsoIn(at: number, timeZone: string): string {
-  const here = zonedStamp(at, DEFAULT_TIMEZONE);
-  return zonedStamp(at, timeZone) === here ? '' : ` (${here})`;
-}
-
-/** PT and labelled. Same format `renderMail` uses. */
-function stamp(at: number): string {
-  return zonedStamp(at, DEFAULT_TIMEZONE);
-}
+import { alsoIn, stamp } from './armed-util.js';
 
 function minutes(ms: number): string {
   const m = Math.round(ms / 60_000);
@@ -257,74 +240,24 @@ export function composeWatchMail(
   return { subject: `watchPr ${spec.repo}#${spec.pr} — ${summary}`, body: lines.join('\n') };
 }
 
-/** Consecutive failed polls, of any class, before a watch is given up on. */
+/** Consecutive failed polls before a watch is given up on. */
 export const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
-/** Consecutive 404s before the target is treated as genuinely gone. */
-export const GONE_404_POLLS = 3;
-
-export type PollFailureClass = {
-  /** Consecutive failures of this kind before the watch is given up on. */
-  readonly bound: number;
-  /** What the mail should say happened. */
-  readonly cause: 'gone' | 'unreachable';
-};
-
-/** Is this failure a reason to give up on the watch, or to try again? */
-export function classifyPollFailure(error: unknown): PollFailureClass {
-  const status = error instanceof GitHubError ? error.status : 0;
-
-  // 410 is unambiguous: the resource was here and is deliberately gone. One
-  // failure is enough.
-  if (status === 410) return { bound: 1, cause: 'gone' };
-
-  if (status === 404) return { bound: GONE_404_POLLS, cause: 'gone' };
-
-  return { bound: MAX_CONSECUTIVE_POLL_FAILURES, cause: 'unreachable' };
-}
-
-/** What the watch could not tell the agent, and why it stopped trying. `cause` is required so no call site inherits another's wording. */
+/** What a watch says when it is given up on: how many polls in a row failed, and the last error. */
 export function composeWatchErrorMail(
   spec: PrWatchSpec,
-  detail: string,
-  cause: 'gone' | 'unreachable' | 'no-token',
-  attempts = 1,
+  lastError: string,
+  failures: number,
 ): ComposedMail {
-  const headline: Record<typeof cause, string> = {
-    gone: 'the target is gone',
-    unreachable: 'the poll kept failing',
-    'no-token': 'this process has no GitHub token',
-  };
-  const opening: Record<typeof cause, string> = {
-    gone:
-      `Your watch on ${spec.repo}#${spec.pr} has been disarmed: GitHub says that pull ` +
-      'request is not there, across ' +
-      `${attempts === 1 ? 'a poll' : `${attempts} consecutive polls`}. It has been deleted, ` +
-      'or it is no longer visible to the credential this process holds — those look the ' +
-      'same from here, and both leave a watch that will never fire.',
-    unreachable:
-      `Your watch on ${spec.repo}#${spec.pr} failed ${attempts} polls in a row and has been ` +
-      'disarmed.',
-    'no-token':
-      `Your watch on ${spec.repo}#${spec.pr} has been disarmed without being polled at all: ` +
-      'this process has no GitHub token. It was armed under a process that had one.',
-  };
-  const closing: Record<typeof cause, string> = {
-    gone:
-      'Arm it again if you believe that is wrong — the check is one request and it costs ' +
-      'nothing to be told twice.',
-    unreachable:
-      'A single failure is no longer enough to do this: a transient one is retried, because ' +
-      'a credential rotation or a 5xx says nothing about the pull request. This many in a ' +
-      'row is treated as the target being genuinely unreachable. Fix the cause and arm it ' +
-      'again.',
-    'no-token':
-      'Nothing was retried and nothing failed — there was no request to make. Give the ' +
-      'process a token and arm it again.',
-  };
   return {
-    subject: `watchPr ${spec.repo}#${spec.pr} — DISARMED, ${headline[cause]}`,
-    body: [opening[cause], '', `What went wrong: ${detail}`, '', closing[cause]].join('\n'),
+    subject: `watchPr ${spec.repo}#${spec.pr} — DISARMED after ${failures} failed polls`,
+    body: [
+      `Your watch on ${spec.repo}#${spec.pr} failed ${failures} polls in a row and has been disarmed.`,
+      '',
+      quoteExternal('the last error', lastError),
+      '',
+      'Fix the cause and arm it again with watchPr.',
+    ].join('\n'),
   };
 }
 
@@ -343,10 +276,8 @@ export class ArmedWaker {
   #timer: NodeJS.Timeout | null = null;
   #ticking = false;
 
-  readonly #failures = new Map<
-    number,
-    { cause: PollFailureClass['cause']; count: number; total: number }
-  >();
+  /** Consecutive failed polls per watch. A poll that works clears it. */
+  readonly #failures = new Map<number, number>();
 
   constructor(options: ArmedWakerOptions) {
     this.#options = options;
@@ -376,7 +307,6 @@ export class ArmedWaker {
         try {
           // The snapshot is taken once and this loop awaits inside it, so a row can be withdrawn by its owner between the query and its turn.
           if (!this.#options.store.get(condition.id)?.active) {
-            // Its strikes go too.
             this.#failures.delete(condition.id);
             this.#options.log(
               `condition ${condition.id} was disarmed after this tick's query; skipped`,
@@ -413,40 +343,8 @@ export class ArmedWaker {
     const seen = condition.seen as ScheduleSeen | null;
     const now = Date.now();
 
-    const disarmUnreadable = (reason: string): void => {
-      this.#options.store.disarm(condition.id);
-      this.#deliver(
-        condition,
-        `Schedule ${condition.id} DISARMED — this build cannot read it`,
-        [
-          `The schedule you armed on ${stamp(condition.armedAt)} cannot be read by the process ` +
-            `that fires it: ${reason}.`,
-          '',
-          'It is disarmed rather than left in the table, because a schedule that throws on ' +
-            'every tick is a schedule that will never fire and would look like one that simply ' +
-            'has nothing to say — the failure would be in the journal and nowhere you can see. ' +
-            'Arm it again once the cause is fixed; nothing else about it was lost.',
-          '',
-          'Your note on it was:',
-          '',
-          spec.note,
-        ].join('\n'),
-      );
-    };
-
     const parsed = parseCron(spec.cron);
-    if (!parsed.ok) {
-      disarmUnreadable(`its expression \`${spec.cron}\` — ${parsed.error}`);
-      return;
-    }
-    if (!isTimezone(spec.timezone)) {
-      disarmUnreadable(
-        `its timezone "${spec.timezone}", which this process cannot resolve. That is a property ` +
-          'of the build rather than of the schedule — the zone was valid when the row was armed, ' +
-          'and an ICU downgrade is the usual reason it stops being',
-      );
-      return;
-    }
+    if (!parsed.ok) throw new Error(`schedule ${condition.id}: ${parsed.error}`);
 
     const plan = planNextFire(parsed.fields, spec.timezone, spec.everyN, condition.dueAt, now);
     const { subject, body } = composeScheduleMail(condition, now, plan);
@@ -455,10 +353,6 @@ export class ArmedWaker {
       lastFiredAt: now,
       fires: (seen?.fires ?? 0) + 1,
       missed: (seen?.missed ?? 0) + plan.skipped,
-      // Latches. One walk that stopped short makes the running total a floor
-      // for the rest of the row's life, and `listArmed` reads this to decide
-      // whether it may state the number plainly.
-      missedExact: (seen?.missedExact ?? true) && plan.skippedExact,
     };
     if (plan.nextAt === null) {
       this.#options.store.disarm(condition.id);
@@ -480,22 +374,18 @@ export class ArmedWaker {
 
     const github = this.#options.github;
     if (!github) {
-      // Armed under a process that had a token, resumed under one that does
-      // not. Saying so beats polling nothing forever.
       this.#options.store.disarm(condition.id);
-      const { subject, body } = composeWatchErrorMail(
-        spec,
-        'no GitHub token is available to the waker process any more',
-        'no-token',
+      this.#deliver(
+        condition,
+        `watchPr ${spec.repo}#${spec.pr} — DISARMED, no GitHub token`,
+        `Your watch on ${spec.repo}#${spec.pr} has been disarmed without being polled: this ` +
+          'process has no GitHub token. Give it one and arm the watch again.',
       );
-      this.#deliver(condition, subject, body);
       return;
     }
 
     let polled: { pr: PullRequestState; reviews: PrReview[]; comments: PrComment[] } | null = null;
-    let failure: string | null = null;
-    // Kept, not stringified: the disarm decision below needs the status.
-    let failureError: unknown = null;
+    let failure = '';
     try {
       const pr = await github.getPullRequest(spec.repo, spec.pr);
       const [reviews, comments] = await Promise.all([
@@ -504,14 +394,11 @@ export class ArmedWaker {
       ]);
       polled = { pr, reviews, comments };
     } catch (error) {
-      failureError = error;
-      failure = String(error).slice(0, 400);
+      failure = String(error).slice(0, 400) || 'unknown error';
     }
 
-    // ── WITHDRAWN WHILE THE POLL WAS IN FLIGHT ──────────────────────────────
     // The agent's `disarm` runs on the same event loop, so the row can have been withdrawn during the requests above.
     if (!this.#options.store.get(condition.id)?.active) {
-      // Drop its strikes too.
       this.#failures.delete(condition.id);
       this.#options.log(
         `watch ${condition.id} on ${spec.repo}#${spec.pr} was disarmed while its poll was in ` +
@@ -521,46 +408,23 @@ export class ArmedWaker {
     }
 
     if (!polled) {
-      const { bound, cause } = classifyPollFailure(failureError);
-      const previous = this.#failures.get(condition.id);
-      const strikes = previous?.cause === cause ? previous.count + 1 : 1;
-      const total = (previous?.total ?? 0) + 1;
-      // Either bound ends it. `attempts` is whichever count justified the
-      // disarm, so the mail still reports an observation rather than a policy.
-      const overClass = strikes >= bound;
-      // WHICH BOUND ENDED IT DECIDES WHAT THE MAIL MAY SAY.
-      const reported: PollFailureClass['cause'] = overClass ? cause : 'unreachable';
-      const attempts = overClass ? strikes : total;
-
-      // TRANSIENT AND NOT YET AT THE BOUND: leave the row alone and say nothing.
-      if (!overClass && total < MAX_CONSECUTIVE_POLL_FAILURES) {
-        this.#failures.set(condition.id, { cause, count: strikes, total });
-        // RESCHEDULED, not just returned.
-        this.#options.store.reschedule(condition.id, Date.now() + spec.pollSeconds * 1000);
+      const failures = (this.#failures.get(condition.id) ?? 0) + 1;
+      if (failures < MAX_CONSECUTIVE_POLL_FAILURES) {
+        this.#failures.set(condition.id, failures);
+        this.#options.store.reschedule(condition.id, Date.now() + spec.pollSeconds * 1000, seen);
         this.#options.log(
           `watch ${condition.id} on ${spec.repo}#${spec.pr} poll failed ` +
-            `(${strikes}/${bound} of this kind, ${total}/${MAX_CONSECUTIVE_POLL_FAILURES} ` +
-            `overall, retrying in ${spec.pollSeconds}s): ${failure ?? 'unknown error'}`,
+            `(${failures}/${MAX_CONSECUTIVE_POLL_FAILURES}, retrying in ${spec.pollSeconds}s): ${failure}`,
         );
         return;
       }
-
       this.#failures.delete(condition.id);
       this.#options.store.disarm(condition.id);
-      // `strikes`, not `bound` — the count observed, not the policy.
-      const { subject, body } = composeWatchErrorMail(
-        spec,
-        failure ?? 'unknown error',
-        reported,
-        attempts,
-      );
+      const { subject, body } = composeWatchErrorMail(spec, failure, failures);
       this.#deliver(condition, subject, body);
       return;
     }
 
-    // A poll that worked clears the count. The bound is on CONSECUTIVE
-    // failures: five scattered over a week are five transients, and treating
-    // them as evidence of a dead target is the same mistake one failure was.
     this.#failures.delete(condition.id);
     const { pr, reviews, comments } = polled;
 
@@ -630,8 +494,7 @@ export class ArmedWaker {
     if (owner.status !== 'live') {
       log(
         `${condition.owner} is dead — its ${condition.kind} was delivered to the inbox and will ` +
-          'NOT wake it. Mail does not resurrect (mail-wake.ts); CLAWSKY.md says a wake should. ' +
-          'It keeps, and whoever resurrects the agent hands it over as the first turn.',
+          'not wake it; mail does not resurrect',
       );
       return;
     }

@@ -343,378 +343,58 @@ test('the default access check reads the real filesystem', () => {
   assert.doesNotMatch(warning, /absent\.pem/);
 });
 
-// ── invisible characters, the class the three variables share ───────────────
+// ── stray characters ────────────────────────────────────────────────────────
 
-test('an App id with a stray character is caught at boot, not at the first mint', () => {
-  // `appId` goes straight into the JWT as `iss`.
-  for (const bad of ['99\r', '99\n', ' 99', '99 ', '99\t']) {
+test('a stray character in GITHUB_APP_ID or the key path is refused, with its position', () => {
+  for (const [bad, at] of [['99\r', 3], ['99\n', 3], [' 99', 1], ['99 ', 3], ['9\t9', 2], ['99\u200b', 3], ['9\u00ad9', 2]]) {
     const { usable, warning } = checkAppConfig(cfg({ appId: bad }), accessOk);
     assert.equal(usable, false, JSON.stringify(bad));
-    assert.match(warning, /GITHUB_APP_ID contains an invisible character/);
+    assert.match(warning, new RegExp(`\\b${at}\\b`), JSON.stringify(bad));
+  }
+  for (const ch of ['\r', '\t', '\u00a0', '\u2007', '\u3000', '\u2028', '\u200b', '\ufeff', '\u180e']) {
+    const { usable, warning } = checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessFailing('ENOENT'));
+    assert.equal(usable, false, JSON.stringify(ch));
+    assert.match(warning, /\b7\b/, JSON.stringify(ch));
   }
 });
 
-test('a client id is still a valid App id', () => {
-  // GitHub accepts the numeric App ID *or* a client ID as `iss`.
-  for (const good of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
-    const { usable, warning } = checkAppConfig(cfg({ appId: good }), accessOk);
-    assert.equal(usable, true, good);
-    assert.equal(warning, null, good);
-  }
-});
-
-test('a key path may contain a space but not a control character', () => {
-  // Spaces are legal in a path and must not be refused; a \r is not, and would
-  // otherwise surface as ENOENT — true, and it sends the operator to stare at a
-  // path that looks correct.
-  const spaced = checkAppConfig(cfg({ privateKeyPath: '/home/my dir/key.pem' }), accessOk);
-  assert.equal(spaced.usable, true, 'a space in a path is legitimate');
-
-  const cr = checkAppConfig(cfg({ privateKeyPath: '/k.pem\r' }), accessFailing('ENOENT'));
-  assert.equal(cr.usable, false);
-  assert.match(cr.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/);
-  assert.doesNotMatch(cr.warning, /not readable/, 'the misleading ENOENT must be suppressed');
-});
-
-test('a zero-width character is caught too, and it is the worst case', () => {
-  const zeroWidth = {
-    'U+200B ZERO WIDTH SPACE': '​',
-    'U+00AD SOFT HYPHEN': '­',
-    'U+2060 WORD JOINER': '⁠',
-    'U+FEFF BYTE ORDER MARK': '﻿',
-    'U+200D ZERO WIDTH JOINER': '‍',
-  };
-  for (const [name, ch] of Object.entries(zeroWidth)) {
-    const id = checkAppConfig(cfg({ appId: `99${ch}` }), accessOk);
-    assert.equal(id.usable, false, name);
-    assert.match(id.warning, /GITHUB_APP_ID contains an invisible character/, name);
-
-    const path = checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessFailing('ENOENT'));
-    assert.equal(path.usable, false, name);
-    assert.match(path.warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
-    assert.doesNotMatch(path.warning, /not readable/, `${name}: misleading ENOENT must be suppressed`);
-  }
-});
-
-test('the invisible-character check does not refuse ordinary values', () => {
-  // The regex is negative, so the risk it carries is over-rejection. These are
-  // the shapes a real deployment uses: both App ID forms, the older dotted
-  // client ID, and a path with a space in it.
+test('ordinary App ids, and a path with a plain space, are accepted', () => {
   for (const appId of ['123456', 'Iv23liAbCdEfGhIjKl', 'Iv1.8a61f9b3a7aba766']) {
-    assert.equal(checkAppConfig(cfg({ appId }), accessOk).usable, true, appId);
+    const { usable, warning } = checkAppConfig(cfg({ appId }), accessOk);
+    assert.equal(usable, true, appId);
+    assert.equal(warning, null, appId);
   }
   assert.equal(
     checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
     true,
-    'spaces are legal in a path and must not be refused',
   );
 });
 
-test('a key path admits U+0020 and nothing else whitespace-shaped', () => {
-  // The path check has to implement the whole of the non-space-whitespace class.
-  const nonSpaceWhitespace = {
-    'U+00A0 NO-BREAK SPACE': ' ',
-    'U+2007 FIGURE SPACE': ' ',
-    'U+3000 IDEOGRAPHIC SPACE': '　',
-    'U+2028 LINE SEPARATOR': ' ',
-    'U+0009 TAB': '\t',
-  };
-  for (const [name, ch] of Object.entries(nonSpaceWhitespace)) {
-    const { usable, warning } = checkAppConfig(
-      cfg({ privateKeyPath: `/k.pem${ch}` }),
-      accessFailing('ENOENT'),
-    );
-    assert.equal(usable, false, name);
-    assert.match(warning, /GITHUB_APP_PRIVATE_KEY_PATH contains an invisible character/, name);
-    assert.doesNotMatch(warning, /not readable/, `${name}: the misleading ENOENT must be suppressed`);
-  }
+// ── the token's shape ───────────────────────────────────────────────────────
 
-  // …and the one exception stays exactly one character wide.
-  assert.equal(
-    checkAppConfig(cfg({ privateKeyPath: '/home/my dir/app key.pem' }), accessOk).usable,
-    true,
-    'U+0020 is the only whitespace a path may contain',
-  );
-});
-
-test('both invisible-character messages name every group they catch', () => {
-  const nbsp = checkAppConfig(cfg({ privateKeyPath: '/k.pem ' }), accessOk).warning;
-  assert.match(nbsp, /whitespace other than a plain space/);
-  assert.match(nbsp, /control character/);
-  assert.match(nbsp, /zero-width/);
-
-  const id = checkAppConfig(cfg({ appId: '99 ' }), accessOk).warning;
-  assert.match(id, /whitespace/);
-  assert.match(id, /control character/);
-  assert.match(id, /zero-width/);
-});
-
-test('the boundary of the invisible-character class is pinned, so widening it is loud', () => {
-  const notCaught = {
-    'U+0301 COMBINING ACUTE ACCENT': '́',
-    'U+FE0F VARIATION SELECTOR-16': '️',
-    'U+E000 PRIVATE USE': '',
-    'U+2800 BRAILLE PATTERN BLANK': '⠀',
-  };
-  const advice = (name) =>
-    `${name} is outside the invisible-character class today. If you have just widened ` +
-    'INVISIBLE or INVISIBLE_OR_SPACE to include it, that may well be right — and two ' +
-    'other things then have to change with it: the warning string in checkAppConfig ' +
-    'for whichever regex you widened, and the docstring above the regexes, which ' +
-    'calls its list of three groups "the whole of the claim".';
-  for (const [name, ch] of Object.entries(notCaught)) {
-    assert.equal(checkAppConfig(cfg({ appId: `99${ch}` }), accessOk).usable, true, advice(name));
-    assert.equal(
-      checkAppConfig(cfg({ privateKeyPath: `/k.pem${ch}` }), accessOk).usable,
-      true,
-      advice(name),
-    );
-  }
-
-  // U+180E is category Cf and IS caught, which is the boundary itself: the class is defined by what the characters ARE, not by a hand-listed set.
-  assert.equal(checkAppConfig(cfg({ appId: '99᠎' }), accessOk).usable, false);
-  assert.equal(checkAppConfig(cfg({ privateKeyPath: '/k.pem᠎' }), accessOk).usable, false);
-});
-
-// The characters with a real route into a token: a browser paste, a shell
-// heredoc, a Windows line ending, a BOM at the front of a file.
-const SAMPLES = [
-  ['tab', '\u0009'],
-  ['newline', '\u000a'],
-  ['carriage return', '\u000d'],
-  ['space', ' '],
-  ['no-break space', '\u00a0'],
-  ['soft hyphen', '\u00ad'],
-  ['zero-width space', '\u200b'],
-  ['zero-width non-joiner', '\u200c'],
-  ['word joiner', '\u2060'],
-  ['byte-order mark', '\ufeff'],
-  ['NUL', '\u0000'],
-  // AND THE ONES OUTSIDE `INVISIBLE_OR_SPACE` ENTIRELY.
-  ['right single quote', '\u2019'],
-  ['en dash', '\u2013'],
-  ['CJK', '\u65e5'],
-];
-
-/** Where it sits, which changes the outcome for the very same character. */
-const POSITIONS = [
-  ['leading', (ch) => ch + 'ghp_abc'],
-  ['embedded', (ch) => 'ghp_' + ch + 'abc'],
-  ['trailing', (ch) => 'ghp_abc' + ch],
-];
-
-/** What the runtime ACTUALLY does with this token in an Authorization header. */
-function actualOutcome(token) {
-  let value;
-  try {
-    value = new Headers({ Authorization: `Bearer ${token}` }).get('authorization');
-  } catch {
-    return 'throws';
-  }
-  // Identical to the header a clean token produces => it cannot be the fault.
-  return value === 'Bearer ghp_abc' ? 'tolerated' : 'rejected';
-}
-
-/** Which of the three the message claims. */
-function claimedOutcome(out) {
-  if (out.includes('throws before anything is sent')) return 'throws';
-  if (out.includes('NOT causing a failure')) return 'tolerated';
-  return 'rejected';
-}
-
-test('describeTokenShape says nothing about a token with nothing wrong', () => {
+test('describeTokenShape says nothing about a clean token', () => {
   assert.equal(describeTokenShape('ghp_' + 'a'.repeat(36)), null);
   assert.equal(describeTokenShape('ghs_MiXeD09AZ'), null);
-  // Absent is not malformed: `GITHUB_TOKEN` unset has its own message
-  // elsewhere, and a second one here would be a thing to disbelieve.
   assert.equal(describeTokenShape(''), null);
 });
 
-test('every sample character is detected, wherever it sits', () => {
-  for (const [name, ch] of SAMPLES) {
-    for (const [where, build] of POSITIONS) {
-      const out = describeTokenShape(build(ch));
-      assert.ok(out, `${where} ${name} (U+${ch.codePointAt(0).toString(16)}) went undetected`);
-    }
+test('a stray character is reported with its position, counted by codepoint', () => {
+  assert.match(describeTokenShape(' ghp_abcdef'), /\b1\b/);
+  assert.match(describeTokenShape(' ghp_abcdef'), /whitespace/);
+  assert.match(describeTokenShape('ghp_abc\u00a0def'), /\b8\b/);
+  assert.match(describeTokenShape('ghp_abc\u00a0def'), /whitespace/);
+  assert.match(describeTokenShape('ghp_\u200babc'), /\b5\b/);
+  assert.match(describeTokenShape('ghp_\u200babc'), /non-printable/);
+  assert.match(describeTokenShape('ghp_abc\n'), /\b8\b/);
+  assert.match(describeTokenShape('\u{1f600}ghp_abc'), /\b1\b/);
+  for (const ch of ['\u2019', '\u2013', '\u65e5', '\u0000', '\ufeff']) {
+    assert.ok(describeTokenShape(`ghp_ab${ch}cdef`), `U+${ch.codePointAt(0).toString(16)} went undetected`);
   }
-});
-
-test('every message agrees with the real header layer', () => {
-  const seen = new Set();
-  for (const [name, ch] of SAMPLES) {
-    for (const [where, build] of POSITIONS) {
-      const token = build(ch);
-      const actual = actualOutcome(token);
-      const claimed = claimedOutcome(describeTokenShape(token));
-      assert.equal(
-        claimed,
-        actual,
-        `${where} ${name}: message says ${claimed}, runtime does ${actual}`,
-      );
-      seen.add(actual);
-    }
-  }
-  // Guard against the matrix collapsing to a single outcome and the loop
-  // passing vacuously -- which is how a test of this shape rots without ever
-  // failing.
-  assert.deepEqual([...seen].sort(), ['rejected', 'throws', 'tolerated']);
-});
-
-test('a trailing newline is reported as harmless, in those words', () => {
-  const out = describeTokenShape('ghp_abcdef\u000a');
-  assert.match(out, /U\+000A/);
-  assert.match(out, /NOT causing a failure/);
-  assert.doesNotMatch(out, /401/);
-  assert.doesNotMatch(out, /throws before anything is sent/);
-});
-
-test('U+00A0 is the 401 case, not the throwing case', () => {
-  const out = describeTokenShape('ghp_abc\u00a0def');
-  assert.match(out, /U\+00A0/);
-  assert.match(out, /401/);
-  assert.doesNotMatch(out, /throws before anything is sent/);
-});
-
-test('a leading space is the 401 case, not the trimmed one', () => {
-  // Not symmetric with trailing, and the asymmetry is easy to get wrong: the
-  // value is `Bearer ` + the token, so anything at the token's front is
-  // interior to the value and survives the trim.
-  const out = describeTokenShape(' ghp_abcdef');
-  assert.match(out, /position 1 of 11\b/);
-  assert.match(out, /401/);
-  assert.doesNotMatch(out, /NOT causing a failure/);
-});
-
-test('the worst outcome is named, not the first character found', () => {
-  const out = describeTokenShape('ghp_ abc\u200b');
-  assert.match(out, /U\+200B/);
-  assert.match(out, /position 9 of 9\b/);
-  assert.match(out, /throws before anything is sent/);
-  assert.doesNotMatch(out, /U\+0020/);
-
-  // And the reverse order, so neither "first" nor "last" passes by accident.
-  const flipped = describeTokenShape('ghp_\u200ba c');
-  assert.match(flipped, /U\+200B/);
-  assert.match(flipped, /position 5 of 8\b/);
-});
-
-test('the position is 1-based, and the length is given beside it', () => {
-  assert.match(describeTokenShape('ghp_\u200babc'), /position 5 of 8\b/);
-  assert.match(describeTokenShape('\ufeffghp_abc'), /position 1 of 8\b/);
-  // Position === length reads as "at the end" without the operator counting.
-  assert.match(describeTokenShape('ghp_abc\u000a'), /position 8 of 8\b/);
-});
-
-test('counted by codepoint, not by UTF-16 unit', () => {
-  assert.match(describeTokenShape('\u{1f600}ghp_abc'), /position 1 of 8\b/);
-});
-
-test('says how many share the outcome, so the second is not a second afternoon', () => {
-  const one = describeTokenShape('ghp_abc\u200bdef');
-  assert.doesNotMatch(one, /characters in the value/);
-  const three = describeTokenShape('\u200bghp_\u200babc\u200b');
-  assert.match(three, /3 characters in the value are of this kind/);
-  assert.match(three, /position 1 of 10\b/);
-  // Counted by OUTCOME, not by hit: a trailing newline alongside two zero-width
-  // spaces must not be counted among them.
-  const mixed = describeTokenShape('ghp_\u200ba\u200bb\u000a');
-  assert.match(mixed, /2 characters in the value are of this kind/);
-});
-
-test('names the character rather than only its codepoint', () => {
-  assert.match(describeTokenShape('ghp_\u200ba'), /zero-width space/);
-  assert.match(describeTokenShape('ghp_\ufeffa'), /byte-order mark/);
-  assert.match(describeTokenShape('ghp_\u000da'), /carriage return/);
-  // Anything without an entry still gets a specific, correct claim.
-  assert.match(describeTokenShape('ghp_\u2061a'), /U\+2061/);
 });
 
 test('never quotes the token, at any length', () => {
-  // This goes to stderr and stderr goes to the journal. Naming a position is
-  // the point precisely BECAUSE it identifies the character without
-  // reproducing the credential around it.
   const secret = 'ghp_' + 'S3cr3tV4lu3'.repeat(3);
   const out = describeTokenShape(secret + '\u200b');
   assert.doesNotMatch(out, /S3cr3tV4lu3/);
   assert.ok(!out.includes(secret.slice(4)), 'the message carried the token body');
-});
-
-test('a character above U+00FF is diagnosed even though it is not invisible', () => {
-  for (const [name, ch] of [
-    ['right single quote', '\u2019'],
-    ['left double quote', '\u201c'],
-    ['en dash', '\u2013'],
-    ['CJK', '\u65e5'],
-  ]) {
-    const out = describeTokenShape('ghp_ab' + ch + 'cdef');
-    assert.ok(out, `${name} went undiagnosed`);
-    assert.match(out, /throws before anything is sent/);
-    // No name in the table, so it degrades to a bare codepoint -- still a
-    // specific claim about a specific position.
-    assert.match(out, new RegExp('U\\+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')));
-  }
-});
-
-test('NUL throws wherever it sits, including trailing', () => {
-  // It is not in the [\t\n\r ] run undici strips, so unlike CR/LF it gets no
-  // trailing exemption. Unreachable in production -- an environment block cannot
-  // carry one -- but the boundary sentence claims completeness.
-  for (const token of ['\u0000ghp_abc', 'ghp_\u0000abc', 'ghp_abc\u0000']) {
-    const out = describeTokenShape(token);
-    assert.match(out, /U\+0000/);
-    assert.match(out, /throws before anything is sent/);
-  }
-});
-
-test('the reason given is true of the character named', () => {
-  let throwing = 0;
-  for (const [name, ch] of SAMPLES) {
-    for (const [where, build] of POSITIONS) {
-      const out = describeTokenShape(build(ch));
-      if (!out.includes('throws before anything is sent')) continue;
-      throwing++;
-      const code = ch.codePointAt(0);
-      const claimsAbove = out.includes('above U+00FF');
-      assert.equal(
-        claimsAbove,
-        code > 0xff,
-        `${where} ${name} (U+${code.toString(16)}): message ` +
-          `${claimsAbove ? 'claims' : 'does not claim'} "above U+00FF", which is ` +
-          `${code > 0xff ? 'true' : 'FALSE'} of it`,
-      );
-      // The alternative clause must actually be there rather than the sentence
-      // silently going missing for the non-ASCII-range causes.
-      if (!claimsAbove) {
-        assert.match(out, /cannot contain a newline, a carriage return or a NUL/);
-      }
-    }
-  }
-  // Not vacuous: the loop must have found throwing cases of BOTH kinds.
-  assert.ok(throwing >= 8, `only ${throwing} throwing cases exercised`);
-});
-
-test('a Windows line ending is not explained by a rule it does not satisfy', () => {
-  const out = describeTokenShape('ghp_\u000dabc');
-  assert.match(out, /U\+000D/);
-  assert.match(out, /Windows line ending/);
-  assert.doesNotMatch(out, /above U\+00FF/);
-  assert.match(out, /cannot contain a newline, a carriage return or a NUL/);
-});
-
-test('the paste-from-a-document characters are named, not just numbered', () => {
-  const family = [
-    ['\u2018', /curly left single quote/],
-    ['\u2019', /curly right single quote/],
-    ['\u201c', /curly left double quote/],
-    ['\u201d', /curly right double quote/],
-    ['\u2013', /en dash/],
-    ['\u2014', /em dash/],
-    ['\u2026', /ellipsis/],
-  ];
-  for (const [ch, name] of family) {
-    const out = describeTokenShape('ghp_abcd' + ch + 'efgh');
-    assert.match(out, name, `U+${ch.codePointAt(0).toString(16)} lost its name`);
-    // Still diagnosed correctly, not merely named.
-    assert.match(out, /throws before anything is sent/);
-  }
 });

@@ -90,13 +90,6 @@ export class GitHubClient implements PullRequestSource {
   readonly #base: string;
 
   constructor(token: string | TokenProvider, apiBase = 'https://api.github.com') {
-    if (!token) {
-      // Constructing a client with no token would produce a watch that polls forever and is refused every time.
-      throw new Error('GitHubClient needs a token');
-    }
-    // A string still works and still means what it meant. Every existing caller
-    // and test passes one, and this keeps the PAT path byte-identical rather
-    // than making every caller learn about providers to stay still.
     this.#token = typeof token === 'string' ? staticTokenProvider(token) : token;
     this.#base = apiBase.replace(/\/+$/, '');
   }

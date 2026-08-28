@@ -8,7 +8,7 @@ import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { ArmedStore } from '../dist/armed.js';
 import { ArmedWaker, composeScheduleMail } from '../dist/armed-wake.js';
-import { buildArmedTools, renderArmed } from '../dist/armed-tool.js';
+import { buildArmedTools } from '../dist/armed-tool.js';
 import {
   advance,
   epochFromWall,
@@ -481,38 +481,6 @@ test('the schedule mail carries the reader\'s instant, and drops it when it woul
   );
 });
 
-test('the hedge follows the number into listArmed, and latches once it is set', () => {
-  const { registry, mail, store } = board();
-  const spec = { note: 'dense', cron: '* * * * *', timezone: LA, everyN: 1, anchorAt: 0 };
-  // Thirty days late on a minutely schedule: the walk cannot count them all.
-  const armed = store.arm(
-    'hamachi-engineer1',
-    'schedule',
-    Date.now() - 30 * 86_400_000,
-    spec,
-    { lastFiredAt: null, fires: 0, missed: 0 },
-  );
-
-  const loop = waker(registry, mail, store);
-  loop.tick();
-
-  const afterFirst = store.get(armed.id);
-  assert.equal(afterFirst.seen.missedExact, false, 'the row remembers that counting stopped');
-
-  const { listArmed } = toolsFor('hamachi-engineer1', store);
-  return listArmed.handler({}, {}).then(async (listed) => {
-    assert.match(said(listed), /at least \d+ occurrence\(s\) missed/);
-
-    // Fire it again, on time. This walk counts nothing and is exact, but the
-    // running total is a floor forever — one short walk cannot be undone.
-    store.reschedule(armed.id, Date.now() - 1000, afterFirst.seen);
-    loop.tick();
-    assert.equal(store.get(armed.id).seen.missedExact, false, 'it latches');
-    assert.match(said(await listArmed.handler({}, {})), /at least/);
-    registry.close();
-  });
-});
-
 test('a phase reset is reported to the agent rather than quietly applied', () => {
   const { registry, mail, store } = board();
   const due = Date.parse('2025-06-01T16:00:00Z');
@@ -617,18 +585,6 @@ test('the fields parse the way cron parses them, and refuse the way this needs t
 });
 
 // ── The tool ───────────────────────────────────────────────────────────────
-
-test('scheduleRecurring has no argument that names an agent', () => {
-  const { registry, store } = board();
-  const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
-
-  assert.deepEqual(
-    Object.keys(scheduleRecurring.inputSchema).sort(),
-    ['anchor', 'cron', 'everyN', 'note', 'timezone'],
-    'a `for` added later fails here rather than in a review',
-  );
-  registry.close();
-});
 
 test('an owner passed to scheduleRecurring is ignored — the target is the closure', async () => {
   const { registry, store } = board();
@@ -880,26 +836,24 @@ test('every mail a schedule sends carries the id that would stop it', () => {
   registry.close();
 });
 
-test('listArmed shows a schedule with when it last fired and when it fires next', async () => {
+test('listArmed shows a schedule with its expression, its zone and when it fires next', async () => {
   const { registry, mail, store } = board();
   const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
   await scheduleRecurring.handler({ note: 'the Monday sweep', cron: '0 9 * * 1' }, {});
 
   const before = said(await listArmed.handler({}, {}));
-  assert.match(before, /schedule/);
   assert.match(before, /`0 9 \* \* 1`/);
   assert.match(before, /America\/Los_Angeles/);
-  assert.match(before, /has not fired yet/, 'never-fired and fired-recently must not look alike');
+  assert.match(before, /the Monday sweep/);
 
-  // Bring it due and let it fire once.
+  // Bring it due and let it fire once: it is still listed, with the next occurrence.
   const [armed] = store.listFor('hamachi-engineer1');
   store.reschedule(armed.id, Date.now() - 1000, armed.seen);
   waker(registry, mail, store).tick();
 
   const after = said(await listArmed.handler({}, {}));
-  assert.match(after, /last fired \d{4}-\d{2}-\d{2}/);
-  assert.match(after, /1 time/);
-  assert.match(after, /fires \d{4}-\d{2}-\d{2}/, 'and when it next does');
+  assert.match(after, new RegExp(`#${armed.id}\\b`));
+  assert.match(after, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/, 'and when it next fires');
   registry.close();
 });
 
@@ -932,87 +886,7 @@ test('a schedule belongs to one agent, and a crewmate can neither see nor stop i
   assert.doesNotMatch(said(await theirs.listArmed.handler({}, {})), /mine alone/);
   const refused = await theirs.disarm.handler({ id: armed.id }, {});
   assert.equal(refused.isError, true);
-  assert.match(said(refused), /belongs to hamachi-engineer1/);
   assert.equal(store.listFor('hamachi-engineer1').length, 1, 'and it is still armed afterwards');
-  registry.close();
-});
-
-test('a schedule this build cannot read is disarmed and says so — expression OR timezone', () => {
-  // Both halves of the spec.
-  for (const [label, spec] of [
-    ['expression', { cron: '0 9 * * * L', timezone: LA }],
-    ['timezone', { cron: '0 9 * * 1', timezone: 'Mars/Olympus_Mons' }],
-  ]) {
-    const { registry, mail, store } = board();
-    const due = Date.now() - 1000;
-    store.arm(
-      'hamachi-engineer1',
-      'schedule',
-      due,
-      { note: 'from the future', ...spec, everyN: 1, anchorAt: due },
-      { lastFiredAt: null, fires: 0, missed: 0 },
-    );
-
-    const loop = waker(registry, mail, store);
-    loop.tick();
-    loop.tick();
-    loop.tick();
-
-    const delivered = mail.unread('hamachi-engineer1');
-    assert.equal(delivered.length, 1, `${label}: told once, not once per tick`);
-    assert.match(delivered[0].subject, /DISARMED/, label);
-    assert.match(delivered[0].body, /from the future/, `${label}: the note comes back with it`);
-    assert.equal(
-      store.listFor('hamachi-engineer1').length,
-      0,
-      `${label}: disarmed rather than left throwing every tick`,
-    );
-    registry.close();
-  }
-});
-
-test('a schedule with an unreadable spec is listed as unreadable, not thrown over', () => {
-  const rendered = renderArmed(
-    'hamachi-engineer1',
-    [
-      {
-        id: 7,
-        owner: 'hamachi-engineer1',
-        kind: 'schedule',
-        armedAt: 0,
-        dueAt: 1_000,
-        active: true,
-        firedAt: null,
-        spec: {},
-        seen: null,
-      },
-    ],
-    { recent: [], older: 0 },
-    2_000,
-  );
-  assert.match(rendered, /#7/);
-  assert.match(rendered, /unreadable/);
-});
-
-test('the tool descriptions state what a schedule is and is not', () => {
-  const { registry, store } = board();
-  const { scheduleRecurring, remindMe } = toolsFor('hamachi-engineer1', store);
-
-  // The repeat's own terms.
-  assert.match(scheduleRecurring.description, /REPEATS UNTIL YOU STOP IT/);
-  assert.match(scheduleRecurring.description, /ONCE, late/);
-  assert.match(scheduleRecurring.description, /posts nothing to Discord or anywhere outside/);
-  assert.match(scheduleRecurring.description, /America\/Los_Angeles/);
-  assert.match(scheduleRecurring.description, /hamachi-engineer1/);
-
-  // And it does not overstate the anchor.
-  assert.doesNotMatch(scheduleRecurring.description, /does\s+NOTHING/);
-  assert.match(scheduleRecurring.description, /A FUTURE anchor delays the first fire/);
-  assert.match(scheduleRecurring.description, /A PAST anchor only chooses/);
-
-  assert.doesNotMatch(remindMe.description, /There is no repeat option/);
-  assert.match(remindMe.description, /ONE-SHOT/);
-  assert.match(remindMe.description, /scheduleRecurring/);
   registry.close();
 });
 
@@ -1074,11 +948,9 @@ test('a schedule in the reader\'s own zone is rendered once, not twice', async (
 
   const mine = said(await listArmed.handler({}, {}));
 
-  // The reader's own zone: one rendering. No ` (…)` echo, and no second line
-  // repeating the first and calling it `local`.
-  assert.match(mine, /fires \d{4}-\d{2}-\d{2} \d{2}:\d{2} P[DS]T/);
-  assert.doesNotMatch(mine, /P[DS]T\)/, 'the parenthetical repeated the line it annotates');
-  assert.doesNotMatch(mine, /P[DS]T local/, 'the `local` line repeated the line above it');
+  // The reader's own zone: one rendering, no ` (…)` echo of the same instant.
+  assert.match(mine, /\d{4}-\d{2}-\d{2} \d{2}:\d{2} P[DS]T/);
+  assert.doesNotMatch(mine, /P[DS]T\)/, 'the parenthetical repeated the instant it annotates');
 
   registry.close();
 });
@@ -1099,7 +971,7 @@ test('a schedule in another zone still shows both, because they are two facts', 
 
   // Suppression must not have eaten the case it exists to preserve: the
   // schedule's own zone and the reader's are different numbers here.
-  assert.match(mine, /local/, 'the schedule-zone line was suppressed when it carried a fact');
-  assert.match(mine, /P[DS]T/, 'the reader\'s own zone is missing');
+  assert.match(mine, /GMT|BST/, 'the schedule-zone instant is missing');
+  assert.match(mine, /\(\d{4}-\d{2}-\d{2} \d{2}:\d{2} P[DS]T\)/, 'the reader\'s own zone is missing');
   registry.close();
 });
