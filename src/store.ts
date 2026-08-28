@@ -1,72 +1,8 @@
-/**
- * The agent registry: who exists, and which session each of them resumes.
- *
- * This began as a Discord-thread → session-id map, and the shape survives
- * because Clawsky's identity model is that table with the key generalised: an
- * agent is a row, not a process. The id is the identity and the session id is
- * a field on it. That ordering is load-bearing — a session id does not exist
- * until the session starts, so it cannot be what mints the name, and an agent
- * resurrected under a new session id must still be the same agent or its mail
- * history detaches from it.
- *
- * `status` is declared, never observed. With agents resumed rather than
- * resident there is no process to look at: a kill writes `dead`, and an agent
- * that dies mid-turn from a crash writes nothing at all. `lastActiveAt` is
- * what makes that survivable — `live` with a fortnight-old `lastActiveAt`
- * reads differently from `dead` without inventing a third state, and it is
- * honest about the case where nobody actually knows.
- *
- * MIGRATION. The live deployment has real rows in `thread_sessions`, one per
- * Discord channel, and losing them means every conversation restarts cold with
- * no warning that it did. So they are COPIED into `agents` exactly once
- * (guarded by `PRAGMA user_version`) and the old table is left precisely where
- * it is. A rollback to the previous `dist/` then finds its data intact, which
- * matters more than tidiness on a deployment where a stale `dist/` is the most
- * common way this system breaks. The copy is one-way and one-time: rows added
- * to `thread_sessions` afterwards are not picked up, because after this ships
- * nothing writes there.
- *
- * A migrated row keeps its Discord channel id as its agent id. That id is what
- * the Discord layer looks sessions up by, so renaming it here would detach
- * every live session from its channel — the exact failure the registry exists
- * to prevent.
- *
- * Uses Node's built-in SQLite (node:sqlite) so there is no native dependency
- * to compile, which matters on a small VM where node-gyp costs both build time
- * and memory.
- */
-
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-/**
- * The five crew roles, and `host`.
- *
- * `coordinator` is the default for anything that predates the registry, because
- * the only agents that existed before it were the ones Discord wakes, and
- * Discord stays with the coordinator.
- *
- * `host` is not a crew member. It is the account on the VPS that runs commands,
- * given a registry row and a mailbox so that reaching it is a DM rather than a
- * queue. It is a role rather than a naming convention because two rules key off
- * it and neither should be a string comparison against an id: only a
- * coordinator may DM it (mail.ts), and nothing inside a container may run it —
- * the ops executor owns that mailbox, from the host (src/mail-wake.ts).
- *
- * `updater` keeps one Discord message current — a task list it edits in place
- * rather than reposting. It is an ordinary crew row like the rest: an id, a
- * mailbox, and turns it arms for itself. It exists as a role rather than as an
- * engineer with unusual instructions because `modelByRole` keys off it, which
- * is what lets it run on Haiku while the crew runs on Opus — polling colleagues
- * and rewriting a short list is mechanical, and a status line that arrives late
- * has already failed.
- *
- * An `<updater-agent>` existed here before, from the initial commit until #44
- * removed it. That one was a Task-tool subagent with a `<recommended-model>`
- * hint in its prose, and #44 retired the whole mechanism rather than the
- * function. This is the function rebuilt on the mechanism that replaced it.
- */
+/** The roles a row may hold. Persisted, so these strings are schema. */
 export type AgentRole =
   | 'coordinator'
   | 'engineer'
@@ -84,14 +20,7 @@ export const AGENT_ROLES: readonly AgentRole[] = [
   'host',
 ];
 
-/**
- * The host agent's id in a given crew.
- *
- * Derived rather than configured, so the executor on the host and the waker in
- * the container arrive at the same name without a shared config file — they
- * have no other way to agree on one. The role on the row is what carries the
- * meaning; this is only how the row is found.
- */
+/** The host agent's id in a given crew. */
 export function hostAgentId(crew: string): string {
   return `${crew}-host`;
 }
@@ -107,7 +36,7 @@ export type AgentRecord = {
   id: string;
   crew: string;
   role: AgentRole;
-  /** Empty until the agent's first run, and rewritten on resurrection. */
+  /** Empty before the agent's first run; rewritten on resurrection. */
   sessionId: string;
   workspacePath: string;
   status: AgentStatus;
@@ -173,14 +102,6 @@ export class AgentRegistry {
     this.#migrate();
   }
 
-  /**
-   * Copy the pre-Clawsky Discord sessions in, once.
-   *
-   * `user_version` rather than a marker table: it is a single integer SQLite
-   * already carries, it survives a rollback (the old code never reads it), and
-   * it cannot be half-written. `INSERT OR IGNORE` on top of it means running
-   * this twice is harmless even if the version is somehow reset.
-   */
   #migrate(): void {
     const version = (
       this.#db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined
@@ -211,12 +132,6 @@ export class AgentRegistry {
     this.#db.exec('PRAGMA user_version = 1');
   }
 
-  /**
-   * The underlying handle, so mail keeps its tables in the same file and
-   * inherits the same WAL settings rather than opening a second database.
-   * Sharing the file is also what lets mail policy join against the registry
-   * in one statement instead of two round trips.
-   */
   get db(): DatabaseSync {
     return this.#db;
   }
@@ -235,15 +150,7 @@ export class AgentRegistry {
     return rows.map(toRecord);
   }
 
-  /**
-   * Make sure a row exists, without touching one that already does.
-   *
-   * Called on every session acquire, so a channel that has never run a turn
-   * still has an identity — and therefore a mailbox, and a name its `sendMail`
-   * can be stamped with — before its first turn rather than after it. Existing
-   * rows are left alone on purpose: role and crew are identity, and a later
-   * spawn or an operator edit must not be silently reverted by a wake.
-   */
+  /** Make sure a row exists, without touching one that already does. */
   ensure(id: string, identity: AgentIdentity): AgentRecord {
     const existing = this.get(id);
     if (existing) return existing;
@@ -268,21 +175,7 @@ export class AgentRegistry {
     return this.get(id) as AgentRecord;
   }
 
-  /**
-   * Create a row for an agent that must not already exist.
-   *
-   * The counterpart of `ensure`, and separate from it because the two want
-   * opposite answers to the same collision. `ensure` is idempotent by design —
-   * a wake must not disturb a row that is already there — so an id that is
-   * taken comes back as somebody else's agent, silently. That is exactly the
-   * wrong answer for a spawn: the caller believes it has a new agent, its mail
-   * lands in an existing inbox, and two identities share one row.
-   *
-   * So this throws. `spawn` mints an ordinal by looking for the first free one
-   * (src/spawn-tool.ts), and the throw is what catches the case where the look
-   * and the insert disagree — a second process on the same board, or a row
-   * written between the two statements.
-   */
+  /** Create a row for an agent that must not already exist. */
   create(id: string, identity: AgentIdentity): AgentRecord {
     const existing = this.get(id);
     if (existing) {
@@ -314,19 +207,7 @@ export class AgentRegistry {
     return this.get(id) as AgentRecord;
   }
 
-  /**
-   * Record the session the agent is now running under.
-   *
-   * Upserts rather than updates because the Discord path used to create rows
-   * here and must keep working if `ensure` was somehow skipped; a wake that
-   * silently failed to persist its session id is a conversation that goes cold
-   * at the next restart.
-   *
-   * The conflict clause updates the session and nothing else, which is what
-   * makes that upsert safe now that rows are spawned rather than only woken:
-   * `role`, `crew` and `spawned_by` are identity, and a turn recording its
-   * session id must not be able to rewrite whose turn it was.
-   */
+  /** Record the session the agent now runs under. An upsert whose conflict clause updates the session only: role, crew and spawned_by are identity. */
   recordSession(id: string, sessionId: string, workspacePath: string, identity: AgentIdentity): void {
     const now = Date.now();
     this.#db
@@ -360,16 +241,6 @@ export class AgentRegistry {
     this.#db.prepare('UPDATE agents SET status = ? WHERE id = ?').run(status, id);
   }
 
-  /**
-   * Forget the session without forgetting the agent.
-   *
-   * `!reset` used to delete the row outright, which under the old schema meant
-   * only "start cold next time". It means considerably more now: the row is
-   * the identity mail is addressed to, so deleting it would drop the mailbox
-   * along with the transcript. Clearing the session id is the faithful
-   * translation — the next wake starts fresh, the agent is still the same
-   * agent.
-   */
   clearSession(id: string): void {
     this.#db.prepare(`UPDATE agents SET session_id = '' WHERE id = ?`).run(id);
   }

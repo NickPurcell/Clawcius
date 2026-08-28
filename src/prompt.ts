@@ -1,16 +1,4 @@
-/**
- * Renders the text the agent receives.
- *
- * There is deliberately no prose in this file. Every string the agent sees —
- * the standing instructions, the wake messages, how an individual message
- * renders — lives in `prompts` in agent-config.yaml. This module only supplies
- * the values and substitutes them, so changing what Clawcius is told is a
- * config edit rather than a code change and a rebuild.
- *
- * Placeholders are validated at startup against `PROMPT_PLACEHOLDERS`, so an
- * unknown one fails the boot instead of reaching the model as a literal
- * `{chanel_id}` that looks like the agent misread its own context.
- */
+/** Renders the text the agent receives. */
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
@@ -28,42 +16,15 @@ function render(template: string, vars: Record<string, string>): string {
   return filled.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/**
- * Who the session is, as the system prompt needs to say it.
- *
- * Resolved by `SessionPool.acquire`, which holds the registry row, and passed
- * in -- the same shape `model` already uses, and for the reason `AgentSession`'s
- * own comment gives: this module knows nothing about the registry.
- */
+/** Who the session is, as the system prompt needs to say it. */
 export type PromptIdentity = { id: string; crew: string; role: string };
 
-/**
- * Assemble the SDK `systemPrompt`.
- *
- * `useClaudeCodeDefault: true` keeps Claude Code's own prompt as the base and
- * layers ours on top. Setting it false replaces that base entirely, including
- * Claude Code's tool-use guidance, so the agent gets noticeably worse at tool
- * work.
- *
- * Order is protocol then append: the operator's instructions land last and so
- * are the most recent thing in context.
- */
+/** Assemble the SDK `systemPrompt`. */
 export function buildSystemPrompt(identity: PromptIdentity): Options['systemPrompt'] {
   const protocol = render(config().agent.prompts.protocol, {
     cli: config().agent.paths.discordCli,
   });
 
-  // WHY THE SYSTEM PROMPT AND NOT A FIRST-TURN MESSAGE. This is rebuilt every
-  // time a session is constructed, including on resume, so it cannot drift out
-  // of step with a session that already carries an old preamble in its history
-  // -- and it survives compaction, which a first turn does not.
-  //
-  // A ROLE THE CREW DOES NOT DEFINE GETS A DIFFERENT TEMPLATE, not a decorated
-  // value. Decorating produced `<sousaphonist (not a role this crew defines)>`
-  // in the clause that says which section is yours -- still telling the agent a
-  // section exists, and naming a nonsense one. Two templates means the unknown
-  // case simply has no such clause. It also keeps this file's own rule from the
-  // header: no prose the agent sees lives in code, only substitution.
   const known = isAgentRole(identity.role);
   const roleNotice = render(
     known ? config().agent.prompts.roleNotice : config().agent.prompts.roleNoticeUnknown,
@@ -80,19 +41,7 @@ export function buildSystemPrompt(identity: PromptIdentity): Options['systemProm
   return layered;
 }
 
-/**
- * The body of the mail a spawned agent wakes to — CLAWSKY.md phase 5.
- *
- * Here rather than in `spawn-tool.ts` because this is the module that renders
- * text the agent receives, and because the template belongs in config with the
- * other four: what a new engineer is told about itself is exactly the kind of
- * thing an operator should be able to change without a rebuild.
- *
- * Every field but `instructions` is derived by the caller from the registry row
- * it just wrote. `instructions` is the caller's prose and is substituted in a
- * single pass, so a `{crew}` inside it stays literal rather than being read as
- * a placeholder.
- */
+/** The body of the mail a spawned agent wakes to — CLAWSKY.md phase 5. */
 export function buildSpawnCharter(vars: {
   id: string;
   role: string;
@@ -103,16 +52,7 @@ export function buildSpawnCharter(vars: {
   return render(config().agent.prompts.spawnCharter, vars);
 }
 
-/**
- * The clock an agent reads beside every Discord message.
- *
- * PINNED TO PT AND LABELLED, because the un-pinned version rendered in whatever
- * zone the WAKER PROCESS happened to run in — and the waker runs on the host,
- * which is `Europe/Berlin`. `container.ts` already puts `TZ` in `HOST_ONLY` so
- * that "whatever the server happens to be set to" cannot silently win inside a
- * container; rendering on the host walked around that wall rather than through
- * it, and the agent had no way to tell, because the number carried no label.
- */
+/** The clock an agent reads beside every Discord message. */
 function clockOf(at: number): string {
   return zonedStamp(at, DEFAULT_TIMEZONE, 'time');
 }

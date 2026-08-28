@@ -1,20 +1,3 @@
-/**
- * scripts/build-info.mjs — the thing that lets a journal answer "did the deploy
- * work?".
- *
- * These run the real script against real temporary git repositories, because
- * every property worth having here is a property of what git actually says:
- * that a dirty tree is reported as dirty, that a detached HEAD is not printed
- * as a branch, that a directory with no repository above it produces UNKNOWN
- * rather than something plausible, and that none of those cases is allowed to
- * fail the build.
- *
- * The generated file is `import()`ed as TypeScript-flavoured source, so it is
- * checked by parsing the JSON out of it rather than by executing it — the
- * script's contract is the shape of `BUILD_INFO`, and asserting on the emitted
- * text keeps the test from depending on a compiler.
- */
-
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -177,12 +160,6 @@ test('the dirty list is capped in the data, and the COUNT still tells the truth'
     }
     const { info } = generate(pkgDir);
 
-    // 262 is the number OJ reproduced on #98, which produced a 10098-byte
-    // waker-status.json — over `MAX_STATUS_BYTES`, so ops read the instance as
-    // BUSY. And because the value is compiled in, every publish from that
-    // artefact would have been the same oversized file: not a transient fat
-    // write, but an instance that is never idle again for the life of the
-    // build, with the journal blaming the waker for it.
     assert.equal(info.dirtyFileCount, 262, 'the count is uncapped and authoritative');
     assert.equal(info.dirtyFiles.length, 20, 'the list is capped');
     assert.match(info.line, /262 uncommitted path\(s\)/);
@@ -202,10 +179,7 @@ test('a very long path is elided rather than carried whole', () => {
     const file = join(deep, 'the-file-that-matters.txt');
     writeFileSync(file, 'x\n');
 
-    // Committed first, then modified. An UNTRACKED file inside a new directory
-    // is collapsed by `git status --porcelain` to the directory alone
-    // (`aaaaaaaaaa/`), which is 11 characters and would not exercise the cap at
-    // all — the long-path case only arrives via a tracked file.
+    // Committed first, then modified.
     git(dir, ['add', '-A']);
     git(dir, ['commit', '-qm', 'deep']);
     writeFileSync(file, 'y\n');
@@ -222,22 +196,6 @@ test('a very long path is elided rather than carried whole', () => {
   }
 });
 
-/**
- * The generator's caps, read out of the generator.
- *
- * NOT restated here. The first version of the budget test below hand-copied
- * `20`, `100`, `200` and `300` into its own worst case and claimed in a comment
- * that raising a cap would fail it. Mutation-tested by OJ: `DIRTY_NAMES_KEPT`
- * 20→60 and `PATH_MAX` 100→500 failed a *neighbouring* test that happened to
- * hardcode the same number, and `STRING_MAX` 200→2000 failed nothing at all —
- * 16 pass, 0 fail — while those four fields alone would have exceeded the
- * ceiling. The budget test would have gone on asserting a worst case the
- * generator no longer produced.
- *
- * That is the same shape as a sweep iterating a remembered list, which this
- * file already had and already fixed. So the numbers come from the source, and
- * a missing or renamed constant is a failure rather than a silent default.
- */
 function generatorCaps() {
   const source = readFileSync(SCRIPT, 'utf8');
   const read = (name) => {
@@ -254,21 +212,12 @@ function generatorCaps() {
   };
 }
 
-/**
- * A string of exactly `cap` characters as `clip` would leave it.
- *
- * The ellipsis is one character and THREE BYTES in UTF-8, and `readIdle`
- * compares bytes — `statSync().size` — not characters. Building the worst case
- * out of ASCII would understate it by up to two bytes per clipped field.
- */
+/** A string of exactly `cap` characters as `clip` would leave it. */
 function clipped(cap, fill = 'x') {
   return `${fill.repeat(cap - 1)}…`;
 }
 
 test('the generator honours STRING_MAX on the fields nothing else pins', () => {
-  // Without this, deleting a `clip(..., STRING_MAX)` call leaves the constant
-  // parsing at 200, the budget test passing, and the real output unbounded —
-  // the budget would be protecting a cap the generator no longer applied.
   const caps = generatorCaps();
   const { dir, pkgDir, cleanup } = scratch({ packageName: 'n'.repeat(400) });
   try {
@@ -351,16 +300,6 @@ test('the generated file is written even when git cannot be found at all', () =>
   }
 });
 
-/**
- * Every package in this repository, DISCOVERED rather than listed.
- *
- * The first draft of the two sweeps below iterated `['.', 'status', 'ops']`
- * while calling itself the check for something that would otherwise be
- * remembered — which it was not. A fourth package would have been exactly as
- * invisible to a hardcoded array as to memory, and a silent partial sweep
- * reading as complete is the defect this entire change is about. Git is asked
- * instead, so adding `foo/` and forgetting its generator fails here.
- */
 function packageDirs() {
   const listed = spawnSync('git', ['ls-files', '--', 'package.json', '*/package.json'], {
     cwd: REPO_ROOT,
@@ -381,11 +320,6 @@ function packageDirs() {
 }
 
 test('an unwritable output stops the build, with a sentence rather than a stack', (t) => {
-  // The one case where failing IS right: `&& tsc` continuing here would compile
-  // against whatever build-info.ts an earlier build left behind, so the
-  // artefact would report someone else's commit — the same lie by a new route.
-  // Root ignores the mode bits, so this cannot be produced as root; saying so
-  // beats passing quietly.
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     t.skip('running as root — mode 0500 is not a write failure for uid 0');
     return;
@@ -401,7 +335,6 @@ test('an unwritable output stops the build, with a sentence rather than a stack'
     assert.match(result.stderr, /CANNOT WRITE/);
     assert.match(result.stderr, /build-info\.ts/, 'the message must name the file');
     assert.match(result.stderr, /previous build/, 'and say why continuing would be wrong');
-    // A raw ERR_ stack is the thing this replaced.
     assert.doesNotMatch(result.stderr, /at Object\.<anonymous>/);
   } finally {
     chmodSync(src, 0o700);
@@ -410,36 +343,7 @@ test('an unwritable output stops the build, with a sentence rather than a stack'
 });
 
 test('the banner is printed even when the process is about to die in its config loader', () => {
-  // The point of the whole mechanism. `await main()` is the first statement in
-  // the body of `index.ts` and `loadConfig()` is the first statement of
-  // `main()`, which throws on a missing environment variable — so this is a
-  // waker that cannot start, the #89 shape, where 22,675 consecutive failed
-  // starts said nothing about which `dist/` was failing. The banner has to come
-  // out of that process anyway, which is why it lives in a module imported ahead
-  // of everything rather than in the body of index.ts.
-  //
-  // #131 moved the program into `daemon.ts` and left this test alone on purpose.
-  // `./daemon.js` is now index.ts's SECOND import, so the whole program — every
-  // module it pulls in — is evaluated after the banner has printed, which is a
-  // strictly stronger version of what the last assertion here pins.
-  //
-  // ── What is load-bearing here, and what stopped being ────────────────────
-  //
-  // Until #130 the throw was at IMPORT time, inside `./config.js`. Moving it
-  // into the body is what made `dist/agent.js` loadable by a test — and the
-  // same fact dissolved this test's grip on the OTHER half of #89. While
-  // `config.js` threw while it was being EVALUATED, moving the banner import
-  // below it meant the banner never printed and this test went red; that was
-  // measured, and ops/src/selftest.ts records having measured it. Now nothing
-  // in the import phase throws, so the banner import can be moved anywhere in
-  // the list and the two assertions below still pass. The position went from
-  // enforced-by-accident to pinned by nothing, which is exactly the state
-  // ops/src/build-banner.ts warns about: "a banner that stopped printing looks
-  // like nothing at all until the next incident".
-  //
-  // So the last two assertions are ported from ops/src/selftest.ts, which has
-  // had them since its own position stopped being load-bearing. Ordering and
-  // the compiled import index, not mere presence.
+  // ── the banner prints before anything that can throw ────────────────────
   const root = resolve(fileURLToPath(import.meta.url), '..', '..');
   const result = spawnSync(process.execPath, [join(root, 'dist', 'index.js')], {
     cwd: root,
@@ -462,18 +366,7 @@ test('the banner is printed even when the process is about to die in its config 
     'the banner must precede the failure it is meant to identify',
   );
 
-  // And the mechanism, on the compiled artefact: the banner's import comes
-  // before every other one. tsc preserves import order in its ESM output, so
-  // this is a fact about what will run, not about what the source looks like.
-  // Nothing else pins it now — no linter here reorders imports, and an editor's
-  // organise-imports does it in one keystroke.
-  //
-  // Anchored to the start of a line, which is where the ops copy differs: a
-  // bare `indexOf('import ')` finds the word inside index.ts's own leading doc
-  // comment, which tsc preserves. That is a false RED rather than a false
-  // green, so ops/src/selftest.ts is not wrong today — but this file's header
-  // contains the word and the ops one does not, which is the whole of the
-  // difference.
+  // And the mechanism, on the compiled artefact: the banner's import comes before every other one.
   const compiled = readFileSync(join(root, 'dist', 'index.js'), 'utf8');
   const bannerAt = compiled.search(/^import '\.\/build-banner\.js';$/m);
   assert.notEqual(bannerAt, -1, 'dist/index.js does not import ./build-banner.js at all');

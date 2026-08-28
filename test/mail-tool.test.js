@@ -1,21 +1,3 @@
-/**
- * `checkMail` and `sendMail`.
- *
- * The interesting half — that the tools reach the agent at all — cannot be
- * tested without a container and a live session, so what is checked here is the
- * half that can be: the server builds against the SDK's current API, the
- * rendering an agent actually reads says who sent what, and the two properties
- * the drop directory was replaced to get.
- *
- * Those two are worth naming, because they are what the tests below are for:
- *
- *   1. THE SENDER CANNOT BE SUPPLIED. There is no argument that names an
- *      author, and passing one anyway changes nothing (Clawcius #35).
- *   2. EVERY REFUSAL REACHES THE CALLER. Not the journal, where the sender
- *      could not see it and a refused message looked exactly like a delivered
- *      one (Clawcius #30).
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -235,8 +217,6 @@ test('rendering names the sender and distinguishes a DM from the feed', () => {
   ]);
 
   assert.match(text, /^2 messages\./);
-  // Same instant, PT: 09:30Z is 02:30 PDT. The zone is part of the assertion
-  // because a bare number is what the defect looked like.
   assert.match(text, /\[DM\] from hamachi-coordinator · 2026-08-14 02:30 PDT/);
   assert.match(text, /subject: the release/);
   assert.match(text, /\[FEED\] from clawcius-poster · 2026-08-14 02:31 PDT/);

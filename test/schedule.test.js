@@ -1,53 +1,3 @@
-/**
- * Recurring schedules: `scheduleRecurring`, the cron arithmetic under it, and
- * the loop that fires it.
- *
- * EVERY FIXTURE HERE SITS ON A DAY WHERE SOMETHING HAPPENS. That is the point
- * of the file and it is the reason it is worth its maintenance: a schedule test
- * anchored to an ordinary Tuesday in June passes against an implementation that
- * stores a UTC instant and adds seven days, which is the implementation this
- * code exists not to be. The days are named because they are load-bearing:
- *
- *   8 MARCH 2026 — Los Angeles has no 02:30 that day. The clocks go 01:59:59 to
- *   03:00:00. An occurrence inside the gap must not run, and must not be
- *   quietly moved to 03:00.
- *
- *   1 NOVEMBER 2026 — Los Angeles has 01:30 twice, at 08:30Z and again at
- *   09:30Z. It must fire ONCE. An hourly schedule runs 24 times across that
- *   25-hour day.
- *
- *   AND ACROSS BOTH — "every day at 9am" must stay 9am. This is the test that
- *   fails for a UTC instant plus a fixed interval, and it fails twice a year,
- *   by an hour, in a direction nobody notices for a week.
- *
- *   17 AUGUST 2026 is a Monday, and the every-other-week fixtures are anchored
- *   to it. The assertion that matters is the one about 24 August: a fortnightly
- *   schedule that fires on the wrong Mondays is right half the time, which is
- *   how it survives a test that only checks the interval.
- *
- * ── And the zones are not all Californian, which cost a round to learn ──────
- *
- * The first version of this file was 31 tests that all sat in
- * `America/Los_Angeles`. They passed, and they were passing over a real defect:
- * a doubled wall clock resolved to the EARLIER instant west of UTC and the
- * LATER one east of it, because the offset probe landed on opposite sides of
- * the answer depending on the sign. OJ found it by sweeping 23 zones against a
- * brute-force reference — 406 cases, every one of them east of Greenwich — and
- * its closing line is the lesson: `Europe/London` in this file would have
- * caught it, and `America/Los_Angeles` alone never could.
- *
- * So the DST fixtures now run east of UTC as well: 25 OCTOBER and 29 MARCH 2026
- * in London and Berlin, 5 APRIL and 27 SEPTEMBER 2026 in Auckland, and
- * `Australia/Lord_Howe`, whose DST shift is THIRTY MINUTES rather than an hour
- * and which therefore breaks anything that assumes the size of the step.
- *
- * The clock is the one thing not tested here: nothing verifies that a schedule
- * armed in real life fires at the real 9am, because that takes a day to observe
- * and a fake timer would only be testing the fake. What is tested is that the
- * instant computed for a named wall clock is the right instant, which is the
- * half that can be wrong silently.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -138,10 +88,6 @@ test('9am stays 9am across spring forward — the UTC instant moves, the wall cl
   assert.equal(zonedStamp(third, LA), '2026-03-08 09:00 PDT');
   assert.equal(zonedStamp(fourth, LA), '2026-03-09 09:00 PDT');
 
-  // The same wall clock is a DIFFERENT instant either side of the boundary,
-  // and the gap between two consecutive 9ams is 23 hours, not 24. A schedule
-  // stored as a UTC instant plus a fixed interval gets this wrong, and gets it
-  // wrong by exactly one hour for the following eight months.
   assert.equal(new Date(second).toISOString(), '2026-03-07T17:00:00.000Z');
   assert.equal(new Date(third).toISOString(), '2026-03-08T16:00:00.000Z');
   assert.equal(third - second, 23 * 3_600_000, 'the short day is 23 hours long');
@@ -201,11 +147,7 @@ test('an hour fall back repeats fires once, at the earlier reading, not twice', 
 // ── The same two boundaries, east of Greenwich ─────────────────────────────
 
 test('a doubled wall clock resolves to the EARLIER instant east of UTC too, not the later', () => {
-  // This is the assertion that was false and passing. Every one of these zones
-  // has a positive offset on the day in question, which is the whole point:
-  // the defect was invisible from California and unmissable from anywhere else.
   const cases = [
-    // zone,                  y  m  d  h  mi, earlier instant,          later
     ['Europe/London', 2026, 10, 25, 1, 30, '2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'],
     ['Europe/Berlin', 2026, 10, 25, 2, 30, '2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'],
     ['Pacific/Auckland', 2026, 4, 5, 2, 30, '2026-04-04T13:30:00.000Z', '2026-04-04T14:30:00.000Z'],
@@ -277,9 +219,6 @@ test('London keeps 9am at 9am, and fires once in its repeated hour', () => {
 
 test('the timezone is a property of the schedule, not of the host', () => {
   const fields = cron('0 9 * * *');
-  // June, so that all three zones are genuinely distinct: London is on GMT
-  // until the last Sunday in March, which is a fact worth having tripped over
-  // once — an equality here in the wrong month proves nothing either way.
   const from = Date.parse('2026-06-20T00:00:00Z');
   const la = nextAfter(fields, LA, from);
   const london = nextAfter(fields, 'Europe/London', from);
@@ -295,10 +234,7 @@ test('an abbreviation is refused even where the system would accept it', () => {
   const { registry, store } = board();
   const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
 
-  // ICU takes all four of these. `EST` and `MST` are FIXED offsets whose clocks
-  // never change, so 9am in them is 8am local for eight months of the year;
-  // `PST` is an alias that does change; `PST8PDT` is a legacy spelling. An
-  // agent cannot be expected to know which is which, so none are accepted.
+  // ICU takes all four of these.
   return Promise.all(
     ['EST', 'MST', 'PST', 'PST8PDT'].map(async (zone) => {
       assert.doesNotThrow(() => new Intl.DateTimeFormat('en-US', { timeZone: zone }));
@@ -388,10 +324,7 @@ test('a back-dated anchor does not walk when everyN is 1, because it cannot matt
   const fields = cron('* * * * *');
   const now = Date.parse('2026-08-16T12:00:00Z');
 
-  // Six years of minutes lie between this anchor and now — three million
-  // occurrences. With everyN 1 every one of them is selected, so which is
-  // "number zero" cannot change the answer, and walking to find that out was
-  // 19 seconds of blocked event loop.
+  // Six years of minutes lie between this anchor and now — three million occurrences.
   const started = Date.now();
   const result = firstFire(fields, LA, 1, Date.parse('2020-01-01T00:00:00Z'), now);
   const elapsed = Date.now() - started;
@@ -400,9 +333,6 @@ test('a back-dated anchor does not walk when everyN is 1, because it cannot matt
   // The answer is the same one the anchor-free question has.
   assert.equal(result.at, nextAfter(fields, LA, now));
   assert.equal(new Date(result.at).toISOString(), '2026-08-16T12:01:00.000Z');
-  // Deliberately loose: this is a regression guard against an O(occurrences)
-  // walk reappearing, not a benchmark. The measured figure is under a
-  // millisecond and the value it replaced was 18,971.
   assert.ok(elapsed < 1000, `took ${elapsed}ms — the anchor short-circuit is gone`);
 });
 
@@ -410,10 +340,7 @@ test('a FUTURE anchor starts the schedule later, at every everyN — a past one 
   const daily = cron('0 9 * * *');
   const now = Date.parse('2026-08-16T12:00:00Z');
 
-  // The short-circuit that makes a back-dated anchor free is guarded on the
-  // anchor being in the past, so this case still walks — and must, because
-  // "start this daily schedule in December" is a sensible thing to ask for and
-  // is the reason the tool description may not say the anchor does nothing.
+  // The short-circuit for a back-dated anchor is guarded on the anchor being in the past, so a future anchor still walks.
   const december = firstFire(daily, LA, 1, Date.parse('2026-12-01T08:00:00Z'), now);
   assert.ok(december.ok, december.error);
   assert.equal(zonedStamp(december.at, LA), '2026-12-01 09:00 PST');
@@ -517,22 +444,6 @@ test('the mail hedges the missed count when it is a floor, and does not when it 
   assert.doesNotMatch(total.body, /FLOOR AND NOT A TOTAL/);
 });
 
-// THE THIRD SUPPRESSION SITE, and the one the other two tests cannot reach.
-// `armed-wake.ts` holds its own private `alsoIn`, independent of the copy in
-// `armed-tool.ts`; both other tests drive `scheduleRecurring` and `listArmed`,
-// which are both in `armed-tool.ts`. So gutting THIS copy to `return ''` left
-// the suite green at 389/389 — verified by doing it — while the mail that wakes
-// an agent silently lost the Pacific instant it was handed.
-//
-// This is the surface where the argument is strongest: a schedule mail is what
-// an agent reads when it is WOKEN, not something it asked for and can re-read
-// with different eyes.
-//
-// Asserted in both directions, because a one-directional test passes on
-// `return ''` for exactly the case that matters. The shape, not the
-// abbreviation: `GMT[^(]*\(.*P[DS]T\)` for the reason at the London preview
-// below — London returns to `GMT` on 25 October 2026 and a pinned `GMT\+1`
-// would go red on correct code.
 test('the schedule mail carries the reader\'s instant, and drops it when it would repeat', () => {
   const at = Date.UTC(2026, 7, 24, 16, 0); // 17:00 in London, 09:00 Pacific
   const base = {
@@ -836,10 +747,6 @@ test('two fortnightly schedules on opposite weeks are two schedules, not a dupli
   const { registry, store } = board();
   const { scheduleRecurring } = toolsFor('hamachi-engineer1', store);
 
-  // Anchors derived from the clock rather than written down, because the tool
-  // refuses an anchor over a year old and a fixture date would quietly become
-  // a failing test twelve months after it was written. The pure-arithmetic
-  // tests above pin real dates by name; these cannot.
   const monday = cron('0 9 * * 1');
   const first = nextAfter(monday, LA, Date.now());
   const next = nextAfter(monday, LA, first);
@@ -863,15 +770,7 @@ test('two fortnightly schedules on opposite weeks are two schedules, not a dupli
   assert.equal(armed.length, 2);
   assert.notEqual(armed[0].dueAt, armed[1].dueAt, 'they fire on different Mondays');
 
-  // But the same schedule spelled with a different anchor is still one
-  // schedule twice: an anchor five days before that first Monday selects the
-  // very same Monday as occurrence zero, so it is the same first fire and the
-  // same schedule.
-  //
-  // This is also why the comparison is on the computed fire and not on
-  // `anchorAt`: the anchor DEFAULTS TO NOW, so two genuinely identical
-  // schedules armed a second apart carry different anchors, and a check that
-  // included the anchor would look like a duplicate check and match nothing.
+  // But the same schedule spelled with a different anchor is still one schedule twice.
   const spelledDifferently = await scheduleRecurring.handler(
     { note: 'standup', cron: '0 9 * * 1', everyN: 2, anchor: asDate(first - 5 * 86_400_000) },
     {},
@@ -1039,12 +938,7 @@ test('a schedule belongs to one agent, and a crewmate can neither see nor stop i
 });
 
 test('a schedule this build cannot read is disarmed and says so — expression OR timezone', () => {
-  // Both halves of the spec, because only one of them was guarded to begin
-  // with. An unresolvable timezone made `Intl.DateTimeFormat` throw inside the
-  // tick, which the per-condition catch logged and swallowed, leaving the row
-  // armed and due in the past — so it threw again every 15 seconds, forever,
-  // and the owner was never told. The realistic cause is an ICU downgrade,
-  // which would do it to every schedule on the board at once.
+  // Both halves of the spec.
   for (const [label, spec] of [
     ['expression', { cron: '0 9 * * * L', timezone: LA }],
     ['timezone', { cron: '0 9 * * 1', timezone: 'Mars/Olympus_Mons' }],
@@ -1111,16 +1005,11 @@ test('the tool descriptions state what a schedule is and is not', () => {
   assert.match(scheduleRecurring.description, /America\/Los_Angeles/);
   assert.match(scheduleRecurring.description, /hamachi-engineer1/);
 
-  // And it does not overstate the anchor. It said the anchor does NOTHING at
-  // everyN 1, which is false for a future one — the description is what an
-  // agent reads while deciding how to call the tool, so an absolute that is
-  // wrong in one direction is worse here than anywhere else in the change.
+  // And it does not overstate the anchor.
   assert.doesNotMatch(scheduleRecurring.description, /does\s+NOTHING/);
   assert.match(scheduleRecurring.description, /A FUTURE anchor delays the first fire/);
   assert.match(scheduleRecurring.description, /A PAST anchor only chooses/);
 
-  // And `remindMe` no longer claims a repeat is impossible, which it was until
-  // this tool existed. A retracted sentence left in place is worse than either.
   assert.doesNotMatch(remindMe.description, /There is no repeat option/);
   assert.match(remindMe.description, /ONE-SHOT/);
   assert.match(remindMe.description, /scheduleRecurring/);
@@ -1128,16 +1017,6 @@ test('the tool descriptions state what a schedule is and is not', () => {
 });
 
 // ── everything an agent is shown is PT, and says so ─────────────────────────
-//
-// THESE EPOCHS ARE CHOSEN, NOT ARBITRARY. The waker runs on the host, which is
-// Europe/Berlin; agent containers are America/Los_Angeles. A test that only
-// asserts "a zone label is present" passes in both, so it would not have caught
-// the defect — the old code produced a correct-looking number in a container and
-// a wrong one on the host.
-//
-// So each epoch below renders in a DIFFERENT HOUR in the two zones, and the
-// assertions pin the hour and the literal abbreviation. Weakening either one
-// makes these pass on the host, which is the thing they exist to stop.
 
 test('a rendered time is PT, in the hour PT would use — not the host process zone', async () => {
   const { zonedStamp, DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
@@ -1149,12 +1028,6 @@ test('a rendered time is PT, in the hour PT would use — not the host process z
   assert.equal(zonedStamp(at, DEFAULT_TIMEZONE, 'time'), '19:30 PDT');
   assert.equal(zonedStamp(at, DEFAULT_TIMEZONE), '2026-08-23 19:30 PDT');
 
-  // The rendering the host would have produced, kept in the file so the contrast
-  // is here rather than in a commit message. Asserted as a DIFFERENCE rather
-  // than as a literal: the first draft asserted 'CEST' from memory and this ICU
-  // renders Europe/Berlin as 'GMT+2'. What matters is that the host's hour is
-  // not PT's, which is the whole defect; the abbreviation it happens to print is
-  // not this test's business.
   const asHost = zonedStamp(at, 'Europe/Berlin', 'time');
   assert.notEqual(asHost.slice(0, 5), '19:30', 'host and PT must not agree here');
   assert.equal(asHost.slice(0, 5), '04:30');
@@ -1174,12 +1047,6 @@ test('DEFAULT_TIMEZONE is the agents\' zone, not the process\'s', async () => {
 });
 
 test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async () => {
-  // The system prompt tells every agent that `date` in its container agrees with
-  // what the waker renders. That is true only while these two independent
-  // constants match — one in TypeScript, one in a shell script — and nothing
-  // derived either from the other. A sentence asserting a stricter mechanism
-  // than the one that shipped is the defect this whole change is about, so the
-  // honest comment beside each is now a guarantee instead.
   const { DEFAULT_TIMEZONE } = await import('../dist/schedule.js');
   const { readFileSync } = await import('node:fs');
   const sh = readFileSync('docker/run-container.sh', 'utf8');
@@ -1194,19 +1061,9 @@ test('DEFAULT_TIMEZONE and the container\'s AGENT_TZ are the same zone', async (
 });
 
 test('a schedule in the reader\'s own zone is rendered once, not twice', async () => {
-  // THIS TEST'S FIRST DRAFT TESTED A COPY OF THE FUNCTION. It pasted `alsoIn`'s
-  // three lines into the test body and asserted on those, so deleting the whole
-  // fix from `armed-tool.ts` left the suite green at 388/388. It was written to
-  // close a finding about a duplication nothing asserted on, and it had the
-  // identical defect: it asserted on something that was not the shipped code.
-  //
-  // So it drives the real tool now, and reads the string an agent would read.
   const { registry, store } = board();
   const { scheduleRecurring, listArmed } = toolsFor('hamachi-engineer1', store);
 
-  // BOTH surfaces, because they use different code and I checked: undoing
-  // `alsoIn` leaves `listArmed` green, and undoing the `local` suppression
-  // leaves the receipt green. One assertion would have caught one defect.
   const receipt = said(
     await scheduleRecurring.handler(
       { note: 'stand-up', cron: '0 9 * * *', timezone: 'America/Los_Angeles' },
@@ -1236,18 +1093,6 @@ test('a schedule in another zone still shows both, because they are two facts', 
       {},
     ),
   );
-  // The preview must still carry both: the schedule's zone and the reader's.
-  //
-  // NOT `/GMT\+1/`. The first draft pinned London's summer abbreviation, and the
-  // schedule is armed at the current time — so it would have gone red on
-  // 25 October 2026, on correct code, when London returns to `GMT`. A test that
-  // fails on a date rather than on a defect, inside the pull request about
-  // times that are wrong for half the year.
-  //
-  // I had used `P[DS]T` for Pacific in the same line, which is the same problem
-  // solved. The awareness did not generalise from one zone to the other, so this
-  // asserts the PROPERTY — a schedule-zone rendering, then a parenthetical
-  // carrying the reader's — rather than either abbreviation.
   assert.match(receipt, /GMT[^(]*\(.*P[DS]T\)/, 'the preview dropped the Pacific instant');
 
   const mine = said(await listArmed.handler({}, {}));

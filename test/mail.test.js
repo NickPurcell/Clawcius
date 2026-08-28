@@ -1,10 +1,4 @@
-/**
- * Mail policy and delivery.
- *
- * The feed's write restriction is the one rule that has to be right on the
- * first commit — it is far harder to add to a board that has already had five
- * writers than to start with — so most of this file is about who is refused.
- */
+/** Mail policy and delivery. */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
