@@ -9,9 +9,10 @@ sees here.
 A Discord-driven system of long-lived Claude Code agents ("crews"). `src/` is the
 waker; `discord-cli/`, `browser-cli/`, `gws-cli/`, `pr-cli/` are the tools the
 agents run inside their containers; `status/` is the Clawsky observability page;
-`docker/`, `squid/`, `systemd/` deploy it. The authors of most pull requests are
-the agents themselves. `ops/` is being removed; do not accept changes that extend
-it.
+`docker/`, `squid/`, `systemd/` deploy it; `deploy/` builds releases from
+`main`; `bots/` holds daemons a crew runs under its own bot identity. The
+authors of most pull requests are the agents themselves. Hamachi runs on the
+host as the operator's hands; Clawcius runs in a gVisor sandbox.
 
 ## Comments
 
@@ -52,14 +53,15 @@ Blocking, specifically here:
 - a test that exists to keep an in-code copy of a YAML value in sync — delete
   the copy instead.
 
-The Python suites under `browser-cli/`, `discord-cli/`, `vidbot/` do not run in
-CI. A pull request touching those directories states how its tests were run.
+CI also runs the Python suites under `browser-cli/` and `bots/vidbot/`.
+`discord-cli` and `gws-cli` have no tests; a pull request touching them says
+how it was exercised.
 
 ## Documents
 
-`README.md`, `SETUP.md`, `CLAWSKY.md`, `status/README.md`, `squid/README.md`,
+`README.md`, `SETUP.md`, `status/README.md`, `squid/README.md`,
 `browser-cli/README.md`, `discord-cli/README.md`, `pr-cli/README.md`,
-`gws-cli/README.md` describe the current system and nothing else. A pull
+`gws-cli/README.md`, `bots/README.md` describe the current system and nothing else. A pull
 request that changes a behaviour one of them describes updates it in the same
 pull request. A pull request that removes a behaviour removes every sentence
 about it. No document gains a section whose subject is the past.
