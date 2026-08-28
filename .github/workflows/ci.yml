@@ -30,4 +30,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 -m unittest discover -s browser-cli -p 'test_*.py'
-      - run: python3 -m unittest discover -s vidbot -p 'test_*.py'
+      - run: python3 -m unittest discover -s bots/vidbot -p 'test_*.py'

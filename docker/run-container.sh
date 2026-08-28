@@ -37,6 +37,8 @@ WORKSPACES=$CLAWCIUS_STATE/workspaces
 # The daemon serves it to the sandbox, so it sits outside every read-write
 # mount and is mounted :ro below; the sandbox must not be able to replace it.
 GITHUB_TOKEN_DIR=${CLAWCIUS_GITHUB_TOKEN_DIR:-$CLAWCIUS_STATE/github-token}
+BOTS=${CLAWCIUS_BOTS_DIR:-$(cd "$(dirname "$0")/.." && pwd)/bots}
+CREW=${CLAWCIUS_CREW:-${NAME%-agent}}
 # The container's only read-write window onto the host filesystem.
 # clawcius-status listens on a unix socket here, `$CLAWCIUS_STATE/run/status.sock`,
 # which is how the page is reachable from a network with no gateway. Mirrored
@@ -259,6 +261,8 @@ docker run -d \
   -v "$BROWSER_CLI:$BROWSER_CLI:ro" \
   -v "$PR_CLI:$PR_CLI:ro" \
   -v "$GITHUB_TOKEN_DIR:$GITHUB_TOKEN_DIR:ro" \
+  -v "$BOTS:$BOTS:ro" \
+  -e BOTS_DIR="$BOTS" -e CREW="$CREW" \
   -e BROWSE_LOG="$WORKSPACES/.browse/navigation.jsonl" \
   "${GWS_MOUNT[@]}" \
   -w "$WORKSPACES" \
