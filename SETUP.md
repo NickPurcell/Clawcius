@@ -53,7 +53,9 @@ git clone https://github.com/NickPurcell/Clawcius.git /tmp/clawcius && sudo /tmp
 
 ## 3. Secrets
 
-`/etc/clawcius/clawcius.env` and `hamachi.env` (`root:hamachi 0640`), one per crew:
+`/etc/clawcius/clawcius.env` and `hamachi.env`, one per crew, each `0640` and group-owned by the user
+that crew's units run as (`npurcell` for Clawcius, `hamachi` for Hamachi); the crew's App PEM the same.
+The directory is `0755`: it lists names, the files keep their own mode.
 
 ```
 DISCORD_TOKEN=            # the crew's bot token; the waker uses the gateway, the CLI uses REST
@@ -125,7 +127,7 @@ Docker, gVisor and Node are already on this box; skip § 2's install commands.
 2. `sudo deploy/setup.sh` from a clone of `main`. It creates the `hamachi` account, `/srv/{clawcius,oj}`,
    `/etc/clawcius` placeholders, and installs the deploy units without enabling them.
 3. Copy `~/.env` → `/etc/clawcius/clawcius.env`, `~/.env.hamachi` → `/etc/clawcius/hamachi.env`, the
-   App PEMs into `/etc/clawcius/`; `chown root:hamachi`, `chmod 0640` (the PEMs 0640 too — both wakers read them).
+   App PEMs into `/etc/clawcius/`; `chmod 0640`, Clawcius's files `chgrp npurcell`, Hamachi's `chgrp hamachi`.
 4. `systemctl stop hamachi-container.service hamachi-snapshot.timer`; `chown -R hamachi:hamachi /var/lib/hamachi`.
 5. `sudo deploy clawcius`. It refuses until 3 and 4 are done. It builds, installs the new units, restarts
    `clawcius-status`, `clawcius` and `hamachi`, and health-checks them; on the first run there is no

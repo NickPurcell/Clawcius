@@ -7,8 +7,10 @@ id hamachi >/dev/null 2>&1 || useradd --system --create-home --home-dir /srv/ham
 install -m 0440 -o root -g root "$(dirname "$0")/hamachi.sudoers" /etc/sudoers.d/hamachi
 visudo -cf /etc/sudoers.d/hamachi
 
-install -d -m 0750 -o root -g hamachi /etc/clawcius
-for f in clawcius.env hamachi.env; do [ -f /etc/clawcius/$f ] || install -m 0640 -o root -g hamachi /dev/null /etc/clawcius/$f; done
+# Each crew's secrets are readable by the user its units run as: docker reads --env-file as that user.
+install -d -m 0755 -o root -g root /etc/clawcius
+[ -f /etc/clawcius/clawcius.env ] || install -m 0640 -o root -g npurcell /dev/null /etc/clawcius/clawcius.env
+[ -f /etc/clawcius/hamachi.env ] || install -m 0640 -o root -g hamachi /dev/null /etc/clawcius/hamachi.env
 
 for repo in clawcius oj; do
   case $repo in clawcius) url=https://github.com/NickPurcell/Clawcius.git ;; oj) url=https://github.com/NickPurcell/OJ.git ;; esac
