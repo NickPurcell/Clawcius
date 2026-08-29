@@ -18,6 +18,14 @@ esac
 
 exec 9>/run/lock/deploy-$REPO.lock; flock -w 600 9
 log() { echo "deploy[$REPO]: $*"; }
+
+# Refuse to switch the services onto a box that is not ready for them.
+if [ $REPO = clawcius ]; then
+  for f in /etc/clawcius/clawcius.env /etc/clawcius/hamachi.env; do
+    [ -s "$f" ] || { log "$f is missing or empty; put the crew's secrets there first (SETUP.md § 3)"; exit 3; }
+  done
+  [ "$(stat -c %U /var/lib/hamachi)" = hamachi ] || { log "/var/lib/hamachi is not owned by hamachi; chown -R hamachi:hamachi /var/lib/hamachi first"; exit 3; }
+fi
 as_builder() { runuser -u $BUILD_USER -- env PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" "$@"; }
 
 # A request file from a crew names a ref; the timer deploys main.
@@ -79,6 +87,8 @@ else
   OK=false; REASON="failed the health check"
   if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
     log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="failed the health check; reverted to ${CURRENT##*/}"
+  else
+    log "no previous release to revert to; the services are left on $SHA — read journalctl -u $UNITS"
   fi
 fi
 

@@ -119,10 +119,22 @@ resume from SQLite on the next wake.
 
 ## 8. Cutover from the previous layout (one-time)
 
+Docker, gVisor and Node are already on this box; skip § 2's install commands.
+
 1. `chmod 600 ~/.env ~/.env.hamachi`; stop and disable `clawcius-ops`; stop `oj`.
-2. `sudo deploy/setup.sh` from a clone; copy the two env files and PEMs into `/etc/clawcius`.
-3. `sudo chown -R hamachi:hamachi /var/lib/hamachi`; stop `hamachi-container`, `hamachi-snapshot.timer`; remove their unit files.
-4. `sudo deploy clawcius`; `sudo deploy oj` (OJ's live `oj-config.yaml` must be the repo's).
-5. Rebuild the image and `docker/up.sh --recreate` for Clawcius so the bots supervisor is the entrypoint; copy vidbot's `state.json` into `/var/lib/clawcius/workspaces/.bots/vidbot/` first.
-6. `userdel clawcius-ops`, `groupdel clawcius-dev`, `rm /etc/sudoers.d/clawcius`, revoke the OJ deploy key, log out the `clawcius-ops` Claude seat, `chmod 750 /home/npurcell`.
-7. Branch protection back on (CI + OJ) for both repos; start `oj`.
+2. `sudo deploy/setup.sh` from a clone of `main`. It creates the `hamachi` account, `/srv/{clawcius,oj}`,
+   `/etc/clawcius` placeholders, and installs the deploy units without enabling them.
+3. Copy `~/.env` → `/etc/clawcius/clawcius.env`, `~/.env.hamachi` → `/etc/clawcius/hamachi.env`, the
+   App PEMs into `/etc/clawcius/`; `chown root:hamachi`, `chmod 0640` (the PEMs 0640 too — both wakers read them).
+4. `systemctl stop hamachi-container.service hamachi-snapshot.timer`; `chown -R hamachi:hamachi /var/lib/hamachi`.
+5. `sudo deploy clawcius`. It refuses until 3 and 4 are done. It builds, installs the new units, restarts
+   `clawcius-status`, `clawcius` and `hamachi`, and health-checks them; on the first run there is no
+   previous release to revert to, so read `journalctl -u hamachi` if it reports a failure. Then `sudo deploy oj`
+   (OJ's live `oj-config.yaml` must be the repo's).
+6. `systemctl enable --now deploy@clawcius.timer deploy@oj.timer deploy@clawcius.path deploy@oj.path`.
+7. Rebuild the image and `docker/up.sh --recreate` for Clawcius so the bots supervisor is the entrypoint;
+   copy vidbot's `state.json` into `/var/lib/clawcius/workspaces/.bots/vidbot/` first.
+8. `userdel clawcius-ops`, `groupdel clawcius-dev`, `rm /etc/sudoers.d/clawcius`, revoke the OJ deploy key,
+   log out the `clawcius-ops` Claude seat, `chmod 750 /home/npurcell`; remove the old unit files for
+   `clawcius-ops`, `clawcius-snapshot-verify`, `hamachi-container`, `hamachi-snapshot`.
+9. Branch protection back on (CI + OJ) for both repos; start `oj`.

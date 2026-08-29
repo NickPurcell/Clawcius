@@ -20,5 +20,10 @@ install -d -m 0755 -o hamachi -g hamachi /var/lib/hamachi/run
 install -m 0644 -o root -g root "$(dirname "$0")"/../systemd/deploy@.service "$(dirname "$0")"/../systemd/deploy@.timer "$(dirname "$0")"/../systemd/deploy@.path /etc/systemd/system/
 install -m 0755 -o root -g root "$(dirname "$0")/deploy.sh" /usr/local/sbin/deploy
 systemctl daemon-reload
-systemctl enable --now deploy@clawcius.timer deploy@oj.timer deploy@clawcius.path deploy@oj.path
-echo "setup done: put secrets in /etc/clawcius, then: deploy clawcius && deploy oj"
+cat <<'NEXT'
+setup done. Next, in this order:
+  1. secrets into /etc/clawcius (clawcius.env, hamachi.env, the PEMs)     — SETUP.md § 3
+  2. chown -R hamachi:hamachi /var/lib/hamachi; stop hamachi-container.service and hamachi-snapshot.timer
+  3. deploy clawcius && deploy oj
+  4. systemctl enable --now deploy@clawcius.timer deploy@oj.timer deploy@clawcius.path deploy@oj.path
+NEXT
