@@ -15,6 +15,8 @@ function onPath(binary: string): boolean {
 
 export async function preflight(): Promise<void> {
   const problems: string[] = [];
+  // A crew whose sessions run on the host has no container or proxy to check.
+  if (!config().agent.container.enabled) return;
   const name = config().agent.container.name;
   const proxy = 'clawcius-squid';
 

@@ -34,7 +34,7 @@ if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$R
 
 as_builder git -C $ROOT/src fetch -q --prune origin
 SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
-CURRENT=$(readlink -f $ROOT/current 2>/dev/null || true)
+CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then exit 0; fi
 log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
 
@@ -58,7 +58,7 @@ switch_to() {   # switch_to <release dir>
     install -m 0644 -o root -g root "$1"/systemd/oj.service /etc/systemd/system/
   fi
   systemctl daemon-reload
-  for u in $UNITS; do systemctl restart $u.service; done
+  for u in $UNITS; do systemctl restart $u.service || true; done   # the health check decides
   [ $REPO = clawcius ] && docker kill -s HUP clawcius-agent >/dev/null 2>&1 || true
 }
 
