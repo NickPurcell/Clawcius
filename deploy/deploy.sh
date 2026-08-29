@@ -35,7 +35,12 @@ if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$R
 as_builder git -C $ROOT/src fetch -q --prune origin
 SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
-if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then exit 0; fi
+if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
+  for u in $UNITS; do
+    [ "$(systemctl is-active $u.service)" = active ] || { log "already at ${SHA:0:8}; starting $u.service"; systemctl reset-failed $u.service 2>/dev/null; systemctl start $u.service || true; }
+  done
+  exit 0
+fi
 log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
 
 # Build in a new directory; nothing that is running is touched until the switch.
