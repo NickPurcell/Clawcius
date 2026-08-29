@@ -41,6 +41,8 @@ GITHUB_TOKEN_DIR=${CLAWCIUS_GITHUB_TOKEN_DIR:-$CLAWCIUS_STATE/github-token}
 REPO=${CLAWCIUS_REPO_DIR:-/srv/clawcius}
 BOTS=$REPO/current/bots
 CREW=${CLAWCIUS_CREW:-${NAME%-agent}}
+# Fixed address: Squid holds .2, and a container that restarts before Squid must not take it.
+AGENT_IP=${CLAWCIUS_AGENT_IP:-172.31.250.3}
 # The container's only read-write window onto the host filesystem.
 STATE_RUN=$CLAWCIUS_STATE/run
 
@@ -238,7 +240,7 @@ docker run -d \
   --name "$NAME" \
   --runtime=runsc \
   --restart unless-stopped \
-  --network clawcius-internal \
+  --network clawcius-internal --ip "$AGENT_IP" \
   --env-file "$ENV_FILE" \
   -e HTTP_PROXY="$PROXY"  -e http_proxy="$PROXY" \
   -e HTTPS_PROXY="$PROXY" -e https_proxy="$PROXY" \
