@@ -57,6 +57,7 @@ switch_to() {   # switch_to <release dir>
   else
     install -m 0644 -o root -g root "$1"/systemd/oj.service /etc/systemd/system/
   fi
+  install -m 0755 -o root -g root "$1/deploy/deploy.sh" /usr/local/sbin/deploy   # the next run uses the release's own copy
   systemctl daemon-reload
   for u in $UNITS; do systemctl restart $u.service || true; done   # the health check decides
   [ $REPO = clawcius ] && docker kill -s HUP clawcius-agent >/dev/null 2>&1 || true
@@ -93,7 +94,8 @@ else
 fi
 
 # Prune old releases; keep the current, the previous, and the newest few.
-ls -1dt $ROOT/releases/* | grep -v -e "$RELEASE" -e "${CURRENT:-none}" | tail -n +$KEEP | while read -r old; do
+for old in $(ls -1dt $ROOT/releases/* 2>/dev/null | tail -n +$((KEEP + 1))); do
+  case "$old" in "$RELEASE"|"$CURRENT") continue;; esac
   as_builder git -C $ROOT/src worktree remove --force "$old" || rm -rf "$old"
 done
 
