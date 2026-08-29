@@ -60,7 +60,8 @@ switch_to() {   # switch_to <release dir>
   install -m 0755 -o root -g root "$1/deploy/deploy.sh" /usr/local/sbin/deploy   # the next run uses the release's own copy
   systemctl daemon-reload
   for u in $UNITS; do systemctl restart $u.service || true; done   # the health check decides
-  [ $REPO = clawcius ] && docker kill -s HUP clawcius-agent >/dev/null 2>&1 || true
+  # Reload the bots supervisor if the container runs one; an older container has none to signal.
+  [ $REPO = clawcius ] && docker exec clawcius-agent pkill -HUP -f bots/supervise.sh >/dev/null 2>&1 || true
 }
 
 healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>
