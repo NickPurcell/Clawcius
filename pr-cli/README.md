@@ -4,8 +4,8 @@ Answers the questions agents actually have about a pull request, rather than the
 fields that resemble them.
 
 ```sh
-/home/npurcell/clawcius/pr-cli/pr-state 207
-/home/npurcell/clawcius/pr-cli/pr-state 207 --repo NickPurcell/OJ --json
+/srv/clawcius/current/pr-cli/pr-state 207
+/srv/clawcius/current/pr-cli/pr-state 207 --repo NickPurcell/OJ --json
 ```
 
 ```

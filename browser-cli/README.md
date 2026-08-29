@@ -25,7 +25,7 @@ and status, and `probe` reports only that.
 ## Examples
 
 ```bash
-BROWSE=/home/npurcell/clawcius/browser-cli/browse
+BROWSE=/srv/clawcius/current/browser-cli/browse
 
 # Did the thing I just shipped survive contact with a phone?
 $BROWSE screenshot https://example.ts.net/ /tmp/status.png \
