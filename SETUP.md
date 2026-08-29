@@ -21,6 +21,10 @@ same under `/srv/oj`, owned by `hamachi`; nobody edits them.
 
 ## 2. A fresh box
 
+**On a box that already runs the stack, skip to the repo's own setup below** — the
+commands here replace Ubuntu's `docker.io` with Docker's packages, which stops every
+container and needs `systemctl enable --now docker.socket` afterwards.
+
 Ubuntu, root. Docker and gVisor first:
 
 ```sh
@@ -38,6 +42,8 @@ sudo usermod -aG docker npurcell        # docker group is root on the host
 ```
 
 Node 22 for the service users (the units use `/home/npurcell/.local/share/node/bin`).
+
+Node 22 is already on this box (`/home/npurcell/.local/share/node/bin`).
 
 Then the repo's own setup, which creates the `hamachi` account, `/srv`, `/etc/clawcius`, the deploy units and timers:
 
