@@ -47,7 +47,6 @@ mail_result() {
   subject="deploy $REPO ${SHA:0:8}: $2"
   body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
   subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
-  # Only a timer success narrows: a requested deploy mails its requester (Hamachi) on every outcome.
   crews=$DM_FAIL; [ "$1" = true ] && [ $HAD_REQUEST = 0 ] && crews=$DM_OK
   for crew in $crews; do
     db=/var/lib/$crew/$crew.db; owner=$(stat -c %U $db)
@@ -59,7 +58,8 @@ mail_result() {
 as_builder git -C $ROOT/src fetch -q --prune origin
 SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") \
   || { SHA=""; [ $HAD_REQUEST = 1 ] && mail_result false "no such ref on origin: $REF"; log "no such ref on origin: $REF"; exit 3; }
-[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] || { log "$REF is not on any origin branch"; exit 3; }
+[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] \
+  || { [ $HAD_REQUEST = 1 ] && mail_result false "$REF is not on any origin branch"; log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   for u in $UNITS; do
