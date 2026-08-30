@@ -293,7 +293,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discordCli = resolve(base.paths.discordCli);
   // What docker/run-container.sh bind-mounts into the agent container.
   const mounts: Array<[string, string]> = [
-    ...(['run', 'workspaces', 'agent-home'] as const).map(
+    ...(['workspaces', 'agent-home'] as const).map(
       (child): [string, string] => [`<stateDir>/${child}, bind-mounted read-write`, join(derived.stateDir, child)],
     ),
     ['paths.skillsDir', skillsDir],
