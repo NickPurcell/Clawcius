@@ -8,7 +8,7 @@ REPO=${1:?usage: deploy.sh <clawcius|oj> [ref]}
 REF=${2:-main}
 ROOT=/srv/$REPO
 BUILD_USER=hamachi
-NODE_BIN=/home/npurcell/.local/share/node/bin
+NODE_BIN=/usr/bin
 KEEP=5
 case $REPO in
   clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_CREWS="clawcius hamachi" ;;

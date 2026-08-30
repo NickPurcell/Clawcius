@@ -25,8 +25,7 @@ WorkingDirectory=/srv/clawcius/current/status
 # No EnvironmentFile: this service holds no secrets.
 Environment=STATUS_CONFIG_PATH=/srv/clawcius/current/status/status-config.yaml
 
-# systemd's default PATH excludes ~/.local, so a bare `node` dies with ENOENT.
-ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 
 Restart=always
 RestartSec=5

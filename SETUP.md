@@ -41,9 +41,7 @@ sudo /usr/local/bin/runsc install && sudo systemctl restart docker
 sudo usermod -aG docker npurcell        # docker group is root on the host
 ```
 
-Node 22 for the service users (the units use `/home/npurcell/.local/share/node/bin`).
-
-Node 22 is already on this box (`/home/npurcell/.local/share/node/bin`).
+Node 22 from the NodeSource apt repository, at `/usr/bin/node`; `setup.sh` installs it when it is missing.
 
 Then the repo's own setup, which creates the `hamachi` account, `/srv`, `/etc/clawcius`, the deploy units and timers:
 

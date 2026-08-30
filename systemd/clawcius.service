@@ -24,11 +24,7 @@ Group=npurcell
 WorkingDirectory=/srv/clawcius/current
 EnvironmentFile=/etc/clawcius/clawcius.env
 
-# The Agent SDK spawns Claude Code invoking bare `node`; systemd's default PATH
-# excludes ~/.local, so without this every spawn dies with ENOENT.
-Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 
 Restart=always
 RestartSec=5
