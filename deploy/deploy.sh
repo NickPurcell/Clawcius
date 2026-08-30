@@ -10,8 +10,8 @@ ROOT=/srv/$REPO
 BUILD_USER=hamachi
 KEEP=5
 case $REPO in
-  clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_CREWS="clawcius hamachi" ;;
-  oj)       UNITS="oj";                              CREWS="";                DM_CREWS="hamachi" ;;
+  clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_OK="clawcius"; DM_FAIL="clawcius hamachi" ;;
+  oj)       UNITS="oj";                              CREWS="";                DM_OK="hamachi";  DM_FAIL="hamachi" ;;
   *) echo "unknown repo $REPO" >&2; exit 2 ;;
 esac
 
@@ -27,21 +27,46 @@ if [ $REPO = clawcius ]; then
 fi
 as_builder() { runuser -u $BUILD_USER -- env PATH="/usr/local/bin:/usr/bin:/bin" "$@"; }
 
-# A request file from a crew names a ref; the timer, with neither, deploys main.
+# A request file from a crew: the first line names a ref, later lines say why
+# and ride into the result mail. The timer, with neither, deploys main.
 REQUEST=/var/lib/hamachi/run/deploy-$REPO
 TIMER=0; [ -z "${2:-}" ] && [ ! -f "$REQUEST" ] && TIMER=1
-if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$REQUEST"; fi
+NOTE=""; HAD_REQUEST=0
+if [ -f "$REQUEST" ]; then
+  REF=$(head -1 "$REQUEST" | tr -cd 'A-Za-z0-9._/-')
+  NOTE=$(tail -n +2 "$REQUEST" | tr -d '\r' | head -c 400)
+  rm -f "$REQUEST"; HAD_REQUEST=1
+fi
 MAIN_SEEN=$ROOT/main-seen
 
+# mail_result <true|false> <reason> — single quotes doubled: the values land in a SQL literal.
+mail_result() {
+  local now title subject body crews crew db owner
+  now=$(date +%s%3N)
+  title=""; [ -n "${SHA:-}" ] && title=" — $(as_builder git -C $ROOT/src log -1 --format=%s $SHA)"
+  subject="deploy $REPO ${SHA:0:8}: $2"
+  body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
+  subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
+  crews=$DM_FAIL; [ "$1" = true ] && [ $HAD_REQUEST = 0 ] && crews=$DM_OK
+  for crew in $crews; do
+    db=/var/lib/$crew/$crew.db; owner=$(stat -c %U $db)
+    runuser -u "$owner" -- sqlite3 "$db" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$subject', '$body', $now FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
+  done
+  log "deploy $REPO ${SHA:0:8}: $2"
+}
+
 as_builder git -C $ROOT/src fetch -q --prune origin
-SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
-[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] || { log "$REF is not on any origin branch"; exit 3; }
+SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") \
+  || { SHA=""; [ $HAD_REQUEST = 1 ] && mail_result false "no such ref on origin: $REF"; log "no such ref on origin: $REF"; exit 3; }
+[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] \
+  || { [ $HAD_REQUEST = 1 ] && mail_result false "$REF is not on any origin branch"; log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   for u in $UNITS; do
     [ "$(systemctl is-active $u.service)" = active ] || { log "already at ${SHA:0:8}; starting $u.service"; systemctl reset-failed $u.service 2>/dev/null; systemctl start $u.service || true; }
   done
   [ $REF = main ] && echo $SHA > $MAIN_SEEN
+  [ $HAD_REQUEST = 1 ] && mail_result true "already deployed; nothing changed"
   exit 0
 fi
 [ $TIMER = 1 ] && [ "$(cat $MAIN_SEEN 2>/dev/null)" = "$SHA" ] && exit 0
@@ -109,13 +134,6 @@ for old in $(ls -1dt $ROOT/releases/* 2>/dev/null | tail -n +$((KEEP + 1))); do
   as_builder git -C $ROOT/src worktree remove --force "$old" || rm -rf "$old"
 done
 
-NOW=$(date +%s%3N)
-SUBJECT="deploy $REPO ${SHA:0:8}: $REASON"
-BODY="$REPO at $REF (${SHA:0:8}) $REASON. $(date -u +%FT%TZ)"
-for crew in $DM_CREWS; do
-  DB=/var/lib/$crew/$crew.db; OWNER=$(stat -c %U $DB)
-  runuser -u "$OWNER" -- sqlite3 "$DB" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$SUBJECT', '$BODY', $NOW FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
-done
-log "$SUBJECT"
+mail_result $OK "$REASON"
 [ $REF = main ] && echo $SHA > $MAIN_SEEN
 [ $OK = true ]
