@@ -35,17 +35,17 @@ if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$R
 MAIN_SEEN=$ROOT/main-seen
 
 as_builder git -C $ROOT/src fetch -q --prune origin
-SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+as_builder git -C $ROOT/src branch -r --contains $SHA | grep -q . || { log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   for u in $UNITS; do
     [ "$(systemctl is-active $u.service)" = active ] || { log "already at ${SHA:0:8}; starting $u.service"; systemctl reset-failed $u.service 2>/dev/null; systemctl start $u.service || true; }
   done
+  [ $REF = main ] && echo $SHA > $MAIN_SEEN
   exit 0
 fi
-# The timer deploys each main sha once, so a manual `deploy <repo> <ref>` holds until main next moves.
 [ $TIMER = 1 ] && [ "$(cat $MAIN_SEEN 2>/dev/null)" = "$SHA" ] && exit 0
-[ $REF = main ] && echo $SHA > $MAIN_SEEN
 log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
 
 # Build in a new directory; nothing that is running is touched until the switch.
@@ -118,4 +118,5 @@ for crew in $DM_CREWS; do
   runuser -u "$OWNER" -- sqlite3 "$DB" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$SUBJECT', '$BODY', $NOW FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
 done
 log "$SUBJECT"
+[ $REF = main ] && echo $SHA > $MAIN_SEEN
 [ $OK = true ]
