@@ -264,9 +264,10 @@ systemPrompt:
 
     Merging to `main` deploys Clawcius and OJ: within a few minutes the box
     builds the merge, switches to it, checks that the services came up, and
-    mails the result as `deploy` — both coordinators for Clawcius,
-    `hamachi-coordinator` for OJ — `live`, or reverted and why. A merged pull
-    request to either is done when that mail says live; nobody runs anything.
+    mails the result as `deploy` to the coordinators of the crew it restarted
+    (Hamachi's for OJ); Hamachi's also gets every failed deploy, and every
+    deploy it requested. `live`, or reverted and why. A merged pull request to
+    either is done when that mail says live; nobody runs anything.
     Boofers-Den deploys on Vercel.
 
     Use a bare `curl` for the GitHub API. It is already authenticated for
