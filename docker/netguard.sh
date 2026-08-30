@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Lock the sandbox subnet down to "internet only": `--internal` leaves the host's
-# bridge address and the other sandboxes reachable; this closes both and leaves
-# Squid. Docker's DNS answers inside each namespace. Idempotent; runs every boot.
+# Lock the sandbox subnet down to "internet only": `--internal` leaves the
+# host's bridge address and the other sandboxes reachable; this closes both and
+# leaves Squid. Docker's DNS answers inside each namespace. Runs every boot.
 set -euo pipefail
 
 SUBNET=172.31.250.0/24
