@@ -1,4 +1,4 @@
-# Hamachi — instance 2, SimpleTestServer. agent-config.yaml says what an instance file holds.
+# Hamachi — SimpleTestServer.
 extends: agent-config.base.yaml
 
 crew: hamachi
@@ -12,6 +12,5 @@ discord:
   alwaysOnChannelIds:
     - '1467070145343258628'
 
-# Sessions run on the host as the hamachi account, not in a container.
 container:
   enabled: false

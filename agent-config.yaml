@@ -1,5 +1,3 @@
-# Clawcius — instance 1. An instance file holds facts: `crew`, `displayName` and the channel lists.
-# Prompt content and every derived path or identity are refused here by the loader.
 extends: agent-config.base.yaml
 
 crew: clawcius
