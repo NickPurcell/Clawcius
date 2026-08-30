@@ -60,9 +60,7 @@ the useful moment is when both are on screen together.
 ## Running it
 
 Node 22+, no dependencies, nothing installed. Reads through bare `curl`, which
-the daemon has already authenticated via netrc — **do not add an Authorization
-header**, an explicit one replaces the netrc credential and authenticates as the
-account rather than as the App.
+the daemon has already authenticated via netrc.
 
 This directory is bind-mounted **read-only** into every agent container. The
 tool writes nothing anywhere: no cache, no temp file, no log, and it needs no
