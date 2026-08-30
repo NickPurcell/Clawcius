@@ -1,16 +1,8 @@
 #!/usr/bin/env node
 /**
- * Answer the questions agents have about a pull request: is a review round
- * running, queued or finished; did the last round read the code on the branch
- * now; can it merge, and if not why; and is each approval still for the head.
- *
- * Usage:  pr-cli/pr-state <pr> [--repo owner/name] [--json]
- *
- * Reads through bare `curl`, which is authenticated via netrc. Do not add an
- * Authorization header: an explicit one replaces the netrc credential and
- * authenticates as the account rather than as the App. Reads `/rulesets`, not
- * `/branches/{branch}/protection`, which is 403 for an App without
- * `Administration: read`.
+ * pr-state <pr> [--repo owner/name] [--json]: is a round running, did it read the head, can it merge.
+ * Reads through bare `curl` authenticated via netrc; an Authorization header would replace the App
+ * credential. Reads `/rulesets`, since `/branches/{branch}/protection` is 403 for an App.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -23,10 +15,7 @@ const REVIEW_LABEL = 'oj:review';
 /** The findings footer, the only place a round names the commit it read. */
 export const FOOTER = /<sub>OJ\s*·\s*round\s*(\d+)\s*·\s*head\s*`([0-9a-f]+)`/;
 
-/**
- * OJ comments that are findings, structurally: the acknowledgement is also a
- * comment by OJ and carries no footer.
- */
+/** A findings comment carries the footer; OJ's acknowledgement comment does not. */
 export function parseFindings(comments) {
   return comments
     .filter((c) => c.user?.login === OJ_BOT)
@@ -35,10 +24,7 @@ export function parseFindings(comments) {
     .map((c) => ({ at: c.at, round: Number(c.m[1]), sha: c.m[2], url: c.url }));
 }
 
-/**
- * OJ declining a round: it unlabels like a pickup and posts no footer. Not
- * anchored hard at `^`, since OJ's system comments may open with an emoji.
- */
+/** OJ declining a round: unlabels like a pickup, posts no footer, may open with an emoji. */
 const DECLINED = /^\W*OJ is not reviewing this:\s*(.*)/;
 
 export function parseDeclines(comments) {
@@ -50,12 +36,8 @@ export function parseDeclines(comments) {
 }
 
 /**
- * Did the last round read the code that is on the branch now?
- *
- * EXACT    the reviewed commit IS the head
- * ANCESTOR the head has moved on; commits since it are unreviewed
- * VOID     the reviewed commit is not in the head's history at all
- * UNKNOWN  the sha is not in this clone
+ * Did the last round read the head? EXACT: it is the head. ANCESTOR: the head moved on.
+ * VOID: the reviewed commit is not in the head's history. UNKNOWN: the sha is not in this clone.
  */
 export function classifyReviewedSha(sha, head, isAncestorFn) {
   if (!sha) return 'NONE';
@@ -66,9 +48,8 @@ export function classifyReviewedSha(sha, head, isAncestorFn) {
 }
 
 /**
- * Approvals, each flagged with whether it is for the code on the branch now.
- * GitHub keeps counting an approval after the branch moves when
- * `dismiss_stale_reviews_on_push` is false.
+ * Approvals, each flagged with whether it is for the head: GitHub keeps counting one after the
+ * branch moves when `dismiss_stale_reviews_on_push` is false.
  */
 export function approvalsFor(reviews, head) {
   // One per reviewer, from their latest review, which is how GitHub counts.
@@ -92,14 +73,9 @@ export function approvalsFor(reviews, head) {
 }
 
 /**
- * Why a stale approval went stale: `spent` when only authors already on the
- * branch pushed after it, `overtaken` when a new author appeared, `null` when
- * it cannot tell (no commits either side, or an author with no login).
- *
- * Authorship is the proxy for who pushed: the REST API does not report the
- * pusher, and a rebase preserves the author. Compared among commit authors,
- * not against `pr.user.login`: the pull request is opened by the App and the
- * commits are authored by the user.
+ * `spent` when only authors already on the branch pushed after the approval, `overtaken` when a
+ * new author appeared, `null` when it cannot tell. Commit authorship stands in for the pusher,
+ * which the REST API does not report; the App opens the pull request, so `pr.user` is not compared.
  */
 export function whyStale(approval, commits) {
   if (!approval?.at) return null;
@@ -126,10 +102,8 @@ export function whyStale(approval, commits) {
 }
 
 /**
- * Does a ruleset ref pattern match this branch? `conditions.ref_name` holds
- * fnmatch patterns against the full ref, so `refs/heads/*` means every branch.
- * `*` becomes `.*`, which crosses `/`; `**` is the same language, so any
- * narrowing of `*` must handle `**` first.
+ * Does a ruleset ref pattern match this branch? `conditions.ref_name` holds fnmatch patterns
+ * against the full ref; `*` and `**` both cross `/`.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -221,12 +195,9 @@ export function explainMergeState(state, approvals, ruleset) {
 }
 
 /**
- * One request: the body, plus the `link` header appended after a sentinel by
- * curl's `--write-out %header{link}` (curl >= 7.84). `-D -` is wrong behind
- * Squid, which emits its own `200 Connection established` block first, and
- * `-D /dev/stderr` segfaults curl under gVisor. On an older curl the literal
- * `%header{link}` is emitted, the regex misses, and pagination reverts to
- * page 1.
+ * One request: the body, then the `link` header after a sentinel via `--write-out %header{link}`
+ * (curl >= 7.84; older curl emits the literal and pagination stops at page 1). `-D -` is wrong
+ * behind Squid, which emits its own `200 Connection established` block first.
  */
 const SENTINEL = '\n@@pr-state-link@@';
 
@@ -253,21 +224,14 @@ function api(path, repo) {
 }
 
 /**
- * A paginated list endpoint: page 1 plus the LAST page. These endpoints are
- * oldest-first with no `direction`, so the newest events are on the last page.
- * Middle pages are not fetched: every question is about the newest comments,
- * or the full set of reviews, which does not reach 200. Past ~200 timeline
- * events the current round's label events can sit in a skipped middle page.
+ * A paginated list: page 1 plus the last page, since these endpoints are oldest-first and every
+ * question is about the newest events. Past ~200 events the current round can sit in a skipped page.
  */
 function apiList(path, repo) {
   return apiListSayingIfTruncated(path, repo).items;
 }
 
-/**
- * `apiList`, plus whether a middle page was skipped: `whyStale` splits commits
- * either side of a timestamp, so an incomplete list would yield a verdict
- * rather than declining.
- */
+/** `apiList`, plus whether a middle page was skipped; `whyStale` declines on an incomplete list. */
 function apiListSayingIfTruncated(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
   const first = curlJson(url, true);
@@ -303,10 +267,8 @@ function isAncestor(sha, head) {
 }
 
 /**
- * Round state from the timeline, read backwards. The label is a request queue
- * and OJ consumes it on pickup, so its presence is not the state: `labeled`
- * with no later `unlabeled` is queued; `labeled` then `unlabeled` by OJ is a
- * round that started then, and whether it finished is answered by findings.
+ * Round state from the timeline, read backwards: `labeled` with no later `unlabeled` is queued;
+ * `unlabeled` by OJ is a round that started then, and the findings footer says whether it finished.
  */
 export function roundState(timeline, findings, declines = []) {
   let lastLabeled = null;
