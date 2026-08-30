@@ -233,8 +233,9 @@ test('onDone still sees the turn s error after a non-retryable refusal', async (
   }
 });
 
-test('a dead credential still reaches onNeedsRespawn', async () => {
+test('a dead credential still reaches onNeedsRespawn', async (t) => {
   // The auth-failure check runs after `onDone`.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = drive();
   try {
     h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
@@ -245,7 +246,9 @@ test('a dead credential still reaches onNeedsRespawn', async () => {
     assert.equal(first.retryScheduled, true, 'the first auth failure is retried');
     assert.equal(h.session.turnPending, true, 'and its mail is deliberately unsettled');
 
-    await new Promise((r) => setTimeout(r, 2_400));
+    // The retry backoff is the only timer the session holds.
+    t.mock.timers.tick(60_000);
+    assert.equal(h.session.busy, true, 'the backoff rewoke the session');
 
     await h.send(refusal('authentication_failed'));
     await h.send(RESULT);
