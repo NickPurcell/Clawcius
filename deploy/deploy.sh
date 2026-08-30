@@ -36,7 +36,7 @@ MAIN_SEEN=$ROOT/main-seen
 
 as_builder git -C $ROOT/src fetch -q --prune origin
 SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
-as_builder git -C $ROOT/src branch -r --contains $SHA | grep -q . || { log "$REF is not on any origin branch"; exit 3; }
+[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] || { log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   for u in $UNITS; do
