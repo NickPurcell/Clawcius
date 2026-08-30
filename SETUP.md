@@ -10,7 +10,7 @@
 | `hamachi` | hamachi | `/srv/clawcius/current` | the Hamachi waker; agents run on the host as `hamachi` |
 | `clawcius-status` | npurcell | `/srv/clawcius/current/status` | Clawsky, loopback only; `tailscale serve` fronts it |
 | `clawcius-snapshot.timer` | npurcell + docker | `docker/snapshot.sh` | nightly `docker commit` of the sandbox, eight kept |
-| `deploy@clawcius.timer`, `deploy@oj.timer` | root | `/usr/local/sbin/deploy` | every minute: is `origin/main` ahead of `current`? deploy |
+| `deploy@clawcius.timer`, `deploy@oj.timer` | root | `/usr/local/sbin/deploy` | every minute: is `origin/main` a sha the timer has not deployed? deploy |
 | `deploy@*.path` | root | same | a crew wrote `/var/lib/hamachi/run/deploy-<repo>` naming a ref |
 
 State: `/var/lib/clawcius` and `/var/lib/hamachi` (SQLite board, workspaces,
@@ -111,7 +111,7 @@ resume from SQLite on the next wake.
 
 ## 7. Operating
 
-- **Deploy**: merge to `main`. **Roll back**: `sudo deploy clawcius <older-sha>`.
+- **Deploy**: merge to `main`. **Roll back**: `sudo deploy clawcius <older-sha>`, which holds until `main` next moves.
 - **Watch**: `journalctl -u clawcius -f`, `-u hamachi`, `-u deploy@clawcius`; Clawsky on the tailnet.
 - **Wedged sandbox**: `docker/up.sh --recreate` (nightly snapshots: `docker images clawcius-agent`).
 - **Disaster**: restore the VPS from the provider's backup.

@@ -27,19 +27,24 @@ if [ $REPO = clawcius ]; then
 fi
 as_builder() { runuser -u $BUILD_USER -- env PATH="/usr/local/bin:/usr/bin:/bin" "$@"; }
 
-# A request file from a crew names a ref; the timer deploys main.
+# A request file from a crew names a ref; the timer, with neither, deploys main.
 REQUEST=/var/lib/hamachi/run/deploy-$REPO
+TIMER=0; [ -z "${2:-}" ] && [ ! -f "$REQUEST" ] && TIMER=1
 if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$REQUEST"; fi
+MAIN_SEEN=$ROOT/main-seen
 
 as_builder git -C $ROOT/src fetch -q --prune origin
-SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+[ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] || { log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   for u in $UNITS; do
     [ "$(systemctl is-active $u.service)" = active ] || { log "already at ${SHA:0:8}; starting $u.service"; systemctl reset-failed $u.service 2>/dev/null; systemctl start $u.service || true; }
   done
+  [ $REF = main ] && echo $SHA > $MAIN_SEEN
   exit 0
 fi
+[ $TIMER = 1 ] && [ "$(cat $MAIN_SEEN 2>/dev/null)" = "$SHA" ] && exit 0
 log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
 
 # Build in a new directory; nothing that is running is touched until the switch.
@@ -105,8 +110,6 @@ for old in $(ls -1dt $ROOT/releases/* 2>/dev/null | tail -n +$((KEEP + 1))); do
 done
 
 NOW=$(date +%s%3N)
-printf '{"repo":"%s","ref":"%s","sha":"%s","previous":"%s","ok":%s,"reason":"%s","at":%s}\n' \
-  "$REPO" "$REF" "$SHA" "${CURRENT##*/}" "$OK" "$REASON" "$NOW" > $ROOT/deploy-result.json
 SUBJECT="deploy $REPO ${SHA:0:8}: $REASON"
 BODY="$REPO at $REF (${SHA:0:8}) $REASON. $(date -u +%FT%TZ)"
 for crew in $DM_CREWS; do
@@ -114,4 +117,5 @@ for crew in $DM_CREWS; do
   runuser -u "$OWNER" -- sqlite3 "$DB" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$SUBJECT', '$BODY', $NOW FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
 done
 log "$SUBJECT"
+[ $REF = main ] && echo $SHA > $MAIN_SEEN
 [ $OK = true ]
