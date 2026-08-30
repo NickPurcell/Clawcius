@@ -8,7 +8,7 @@ description: Read, send, search, react to, edit, and delete Discord messages via
 `discord` operates on **one** pre-configured Discord server. Run it as:
 
 ```
-/home/npurcell/clawcius/discord-cli/discord <command> [flags]
+/srv/clawcius/current/discord-cli/discord <command> [flags]
 ```
 
 Output is JSON whenever stdout is not a terminal, so piped calls are already
