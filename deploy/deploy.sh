@@ -8,7 +8,6 @@ REPO=${1:?usage: deploy.sh <clawcius|oj> [ref]}
 REF=${2:-main}
 ROOT=/srv/$REPO
 BUILD_USER=hamachi
-NODE_BIN=/usr/bin
 KEEP=5
 case $REPO in
   clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_CREWS="clawcius hamachi" ;;
@@ -26,7 +25,7 @@ if [ $REPO = clawcius ]; then
   done
   [ "$(stat -c %U /var/lib/hamachi)" = hamachi ] || { log "/var/lib/hamachi is not owned by hamachi; chown -R hamachi:hamachi /var/lib/hamachi first"; exit 3; }
 fi
-as_builder() { runuser -u $BUILD_USER -- env PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" "$@"; }
+as_builder() { runuser -u $BUILD_USER -- env PATH="/usr/local/bin:/usr/bin:/bin" "$@"; }
 
 # A request file from a crew names a ref; the timer deploys main.
 REQUEST=/var/lib/hamachi/run/deploy-$REPO

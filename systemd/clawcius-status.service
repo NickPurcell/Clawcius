@@ -61,8 +61,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# read-only, not true: the working directory and the config are under /home.
-ProtectHome=read-only
+ProtectHome=true
 
 # The paths this unit reads, per crew in status-config.yaml: the transcript
 # root, the workspaces (for bots' health.json) and the board. `-` prefixed

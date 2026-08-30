@@ -119,7 +119,7 @@ resume from SQLite on the next wake.
 
 ## 8. Cutover from the previous layout (one-time)
 
-Docker, gVisor and Node are already on this box; skip § 2's install commands.
+Docker and gVisor are already on this box; skip § 2's install commands.
 
 1. `chmod 600 ~/.env ~/.env.hamachi`; stop and disable `clawcius-ops`; stop `oj`.
 2. `sudo deploy/setup.sh` from a clone of `main`. It creates the `hamachi` account, `/srv/{clawcius,oj}`,
