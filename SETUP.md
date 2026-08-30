@@ -113,7 +113,7 @@ resume from SQLite on the next wake.
 
 ## 7. Operating
 
-- **Deploy**: merge to `main`. **Roll back**: `sudo deploy clawcius <older-sha>`.
+- **Deploy**: merge to `main`. **Roll back**: `sudo deploy clawcius <older-sha>`, which holds until `main` next moves.
 - **Watch**: `journalctl -u clawcius -f`, `-u hamachi`, `-u deploy@clawcius`; Clawsky on the tailnet.
 - **Wedged sandbox**: `docker/up.sh --recreate` (nightly snapshots: `docker images clawcius-agent`).
 - **Disaster**: restore the VPS from the provider's backup.

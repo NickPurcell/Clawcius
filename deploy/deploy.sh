@@ -28,9 +28,11 @@ if [ $REPO = clawcius ]; then
 fi
 as_builder() { runuser -u $BUILD_USER -- env PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" "$@"; }
 
-# A request file from a crew names a ref; the timer deploys main.
+# A request file from a crew names a ref; the timer, with neither, deploys main.
 REQUEST=/var/lib/hamachi/run/deploy-$REPO
+TIMER=0; [ -z "${2:-}" ] && [ ! -f "$REQUEST" ] && TIMER=1
 if [ -f "$REQUEST" ]; then REF=$(tr -cd 'A-Za-z0-9._/-' < "$REQUEST"); rm -f "$REQUEST"; fi
+MAIN_SEEN=$ROOT/main-seen
 
 as_builder git -C $ROOT/src fetch -q --prune origin
 SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
@@ -41,6 +43,9 @@ if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
   done
   exit 0
 fi
+# The timer deploys each main sha once, so a manual `deploy <repo> <ref>` holds until main next moves.
+[ $TIMER = 1 ] && [ "$(cat $MAIN_SEEN 2>/dev/null)" = "$SHA" ] && exit 0
+[ $REF = main ] && echo $SHA > $MAIN_SEEN
 log "deploying $REF at ${SHA:0:8} (was ${CURRENT##*/})"
 
 # Build in a new directory; nothing that is running is touched until the switch.
@@ -106,8 +111,6 @@ for old in $(ls -1dt $ROOT/releases/* 2>/dev/null | tail -n +$((KEEP + 1))); do
 done
 
 NOW=$(date +%s%3N)
-printf '{"repo":"%s","ref":"%s","sha":"%s","previous":"%s","ok":%s,"reason":"%s","at":%s}\n' \
-  "$REPO" "$REF" "$SHA" "${CURRENT##*/}" "$OK" "$REASON" "$NOW" > $ROOT/deploy-result.json
 SUBJECT="deploy $REPO ${SHA:0:8}: $REASON"
 BODY="$REPO at $REF (${SHA:0:8}) $REASON. $(date -u +%FT%TZ)"
 for crew in $DM_CREWS; do
