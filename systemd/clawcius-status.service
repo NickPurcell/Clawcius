@@ -25,8 +25,7 @@ WorkingDirectory=/srv/clawcius/current/status
 # No EnvironmentFile: this service holds no secrets.
 Environment=STATUS_CONFIG_PATH=/srv/clawcius/current/status/status-config.yaml
 
-# systemd's default PATH excludes ~/.local, so a bare `node` dies with ENOENT.
-ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 
 Restart=always
 RestartSec=5
@@ -62,8 +61,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# read-only, not true: the working directory and the config are under /home.
-ProtectHome=read-only
+ProtectHome=true
 
 # The paths this unit reads, per crew in status-config.yaml: the transcript
 # root, the workspaces (for bots' health.json) and the board. `-` prefixed
