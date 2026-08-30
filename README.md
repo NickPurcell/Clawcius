@@ -59,7 +59,7 @@ wall. Hamachi snapshots before anything destructive.
 `main` is always deployable. Only pull requests reach it; CI (typecheck, tests,
 the Python suites) and OJ's review are required; merges are squashed; the
 deploy timer on the box pulls, builds, switches and health-checks within a
-minute. Rollback is the same script with an older commit.
+minute. Rollback is the same script with an older commit, which holds until `main` next moves.
 
 ## Configuration
 
