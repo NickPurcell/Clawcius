@@ -63,10 +63,8 @@ SystemCallErrorNumber=EPERM
 
 ProtectHome=true
 
-# The paths this unit reads, per crew in status-config.yaml: the transcript
-# root, the workspaces (for bots' health.json) and the board. `-` prefixed
-# where a different service creates the path, because without the dash a
-# missing path fails namespace setup and the unit retries forever.
+# Per crew: the transcript root, the workspaces (bots' health.json) and the board. `-` prefixed
+# where another service creates the path; without it a missing path fails namespace setup.
 ReadOnlyPaths=/var/lib/clawcius/agent-home
 ReadOnlyPaths=/var/lib/hamachi/agent-home
 ReadOnlyPaths=-/var/lib/clawcius/workspaces
@@ -74,10 +72,8 @@ ReadOnlyPaths=-/var/lib/hamachi/workspaces
 ReadOnlyPaths=-/var/lib/clawcius/clawcius.db
 ReadOnlyPaths=-/var/lib/hamachi/hamachi.db
 
-# No ReadWritePaths= for a board: a WAL reader needs the `-shm` beside the
-# board and cannot create it under ProtectSystem=strict, so a board with no
-# writer open is unreadable while that is so. The page reports that state;
-# a writable path here would make this service a second writer.
+# No ReadWritePaths= for a board: a WAL reader cannot create the `-shm` under strict, so a board
+# with no writer open is reported as such rather than making this service a second writer.
 
 # Accepts loopback connections and makes none of its own; `localhost` covers
 # 127.0.0.0/8 and ::1. AF_UNIX is for the docker CLI's socket.

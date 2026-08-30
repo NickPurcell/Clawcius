@@ -20,12 +20,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 RUN pip3 install --no-cache-dir --break-system-packages yt-dlp
 
-# Headless Chromium for `browser-cli/`, which is bind-mounted and needs no
-# rebuild; this does. PLAYWRIGHT_BROWSERS_PATH is set before the install
-# because this RUN executes as root and the agent runs as `agent`, so the
-# per-user default would land where the agent cannot reach it. The pip version
-# is pinned because the package pins the browser revision. Fonts are named
-# explicitly: without them a page renders every glyph as a hollow box.
+# Headless Chromium for `browser-cli/`. PLAYWRIGHT_BROWSERS_PATH is shared because this RUN is root
+# and the agent is `agent`; the pip version pins the browser revision; without the fonts every glyph
+# renders as a hollow box.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN apt-get update \
     && pip3 install --no-cache-dir --break-system-packages playwright==1.62.0 \

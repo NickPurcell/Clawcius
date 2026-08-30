@@ -37,11 +37,8 @@ WatchdogSec=90
 StateDirectory=clawcius
 StateDirectoryMode=0750
 
-# MemoryHigh throttles first; MemoryMax is the hard stop, kept well under total
-# RAM so a runaway is stopped before it squeezes the OS. The agent itself is
-# bound by the container's --memory and --pids-limit; these cover the waker.
-# Each live session holds a standing `docker exec` client in this cgroup, so
-# TasksMax scales with sessions.maxConcurrent.
+# These bound the waker; the agent is bound by the container's --memory and --pids-limit.
+# Each live session holds a `docker exec` client here, so TasksMax scales with sessions.maxConcurrent.
 MemoryHigh=3G
 MemoryMax=4G
 TasksMax=512
