@@ -87,9 +87,11 @@ sudo systemctl enable --now clawcius-netguard clawcius-container clawcius clawci
 `deploy` fetches, builds `releases/<sha>`, flips `current`, installs the units,
 restarts, waits up to 90 s for every unit to be active without restarts and
 for each waker's `waker-status.json` to report the new commit, and reverts to
-the previous release if not. A success DMs the crew it redeployed (Hamachi for OJ); a failure DMs Hamachi too. The timers do
-the same every minute when `origin/main` moves; a crew can ask for a specific
-ref by writing it to `/var/lib/hamachi/run/deploy-<repo>`.
+the previous release if not. A timer success DMs the crew it redeployed
+(Hamachi for OJ); a failure, and every requested deploy, DMs Hamachi too. The
+timers run every minute when `origin/main` moves; a crew requests a specific
+ref with one write — `printf 'main\nwhy\n' > /var/lib/hamachi/run/deploy-<repo>`
+— first line the ref, later lines a note that returns in the result mail.
 
 ## 5. Adding a crew
 
