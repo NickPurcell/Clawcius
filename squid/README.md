@@ -5,7 +5,7 @@ Squid, on both that network and one with a route, is the only way to the
 internet, so the proxy variables the container carries are not advice. Squid
 filters on the CONNECT target — no TLS interception, no CA key.
 
-Policy is **default-allow with a blocklist** (`squid.conf` §5). Today the list
+Policy is **default-allow with a blocklist**. Today the list
 blocks nothing: its one entry, `.invalid`, keeps the ACL parseable. It is a
 kill switch for a destination that turns out to be a problem, not a boundary.
 Ports other than 80 and 443 are refused, and so are the host's loopback and the
