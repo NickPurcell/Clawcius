@@ -37,8 +37,9 @@ WatchdogSec=90
 StateDirectory=clawcius
 StateDirectoryMode=0750
 
-# These bound the waker; the agent is bound by the container's --memory and --pids-limit.
-# Each live session holds a `docker exec` client here, so TasksMax scales with sessions.maxConcurrent.
+# These bound the waker; the container's --memory and --pids-limit bound the
+# agent. Each live session holds a `docker exec` client here, so TasksMax
+# scales with sessions.maxConcurrent.
 MemoryHigh=3G
 MemoryMax=4G
 TasksMax=512

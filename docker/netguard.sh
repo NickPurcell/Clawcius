@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Lock the sandbox subnet down to "internet only": `--internal` leaves the bridge address (the host)
-# and the other sandboxes reachable without Squid; this closes both and leaves Squid. Docker's DNS
-# answers inside each container's namespace and is unaffected. Idempotent; runs on every boot.
+# Lock the sandbox subnet down to "internet only": `--internal` leaves the host's
+# bridge address and the other sandboxes reachable; this closes both and leaves
+# Squid. Docker's DNS answers inside each namespace. Idempotent; runs every boot.
 set -euo pipefail
 
 SUBNET=172.31.250.0/24
@@ -24,8 +24,8 @@ echo "netguard: host"
 ensure INPUT -s "$SUBNET" -j DROP
 
 echo "netguard: sandbox isolation"
-# -I inserts at the top, so the DROP goes in first and the RETURNs land above it and win.
-# DOCKER-USER is the chain Docker does not rewrite.
+# -I inserts at the top, so the DROP goes in first and the RETURNs land above
+# it and win. DOCKER-USER is the chain Docker does not rewrite.
 ensure DOCKER-USER -s "$SUBNET" -d "$SUBNET" -j DROP
 ensure DOCKER-USER -s "$SUBNET" -d "$PROXY" -j RETURN
 ensure DOCKER-USER -s "$PROXY" -d "$SUBNET" -j RETURN

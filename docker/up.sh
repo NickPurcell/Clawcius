@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bring up the agent stack: networks, Squid, then the agent container. Idempotent: Squid has no
-# state and is recreated every time; the agent container is reused unless --recreate is passed.
+# Bring up the agent stack: networks, Squid, then the agent container.
+# Idempotent: Squid has no state and is recreated every time; the agent
+# container is reused unless --recreate is passed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
