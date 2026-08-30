@@ -43,8 +43,6 @@ BOTS=$REPO/current/bots
 CREW=${CLAWCIUS_CREW:-${NAME%-agent}}
 # Fixed address: Squid holds .2, and a container that restarts before Squid must not take it.
 AGENT_IP=${CLAWCIUS_AGENT_IP:-172.31.250.3}
-# The container's only read-write window onto the host filesystem.
-STATE_RUN=$CLAWCIUS_STATE/run
 
 # BROWSE_LOG (set on the container below) lives under $WORKSPACES rather than
 # browse's default under $HOME, so the record of what `browse` contacted
@@ -65,7 +63,6 @@ AGENT_CLAUDE=/home/agent/.claude-agent
 # This script runs as npurcell and the Dockerfile builds `agent` with
 # AGENT_UID=1000 to match, so `mkdir -p` lands with the uid the container runs
 # as; no chown needed.
-mkdir -p "$STATE_RUN"
 # Created, not asserted: a fresh instance has no workspaces directory yet. The
 # parent is the instance unit's StateDirectory.
 mkdir -p "$WORKSPACES"
@@ -249,7 +246,6 @@ docker run -d \
   -e HOME=/home/agent \
   -e TZ="$AGENT_TZ" \
   -v "$WORKSPACES:$WORKSPACES:rw" \
-  -v "$STATE_RUN:$STATE_RUN:rw" \
   -v "$AGENT_HOME:$AGENT_CLAUDE:rw" \
   -v "$REPO:$REPO:ro" \
   -v "$GITHUB_TOKEN_DIR:$GITHUB_TOKEN_DIR:ro" \
