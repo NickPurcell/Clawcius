@@ -9,7 +9,6 @@ REF=${2:-main}
 ROOT=/srv/$REPO
 BUILD_USER=hamachi
 KEEP=5
-# A success mails the crew that was redeployed; a failure mails Hamachi too.
 case $REPO in
   clawcius) UNITS="clawcius-status clawcius hamachi"; CREWS="clawcius hamachi"; DM_OK="clawcius"; DM_FAIL="clawcius hamachi" ;;
   oj)       UNITS="oj";                              CREWS="";                DM_OK="hamachi";  DM_FAIL="hamachi" ;;
@@ -44,11 +43,12 @@ MAIN_SEEN=$ROOT/main-seen
 mail_result() {
   local now title subject body crews crew db owner
   now=$(date +%s%3N)
-  title=$(as_builder git -C $ROOT/src log -1 --format=%s $SHA)
+  title=""; [ -n "${SHA:-}" ] && title=" — $(as_builder git -C $ROOT/src log -1 --format=%s $SHA)"
   subject="deploy $REPO ${SHA:0:8}: $2"
-  body="$REPO at $REF (${SHA:0:8}) $2 — $title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
+  body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
   subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
-  crews=$DM_OK; [ "$1" = true ] || crews=$DM_FAIL
+  # Only a timer success narrows: a requested deploy mails its requester (Hamachi) on every outcome.
+  crews=$DM_FAIL; [ "$1" = true ] && [ $HAD_REQUEST = 0 ] && crews=$DM_OK
   for crew in $crews; do
     db=/var/lib/$crew/$crew.db; owner=$(stat -c %U $db)
     runuser -u "$owner" -- sqlite3 "$db" "INSERT INTO mail (author, recipient, subject, body, sent_at) SELECT 'deploy', id, '$subject', '$body', $now FROM agents WHERE role='coordinator' AND status='live';" || log "could not DM $crew"
@@ -57,7 +57,8 @@ mail_result() {
 }
 
 as_builder git -C $ROOT/src fetch -q --prune origin
-SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") || { log "no such ref on origin: $REF"; exit 3; }
+SHA=$(as_builder git -C $ROOT/src rev-parse --verify -q "origin/$REF^{commit}" || as_builder git -C $ROOT/src rev-parse --verify -q "$REF^{commit}") \
+  || { SHA=""; [ $HAD_REQUEST = 1 ] && mail_result false "no such ref on origin: $REF"; log "no such ref on origin: $REF"; exit 3; }
 [ -n "$(as_builder git -C $ROOT/src branch -r --contains $SHA)" ] || { log "$REF is not on any origin branch"; exit 3; }
 CURRENT=$(readlink -e $ROOT/current 2>/dev/null || true)
 if [ "$CURRENT" = "$ROOT/releases/$SHA" ]; then
