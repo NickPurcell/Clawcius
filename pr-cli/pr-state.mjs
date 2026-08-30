@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * pr-state <pr> [--repo owner/name] [--json]: is a round running, did it read the head, can it merge.
- * Reads through bare `curl` authenticated via netrc; an Authorization header would replace the App
- * credential. Reads `/rulesets`, since `/branches/{branch}/protection` is 403 for an App.
+ * pr-state <pr> [--repo owner/name] [--json]: is a round running, did it read
+ * the head, can it merge. Reads through bare `curl` authenticated via netrc;
+ * an Authorization header would replace the App credential.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -15,7 +15,7 @@ const REVIEW_LABEL = 'oj:review';
 /** The findings footer, the only place a round names the commit it read. */
 export const FOOTER = /<sub>OJ\s*·\s*round\s*(\d+)\s*·\s*head\s*`([0-9a-f]+)`/;
 
-/** A findings comment carries the footer; OJ's acknowledgement comment does not. */
+/** A findings comment carries the footer; OJ's acknowledgement does not. */
 export function parseFindings(comments) {
   return comments
     .filter((c) => c.user?.login === OJ_BOT)
@@ -24,7 +24,7 @@ export function parseFindings(comments) {
     .map((c) => ({ at: c.at, round: Number(c.m[1]), sha: c.m[2], url: c.url }));
 }
 
-/** OJ declining a round: unlabels like a pickup, posts no footer, may open with an emoji. */
+/** OJ declining: unlabels like a pickup, no footer, may open with an emoji. */
 const DECLINED = /^\W*OJ is not reviewing this:\s*(.*)/;
 
 export function parseDeclines(comments) {
@@ -36,8 +36,9 @@ export function parseDeclines(comments) {
 }
 
 /**
- * Did the last round read the head? EXACT: it is the head. ANCESTOR: the head moved on.
- * VOID: the reviewed commit is not in the head's history. UNKNOWN: the sha is not in this clone.
+ * Did the last round read the head? EXACT: it is the head. ANCESTOR: the head
+ * moved on. VOID: the reviewed commit is not in the head's history. UNKNOWN:
+ * the sha is not in this clone.
  */
 export function classifyReviewedSha(sha, head, isAncestorFn) {
   if (!sha) return 'NONE';
@@ -48,8 +49,9 @@ export function classifyReviewedSha(sha, head, isAncestorFn) {
 }
 
 /**
- * Approvals, each flagged with whether it is for the head: GitHub keeps counting one after the
- * branch moves when `dismiss_stale_reviews_on_push` is false.
+ * Approvals, each flagged with whether it is for the head: GitHub keeps
+ * counting one after the branch moves when `dismiss_stale_reviews_on_push` is
+ * false.
  */
 export function approvalsFor(reviews, head) {
   // One per reviewer, from their latest review, which is how GitHub counts.
@@ -73,9 +75,9 @@ export function approvalsFor(reviews, head) {
 }
 
 /**
- * `spent` when only authors already on the branch pushed after the approval, `overtaken` when a
- * new author appeared, `null` when it cannot tell. Commit authorship stands in for the pusher,
- * which the REST API does not report; the App opens the pull request, so `pr.user` is not compared.
+ * `spent` when only authors already on the branch pushed after the approval,
+ * `overtaken` when a new author appeared, `null` when it cannot tell. Commit
+ * authorship stands in for the pusher, which the REST API does not report.
  */
 export function whyStale(approval, commits) {
   if (!approval?.at) return null;
@@ -102,8 +104,8 @@ export function whyStale(approval, commits) {
 }
 
 /**
- * Does a ruleset ref pattern match this branch? `conditions.ref_name` holds fnmatch patterns
- * against the full ref; `*` and `**` both cross `/`.
+ * Does a ruleset ref pattern match this branch? `conditions.ref_name` holds
+ * fnmatch patterns against the full ref; `*` and `**` both cross `/`.
  */
 export function refPatternMatches(pattern, branch) {
   if (!pattern || !branch) return false;
@@ -195,9 +197,9 @@ export function explainMergeState(state, approvals, ruleset) {
 }
 
 /**
- * One request: the body, then the `link` header after a sentinel via `--write-out %header{link}`
- * (curl >= 7.84; older curl emits the literal and pagination stops at page 1). `-D -` is wrong
- * behind Squid, which emits its own `200 Connection established` block first.
+ * One request: the body, then the `link` header after a sentinel via
+ * `--write-out %header{link}` (curl >= 7.84; older curl emits the literal and
+ * pagination stops at page 1). `-D -` breaks behind Squid's CONNECT block.
  */
 const SENTINEL = '\n@@pr-state-link@@';
 
@@ -224,14 +226,15 @@ function api(path, repo) {
 }
 
 /**
- * A paginated list: page 1 plus the last page, since these endpoints are oldest-first and every
- * question is about the newest events. Past ~200 events the current round can sit in a skipped page.
+ * A paginated list: page 1 plus the last page, since these endpoints are
+ * oldest-first and every question is about the newest events. Past ~200
+ * events the current round can sit in a skipped page.
  */
 function apiList(path, repo) {
   return apiListSayingIfTruncated(path, repo).items;
 }
 
-/** `apiList`, plus whether a middle page was skipped; `whyStale` declines on an incomplete list. */
+/** `apiList`, plus whether a middle page was skipped. */
 function apiListSayingIfTruncated(path, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
   const first = curlJson(url, true);
@@ -267,8 +270,9 @@ function isAncestor(sha, head) {
 }
 
 /**
- * Round state from the timeline, read backwards: `labeled` with no later `unlabeled` is queued;
- * `unlabeled` by OJ is a round that started then, and the findings footer says whether it finished.
+ * Round state from the timeline, read backwards: `labeled` with no later
+ * `unlabeled` is queued; `unlabeled` by OJ is a round that started then, and
+ * the findings footer says whether it finished.
  */
 export function roundState(timeline, findings, declines = []) {
   let lastLabeled = null;
@@ -333,8 +337,6 @@ export function main() {
   const timeline = apiList(`/issues/${number}/timeline?per_page=100`, repo);
   const reviews = apiList(`/pulls/${number}/reviews?per_page=100`, repo);
 
-  // Findings carry the footer; the acknowledgement does not. Searched over
-  // comments and review bodies both.
   const carriers = [
     ...comments,
     ...reviews.map((r) => ({ user: r.user, created_at: r.submitted_at, body: r.body, html_url: r.html_url })),
