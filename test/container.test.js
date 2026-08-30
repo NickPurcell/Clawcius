@@ -142,13 +142,13 @@ test('the env file is 0600 as the exec sees it, not as we meant it', async () =>
 
 test('host-only variables still reach neither the argv nor the file', async () => {
   const { argv, envFile } = await run({
-    PATH: '/home/npurcell/.local/share/node/bin',
+    PATH: '/usr/bin',
     HOME: '/home/npurcell',
     TZ: 'UTC',
     DISCORD_TOKEN,
   });
 
-  assert.equal(argv.join(' ').includes('/home/npurcell/.local/share/node/bin'), false);
+  assert.equal(argv.join(' ').includes('/usr/bin'), false);
   assert.equal(envFile.includes('PATH='), false);
   assert.equal(envFile.includes('HOME='), false);
   assert.equal(envFile.includes('TZ='), false);

@@ -18,9 +18,7 @@ EnvironmentFile=/etc/clawcius/hamachi.env
 Environment=AGENT_CONFIG_PATH=/srv/clawcius/current/agent-config.hamachi.yaml
 # The crew's Claude login; sessions inherit the waker's environment.
 Environment=CLAUDE_CONFIG_DIR=/var/lib/hamachi/agent-home
-# systemd's default PATH excludes the node install; the SDK spawns a bare `node`.
-Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
 # The waker pings only while the Discord gateway is healthy.
