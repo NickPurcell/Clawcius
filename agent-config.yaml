@@ -1,77 +1,14 @@
-# ===========================================================================
-# CLAWCIUS — instance 1. The original deployment.
-#
-# This is an INSTANCE FILE. Everything that is true of all crews — the system
-# prompt, the prompt templates, tool guidance, models, session limits — lives
-# in agent-config.base.yaml and is shared, not copied. Before #203 this file
-# was a 937-line full copy and its Hamachi sibling was a 972-line full copy of
-# the same thing; 111 lines differed, of which exactly 3 were config VALUES.
-#
-# WHAT GOES IN AN INSTANCE FILE: facts. `crew`, `displayName` and the Discord
-# channel lists — that is the whole intended surface. Any other key that is not
-# on one of the refusal lists below WILL be merged and honoured; the loader
-# enforces two denylists, not an allowlist, so read this as the convention plus
-# two hard rules rather than as a closed set.
-#
-# WHAT MAY NOT: prompt content. `systemPrompt.append` and every `prompts.*`
-# template are refused here, as a hard boot error. The rule is that crews share
-# one prompt and differ only in facts interpolated into it — so a sentence that
-# is true of one crew and false of another gets rewritten to be true of the
-# MECHANISM, which is what #197 did and what this makes the rule rather than an
-# accident. A per-crew paragraph would have no drift check left to catch it.
-#
-# WHAT IS DERIVED AND SO IS NOT HERE EITHER: every path and identity. See the
-# table in agent-config.base.yaml. `container.name`, `container.stateDir`,
-# `container.execEnvDir`, `container.githubTokenDir`, `sessions.workspaceRoot`,
-# `status.file`, `status.instance`, `git.userName` and `git.userEmail` all come
-# off `crew` and `displayName`. Setting one here IS a boot error — refused in
-# this file and in the base, by the same list.
-#
-# It is refused in both because it is two different bugs. In the base, a value
-# is INHERITED by every instance that did not override it. Here, it is a
-# RESTATEMENT that silently disagrees with the crew name above it — and
-# `container.name` is the `docker exec` target, so a restatement naming another
-# crew's container does not fail, it succeeds against the wrong sandbox.
-#
-# TO ADD A THIRD CREW: copy this file, change `crew`, `displayName` and the
-# three channel lists, add its .env and its systemd units. That is the whole
-# procedure — SETUP.md § Adding an instance.
-#
-# The bot token and guild id are NOT here. They are secrets and live in .env,
-# which is gitignored.
-# ===========================================================================
-
-# THIS LINE IS LOAD-BEARING AND IS NOT BOILERPLATE. It names the shared base
-# holding the system prompt, the prompt templates, the model and the session
-# limits — roughly 90% of what this crew runs on.
-#
-# Deleting it does not fall back to anything sensible. Until #221 it produced a
-# crew with a 0-character system prompt, on the wrong model, silently. It is now
-# a boot error naming both modes, because a file must DECLARE whether it extends
-# a base or is deliberately self-contained (`standalone: true`) rather than have
-# that inferred from silence.
+# Clawcius — instance 1. An instance file holds facts: `crew`, `displayName` and the channel lists.
+# Prompt content and every derived path or identity are refused here by the loader.
 extends: agent-config.base.yaml
 
-# Prefixes every agent id in this crew (clawcius-engineer1), names its
-# container and its state directory, and is the boundary DMs stay inside.
-# One name, and everything else is derived from it.
 crew: clawcius
-
-# How the crew refers to itself in its own system prompt, and its git commit
-# identity. Defaults to `crew` capitalised, which is what this is; stated
-# anyway because it is the one value an agent reads about itself and a silent
-# default is a poor place for that.
 displayName: Clawcius
 
 discord:
-  # Channels where the agent may be woken at all. See the base file for what
-  # this gate does and does not govern.
   allowedChannelIds:
     - '1105739162230984735'  # clanker-internet-asbestos-gen
-
   followUpChannelIds:
-    - '1105739162230984735'  # clanker-internet-asbestos-gen (dev)
-
-  # Empty on purpose. If you want a dedicated always-on room for Clawcius, name
-  # a channel from *this* guild — it must also appear in allowedChannelIds.
+    - '1105739162230984735'
+  # A channel here wakes the crew on every message; it must also be in allowedChannelIds.
   alwaysOnChannelIds: []

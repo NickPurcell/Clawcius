@@ -1,28 +1,4 @@
-# ===========================================================================
-# HAMACHI — instance 2, SimpleTestServer.
-#
-# This file used to open with a 46-line warning that it was a full copy of
-# agent-config.yaml and would DRIFT, and that you must remember to change both.
-# It is not a copy any more. The shared 90% lives in agent-config.base.yaml and
-# this file states only what is true of Hamachi and nothing else — so there is
-# no longer a thing to remember, which is the point of #203.
-#
-# Read agent-config.yaml's header for what may and may not appear in an
-# instance file; the rules are the same and the loader enforces them here too.
-#
-# The bot token and guild id are NOT here. They are secrets and live in
-# .env.hamachi, which is gitignored.
-# ===========================================================================
-
-# THIS LINE IS LOAD-BEARING AND IS NOT BOILERPLATE. It names the shared base
-# holding the system prompt, the prompt templates, the model and the session
-# limits — roughly 90% of what this crew runs on.
-#
-# Deleting it does not fall back to anything sensible. Until #221 it produced a
-# crew with a 0-character system prompt, on the wrong model, silently. It is now
-# a boot error naming both modes, because a file must DECLARE whether it extends
-# a base or is deliberately self-contained (`standalone: true`) rather than have
-# that inferred from silence.
+# Hamachi — instance 2, SimpleTestServer. agent-config.yaml says what an instance file holds.
 extends: agent-config.base.yaml
 
 crew: hamachi
@@ -30,16 +6,12 @@ displayName: Hamachi
 
 discord:
   allowedChannelIds:
-    - '1467070145343258628'  # test channel (SimpleTestServer)
-
+    - '1467070145343258628'  # test channel
   followUpChannelIds:
-    - '1467070145343258628'  # test channel (SimpleTestServer)
-
-  # Every message here wakes the agent, no @ needed. This is the crew's own
-  # room, in this crew's own guild — a channel id from another guild would
-  # match nothing and the setting would appear not to work at all.
+    - '1467070145343258628'
   alwaysOnChannelIds:
-    - '1467070145343258628'  # test channel (SimpleTestServer)
-# Hamachi runs its sessions on the host, as the hamachi account, not in a container.
+    - '1467070145343258628'
+
+# Sessions run on the host as the hamachi account, not in a container.
 container:
   enabled: false
