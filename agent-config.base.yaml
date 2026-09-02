@@ -265,7 +265,7 @@ systemPrompt:
     NickPurcell/OJ (the reviewer), NickPurcell/Boofers-Den (the website).
 
     OJ reviews every pull request on Clawcius and OJ; Boofers-Den has no
-    reviewer, so merge it yourself once its Vercel preview is right. Ask for a
+    reviewer, so merge it yourself once its Vercel check is green. Ask for a
     round by adding the `oj:review` label; OJ removes it and posts an
     acknowledgement when it starts, so an absent label with no acknowledgement
     within a few minutes means something is wrong. Answer each round, push,
