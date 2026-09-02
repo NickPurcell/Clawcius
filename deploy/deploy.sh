@@ -38,13 +38,14 @@ if [ -f "$REQUEST" ]; then
   rm -f "$REQUEST"; HAD_REQUEST=1
 fi
 MAIN_SEEN=$ROOT/main-seen
+HEALTH_WHY=""   # the failing unit(s) and the state systemd reported for them
 
 # mail_result <true|false> <reason> — single quotes doubled: the values land in a SQL literal.
 mail_result() {
   local now title subject body crews crew db owner
   now=$(date +%s%3N)
   title=""; [ -n "${SHA:-}" ] && title=" — $(as_builder git -C $ROOT/src log -1 --format=%s $SHA)"
-  subject="deploy $REPO ${SHA:0:8}: $2"
+  subject="deploy $REPO ${SHA:0:8}: $(printf '%s' "$2" | head -c 140)"
   body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
   subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
   crews=$DM_FAIL; [ "$1" = true ] && [ $HAD_REQUEST = 0 ] && crews=$DM_OK
@@ -98,31 +99,51 @@ switch_to() {   # switch_to <release dir>
   [ $REPO = clawcius ] && docker exec clawcius-agent pkill -HUP -f bots/supervise.sh >/dev/null 2>&1 || true
 }
 
+# --- health check helpers: test/deploy-diagnosis.test.js lifts this block out by the
+# --- markers around it, so keep them in place and keep the block self-contained.
+#
+# prop <systemctl show output> <name> — one property out of a `show` block.
+prop() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1
+}
+
 healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>
-  local sha=$1 deadline=$((SECONDS + 90))
+  local sha=$1 deadline=$((SECONDS + 90)) ok why u c props state sub nr res f age
   while [ $SECONDS -lt $deadline ]; do
-    sleep 5; local ok=1
+    sleep 5; ok=1; why=""
     for u in $UNITS; do
-      [ "$(systemctl show -p ActiveState --value $u.service)" = active ] || ok=0
-      [ "$(systemctl show -p NRestarts --value $u.service)" = 0 ] || ok=0
+      props=$(systemctl show -p ActiveState -p SubState -p NRestarts -p Result $u.service 2>/dev/null || true)
+      state=$(prop "$props" ActiveState); sub=$(prop "$props" SubState)
+      nr=$(prop "$props" NRestarts);      res=$(prop "$props" Result)
+      : "${state:=unknown}" "${sub:=unknown}" "${nr:=unknown}" "${res:=unknown}"
+      [ "$state" = active ] && [ "$nr" = 0 ] || {
+        ok=0
+        why="$why $u(ActiveState=$state SubState=$sub NRestarts=$nr Result=$res);"
+      }
     done
     for c in $CREWS; do
-      grep -q "\"commit\": *\"$sha\"" /var/lib/$c/waker-status.json 2>/dev/null || ok=0
-      [ $(( $(date +%s) - $(stat -c %Y /var/lib/$c/waker-status.json 2>/dev/null || echo 0) )) -lt 60 ] || ok=0
+      f=/var/lib/$c/waker-status.json
+      grep -q "\"commit\": *\"$sha\"" $f 2>/dev/null || { ok=0; why="$why $c is not reporting ${sha:0:8};"; }
+      age=$(( $(date +%s) - $(stat -c %Y $f 2>/dev/null || echo 0) ))
+      [ $age -lt 60 ] || { ok=0; why="$why $c status file is ${age}s stale;"; }
     done
+    # Keep the latest verdict, so a failure reports the state we actually gave up in rather
+    # than whatever happened to be wrong on the first poll.
+    HEALTH_WHY=$why
     [ $ok = 1 ] && return 0
   done
   return 1
 }
+# --- end health check helpers ---
 
 for u in $UNITS; do systemctl reset-failed $u.service 2>/dev/null || true; done
 switch_to "$RELEASE"
 if healthy "$SHA"; then
   OK=true; REASON="live"
 else
-  OK=false; REASON="failed the health check"
+  OK=false; REASON="failed the health check —${HEALTH_WHY}"
   if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
-    log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="failed the health check; reverted to ${CURRENT##*/}"
+    log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="$REASON reverted to ${CURRENT##*/}"
   else
     log "no previous release to revert to; the services are left on $SHA — read journalctl -u $UNITS"
   fi
