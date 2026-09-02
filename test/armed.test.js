@@ -907,3 +907,35 @@ test('a watch resumed under a process with no token is disarmed and told once', 
   assert.equal(store.listFor('hamachi-engineer1').length, 0);
   registry.close();
 });
+
+const approvedPr = { ...openPr, headSha: 'h1' };
+const approval = { id: 9, author: 'osmosis-jones', state: 'APPROVED', body: 'clean', htmlUrl: 'u9', commitId: 'h1' };
+
+test('a pull request left approved on its head is re-raised to its owner after an hour, until the head moves', async () => {
+  const { registry, mail, store } = board();
+  await toolsFor('hamachi-engineer1', store, { github: stubGitHub({ pr: approvedPr, reviews: [], comments: [] }) })
+    .watchPr.handler({ pr: 44 }, {});
+  const [row] = store.listFor('hamachi-engineer1');
+  const state = { pr: approvedPr, reviews: [approval], comments: [] };
+  const waker = new ArmedWaker({ store, registry, mail, github: stubGitHub(state), tickMs: 1000, log: () => {} });
+
+  store.reschedule(row.id, Date.now() - 1000, row.seen);
+  await waker.tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 1, 'the approval itself is one mail');
+  assert.ok(store.get(row.id).seen.nudgedAt, 'the clock starts with the approval mail');
+
+  store.reschedule(row.id, Date.now() - 1000, store.get(row.id).seen);
+  await waker.tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 1, 'nothing new within the hour');
+
+  store.reschedule(row.id, Date.now() - 1000, { ...store.get(row.id).seen, nudgedAt: Date.now() - 61 * 60 * 1000 });
+  await waker.tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 2, 'a re-raise after the hour');
+
+  state.pr = { ...approvedPr, headSha: 'h2' };
+  store.reschedule(row.id, Date.now() - 1000, { ...store.get(row.id).seen, nudgedAt: Date.now() - 61 * 60 * 1000 });
+  await waker.tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 2, 'the approval no longer covers the head');
+  assert.equal(store.get(row.id).seen.nudgedAt, null);
+  registry.close();
+});

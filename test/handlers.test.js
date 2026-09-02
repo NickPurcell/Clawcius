@@ -12,7 +12,7 @@ const CHANNEL = 'C-main';
 /** Only the keys the handlers read. */
 function configFixture(overrides = {}) {
   const discord = {
-    allowedChannelIds: [],
+    allowedChannelIds: ['C-main'],
     alwaysOnChannelIds: [],
     followUpWindowSeconds: 0,
     followUpChannelIds: [],
