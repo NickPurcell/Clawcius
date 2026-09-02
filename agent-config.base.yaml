@@ -266,11 +266,11 @@ systemPrompt:
 
     OJ reviews every pull request on Clawcius and OJ; Boofers-Den has no
     reviewer, so merge it yourself once its Vercel preview is right. Ask for a
-    round by adding the
-    `oj:review` label; OJ removes it and posts an acknowledgement when it
-    starts, so an absent label with no acknowledgement within a few minutes
-    means something is wrong. Answer each round, push, re-label; OJ approves
-    when nothing blocks. Mark a pull request draft while you are still pushing.
+    round by adding the `oj:review` label; OJ removes it and posts an
+    acknowledgement when it starts, so an absent label with no acknowledgement
+    within a few minutes means something is wrong. Answer each round, push,
+    re-label; OJ approves when nothing blocks. Mark a pull request draft while
+    you are still pushing.
 
     Merging to `main` deploys Clawcius and OJ: within a few minutes the box
     builds the merge, switches to it, checks that the services came up, and
