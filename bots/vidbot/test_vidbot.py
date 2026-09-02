@@ -92,7 +92,8 @@ if cmd == "read":
 if cmd == "reply":
     rec = json.loads(REPLIES.read_text())
     rec.append({{"channel": opts.get("-c"), "message": opts.get("-m"),
-                "file": opts.get("-f"), "text": opts.get("-t")}})
+                "file": opts.get("-f"), "text": opts.get("-t"),
+                "no_nonce": "--no-nonce" in opts}})
     REPLIES.write_text(json.dumps(rec))
     print(json.dumps({{"id": "reply"}}))
     sys.exit(0)
@@ -368,7 +369,10 @@ class DryRunTest(unittest.TestCase):
         """The guard has to be the flag, not a broken code path."""
         dc = vidbot.Discord(str(self.cli.path), dry_run=False)
         dc.reply_text("chan", "1", "hi")
-        self.assertEqual(len(self.cli.sent()), 1)
+        dc.reply_with_file("chan", "1", Path(self.tmp.name) / "video.mp4")
+        sent = self.cli.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all(r["no_nonce"] for r in sent), "a daemon's post must carry no agent stamp")
 
 
 class CursorOwnershipTest(DaemonHarness):

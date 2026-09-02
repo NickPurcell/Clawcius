@@ -115,9 +115,13 @@ class Client:
     def guild_channels(self, guild_id):
         return self.get(f"/guilds/{guild_id}/channels")
 
-    def send_message(self, channel_id, content, reply_to=None, files=None):
+    def send_message(self, channel_id, content, reply_to=None, files=None, stamped=True):
         """Post a message, with attachments when `files` is non-empty."""
+        # The nonce comes back on the gateway; the waker keeps the follow-up
+        # window open only for messages carrying it.
         payload = {"content": content or ""}
+        if stamped:
+            payload["nonce"] = "agent"
         if reply_to:
             # fail_if_not_exists=False degrades to a plain message rather than
             # erroring if the target was deleted between read and reply.

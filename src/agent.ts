@@ -606,6 +606,9 @@ export class SessionManager {
         spawnedBy: row.spawnedBy,
       };
     }
+    process.stderr.write(
+      `[clawcius ${agentId}] no registry row; minting a ${DEFAULT_CHANNEL_ROLE} for crew ${config().agent.clawsky.crew}\n`,
+    );
     return {
       crew: config().agent.clawsky.crew,
       role: DEFAULT_CHANNEL_ROLE,

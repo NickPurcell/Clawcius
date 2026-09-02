@@ -68,8 +68,8 @@ GITHUB_APP_PRIVATE_KEY_PATH=/etc/clawcius/<crew>-app.pem
 Discord app: create it at discord.com/developers, enable **Message Content
 Intent**, invite with scopes `bot` and permissions Send Messages, Read Message
 History, Create Public Threads, Send Messages in Threads. Anyone in the server
-can wake the agent; `discord.allowedChannelIds` in the crew's config confines
-it to channels.
+can wake the agent; `discord.allowedChannelIds` in the crew's config names the
+channels it answers in, and must name at least one.
 
 Claude login: once per crew, as the service user, with `CLAUDE_CONFIG_DIR`
 pointing at the crew's `agent-home` (`claude auth`); verify with

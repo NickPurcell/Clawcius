@@ -173,9 +173,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
 
   /** Anyone in the server may wake the agent — there is no per-user allowlist. */
   function isAuthorized(message: Message): boolean {
-    const { allowedChannelIds } = config.agent.discord;
-    if (allowedChannelIds.length === 0) return true;
-    return allowedChannelIds.includes(message.channelId);
+    return config.agent.discord.allowedChannelIds.includes(message.channelId);
   }
 
   /** Strip the leading bot mention so the agent sees the actual request. */
@@ -247,10 +245,10 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   async function handleMessage(message: Message): Promise<void> {
     if (!client.user) return;
 
-    // Our own traffic extends the window rather than waking anything: the bot
-    // having just spoken is exactly what should keep the conversation alive.
+    // Our account also posts as vidbot; only the agent's own replies, stamped by
+    // the discord CLI, keep the conversation alive.
     if (message.author.id === client.user.id) {
-      windows.extend(message.channelId);
+      if (message.nonce === 'agent') windows.extend(message.channelId);
       return;
     }
     if (message.author.bot) return;
@@ -660,17 +658,14 @@ export async function main(): Promise<void> {
   // An always-on channel that `allowedChannelIds` excludes wakes nothing at all.
   // That combination is always a mistake, and a silent one — the room simply
   // stays quiet — so say so at startup rather than at debugging time.
-  {
-    const { allowedChannelIds } = config.agent.discord;
-    if (allowedChannelIds.length > 0) {
-      const unreachable = [...alwaysOnChannels].filter((id) => !allowedChannelIds.includes(id));
-      if (unreachable.length > 0) {
-        console.warn(
-          `[config] alwaysOnChannelIds ${unreachable.join(', ')} are not in allowedChannelIds — ` +
-            'they will never wake the agent. Add them there or clear allowedChannelIds.',
-        );
-      }
-    }
+  const unreachable = [...alwaysOnChannels].filter(
+    (id) => !config.agent.discord.allowedChannelIds.includes(id),
+  );
+  if (unreachable.length > 0) {
+    console.warn(
+      `[config] alwaysOnChannelIds ${unreachable.join(', ')} are not in allowedChannelIds — ` +
+        'they will never wake the agent. Add them there.',
+    );
   }
 
   const client = new Client({

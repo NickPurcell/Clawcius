@@ -228,6 +228,8 @@ class Discord:
             cmd += ["-t", text]
         if max_bytes:
             cmd += ["--max-upload-bytes", str(max_bytes)]
+        # A daemon's post must not hold the agent's follow-up window open.
+        cmd.append("--no-nonce")
         # Uploads are slow; give them their own, longer budget.
         return json.loads(run(cmd, timeout=300).stdout)
 
@@ -236,7 +238,7 @@ class Discord:
             return self._refuse("text reply", channel)
         return json.loads(run(
             [self.cli, "-o", "json", "reply", "-c", channel,
-             "-m", message_id, "-t", text]
+             "-m", message_id, "-t", text, "--no-nonce"]
         ).stdout)
 
 
