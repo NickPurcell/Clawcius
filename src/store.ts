@@ -66,13 +66,12 @@ function toRecord(row: Record<string, unknown>): AgentRecord {
 
 export class AgentRegistry {
   readonly #db: DatabaseSync;
-  /** Crew and role given to rows migrated from `thread_sessions`. */
-  readonly #migrationCrew: string;
+  readonly #crew: string;
 
   constructor(dbPath: string, options: { crew: string }) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.#db = new DatabaseSync(dbPath);
-    this.#migrationCrew = options.crew;
+    this.#crew = options.crew;
 
     // WAL keeps reads from blocking the writer, which matters because the
     // Discord gateway handler, the mail drop and the agent stream all touch
@@ -116,10 +115,10 @@ export class AgentRegistry {
                   NULL, created_at, last_active_at
              FROM thread_sessions`,
         )
-        .run(this.#migrationCrew);
+        .run(this.#crew);
       process.stdout.write(
         `[registry] migrated ${copied.changes} Discord session(s) into the agent registry ` +
-          `as crew "${this.#migrationCrew}" — thread_sessions left in place\n`,
+          `as crew "${this.#crew}" — thread_sessions left in place\n`,
       );
     }
 
@@ -132,7 +131,7 @@ export class AgentRegistry {
 
   /** The crew this board belongs to. */
   get crew(): string {
-    return this.#migrationCrew;
+    return this.#crew;
   }
 
   get(id: string): AgentRecord | undefined {

@@ -25,7 +25,6 @@ for repo in clawcius oj; do
   [ -d /srv/$repo/src/.git ] || runuser -u hamachi -- git clone -q "$url" /srv/$repo/src
 done
 install -d -m 0755 -o hamachi -g hamachi /var/lib/hamachi/run
-# A crew's spool: any user may drop a file, only the crew's user reads it (cross-crew coordinator mail).
 install -d -m 1733 -o npurcell -g npurcell /var/spool/clawcius/clawcius
 install -d -m 1733 -o hamachi -g hamachi /var/spool/clawcius/hamachi
 

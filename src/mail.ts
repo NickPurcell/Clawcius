@@ -8,10 +8,10 @@ import type { AgentRecord, AgentRegistry } from './store.js';
 export const FEED = '*';
 
 /** `<crew>-coordinator`: that crew's live coordinators, whichever crew it is. */
-const COORDINATOR_ALIAS = /^([a-z][a-z0-9]*)-coordinator$/;
+const COORDINATOR_ALIAS = /^([a-z][a-z0-9-]*)-coordinator$/;
 
 /** Each crew owns `<root>/<crew>` (mode 1733): any user may drop a file, only the crew reads it. */
-export const SPOOL_ROOT = '/var/spool/clawcius';
+const SPOOL_ROOT = '/var/spool/clawcius';
 
 /** Refused above this. A message is prose, not a payload. */
 const MAX_BODY_BYTES = 64 * 1024;
@@ -103,9 +103,7 @@ export class MailStore {
         return { accepted: false, detail: `unknown recipient "${mail.recipient}"` };
       }
       // Crews talk to each other in public on the feed; within a crew, agents talk privately.
-      // Coordinators may DM each other across crews (how a sandboxed crew reaches the operator's).
-      const bothCoordinators = author.role === 'coordinator' && recipient.role === 'coordinator';
-      if (recipient.crew !== author.crew && !bothCoordinators) {
+      if (recipient.crew !== author.crew) {
         return {
           accepted: false,
           detail:
@@ -116,21 +114,7 @@ export class MailStore {
     }
 
     const subject = mail.subject.slice(0, MAX_SUBJECT_CHARS);
-    const sentAt = Date.now();
-    const inserted = this.#db
-      .prepare('INSERT INTO mail (author, recipient, subject, body, sent_at) VALUES (?, ?, ?, ?, ?)')
-      .run(author.id, mail.recipient, subject, mail.body, sentAt);
-
-    // After the insert, never before: a subscriber that reads the inbox must
-    // find the message it is being told about.
-    this.onDelivered({
-      id: Number(inserted.lastInsertRowid),
-      author: author.id,
-      recipient: mail.recipient,
-      subject,
-      body: mail.body,
-      sentAt,
-    });
+    this.#insert(author.id, mail.recipient, subject, mail.body, Date.now());
 
     return {
       accepted: true,
@@ -144,6 +128,7 @@ export class MailStore {
       .filter((a) => a.role === 'coordinator' && a.status === 'live');
   }
 
+  /** `onDelivered` fires after the insert, never before: a subscriber that reads the inbox must find the message. */
   #insert(author: string, recipient: string, subject: string, body: string, sentAt: number): void {
     const inserted = this.#db
       .prepare('INSERT INTO mail (author, recipient, subject, body, sent_at) VALUES (?, ?, ?, ?, ?)')
@@ -187,7 +172,9 @@ export class MailStore {
     const dir = join(this.#spoolRoot, this.#registry.crew);
     let names: string[];
     try {
-      names = readdirSync(dir).filter((n) => n.endsWith('.json') && !n.startsWith('.'));
+      names = readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isFile() && !e.name.startsWith('.'))
+        .map((e) => e.name);
     } catch {
       return [];
     }
@@ -211,10 +198,7 @@ export class MailStore {
         lines.push(`spool: dropped ${name} — not a message`);
         continue;
       }
-      if (coordinators.length === 0) {
-        lines.push(`spool: ${name} waits — no live coordinator`);
-        continue;
-      }
+      if (coordinators.length === 0) continue;
       const sentAt = typeof record.sentAt === 'number' ? record.sentAt : Date.now();
       unlinkSync(path);
       for (const c of coordinators) this.#insert(author, c.id, subject.slice(0, MAX_SUBJECT_CHARS), body, sentAt);

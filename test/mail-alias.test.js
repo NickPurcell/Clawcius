@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8,7 +8,6 @@ import { AgentRegistry } from '../dist/store.js';
 import { MailStore } from '../dist/mail.js';
 import { MailWaker } from '../dist/mail-wake.js';
 
-/** A hamachi board with two coordinators (one dead), an engineer, and a spool root with both crews' boxes. */
 function board() {
   const dir = mkdtempSync(join(tmpdir(), 'clawsky-alias-'));
   const registry = new AgentRegistry(join(dir, 'hamachi.db'), { crew: 'hamachi' });
@@ -69,6 +68,7 @@ test('the sweep imports the spool: one copy per live coordinator, file removed, 
   const own = join(spoolRoot, 'hamachi');
   writeFileSync(join(own, '1-a.json'), JSON.stringify({ author: 'clawcius-coordinator', subject: 'hi', body: 'from next door', sentAt: 5 }));
   writeFileSync(join(own, '2-b.json'), 'not json');
+  mkdirSync(join(own, 'a-directory'));
   const started = [];
   const waker = new MailWaker({
     crew: 'hamachi',
@@ -81,10 +81,9 @@ test('the sweep imports the spool: one copy per live coordinator, file removed, 
   mail.onDelivered = (m) => waker.onDelivered(m.recipient);
 
   waker.sweep();
-  assert.equal(readdirSync(own).length, 0, 'both files are gone');
+  assert.deepEqual(readdirSync(own), ['a-directory'], 'both files are gone; a directory is left alone');
   assert.equal(mail.unread('111')[0].author, 'clawcius-coordinator');
   assert.equal(mail.unread('222')[0].body, 'from next door');
   assert.deepEqual(started.sort(), ['111', '222']);
-  assert.equal(existsSync(join(own, '2-b.json')), false);
   registry.close();
 });

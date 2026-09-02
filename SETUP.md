@@ -126,7 +126,7 @@ Docker and gVisor are already on this box; skip § 2's install commands.
 
 1. `chmod 600 ~/.env ~/.env.hamachi`; stop and disable `clawcius-ops`; stop `oj`.
 2. `sudo deploy/setup.sh` from a clone of `main`. It creates the `hamachi` account, `/srv/{clawcius,oj}`,
-   `/etc/clawcius` placeholders, and installs the deploy units without enabling them.
+   `/etc/clawcius` placeholders and the two spools, and installs the deploy units without enabling them.
 3. Copy `~/.env` → `/etc/clawcius/clawcius.env`, `~/.env.hamachi` → `/etc/clawcius/hamachi.env`, the
    App PEMs into `/etc/clawcius/`; `chmod 0640`, Clawcius's files `chgrp npurcell`, Hamachi's `chgrp hamachi`.
 4. `systemctl stop hamachi-container.service hamachi-snapshot.timer`; `chown -R hamachi:hamachi /var/lib/hamachi`.
