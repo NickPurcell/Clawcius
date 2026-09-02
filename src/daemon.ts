@@ -247,10 +247,10 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   async function handleMessage(message: Message): Promise<void> {
     if (!client.user) return;
 
-    // Our own traffic extends the window rather than waking anything: the bot
-    // having just spoken is exactly what should keep the conversation alive.
+    // Our account also posts as vidbot; only the agent's own replies, stamped by
+    // the discord CLI, keep the conversation alive.
     if (message.author.id === client.user.id) {
-      windows.extend(message.channelId);
+      if (message.nonce === 'agent') windows.extend(message.channelId);
       return;
     }
     if (message.author.bot) return;

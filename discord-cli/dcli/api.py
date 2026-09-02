@@ -117,7 +117,9 @@ class Client:
 
     def send_message(self, channel_id, content, reply_to=None, files=None):
         """Post a message, with attachments when `files` is non-empty."""
-        payload = {"content": content or ""}
+        # The nonce comes back on the gateway; the waker keeps the follow-up
+        # window open only for messages carrying it (src/daemon.ts).
+        payload = {"content": content or "", "nonce": "agent"}
         if reply_to:
             # fail_if_not_exists=False degrades to a plain message rather than
             # erroring if the target was deleted between read and reply.

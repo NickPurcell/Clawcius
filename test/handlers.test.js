@@ -141,6 +141,7 @@ function harness(overrides = {}) {
 
 /** A Discord message, as much of one as the handler touches. */
 function message({
+  nonce = null,
   content = 'hello',
   channelId = CHANNEL,
   mentioned = false,
@@ -155,6 +156,7 @@ function message({
     content,
     createdTimestamp: 1_700_000_000_000,
     author: { id: authorId, bot, tag: 'human#0001' },
+    nonce,
     mentions: { has: () => mentioned },
     replies,
     reply: async (text) => {
@@ -316,9 +318,18 @@ test("the bot's own message extends the window rather than waking anything", asy
   });
 
   assert.equal(windows.isOpen(CHANNEL), false);
-  await handlers.handleMessage(message({ authorId: BOT, content: 'posted by the agent' }));
+  await handlers.handleMessage(message({ authorId: BOT, nonce: 'agent', content: 'posted by the agent' }));
   assert.deepEqual(sessions.acquired, [], 'the bot must never wake itself');
   assert.equal(windows.isOpen(CHANNEL), true, 'the bot having spoken keeps the conversation alive');
+});
+
+test("a post from our account without the agent stamp — a bot's upload — opens no window", async () => {
+  const { handlers, sessions, windows } = harness({
+    config: { discord: { followUpWindowSeconds: 300 } },
+  });
+  await handlers.handleMessage(message({ authorId: BOT, content: 'video.mp4' }));
+  assert.deepEqual(sessions.acquired, []);
+  assert.equal(windows.isOpen(CHANNEL), false, 'a daemon posting through the same account is not a conversation');
 });
 
 test('another bot is ignored entirely, window or no window', async () => {
