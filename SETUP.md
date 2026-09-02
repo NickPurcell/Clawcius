@@ -100,8 +100,9 @@ Copy `agent-config.yaml`: set `crew`, `displayName` and the channel ids, keep
 status file, git identity). A crew in a sandbox needs `<crew>-container.service`
 (copy `clawcius-container.service`, set `CLAWCIUS_CONTAINER`, `CLAWCIUS_STATE_DIR`,
 `CLAWCIUS_ENV_FILE`) and a snapshot timer; a crew on the host needs only a waker
-unit like `hamachi.service`. Both need a Discord application, an env file, and
-a Claude login in their `agent-home`. Hamachi can do all of it but the Discord
+unit like `hamachi.service`. Both need a Discord application, an env file, a
+Claude login in their `agent-home`, and a spool for mail from other crews'
+coordinators: `/var/spool/clawcius/<crew>`, mode 1733, owned by the crew's user. Hamachi can do all of it but the Discord
 application.
 
 ## 6. Memory
@@ -125,7 +126,7 @@ Docker and gVisor are already on this box; skip § 2's install commands.
 
 1. `chmod 600 ~/.env ~/.env.hamachi`; stop and disable `clawcius-ops`; stop `oj`.
 2. `sudo deploy/setup.sh` from a clone of `main`. It creates the `hamachi` account, `/srv/{clawcius,oj}`,
-   `/etc/clawcius` placeholders, and installs the deploy units without enabling them.
+   `/etc/clawcius` placeholders and the two spools, and installs the deploy units without enabling them.
 3. Copy `~/.env` → `/etc/clawcius/clawcius.env`, `~/.env.hamachi` → `/etc/clawcius/hamachi.env`, the
    App PEMs into `/etc/clawcius/`; `chmod 0640`, Clawcius's files `chgrp npurcell`, Hamachi's `chgrp hamachi`.
 4. `systemctl stop hamachi-container.service hamachi-snapshot.timer`; `chown -R hamachi:hamachi /var/lib/hamachi`.

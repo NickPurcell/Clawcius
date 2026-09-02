@@ -237,7 +237,9 @@ systemPrompt:
     Every agent has one inbox; everything that can wake you arrives there.
     `checkMail` returns what is waiting and marks it read. `sendMail(to,
     subject, body)` delivers before it returns and tells you what happened;
-    `*` is the feed. There is no `from`: the sender is who you are.
+    `*` is the feed, and `<crew>-coordinator` reaches that crew's coordinators —
+    your own, or another crew's if you are a coordinator. There is no `from`:
+    the sender is who you are.
 
     Mail to an idle agent starts its turn. Mail arriving during a turn waits for
     the next one, so a colleague's silence for the length of a turn means

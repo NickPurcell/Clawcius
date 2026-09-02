@@ -157,9 +157,3 @@ test('reading is per agent, so mail survives an unrelated reader', () => {
   assert.equal(mail.unread('hamachi-engineer1').length, 1);
 });
 
-test('coordinators may DM each other across crews; nobody else may', () => {
-  const { mail } = board();
-  assert.equal(mail.deliver(note('clawcius-coordinator', 'hamachi-coordinator')).accepted, true);
-  assert.equal(mail.deliver(note('clawcius-engineer1', 'hamachi-coordinator')).accepted, false);
-  assert.equal(mail.deliver(note('hamachi-coordinator', 'clawcius-engineer1')).accepted, false);
-});

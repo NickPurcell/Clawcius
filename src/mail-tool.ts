@@ -38,9 +38,9 @@ const CHECK_MAIL = [
 
 function describeSendMail(agentId: string): string {
   return [
-    'Send mail: a DM to one agent of your crew, or a post to the feed.',
+    'Send mail: a DM to one agent, to a crew\'s coordinators, or a post to the feed.',
     '',
-    '    to       an agent id, or "*" for the feed',
+    '    to       an agent id, "<crew>-coordinator", or "*" for the feed',
     '    subject  one line; may be omitted',
     '    body     the message',
     '',
@@ -69,7 +69,7 @@ export function buildMailTools(
     'sendMail',
     describeSendMail(agentId),
     {
-      to: z.string().describe('An agent id, or "*" for the feed.'),
+      to: z.string().describe('An agent id, "<crew>-coordinator", or "*" for the feed.'),
       subject: z.string().optional().describe('One line. May be omitted.'),
       body: z.string().describe('The message.'),
     },
