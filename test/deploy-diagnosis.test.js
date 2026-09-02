@@ -264,6 +264,20 @@ test('a journal that hangs is cut off, and the block says so rather than looking
   assert.match(r.out, /the read was cut off after 2s so the journal may continue/);
 });
 
+test('a journal past the read bound keeps the END and says the earliest were never read', () => {
+  // The bound that neither counter can see: bytes dropped before anything was measured.
+  // JOURNAL_READ_MAX is overridden to keep the fixture small; the mechanism is the point.
+  const content = `${'noise line\n'.repeat(200)}THE ACTUAL FAILURE\n`;
+  const r = shell('JOURNAL_READ_MAX=500; capture clawcius 100', { files: { 'journal.clawcius': content } });
+  assert.match(r.out, /\| THE ACTUAL FAILURE/);
+  assert.match(r.out, /logged more than 500 bytes so the earliest were never read/);
+});
+
+test('a journal inside the read bound says nothing about it', () => {
+  const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'small\n' } });
+  assert.doesNotMatch(r.out, /never read/);
+});
+
 test('a journal that completes says nothing about being cut off', () => {
   const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'all of it\n' } });
   assert.match(r.out, /bytes dropped/);

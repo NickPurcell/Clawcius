@@ -159,18 +159,29 @@ redact() {
 # capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
 # byte-bounded, quoted, and labelled as evidence rather than as direction.
 capture() {
-  local unit=$1 since=$2 raw red kept dropped rcf rc cut=""
-  # journalctl's own status is written out of band, because `head` and pipefail would
+  local unit=$1 since=$2 raw red kept dropped rcf buf rc cut="" over=0
+  # journalctl's own status is written out of band, because the pipeline and pipefail would
   # otherwise hide it, and `|| rc=$?` is what keeps a non-zero status from aborting this
-  # subshell under `set -e` before the status is recorded. 124 is the timeout; 141 is
-  # SIGPIPE from head reaching the read bound, which the byte count already reports.
-  rcf=$(mktemp)
-  raw=$( { rc=0; timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
-             --no-pager -o short-iso 2>/dev/null || rc=$?; echo $rc >"$rcf"; } \
-         | head -c $JOURNAL_READ_MAX | tr -d '\000-\010\013\014\016-\037' || true )
-  rc=$(cat "$rcf" 2>/dev/null || echo 0); rm -f "$rcf"
+  # subshell under `set -e` before the status is recorded. 124 is the timeout.
+  rcf=$(mktemp); buf=$(mktemp)
+  # tail, not head: the failure is at the end, and taking the front would defeat the same
+  # choice made below for the mail bound. One byte over the bound is how a read that
+  # dropped something is told apart from one that fitted -- measured on the file, because
+  # a command substitution strips the trailing newline and makes N+1 indistinguishable
+  # from N.
+  { rc=0; timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
+      --no-pager -o short-iso 2>/dev/null || rc=$?; echo $rc >"$rcf"; } \
+    | tail -c $((JOURNAL_READ_MAX + 1)) > "$buf" || true
+  rc=$(cat "$rcf" 2>/dev/null || echo 0)
+  [ "$(wc -c < "$buf")" -gt "$JOURNAL_READ_MAX" ] && over=1
+  raw=$(tr -d '\000-\010\013\014\016-\037' < "$buf")
+  rm -f "$rcf" "$buf"
   [ -n "$raw" ] || return 0
+  # Every bound that fired has to say so. A trailer that reports one loss and stays silent
+  # about another is worse than one that reports neither: the number it does give is then
+  # read as the whole of what was lost.
   [ "$rc" = 124 ] && cut=", and the read was cut off after ${JOURNAL_TIMEOUT}s so the journal may continue"
+  [ "$over" = 1 ] && cut="$cut, and the unit logged more than ${JOURNAL_READ_MAX} bytes so the earliest were never read and are not counted here"
   red=$(redact "$raw")
   kept=$(printf '%s' "$red" | tail -c $JOURNAL_MAX_BYTES)
   dropped=$(( $(printf '%s' "$red" | wc -c) - $(printf '%s' "$kept" | wc -c) ))
