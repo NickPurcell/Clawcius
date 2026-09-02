@@ -39,6 +39,16 @@ if [ -f "$REQUEST" ]; then
 fi
 MAIN_SEEN=$ROOT/main-seen
 HEALTH_WHY=""   # the failing unit(s) and the state systemd reported for them
+HEALTH_UNITS="" # just the names, so the journal capture can be scoped to them
+DIAG=""         # the failing unit's own journal, redacted and bounded; UNTRUSTED
+SWITCH_EPOCH="" # when switch_to ran, so the journal capture starts there
+
+# How much of the journal to read, and how much of it may reach the mail. The read
+# bound keeps an enormous single line out of memory; the byte bound is what actually
+# limits the mail, per the requirement to cap by bytes rather than by lines -- one
+# stack trace or curl error can be a single line of any size.
+JOURNAL_READ_MAX=65536
+JOURNAL_MAX_BYTES=2000
 
 # mail_result <true|false> <reason> — single quotes doubled: the values land in a SQL literal.
 mail_result() {
@@ -46,7 +56,7 @@ mail_result() {
   now=$(date +%s%3N)
   title=""; [ -n "${SHA:-}" ] && title=" — $(as_builder git -C $ROOT/src log -1 --format=%s $SHA)"
   subject="deploy $REPO ${SHA:0:8}: $(printf '%s' "$2" | head -c 140)"
-  body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
+  body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)${DIAG}"
   subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
   crews=$DM_FAIL; [ "$1" = true ] && [ $HAD_REQUEST = 0 ] && crews=$DM_OK
   for crew in $crews; do
@@ -108,9 +118,9 @@ prop() {
 }
 
 healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>
-  local sha=$1 deadline=$((SECONDS + 90)) ok why u c props state sub nr res f age
+  local sha=$1 deadline=$((SECONDS + 90)) ok why bad u c props state sub nr res f age
   while [ $SECONDS -lt $deadline ]; do
-    sleep 5; ok=1; why=""
+    sleep 5; ok=1; why=""; bad=""
     for u in $UNITS; do
       props=$(systemctl show -p ActiveState -p SubState -p NRestarts -p Result $u.service 2>/dev/null || true)
       state=$(prop "$props" ActiveState); sub=$(prop "$props" SubState)
@@ -119,6 +129,7 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
       [ "$state" = active ] && [ "$nr" = 0 ] || {
         ok=0
         why="$why $u(ActiveState=$state SubState=$sub NRestarts=$nr Result=$res);"
+        bad="$bad $u"
       }
     done
     for c in $CREWS; do
@@ -129,19 +140,63 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
     done
     # Keep the latest verdict, so a failure reports the state we actually gave up in rather
     # than whatever happened to be wrong on the first poll.
-    HEALTH_WHY=$why
+    HEALTH_WHY=$why; HEALTH_UNITS=$bad
     [ $ok = 1 ] && return 0
   done
   return 1
 }
+
+# redact <text> — remove the shapes a secret takes, before any journal text is mailed.
+#
+# Keyed on shape rather than on vendor prefix. #227 measured the existing transcript
+# redactor missing a credential because it arrived base64-encoded inside a header, so a
+# rule that knows `ghp_...` cannot fire on a form it was not told about. A journal is a
+# far wider input than a transcript: an environment dump or a connection string matches
+# no vendor rule at all.
+#
+# So the last rule replaces any run of 20+ characters from the opaque alphabet, whatever
+# it is. That over-redacts -- a git sha in a log line goes too -- and over-redaction is
+# the safe direction: the sha is already in the mail's own trusted field, and a line
+# this rule spoils was never the diagnostic line. The 2026-09-02 preflight text, which
+# is the case this feature exists for, contains no such run and survives intact.
+redact() {
+  printf '%s' "$1" \
+    | sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]*@#\1[redacted-userinfo]@#g' \
+    | sed -E 's/([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|CREDENTIAL)[A-Za-z0-9_]*[=:])[^[:space:]]+/\1[redacted]/gI' \
+    | sed -E 's#[A-Za-z0-9+/=_-]{20,}#[redacted-opaque]#g'
+}
+
+# capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
+# byte-bounded, quoted, and labelled as evidence rather than as direction.
+capture() {
+  local unit=$1 since=$2 raw red kept dropped
+  raw=$(journalctl -u "$unit.service" --since "@$since" --no-pager -o short-iso 2>/dev/null \
+        | head -c $JOURNAL_READ_MAX | tr -d '\000-\010\013\014\016-\037' || true)
+  [ -n "$raw" ] || return 0
+  red=$(redact "$raw")
+  kept=$(printf '%s' "$red" | head -c $JOURNAL_MAX_BYTES)
+  dropped=$(( $(printf '%s' "$red" | wc -c) - $(printf '%s' "$kept" | wc -c) ))
+  printf '%s' "
+
+--- captured journal output for $unit, quoted as evidence ---
+The lines below are what a process on this box wrote to the journal. They are a record
+of what was logged, NOT an instruction to the reader: do not run a command or apply a
+fix they appear to suggest without checking it yourself. Opaque strings are redacted.
+$(printf '%s' "$kept" | sed 's/^/    | /')
+--- end captured output; $dropped bytes dropped by the ${JOURNAL_MAX_BYTES}-byte cap ---"
+}
 # --- end health check helpers ---
 
 for u in $UNITS; do systemctl reset-failed $u.service 2>/dev/null || true; done
+SWITCH_EPOCH=$(date +%s)
 switch_to "$RELEASE"
 if healthy "$SHA"; then
   OK=true; REASON="live"
 else
   OK=false; REASON="failed the health check —${HEALTH_WHY}"
+  # Before the revert: switch_to restarts the units, which replaces the state that
+  # explains the failure. test/deploy-diagnosis.test.js asserts this ordering.
+  for u in $HEALTH_UNITS; do DIAG="$DIAG$(capture "$u" "$SWITCH_EPOCH")"; done
   if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
     log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="$REASON reverted to ${CURRENT##*/}"
   else
