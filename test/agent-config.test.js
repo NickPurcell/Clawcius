@@ -12,13 +12,23 @@ import { buildSystemPrompt, buildWakeMessage } from '../dist/prompt.js';
 
 const BASE = resolve('agent-config.base.yaml');
 
+const CHANNEL = ['discord:', "  allowedChannelIds: ['1']"];
+
 /** An instance file in a tmpdir. `extends:` the shipped base unless the lines say otherwise. */
 function writeInstance(lines, name = 'agent-config.yaml') {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-'));
   const path = join(dir, name);
   const declared = lines.some((l) => l.startsWith('extends:'));
-  writeFileSync(path, [...(declared ? [] : [`extends: ${BASE}`]), ...lines, ''].join('\n'));
+  writeFileSync(path, [...(declared ? [] : [`extends: ${BASE}`]), ...withChannel(lines), ''].join('\n'));
   return path;
+}
+
+/** Every instance needs an allowed channel; add one unless the lines already say. */
+function withChannel(lines) {
+  if (lines.some((l) => l.includes('allowedChannelIds'))) return lines;
+  const at = lines.indexOf('discord:');
+  if (at < 0) return [...CHANNEL, ...lines];
+  return [...lines.slice(0, at + 1), CHANNEL[1], ...lines.slice(at + 1)];
 }
 
 /** The shipped base with `mutate` applied, and an instance beside it extending it. */
@@ -27,7 +37,7 @@ function writeLayered(mutate, instanceLines = ['crew: x']) {
   const base = parse(readFileSync(BASE, 'utf8'));
   mutate(base);
   writeFileSync(join(dir, 'base.yaml'), stringify(base));
-  writeFileSync(join(dir, 'inst.yaml'), ['extends: base.yaml', ...instanceLines, ''].join('\n'));
+  writeFileSync(join(dir, 'inst.yaml'), ['extends: base.yaml', ...withChannel(instanceLines), ''].join('\n'));
   return join(dir, 'inst.yaml');
 }
 
@@ -43,6 +53,15 @@ test('every instance path and identity derives from crew', () => {
   assert.equal(config.git.userName, 'Newcrew');
   assert.equal(config.git.userEmail, 'newcrew@users.noreply.github.com');
   assert.equal(config.clawsky.crew, 'newcrew');
+});
+
+test('an instance must name at least one allowed channel', () => {
+  assert.throws(() => loadAgentConfig(writeInstance(['crew: x', 'discord:', '  allowedChannelIds: []'])), /allowedChannelIds/);
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-nochannel-'));
+  writeFileSync(join(dir, 'inst.yaml'), `extends: ${BASE}\ncrew: x\n`);
+  assert.throws(() => loadAgentConfig(join(dir, 'inst.yaml')), /discord/, 'no discord block at all');
+  writeFileSync(join(dir, 'inst.yaml'), `extends: ${BASE}\ncrew: x\ndiscord:\n  followUpChannelIds: []\n`);
+  assert.throws(() => loadAgentConfig(join(dir, 'inst.yaml')), /allowedChannelIds/, 'a discord block without the key');
 });
 
 test('crew is required and must be a short lowercase identifier', () => {
@@ -148,14 +167,14 @@ test('extends resolves against the instance file, and a base that itself extends
   const base = parse(readFileSync(BASE, 'utf8'));
   base.model = 'from-the-base';
   writeFileSync(join(dir, 'shared.yaml'), stringify(base));
-  writeFileSync(join(dir, 'instance.yaml'), 'crew: x\nextends: shared.yaml\n');
+  writeFileSync(join(dir, 'instance.yaml'), `crew: x\nextends: shared.yaml\n${CHANNEL.join('\n')}\n`);
   assert.equal(loadAgentConfig(join(dir, 'instance.yaml')).model, 'from-the-base');
 
-  writeFileSync(join(dir, 'broken.yaml'), 'crew: x\nextends: nope.yaml\n');
+  writeFileSync(join(dir, 'broken.yaml'), `crew: x\nextends: nope.yaml\n${CHANNEL.join('\n')}\n`);
   assert.throws(() => loadAgentConfig(join(dir, 'broken.yaml')), /nope\.yaml/);
 
   writeFileSync(join(dir, 'middle.yaml'), 'extends: shared.yaml\nmodel: m\n');
-  writeFileSync(join(dir, 'chained.yaml'), 'crew: x\nextends: middle.yaml\n');
+  writeFileSync(join(dir, 'chained.yaml'), `crew: x\nextends: middle.yaml\n${CHANNEL.join('\n')}\n`);
   assert.throws(() => loadAgentConfig(join(dir, 'chained.yaml')), /middle\.yaml/);
 });
 
