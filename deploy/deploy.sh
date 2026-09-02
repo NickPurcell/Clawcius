@@ -153,16 +153,15 @@ redact() {
   printf '%s' "$1" \
     | sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]*@#\1[redacted-userinfo]@#g' \
     | sed -E 's/([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL)[A-Za-z0-9_]*[=:])[^[:space:]]+/\1[redacted]/gI' \
-    | sed -E 's#[A-Za-z0-9+_-]{20,}#[redacted-opaque]#g'
+    | sed -E 's#[A-Za-z0-9+_-]{20,}#[redacted-opaque]#g' \
+    | sed -E 's#[A-Za-z0-9+/=_-]*\[redacted-opaque\][A-Za-z0-9+/=_-]*#[redacted-opaque]#g'
 }
 
 # capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
 # byte-bounded, quoted, and labelled as evidence rather than as direction.
 capture() {
   local unit=$1 since=$2 raw red kept dropped rcf buf rc cut="" over=0
-  # journalctl's own status is written out of band, because the pipeline and pipefail would
-  # otherwise hide it, and `|| rc=$?` is what keeps a non-zero status from aborting this
-  # subshell under `set -e` before the status is recorded. 124 is the timeout.
+  # journalctl's status is recorded out of band; the pipeline would otherwise hide it.
   rcf=$(mktemp); buf=$(mktemp)
   # tail, not head: the failure is at the end, and taking the front would defeat the same
   # choice made below for the mail bound. One byte over the bound is how a read that
@@ -171,10 +170,10 @@ capture() {
   # from N.
   { rc=0; timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
       --no-pager -o short-iso 2>/dev/null || rc=$?; echo $rc >"$rcf"; } \
-    | tail -c $((JOURNAL_READ_MAX + 1)) > "$buf" || true
+    | tail -c $((JOURNAL_READ_MAX + 1)) > "$buf"
   rc=$(cat "$rcf" 2>/dev/null || echo 0)
   [ "$(wc -c < "$buf")" -gt "$JOURNAL_READ_MAX" ] && over=1
-  raw=$(tr -d '\000-\010\013\014\016-\037' < "$buf")
+  raw=$(tr -d '\000-\010\013-\037' < "$buf")
   rm -f "$rcf" "$buf"
   [ -n "$raw" ] || return 0
   # Every bound that fired has to say so. A trailer that reports one loss and stays silent

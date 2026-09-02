@@ -139,16 +139,12 @@ test('the crew status-file conditions name the crew and say which of the two fai
 });
 
 test('a crew that is not reporting is queued for a journal, even with its unit healthy', () => {
-  // The unit tuple says nothing in this case — an active, unrestarted waker that never
-  // writes its status file — so the journal is the only thing that would explain it.
   const r = health({ crews: 'no-such-crew-exists' });
   assert.equal(r.units, 'no-such-crew-exists');
 });
 
 test('a crew whose own unit also failed is queued once, not twice', () => {
-  // Crew and unit share a name, so both loops reach for the same journal. The name has to
-  // be a unit as well as a crew for this to be exercised at all — with a crew that is not
-  // a unit there is nothing to collide with, and the test would pass without the guard.
+  // Crew and unit share a name, so both loops reach for the same journal.
   const r = health({
     units: 'clawcius-status clawcius no-such-crew-exists',
     crews: 'no-such-crew-exists',
@@ -186,6 +182,15 @@ test('redaction removes any long opaque run, even one no vendor rule would match
   assert.match(out, /\[redacted-opaque\]/);
 });
 
+test('a base64 credential is redacted whole, slashes and all', () => {
+  // base64's 63rd symbol is `/`. Taking `/` out of the opaque class to spare paths left
+  // any segment under 20 bytes beside a slash surviving — a partly-redacted credential,
+  // which is the reassembly failure #227 is about.
+  const out = redact('Authorization: Basic dXNlcjpwYXNz/d29yZDEyMzQ1Njc4OTAxMjM0NTY3ODkw');
+  assert.doesNotMatch(out, /dXNlcjpwYXNz/);
+  assert.match(out, /Basic \[redacted-opaque\]$/m);
+});
+
 test('redaction leaves paths intact — for ENOENT the path IS the diagnostic line', () => {
   const out = redact([
     "Error: Cannot find module '/srv/clawcius/current/dist/index.js'",
@@ -214,6 +219,15 @@ test('capture quotes every line behind a marker so it cannot merge into the mail
   });
   assert.match(r.out, /^ {4}\| Error: Preflight failed:$/m);
   assert.match(r.out, /^ {4}\| Fix: {2}docker\/up\.sh$/m);
+});
+
+test('a carriage return cannot overwrite the quoting marker', () => {
+  // \r was the one control character the filter kept. In a terminal it returns the cursor
+  // to the start of the line, so a journal line containing one redraws over the `    | `
+  // and the quoting — the boundary between evidence and the mail's own voice — disappears.
+  const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'safe\rINJECTED\n' } });
+  assert.doesNotMatch(r.out, /\r/);
+  assert.match(r.out, /^ {4}\| safeINJECTED$/m);
 });
 
 test('capture is scoped to the unit it is given, and asks the journal for only that unit', () => {
@@ -257,11 +271,11 @@ test('capture redacts before quoting, so a secret never reaches the mail body', 
 });
 
 test('a journal that hangs is cut off, and the block says so rather than looking whole', () => {
-  const r = shell('JOURNAL_TIMEOUT=2; capture clawcius 100', {
+  const r = shell('JOURNAL_TIMEOUT=0.5; capture clawcius 100', {
     files: { 'journal.clawcius': 'partial line before the hang\n', hang: '' },
   });
   assert.match(r.out, /\| partial line before the hang/);
-  assert.match(r.out, /the read was cut off after 2s so the journal may continue/);
+  assert.match(r.out, /cut off after 0\.5s/);
 });
 
 test('a journal past the read bound keeps the END and says the earliest were never read', () => {
