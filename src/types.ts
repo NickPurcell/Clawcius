@@ -50,5 +50,7 @@ export type TurnSummary = {
   durationMs: number;
   /** `success`, or a failure subtype such as `error_max_turns`. */
   subtype: string;
+  /** The turn ran on a session that was already closed — a backlog draining after `!reset`, an eviction, or a shutdown. Reported rather than guarded here, because only the caller knows whether its wiring can reach a channel. */
+  drained: boolean;
 };
 

@@ -288,3 +288,53 @@ test('!stop during a retry BACKOFF settles, or the agent goes deaf forever', asy
     h.restore();
   }
 });
+
+test('a turn on a CLOSED session is reported as drained (#264)', async () => {
+  // close() does not stop a session: PromptQueue checks #closed once per BATCH,
+  // so the batch in hand keeps yielding and every queued turn completes. The
+  // session reports rather than suppresses — handlers.test.js pins the gate.
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    void h.session.close();
+
+    await h.send(RESULT);
+
+    const done = h.events.find((e) => e.kind === 'done');
+    assert.ok(done, 'the journal keeps its completion line — this is #241 s line');
+    assert.equal(done.drained, true);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a turn on a LIVE session is not — the control (#264)', async () => {
+  const h = drive();
+  try {
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, () => {});
+    await h.send(RESULT);
+    assert.equal(h.events.find((e) => e.kind === 'done')?.drained, false);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a closed session still SETTLES, because that is how the mail survives (#264)', async () => {
+  // Why nothing skips #handle wholesale: skipping would leave a mail turn
+  // unsettled, safe today only because the sweep re-offers unread rows.
+  const h = drive();
+  try {
+    const settles = [];
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1 }, (ran, why) =>
+      settles.push({ ran, why }),
+    );
+    void h.session.close();
+
+    await h.send(RESULT);
+
+    assert.equal(settles.length, 1, 'a closed session must still account for its mail');
+    assert.equal(settles[0].ran, true, 'the turn did run — it simply did not announce itself');
+  } finally {
+    h.restore();
+  }
+});
