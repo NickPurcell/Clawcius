@@ -10,6 +10,7 @@ const DEPLOY_SH = 'deploy/deploy.sh';
 // The helpers are lifted out of deploy.sh between its two markers; awk exits non-zero if it
 // never reached the end marker, so an extraction that overran the block fails the run.
 const PRELUDE = `
+set -o pipefail
 block=$(awk '/^# --- health check helpers/{f=1} /^# --- end health check helpers/{e=1; exit} f {print} END{exit !e}' "$DEPLOY_SH") || exit 90
 eval "$block"
 sleep() { SECONDS=$((SECONDS + 5)); }   # the 90s poll, without waiting 90 seconds for it
@@ -183,12 +184,15 @@ test('redaction removes any long opaque run, even one no vendor rule would match
 });
 
 test('a base64 credential is redacted whole, slashes and all', () => {
-  // base64's 63rd symbol is `/`. Taking `/` out of the opaque class to spare paths left
-  // any segment under 20 bytes beside a slash surviving — a partly-redacted credential,
-  // which is the reassembly failure #227 is about.
   const out = redact('Authorization: Basic dXNlcjpwYXNz/d29yZDEyMzQ1Njc4OTAxMjM0NTY3ODkw');
   assert.doesNotMatch(out, /dXNlcjpwYXNz/);
   assert.match(out, /Basic \[redacted-opaque\]$/m);
+});
+
+test('an assignment keeps its name when only its value was opaque', () => {
+  const out = redact('SOMEVAR=abcdefghijklmnopqrstuvwxyz1234\nNODE_OPTIONS=--max-old-space-size=4096');
+  assert.match(out, /^SOMEVAR=\[redacted-opaque\]$/m);
+  assert.match(out, /^NODE_OPTIONS=\[redacted-opaque\]$/m);
 });
 
 test('redaction leaves paths intact — for ENOENT the path IS the diagnostic line', () => {
@@ -222,9 +226,6 @@ test('capture quotes every line behind a marker so it cannot merge into the mail
 });
 
 test('a carriage return cannot overwrite the quoting marker', () => {
-  // \r was the one control character the filter kept. In a terminal it returns the cursor
-  // to the start of the line, so a journal line containing one redraws over the `    | `
-  // and the quoting — the boundary between evidence and the mail's own voice — disappears.
   const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'safe\rINJECTED\n' } });
   assert.doesNotMatch(r.out, /\r/);
   assert.match(r.out, /^ {4}\| safeINJECTED$/m);
@@ -246,7 +247,7 @@ test('capture bounds by bytes and reports how many were dropped', () => {
   const cap = Number(/^CAP=(\d+)$/m.exec(r.out)[1]);
   const kept = r.out.split('\n').filter((l) => l.startsWith('    | ')).map((l) => l.slice(6)).join('\n');
   assert.equal(kept.length, cap);
-  assert.equal(Number(/(\d+) earlier bytes dropped/.exec(r.out)[1]), content.length - cap);
+  assert.equal(Number(/(\d+)[^\n]*bytes dropped/.exec(r.out)[1]), content.length - cap);
 });
 
 test('capture keeps the END of the journal, where the failure is', () => {

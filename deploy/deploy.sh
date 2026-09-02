@@ -154,31 +154,24 @@ redact() {
     | sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]*@#\1[redacted-userinfo]@#g' \
     | sed -E 's/([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL)[A-Za-z0-9_]*[=:])[^[:space:]]+/\1[redacted]/gI' \
     | sed -E 's#[A-Za-z0-9+_-]{20,}#[redacted-opaque]#g' \
-    | sed -E 's#[A-Za-z0-9+/=_-]*\[redacted-opaque\][A-Za-z0-9+/=_-]*#[redacted-opaque]#g'
+    | sed -E 's#[A-Za-z0-9+/_-]*\[redacted-opaque\][A-Za-z0-9+/=_-]*#[redacted-opaque]#g'
 }
 
 # capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
 # byte-bounded, quoted, and labelled as evidence rather than as direction.
 capture() {
-  local unit=$1 since=$2 raw red kept dropped rcf buf rc cut="" over=0
-  # journalctl's status is recorded out of band; the pipeline would otherwise hide it.
-  rcf=$(mktemp); buf=$(mktemp)
-  # tail, not head: the failure is at the end, and taking the front would defeat the same
-  # choice made below for the mail bound. One byte over the bound is how a read that
-  # dropped something is told apart from one that fitted -- measured on the file, because
-  # a command substitution strips the trailing newline and makes N+1 indistinguishable
-  # from N.
-  { rc=0; timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
-      --no-pager -o short-iso 2>/dev/null || rc=$?; echo $rc >"$rcf"; } \
-    | tail -c $((JOURNAL_READ_MAX + 1)) > "$buf"
-  rc=$(cat "$rcf" 2>/dev/null || echo 0)
+  local unit=$1 since=$2 raw red kept dropped buf rc=0 cut="" over=0
+  buf=$(mktemp)
+  # One byte over the bound is how a read that dropped something is told apart from one
+  # that fitted, measured on the file: a command substitution strips the trailing newline
+  # and would make N+1 indistinguishable from N.
+  timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
+      --no-pager -o short-iso 2>/dev/null \
+    | tail -c $((JOURNAL_READ_MAX + 1)) > "$buf" || rc=${PIPESTATUS[0]}
   [ "$(wc -c < "$buf")" -gt "$JOURNAL_READ_MAX" ] && over=1
   raw=$(tr -d '\000-\010\013-\037' < "$buf")
-  rm -f "$rcf" "$buf"
+  rm -f "$buf"
   [ -n "$raw" ] || return 0
-  # Every bound that fired has to say so. A trailer that reports one loss and stays silent
-  # about another is worse than one that reports neither: the number it does give is then
-  # read as the whole of what was lost.
   [ "$rc" = 124 ] && cut=", and the read was cut off after ${JOURNAL_TIMEOUT}s so the journal may continue"
   [ "$over" = 1 ] && cut="$cut, and the unit logged more than ${JOURNAL_READ_MAX} bytes so the earliest were never read and are not counted here"
   red=$(redact "$raw")
