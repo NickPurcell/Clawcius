@@ -185,7 +185,7 @@ def cmd_send(args):
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(channel_id, content, files=files, nonce=None if args.no_nonce else "agent")
+        sent = client.send_message(channel_id, content, files=files, stamped=not args.no_nonce)
     _out(render.slim_message(sent), lambda m: f"sent {m['id']}")
 
 
@@ -196,9 +196,7 @@ def cmd_reply(args):
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(
-            channel_id, content, reply_to=message_id, files=files, nonce=None if args.no_nonce else "agent"
-        )
+        sent = client.send_message(channel_id, content, reply_to=message_id, files=files, stamped=not args.no_nonce)
     _out(render.slim_message(sent), lambda m: f"replied {m['id']}")
 
 
