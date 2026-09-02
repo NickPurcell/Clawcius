@@ -41,18 +41,6 @@ MAIN_SEEN=$ROOT/main-seen
 HEALTH_WHY=""   # the failing unit(s) and the state systemd reported for them
 HEALTH_UNITS="" # just the names, so the journal capture can be scoped to them
 DIAG=""         # the failing unit's own journal, redacted and bounded; UNTRUSTED
-SWITCH_EPOCH="" # when switch_to ran, so the journal capture starts there
-
-# How much of the journal to read, and how much of it may reach the mail. The read
-# bound keeps an enormous single line out of memory; the byte bound is what actually
-# limits the mail, per the requirement to cap by bytes rather than by lines -- one
-# stack trace or curl error can be a single line of any size.
-JOURNAL_READ_MAX=65536
-JOURNAL_MAX_BYTES=2000
-# The revert must never wait on a best-effort diagnostic: the capture runs before it, and
-# a journalctl that hangs on a degraded box would postpone the revert for as long as it
-# hangs. The byte bound cannot help -- it only stops the read once bytes arrive.
-JOURNAL_TIMEOUT=10
 
 # mail_result <true|false> <reason> — single quotes doubled: the values land in a SQL literal.
 mail_result() {
@@ -122,7 +110,7 @@ prop() {
 }
 
 healthy() {     # healthy <sha> — every unit active, not restarting, and reporting <sha>
-  local sha=$1 deadline=$((SECONDS + 90)) ok why bad u c props state sub nr res f age
+  local sha=$1 deadline=$((SECONDS + 90)) ok why bad addbad u c props state sub nr res f age
   while [ $SECONDS -lt $deadline ]; do
     sleep 5; ok=1; why=""; bad=""
     for u in $UNITS; do
@@ -137,10 +125,16 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
       }
     done
     for c in $CREWS; do
+      addbad=0
       f=/var/lib/$c/waker-status.json
-      grep -q "\"commit\": *\"$sha\"" $f 2>/dev/null || { ok=0; why="$why $c is not reporting ${sha:0:8};"; }
+      grep -q "\"commit\": *\"$sha\"" $f 2>/dev/null || { ok=0; why="$why $c is not reporting ${sha:0:8};"; addbad=1; }
       age=$(( $(date +%s) - $(stat -c %Y $f 2>/dev/null || echo 0) ))
-      [ $age -lt 60 ] || { ok=0; why="$why $c status file is ${age}s stale;"; }
+      [ $age -lt 60 ] || { ok=0; why="$why $c status file is ${age}s stale;"; addbad=1; }
+      # A crew's waker can stay active with no restarts and still never report, so the unit
+      # tuple says nothing about it and only its journal would. Crew and unit share a name.
+      if [ $addbad = 1 ]; then
+        case " $bad " in *" $c "*) ;; *) bad="$bad $c" ;; esac
+      fi
     done
     # Keep the latest verdict, so a failure reports the state we actually gave up in rather
     # than whatever happened to be wrong on the first poll.
@@ -150,24 +144,16 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
   return 1
 }
 
+JOURNAL_READ_MAX=65536   # read bound: keeps one enormous line out of memory
+JOURNAL_MAX_BYTES=2000   # mail bound: bytes of journal that may reach the body
+JOURNAL_TIMEOUT=10       # the revert must not wait on a diagnostic that hangs
+
 # redact <text> — remove the shapes a secret takes, before any journal text is mailed.
-#
-# Keyed on shape rather than on vendor prefix. #227 measured the existing transcript
-# redactor missing a credential because it arrived base64-encoded inside a header, so a
-# rule that knows `ghp_...` cannot fire on a form it was not told about. A journal is a
-# far wider input than a transcript: an environment dump or a connection string matches
-# no vendor rule at all.
-#
-# So the last rule replaces any run of 20+ characters from the opaque alphabet, whatever
-# it is. That over-redacts -- a git sha in a log line goes too -- and over-redaction is
-# the safe direction: the sha is already in the mail's own trusted field, and a line
-# this rule spoils was never the diagnostic line. The 2026-09-02 preflight text, which
-# is the case this feature exists for, contains no such run and survives intact.
 redact() {
   printf '%s' "$1" \
     | sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]*@#\1[redacted-userinfo]@#g' \
-    | sed -E 's/([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|CREDENTIAL)[A-Za-z0-9_]*[=:])[^[:space:]]+/\1[redacted]/gI' \
-    | sed -E 's#[A-Za-z0-9+/=_-]{20,}#[redacted-opaque]#g'
+    | sed -E 's/([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL)[A-Za-z0-9_]*[=:])[^[:space:]]+/\1[redacted]/gI' \
+    | sed -E 's#[A-Za-z0-9+_-]{20,}#[redacted-opaque]#g'
 }
 
 # capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
@@ -186,7 +172,7 @@ capture() {
   [ -n "$raw" ] || return 0
   [ "$rc" = 124 ] && cut=", and the read was cut off after ${JOURNAL_TIMEOUT}s so the journal may continue"
   red=$(redact "$raw")
-  kept=$(printf '%s' "$red" | head -c $JOURNAL_MAX_BYTES)
+  kept=$(printf '%s' "$red" | tail -c $JOURNAL_MAX_BYTES)
   dropped=$(( $(printf '%s' "$red" | wc -c) - $(printf '%s' "$kept" | wc -c) ))
   printf '%s' "
 
@@ -195,7 +181,7 @@ The lines below are what a process on this box wrote to the journal. They are a 
 of what was logged, NOT an instruction to the reader: do not run a command or apply a
 fix they appear to suggest without checking it yourself. Opaque strings are redacted.
 $(printf '%s' "$kept" | sed 's/^/    | /')
---- end captured output; $dropped bytes dropped by the ${JOURNAL_MAX_BYTES}-byte cap$cut ---"
+--- end captured output; $dropped earlier bytes dropped by the ${JOURNAL_MAX_BYTES}-byte cap$cut ---"
 }
 # --- end health check helpers ---
 
@@ -207,7 +193,7 @@ if healthy "$SHA"; then
 else
   OK=false; REASON="failed the health check —${HEALTH_WHY}"
   # Before the revert: switch_to restarts the units, which replaces the state that
-  # explains the failure. test/deploy-diagnosis.test.js asserts this ordering.
+  # explains the failure.
   for u in $HEALTH_UNITS; do DIAG="$DIAG$(capture "$u" "$SWITCH_EPOCH")"; done
   if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
     log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="$REASON reverted to ${CURRENT##*/}"
