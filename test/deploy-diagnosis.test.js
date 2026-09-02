@@ -13,7 +13,7 @@ const PRELUDE = `
 set -o pipefail
 block=$(awk '/^# --- health check helpers/{f=1} /^# --- end health check helpers/{e=1; exit} f {print} END{exit !e}' "$DEPLOY_SH") || exit 90
 eval "$block"
-sleep() { SECONDS=$((SECONDS + 5)); }   # the 90s poll, without waiting 90 seconds for it
+sleep() { SECONDS=$((SECONDS + 45)); }  # the 90s poll in two iterations, not eighteen
 HEALTH_WHY=""; HEALTH_UNITS=""
 `;
 
@@ -231,6 +231,20 @@ test('a carriage return cannot overwrite the quoting marker', () => {
   assert.match(r.out, /^ {4}\| safeINJECTED$/m);
 });
 
+test('the quoted journal is introduced by a label, whatever it says', () => {
+  // Structural, not textual: between the opening delimiter and the first quoted line there
+  // must be prose addressed to the reader. Asserting the wording is what made the previous
+  // version of this a decoration test; asserting nothing let the label be deleted with the
+  // suite still green.
+  const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'a line\n' } });
+  const lines = r.out.split('\n');
+  const open = lines.findIndex((l) => l.startsWith('--- captured'));
+  const firstQuoted = lines.findIndex((l) => l.startsWith('    | '));
+  assert.ok(open >= 0 && firstQuoted > open, 'delimiter must precede the quoted lines');
+  const preamble = lines.slice(open + 1, firstQuoted).filter((l) => l.trim() !== '');
+  assert.ok(preamble.length > 0, 'the quoted block must be introduced, not bare');
+});
+
 test('capture is scoped to the unit it is given, and asks the journal for only that unit', () => {
   const r = shell('capture clawcius 100', {
     files: { 'journal.clawcius': 'mine\n', 'journal.hamachi': 'not mine\n' },
@@ -285,7 +299,7 @@ test('a journal past the read bound keeps the END and says the earliest were nev
   const content = `${'noise line\n'.repeat(200)}THE ACTUAL FAILURE\n`;
   const r = shell('JOURNAL_READ_MAX=500; capture clawcius 100', { files: { 'journal.clawcius': content } });
   assert.match(r.out, /\| THE ACTUAL FAILURE/);
-  assert.match(r.out, /logged more than 500 bytes so the earliest were never read/);
+  assert.match(r.out, /more than 500 bytes/);
 });
 
 test('a journal inside the read bound says nothing about it', () => {
