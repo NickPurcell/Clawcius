@@ -17,6 +17,7 @@ export type PullRequestState = {
   merged: boolean;
   htmlUrl: string;
   author: string;
+  headSha: string;
 };
 
 export type PrReview = {
@@ -26,6 +27,8 @@ export type PrReview = {
   state: string;
   body: string;
   htmlUrl: string;
+  /** The head the review was submitted against. */
+  commitId: string;
 };
 
 export type PrComment = {
@@ -146,6 +149,7 @@ export class GitHubClient implements PullRequestSource {
       merged: row['merged'] === true,
       htmlUrl: text(row['html_url'], 300),
       author: login(row['user']),
+      headSha: text(((row['head'] ?? {}) as Record<string, unknown>)['sha'], 64),
     };
   }
 
@@ -159,6 +163,7 @@ export class GitHubClient implements PullRequestSource {
       state: text(row['state'], 40) || 'COMMENTED',
       body: text(row['body'], MAX_EXTERNAL_CHARS * 2),
       htmlUrl: text(row['html_url'], 300),
+      commitId: text(row['commit_id'], 64),
     }));
   }
 

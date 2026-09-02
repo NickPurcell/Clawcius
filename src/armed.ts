@@ -53,6 +53,8 @@ export type PrWatchSeen = {
   issueCommentId: number;
   reviewCommentId: number;
   state: string;
+  /** When the owner was last told the pull request is approved and unmerged; null while it is not. */
+  nudgedAt?: number | null;
 };
 
 export type ArmedSpec = ReminderSpec | PrWatchSpec | ScheduleSpec;

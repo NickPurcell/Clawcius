@@ -158,6 +158,17 @@ export type WatchFindings = {
   finished: boolean;
 };
 
+/** An approved, unmerged pull request is re-raised this often until it merges or closes. */
+const NUDGE_MS = 60 * 60 * 1000;
+
+/** Whether any reviewer's standing verdict approves the current head; a later COMMENTED review changes nothing, as on GitHub. */
+export function approvedOnHead(reviews: PrReview[], headSha: string): boolean {
+  if (!headSha) return false;
+  const latest = new Map<string, PrReview>();
+  for (const review of reviews) if (review.state !== 'COMMENTED') latest.set(review.author, review);
+  return [...latest.values()].some((r) => r.state === 'APPROVED' && r.commitId === headSha);
+}
+
 /** What a PR watch says when it has something to report. */
 export function composeWatchMail(
   spec: PrWatchSpec,
@@ -437,6 +448,18 @@ export class ArmedWaker {
         )
       : [];
     const finished = pr.state !== 'open' || pr.merged;
+    const report = newReviews.length > 0 || newComments.length > 0 || finished;
+
+    // The clock starts when the owner is told (or the approval is first seen) and re-raises hourly.
+    const approved = !finished && approvedOnHead(reviews, pr.headSha);
+    let nudgedAt = seen.nudgedAt ?? null;
+    let nudge = false;
+    if (!approved) nudgedAt = null;
+    else if (report || nudgedAt === null) nudgedAt = Date.now();
+    else if (Date.now() - nudgedAt >= NUDGE_MS) {
+      nudge = true;
+      nudgedAt = Date.now();
+    }
 
     // Watermarks move over EVERYTHING seen, including events the agent did not ask to hear about.
     const next: PrWatchSeen = {
@@ -452,9 +475,8 @@ export class ArmedWaker {
         0,
       ),
       state: pr.merged ? 'merged' : pr.state,
+      nudgedAt,
     };
-
-    const report = newReviews.length > 0 || newComments.length > 0 || finished;
 
     if (finished) {
       this.#options.store.disarm(condition.id);
@@ -462,6 +484,7 @@ export class ArmedWaker {
       this.#options.store.reschedule(condition.id, Date.now() + spec.pollSeconds * 1000, next);
     }
 
+    if (nudge) this.#nudge(condition, spec, pr);
     if (!report) return;
 
     const { subject, body } = composeWatchMail(spec, pr, {
@@ -470,6 +493,16 @@ export class ArmedWaker {
       finished,
     });
     this.#deliver(condition, subject, body);
+  }
+
+  /** Approved on its head and still open: tell the owner again. */
+  #nudge(condition: ArmedCondition, spec: PrWatchSpec, pr: PullRequestState): void {
+    this.#deliver(
+      condition,
+      `watchPr ${spec.repo}#${spec.pr} — approved on its head and still unmerged`,
+      `${pr.title} (${pr.htmlUrl}) has been approved on its current head and not merged. ` +
+        'Merge it, or say what it is waiting on and disarm the watch.',
+    );
   }
 
   #deliver(condition: ArmedCondition, subject: string, body: string): void {

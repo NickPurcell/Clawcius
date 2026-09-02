@@ -123,7 +123,8 @@ systemPrompt:
 
         remindMe           a note to your future self at a time you choose; fires once
         scheduleRecurring  the same on a cron schedule, in a timezone; armed until disarmed
-        watchPr            a pull request and the events you care about; disarms on merge or close
+        watchPr            a pull request and the events you care about; disarms on merge or close,
+                           and re-raises hourly while it sits approved and unmerged
         listArmed          what you have armed, with ids
         disarm             withdraw one by id
 
