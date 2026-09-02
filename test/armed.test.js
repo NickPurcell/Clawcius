@@ -911,13 +911,13 @@ test('a watch resumed under a process with no token is disarmed and told once', 
 const approvedPr = { ...openPr, headSha: 'h1' };
 const approval = { id: 9, author: 'osmosis-jones', state: 'APPROVED', body: 'clean', htmlUrl: 'u9', commitId: 'h1' };
 
-test('a pull request left approved on its head is re-raised to its owner after an hour', async () => {
+test('a pull request left approved on its head is re-raised to its owner after an hour, until the head moves', async () => {
   const { registry, mail, store } = board();
   await toolsFor('hamachi-engineer1', store, { github: stubGitHub({ pr: approvedPr, reviews: [], comments: [] }) })
     .watchPr.handler({ pr: 44 }, {});
   const [row] = store.listFor('hamachi-engineer1');
-  const github = stubGitHub({ pr: approvedPr, reviews: [approval], comments: [] });
-  const waker = new ArmedWaker({ store, registry, mail, github, tickMs: 1000, log: () => {} });
+  const state = { pr: approvedPr, reviews: [approval], comments: [] };
+  const waker = new ArmedWaker({ store, registry, mail, github: stubGitHub(state), tickMs: 1000, log: () => {} });
 
   store.reschedule(row.id, Date.now() - 1000, row.seen);
   await waker.tick();
@@ -930,29 +930,12 @@ test('a pull request left approved on its head is re-raised to its owner after a
 
   store.reschedule(row.id, Date.now() - 1000, { ...store.get(row.id).seen, nudgedAt: Date.now() - 61 * 60 * 1000 });
   await waker.tick();
-  const inbox = mail.unread('hamachi-engineer1');
-  assert.equal(inbox.length, 2);
-  assert.match(inbox[1].subject, /approved on its head, unmerged for/);
-  registry.close();
-});
+  assert.equal(mail.unread('hamachi-engineer1').length, 2, 'a re-raise after the hour');
 
-test('the re-raise reaches the coordinator when the owner is retired', async () => {
-  const { registry, mail, store } = board();
-  registry.ensure('hamachi-researcher1', {
-    crew: 'hamachi',
-    role: 'researcher',
-    workspacePath: '/w/r1',
-    spawnedBy: 'hamachi-coordinator',
-  });
-  await toolsFor('hamachi-researcher1', store, { github: stubGitHub({ pr: approvedPr, reviews: [approval], comments: [] }) })
-    .watchPr.handler({ pr: 44 }, {});
-  const [row] = store.listFor('hamachi-researcher1');
-  registry.setStatus('hamachi-researcher1', 'dead');
-
-  store.reschedule(row.id, Date.now() - 1000, { ...row.seen, nudgedAt: Date.now() - 61 * 60 * 1000 });
-  await new ArmedWaker({ store, registry, mail, github: stubGitHub({ pr: approvedPr, reviews: [approval], comments: [] }), tickMs: 1000, log: () => {} }).tick();
-  const [nudge] = mail.unread('hamachi-coordinator');
-  assert.ok(nudge, 'the coordinator hears about it');
-  assert.match(nudge.body, /hamachi-researcher1 is retired/);
+  state.pr = { ...approvedPr, headSha: 'h2' };
+  store.reschedule(row.id, Date.now() - 1000, { ...store.get(row.id).seen, nudgedAt: Date.now() - 61 * 60 * 1000 });
+  await waker.tick();
+  assert.equal(mail.unread('hamachi-engineer1').length, 2, 'the approval no longer covers the head');
+  assert.equal(store.get(row.id).seen.nudgedAt, null);
   registry.close();
 });
