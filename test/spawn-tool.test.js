@@ -322,7 +322,9 @@ test('a coordinator retires a crewmate: session released, wakes disarmed, mail n
   assert.deepEqual(board.started, [], 'mail must not resurrect a retired agent');
 
   const again = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-researcher1' });
-  assert.match(again.content[0].text, /already retired/);
+  assert.equal(again.isError, undefined, 'a second retire is not an error');
+  assert.equal(board.released.length, 1, 'and releases nothing again');
+  assert.equal(board.disarmed.length, 1);
 });
 
 test('retire is refused to non-coordinators, for coordinators, and for unknown ids', async () => {
