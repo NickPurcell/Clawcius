@@ -335,6 +335,10 @@ test('retire is refused to non-coordinators, for coordinators, and for unknown i
   assert.equal(self.isError, true);
   const unknown = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-engineer9' });
   assert.equal(unknown.isError, true);
+  board.registry.ensure('clawcius-engineer1', { crew: 'clawcius', role: 'engineer', workspacePath: '/w/other' });
+  const otherCrew = await board.retireOf('hamachi-coordinator').handler({ id: 'clawcius-engineer1' });
+  assert.equal(otherCrew.isError, true);
+  assert.equal(board.registry.get('clawcius-engineer1').status, 'live');
   assert.equal(board.registry.get('hamachi-engineer1').status, 'live');
   assert.deepEqual(board.released, []);
 });

@@ -718,8 +718,10 @@ export class SessionManager {
                     capacity: () => this.capacity,
                     log: this.#spawnLog,
                     disarm: (owner) => {
-                      const held = this.#armed?.store.listFor(owner) ?? [];
-                      for (const condition of held) this.#armed?.store.disarm(condition.id);
+                      const store = this.#armed?.store;
+                      if (!store) return 0;
+                      const held = store.listFor(owner);
+                      for (const condition of held) store.disarm(condition.id);
                       return held.length;
                     },
                     release: (id) => this.release(id),
