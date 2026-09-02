@@ -31,6 +31,10 @@ export type SpawnToolOptions = {
   capacity: () => { live: number; max: number; idleTimeoutMinutes: number };
   /** Journal, so a spawn is legible from outside the turn that did it. */
   log: (line: string) => void;
+  /** Disarm every condition `owner` holds; returns how many. */
+  disarm: (owner: string) => number;
+  /** End `id`'s live session, if it has one. */
+  release: (id: string) => Promise<void>;
 };
 
 function refuse(text: string) {
@@ -59,15 +63,54 @@ const DESCRIPTION = [
   'The id is minted here as <crew>-<role><n> and returned; there is no id argument.',
   'A workspace directory and a registry row are created, and `instructions` is',
   'delivered as mail from you, which starts its first turn. Reach it afterwards',
-  'with sendMail. It stays on the board between tasks; there is no way to remove it.',
+  'with sendMail. It stays on the board between tasks until you retire it.',
 ].join('\n');
 
-/** The spawn tool, built for one session. */
+const RETIRE_DESCRIPTION = [
+  'Retire an agent of your crew: its session ends, its armed wakes are disarmed,',
+  'and mail no longer wakes it. Only within your own crew, and never a',
+  'coordinator. The row stays on the board as history.',
+].join('\n');
+
+/** The spawn and retire tools, built for one session. */
 export function buildSpawnTools(
   agentId: string,
   options: SpawnToolOptions,
 ): SdkMcpToolDefinition<any>[] {
-  const { registry, mail, workspaceRoot, charter: renderCharter, wakesOnMail, capacity, log } = options;
+  const { registry, mail, workspaceRoot, charter: renderCharter, wakesOnMail, capacity, log, disarm, release } =
+    options;
+
+  const retire = tool(
+    'retire',
+    RETIRE_DESCRIPTION,
+    { id: z.string().describe('The agent to retire, e.g. hamachi-researcher2.') },
+    async ({ id }) => {
+      const caller = registry.get(agentId);
+      if (!caller) return refuse(`Not retired — ${agentId} has no row on this board.`);
+      if (caller.role !== 'coordinator') {
+        return refuse(`Not retired — only a coordinator may retire; ${caller.id} is a ${caller.role}.`);
+      }
+      const target = registry.get(id.trim());
+      if (!target) return refuse(`Not retired — no agent "${id}" on this board.`);
+      if (target.crew !== caller.crew) {
+        return refuse(`Not retired — ${target.id} is ${target.crew}'s, not ${caller.crew}'s.`);
+      }
+      if (target.role === 'coordinator') {
+        return refuse(`Not retired — ${target.id} is a coordinator; the operator retires those.`);
+      }
+      if (target.status !== 'live') return say(`${target.id} is already retired.`);
+
+      registry.setStatus(target.id, 'dead');
+      const disarmed = disarm(target.id);
+      await release(target.id);
+      log(`${caller.id} retired ${target.id} (${target.role}); ${disarmed} armed condition(s) disarmed`);
+      return say(
+        `Retired ${target.id}. Its session is closed, ${disarmed} armed condition(s) are disarmed, ` +
+          'and mail will not wake it again.',
+      );
+    },
+    { alwaysLoad: true },
+  );
 
   const spawn = tool(
     'spawn',
@@ -97,7 +140,7 @@ export function buildSpawnTools(
         );
       }
 
-      const wanted = typeof role === 'string' ? role.trim().toLowerCase() : '';
+      const wanted = role.trim().toLowerCase();
       if (!(SPAWNABLE_ROLES as readonly string[]).includes(wanted)) {
         if (wanted === 'coordinator') {
           return refuse('Not spawned — a coordinator cannot be spawned; the operator mints one.');
@@ -108,7 +151,7 @@ export function buildSpawnTools(
       }
       const newRole = wanted as AgentRole;
 
-      const brief = typeof instructions === 'string' ? instructions.trim() : '';
+      const brief = instructions.trim();
       if (!brief) {
         return refuse('Not spawned — say what the agent is for; an empty brief wakes it to nothing.');
       }
@@ -198,5 +241,5 @@ export function buildSpawnTools(
     { alwaysLoad: true },
   );
 
-  return [spawn];
+  return [spawn, retire];
 }

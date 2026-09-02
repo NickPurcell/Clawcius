@@ -80,7 +80,7 @@ export class MailWaker {
     try {
       for (const line of this.#options.mail.importSpool()) this.#options.log(line);
       for (const agent of this.#options.registry.listByCrew(this.#options.crew)) {
-        this.#consider(agent);
+        if (agent.status === 'live') this.#consider(agent);
       }
     } finally {
       this.#sweeping = false;
@@ -125,15 +125,6 @@ export class MailWaker {
       return;
     }
     this.#capped.delete(agent.id);
-
-    if (agent.status !== 'live') {
-      log(
-        `${agent.id} is dead and has ${pending.length} unread message(s) — not waking it. ` +
-          'Mail does not resurrect: a killed agent that any crewmate could bring back by ' +
-          'writing to it was never killed. Resurrect it and this is its first turn.',
-      );
-      return;
-    }
 
     const context: WakeContext = {
       kind: 'mail',

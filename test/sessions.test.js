@@ -423,7 +423,7 @@ function boardPool(options = {}) {
   return { manager, registry, mail, built };
 }
 
-test("a coordinator's session is offered the spawn tool", async () => {
+test("a coordinator's session is offered the spawn and retire tools", async () => {
   const { manager, registry, built } = boardPool();
   registry.ensure('hamachi-coordinator', {
     crew: CREW,
@@ -432,7 +432,7 @@ test("a coordinator's session is offered the spawn tool", async () => {
   });
 
   manager.acquire('hamachi-coordinator', events);
-  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'sendMail', 'spawn']);
+  assert.deepEqual(toolNames(built[0].mcpServers), ['checkMail', 'retire', 'sendMail', 'spawn']);
   await manager.shutdown();
 });
 
