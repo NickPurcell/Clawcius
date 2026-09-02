@@ -9,4 +9,6 @@ container's entrypoint. A bot's working directory is
 restarts every bot on the new code.
 
 To add one: put it under `bots/<name>/`, add a manifest line, open a pull
-request. Tests under `bots/<name>/test_*.py` run in CI.
+request. Tests under `bots/<name>/test_*.py` run in CI. A bot that posts through
+the `discord` CLI passes `--no-nonce`, so its posts do not hold the agent's
+follow-up window open.
