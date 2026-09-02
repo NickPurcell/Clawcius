@@ -69,7 +69,7 @@ export function buildMailTools(
     'sendMail',
     describeSendMail(agentId),
     {
-      to: z.string().describe('An agent id, or "*" for the feed.'),
+      to: z.string().describe('An agent id, "<crew>-coordinator", or "*" for the feed.'),
       subject: z.string().optional().describe('One line. May be omitted.'),
       body: z.string().describe('The message.'),
     },

@@ -100,8 +100,9 @@ Copy `agent-config.yaml`: set `crew`, `displayName` and the channel ids, keep
 status file, git identity). A crew in a sandbox needs `<crew>-container.service`
 (copy `clawcius-container.service`, set `CLAWCIUS_CONTAINER`, `CLAWCIUS_STATE_DIR`,
 `CLAWCIUS_ENV_FILE`) and a snapshot timer; a crew on the host needs only a waker
-unit like `hamachi.service`. Both need a Discord application, an env file, and
-a Claude login in their `agent-home`. Hamachi can do all of it but the Discord
+unit like `hamachi.service`. Both need a Discord application, an env file, a
+Claude login in their `agent-home`, and a spool for mail from other crews'
+coordinators: `/var/spool/clawcius/<crew>`, mode 1733, owned by the crew's user. Hamachi can do all of it but the Discord
 application.
 
 ## 6. Memory

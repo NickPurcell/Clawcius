@@ -130,6 +130,11 @@ export class AgentRegistry {
     return this.#db;
   }
 
+  /** The crew this board belongs to. */
+  get crew(): string {
+    return this.#migrationCrew;
+  }
+
   get(id: string): AgentRecord | undefined {
     const row = this.#db
       .prepare(`SELECT ${COLUMNS} FROM agents WHERE id = ?`)
