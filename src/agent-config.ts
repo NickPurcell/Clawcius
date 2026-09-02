@@ -71,7 +71,6 @@ export type AgentConfig = {
     workspaceRoot: string;
   };
   discord: {
-    /** Empty means every channel the bot can see. */
     allowedChannelIds: string[];
     /** After the bot is addressed, seconds during which ordinary messages in that channel also reach the agent. */
     followUpWindowSeconds: number;
@@ -133,7 +132,7 @@ const Instance = z.strictObject({
   displayName: z.string().min(1).optional(),
   discord: z
     .strictObject({
-      allowedChannelIds: z.array(z.string()).min(1, 'discord.allowedChannelIds must name at least one channel'),
+      allowedChannelIds: z.array(z.string()).min(1, { error: 'must name at least one channel' }),
       followUpChannelIds: z.array(z.string()).default([]),
       alwaysOnChannelIds: z.array(z.string()).default([]),
     }),

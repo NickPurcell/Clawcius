@@ -57,6 +57,9 @@ test('every instance path and identity derives from crew', () => {
 
 test('an instance must name at least one allowed channel', () => {
   assert.throws(() => loadAgentConfig(writeInstance(['crew: x', 'discord:', '  allowedChannelIds: []'])), /allowedChannelIds/);
+  const dir = mkdtempSync(join(tmpdir(), 'agent-config-nochannel-'));
+  writeFileSync(join(dir, 'inst.yaml'), `extends: ${BASE}\ncrew: x\n`);
+  assert.throws(() => loadAgentConfig(join(dir, 'inst.yaml')), /allowedChannelIds/);
 });
 
 test('crew is required and must be a short lowercase identifier', () => {
