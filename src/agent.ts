@@ -606,6 +606,8 @@ export class SessionManager {
         spawnedBy: row.spawnedBy,
       };
     }
+    // A channel the registry has never seen gets a coordinator; allowedChannelIds is the only gate.
+    console.warn(`[registry] no row for ${agentId}; minting a ${DEFAULT_CHANNEL_ROLE} for crew ${config().agent.clawsky.crew}`);
     return {
       crew: config().agent.clawsky.crew,
       role: DEFAULT_CHANNEL_ROLE,

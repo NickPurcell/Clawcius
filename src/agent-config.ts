@@ -133,11 +133,10 @@ const Instance = z.strictObject({
   displayName: z.string().min(1).optional(),
   discord: z
     .strictObject({
-      allowedChannelIds: z.array(z.string()).default([]),
+      allowedChannelIds: z.array(z.string()).min(1, 'discord.allowedChannelIds must name at least one channel'),
       followUpChannelIds: z.array(z.string()).default([]),
       alwaysOnChannelIds: z.array(z.string()).default([]),
-    })
-    .prefault({}),
+    }),
   container: z.strictObject({ enabled: z.boolean().default(true) }).prefault({}),
 });
 
