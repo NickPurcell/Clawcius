@@ -66,7 +66,7 @@ function run({
         UNITS: units,
       },
     });
-    return { out, why: /^WHY=(.*)$/m.exec(out)[1], healthy: out.includes('HEALTHY=yes') };
+    return { why: /^WHY=(.*)$/m.exec(out)[1], healthy: out.includes('HEALTHY=yes') };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
