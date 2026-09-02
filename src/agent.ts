@@ -457,6 +457,7 @@ export class AgentSession {
           numTurns: message.num_turns,
           durationMs: message.duration_ms,
           subtype: message.subtype,
+          drained: this.#closed,
           apiError: this.#apiErrorThisTurn,
           apiErrorKind: this.#apiErrorKindThisTurn,
           retryScheduled: willRetry,

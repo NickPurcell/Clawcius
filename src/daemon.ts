@@ -199,12 +199,24 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
       }
 
       case 'reset': {
-        await sessions.release(channelId);
+        // Not awaited: the slot is free as soon as `release` returns its promise, but
+        // the drain waits on the SDK stream — 4m14s on 2026-08-24, which is how long
+        // `Session cleared` took to arrive.
+        const draining = sessions.release(channelId);
         // The session, not the identity: the registry row is what mail is
         // addressed to, so deleting it would throw away the mailbox along with
         // the transcript.
         registry.clearSession(channelId);
         await message.reply('Session cleared. The next mention starts fresh.');
+
+        // Not dropped either: an unobserved rejection is an unhandled one.
+        void draining
+          .then(() => process.stdout.write(`[clawcius ${channelId}] reset: old session drained\n`))
+          .catch((error) =>
+            process.stderr.write(
+              `[clawcius ${channelId}] reset: draining the old session failed — ${String(error)}\n`,
+            ),
+          );
         return true;
       }
 
@@ -363,7 +375,10 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
             // would cry outage at something about to fix itself.
             const respawnWillHandleIt =
               summary.apiErrorKind === 'authentication_failed' && !afterRespawn;
-            if (!summary.retryScheduled && !respawnWillHandleIt) {
+            // `announceOutage` is the only thing in the tree that speaks to a channel on
+            // a session's behalf, so the drain gate belongs here rather than in the
+            // session, which cannot tell a channel wiring from the mail one. #264.
+            if (!summary.retryScheduled && !respawnWillHandleIt && !summary.drained) {
               void announceOutage(channelId, summary);
             }
           }

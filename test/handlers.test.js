@@ -188,6 +188,7 @@ async function settle(times = 10) {
 
 const authFailure = (overrides = {}) => {
   const base = {
+    drained: false,
     isError: false,
     costUsd: 0,
     numTurns: 1,
@@ -218,6 +219,7 @@ const authFailure = (overrides = {}) => {
 };
 
 const cleanTurn = () => ({
+  drained: false,
   isError: false,
   costUsd: 0.42,
   numTurns: 3,
@@ -458,6 +460,31 @@ test('!reset clears the session and keeps the row, because the row is the mailbo
   assert.match(msg.replies[0], /Session cleared/);
 });
 
+test('!reset replies BEFORE the old session finishes draining (#264)', async () => {
+  // The harness's release resolves at once, so blocking and not-blocking look
+  // identical to every other test. This one holds the drain open.
+  const { handlers, sessions, registry } = harness();
+  let finishDrain;
+  const drained = new Promise((resolve) => {
+    finishDrain = resolve;
+  });
+  sessions.release = async (channelId) => {
+    sessions.released.push(channelId);
+    await drained;
+  };
+
+  const msg = message({ content: `<@${BOT}> !reset`, mentioned: true });
+  await handlers.handleMessage(msg);
+
+  // The drain has NOT finished, and the user has already been answered.
+  assert.match(msg.replies[0], /Session cleared/, 'the reply must not wait on the drain');
+  assert.deepEqual(sessions.released, [CHANNEL]);
+  assert.deepEqual(registry.cleared, [CHANNEL], 'and the session id is cleared either way');
+
+  finishDrain();
+  await drained;
+});
+
 test('a ! line inside a follow-up window is text for the agent, not a command', async () => {
   const { handlers, sessions } = harness({
     config: { discord: { followUpWindowSeconds: 300 } },
@@ -592,6 +619,34 @@ test('a terminal refusal that no respawn will handle is announced', async () => 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /the API refused it \(`billing_error`\)/);
   assert.match(log, /not retrying — this one does not clear on its own/);
+});
+
+test('a turn from a DISCARDED session does not announce in the channel (#264)', async () => {
+  // During the 529 outage the operator typed !reset and was then told TWICE by
+  // the session they had just killed that the API had refused them.
+  const { handlers, sessions, sent } = harness();
+  handlers.deliver(CHANNEL, buffered(), true);
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ drained: true }));
+    await settle();
+  });
+
+  assert.deepEqual(sent, [], 'a session the user discarded must not speak as the bot');
+});
+
+test('and the SAME turn from a live session does announce — the control', async () => {
+  // Without this, the assertion above would hold if the harness never announced.
+  const { handlers, sessions, sent } = harness();
+  handlers.deliver(CHANNEL, buffered(), true);
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ drained: false }));
+    await settle();
+  });
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /re-login on the host/);
 });
 
 test('an auth failure on the FIRST attempt is left to the respawn', async () => {
