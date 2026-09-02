@@ -115,11 +115,13 @@ class Client:
     def guild_channels(self, guild_id):
         return self.get(f"/guilds/{guild_id}/channels")
 
-    def send_message(self, channel_id, content, reply_to=None, files=None):
+    def send_message(self, channel_id, content, reply_to=None, files=None, nonce="agent"):
         """Post a message, with attachments when `files` is non-empty."""
         # The nonce comes back on the gateway; the waker keeps the follow-up
-        # window open only for messages carrying it (src/daemon.ts).
-        payload = {"content": content or "", "nonce": "agent"}
+        # window open only for messages carrying it. None omits it.
+        payload = {"content": content or ""}
+        if nonce:
+            payload["nonce"] = nonce
         if reply_to:
             # fail_if_not_exists=False degrades to a plain message rather than
             # erroring if the target was deleted between read and reply.

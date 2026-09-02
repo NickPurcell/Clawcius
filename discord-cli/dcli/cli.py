@@ -185,7 +185,7 @@ def cmd_send(args):
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(channel_id, content, files=files)
+        sent = client.send_message(channel_id, content, files=files, nonce=None if args.no_nonce else "agent")
     _out(render.slim_message(sent), lambda m: f"sent {m['id']}")
 
 
@@ -196,7 +196,9 @@ def cmd_reply(args):
     guild_id = config.get_guild_id()
     with Client() as client:
         channel_id = resolve.resolve_channel(client, guild_id, args.channel)
-        sent = client.send_message(channel_id, content, reply_to=message_id, files=files)
+        sent = client.send_message(
+            channel_id, content, reply_to=message_id, files=files, nonce=None if args.no_nonce else "agent"
+        )
     _out(render.slim_message(sent), lambda m: f"replied {m['id']}")
 
 
@@ -370,6 +372,7 @@ def build_parser():
     p.add_argument("--full", action="store_true", help="Emit raw Discord objects instead of slim ones.")
 
     p = add("send", cmd_send, "Send a message to a channel. Reads stdin when --text is omitted.")
+    p.add_argument("--no-nonce", action="store_true", help="Post without the agent stamp; for daemons.")
     p.add_argument("--channel", "-c", required=True, help="Channel name or ID.")
     p.add_argument("--text", "-t", help="Message text. If omitted, read from stdin.")
     p.add_argument(
@@ -386,6 +389,7 @@ def build_parser():
     )
 
     p = add("reply", cmd_reply, "Reply to a specific message.")
+    p.add_argument("--no-nonce", action="store_true", help="Post without the agent stamp; for daemons.")
     p.add_argument("--message", "-m", required=True, help="ID of the message to reply to.")
     p.add_argument("--channel", "-c", required=True, help="Channel name or ID containing that message.")
     p.add_argument("--text", "-t", help="Reply text. If omitted, read from stdin.")
