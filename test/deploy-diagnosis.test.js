@@ -18,7 +18,7 @@ const EXTRACT =
 const PRELUDE = `
 block=$(awk '/^# --- health check helpers/{f=1} /^# --- end health check helpers/{e=1; exit} f {print} END{exit !e}' "$DEPLOY_SH") || exit 90
 eval "$block"
-eval "$(grep -E '^(JOURNAL_READ_MAX|JOURNAL_MAX_BYTES)=[0-9]+$' "$DEPLOY_SH")"
+eval "$(grep -E '^(JOURNAL_READ_MAX|JOURNAL_MAX_BYTES|JOURNAL_TIMEOUT)=[0-9]+$' "$DEPLOY_SH")"
 sleep() { SECONDS=$((SECONDS + 5)); }   # the 90s poll, without waiting 90 seconds for it
 HEALTH_WHY=""; HEALTH_UNITS=""
 `;
@@ -63,6 +63,8 @@ const JOURNALCTL = [
   'done',
   'echo "$unit" >> "$d/journalctl.calls"',
   'cat "$d/journal.$(basename "$unit" .service)" 2>/dev/null || true',
+  '[ -f "$d/hang" ] && sleep 30',   // a journal that never finishes, for the timeout bound
+  'exit 0',
 ].join('\n');
 
 function shell(snippet, { files = {}, crews = '', units = 'clawcius-status clawcius hamachi',
@@ -232,6 +234,24 @@ test('capture redacts before quoting, so a secret never reaches the mail body', 
   assert.match(r.out, /\[redacted-userinfo\]/);
 });
 
+test('a journal that hangs is cut off, and the block says so rather than looking whole', () => {
+  // JOURNAL_TIMEOUT is overridden to keep the suite quick; the mechanism is what is under
+  // test here, and that deploy.sh passes the real constant to `timeout` is asserted below.
+  const r = shell('JOURNAL_TIMEOUT=2; capture clawcius 100', {
+    files: { 'journal.clawcius': 'partial line before the hang\n', hang: '' },
+  });
+  assert.match(r.out, /\| partial line before the hang/);
+  assert.match(r.out, /the read was cut off after 2s so the journal may continue/);
+});
+
+test('a journal that completes says nothing about being cut off', () => {
+  // The announcement has to be conditional: a trailer that always claims truncation is
+  // as useless as one that never does.
+  const r = shell('capture clawcius 100', { files: { 'journal.clawcius': 'all of it\n' } });
+  assert.match(r.out, /bytes dropped/);
+  assert.doesNotMatch(r.out, /cut off after/);
+});
+
 // --------------------------------------------------- the boundary between trusted and not
 
 test('healthy() never reads the journal, so untrusted text cannot reach HEALTH_WHY', () => {
@@ -255,6 +275,11 @@ test('the capture happens before the revert, which would replace the failing sta
   const revert = SRC.indexOf('switch_to "$CURRENT"');
   assert.ok(capture > 0 && revert > 0, 'both lines must exist');
   assert.ok(capture < revert, 'capture must precede the revert that restarts the units');
+});
+
+test('the journal read is bounded by the real JOURNAL_TIMEOUT constant', () => {
+  assert.match(SRC, /^JOURNAL_TIMEOUT=\d+$/m);
+  assert.match(SRC, /timeout \$JOURNAL_TIMEOUT journalctl/);
 });
 
 test('the untrusted capture reaches the mail body and never the subject', () => {

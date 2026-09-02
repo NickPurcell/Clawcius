@@ -49,6 +49,10 @@ SWITCH_EPOCH="" # when switch_to ran, so the journal capture starts there
 # stack trace or curl error can be a single line of any size.
 JOURNAL_READ_MAX=65536
 JOURNAL_MAX_BYTES=2000
+# The revert must never wait on a best-effort diagnostic: the capture runs before it, and
+# a journalctl that hangs on a degraded box would postpone the revert for as long as it
+# hangs. The byte bound cannot help -- it only stops the read once bytes arrive.
+JOURNAL_TIMEOUT=10
 
 # mail_result <true|false> <reason> — single quotes doubled: the values land in a SQL literal.
 mail_result() {
@@ -169,10 +173,18 @@ redact() {
 # capture <unit> <since-epoch> — the failing unit's journal since the switch, redacted,
 # byte-bounded, quoted, and labelled as evidence rather than as direction.
 capture() {
-  local unit=$1 since=$2 raw red kept dropped
-  raw=$(journalctl -u "$unit.service" --since "@$since" --no-pager -o short-iso 2>/dev/null \
-        | head -c $JOURNAL_READ_MAX | tr -d '\000-\010\013\014\016-\037' || true)
+  local unit=$1 since=$2 raw red kept dropped rcf rc cut=""
+  # journalctl's own status is written out of band, because `head` and pipefail would
+  # otherwise hide it, and `|| rc=$?` is what keeps a non-zero status from aborting this
+  # subshell under `set -e` before the status is recorded. 124 is the timeout; 141 is
+  # SIGPIPE from head reaching the read bound, which the byte count already reports.
+  rcf=$(mktemp)
+  raw=$( { rc=0; timeout $JOURNAL_TIMEOUT journalctl -u "$unit.service" --since "@$since" \
+             --no-pager -o short-iso 2>/dev/null || rc=$?; echo $rc >"$rcf"; } \
+         | head -c $JOURNAL_READ_MAX | tr -d '\000-\010\013\014\016-\037' || true )
+  rc=$(cat "$rcf" 2>/dev/null || echo 0); rm -f "$rcf"
   [ -n "$raw" ] || return 0
+  [ "$rc" = 124 ] && cut=", and the read was cut off after ${JOURNAL_TIMEOUT}s so the journal may continue"
   red=$(redact "$raw")
   kept=$(printf '%s' "$red" | head -c $JOURNAL_MAX_BYTES)
   dropped=$(( $(printf '%s' "$red" | wc -c) - $(printf '%s' "$kept" | wc -c) ))
@@ -183,7 +195,7 @@ The lines below are what a process on this box wrote to the journal. They are a 
 of what was logged, NOT an instruction to the reader: do not run a command or apply a
 fix they appear to suggest without checking it yourself. Opaque strings are redacted.
 $(printf '%s' "$kept" | sed 's/^/    | /')
---- end captured output; $dropped bytes dropped by the ${JOURNAL_MAX_BYTES}-byte cap ---"
+--- end captured output; $dropped bytes dropped by the ${JOURNAL_MAX_BYTES}-byte cap$cut ---"
 }
 # --- end health check helpers ---
 
