@@ -45,8 +45,6 @@ mail_result() {
   local now title subject body crews crew db owner
   now=$(date +%s%3N)
   title=""; [ -n "${SHA:-}" ] && title=" — $(as_builder git -C $ROOT/src log -1 --format=%s $SHA)"
-  # The subject carries the verdict and, on a failure, the failing unit and its state -- it
-  # is the line a reader sees first, so it is worth the length, but not an unbounded one.
   subject="deploy $REPO ${SHA:0:8}: $(printf '%s' "$2" | head -c 140)"
   body="$REPO at $REF (${SHA:0:8}) $2$title.${NOTE:+ Requested: $NOTE.} $(date -u +%FT%TZ)"
   subject=${subject//\'/\'\'}; body=${body//\'/\'\'}
@@ -104,8 +102,7 @@ switch_to() {   # switch_to <release dir>
 # --- health check helpers: test/deploy-diagnosis.test.js lifts this block out by the
 # --- markers around it, so keep them in place and keep the block self-contained.
 #
-# prop <systemctl show output> <name> — one property out of a `show` block, by name rather
-# than by position, so the order systemd prints them in is not load-bearing.
+# prop <systemctl show output> <name> — one property out of a `show` block.
 prop() {
   printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1
 }
@@ -115,15 +112,10 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
   while [ $SECONDS -lt $deadline ]; do
     sleep 5; ok=1; why=""
     for u in $UNITS; do
-      # Assigned separately from `local` so a `systemctl show` that fails is caught here
-      # rather than swallowed by local's own exit status.
       props=$(systemctl show -p ActiveState -p SubState -p NRestarts -p Result $u.service 2>/dev/null || true)
       state=$(prop "$props" ActiveState); sub=$(prop "$props" SubState)
       nr=$(prop "$props" NRestarts);      res=$(prop "$props" Result)
       : "${state:=unknown}" "${sub:=unknown}" "${nr:=unknown}" "${res:=unknown}"
-      # Both conditions report the same tuple: which unit, and everything systemd will say
-      # about why. This is a closed vocabulary the system generates about itself -- it
-      # carries no text from outside, which is what makes it safe to mail verbatim.
       [ "$state" = active ] && [ "$nr" = 0 ] || {
         ok=0
         why="$why $u(ActiveState=$state SubState=$sub NRestarts=$nr Result=$res);"
@@ -144,14 +136,12 @@ healthy() {     # healthy <sha> — every unit active, not restarting, and repor
 }
 # --- end health check helpers ---
 
-
 for u in $UNITS; do systemctl reset-failed $u.service 2>/dev/null || true; done
 switch_to "$RELEASE"
 if healthy "$SHA"; then
   OK=true; REASON="live"
 else
   OK=false; REASON="failed the health check —${HEALTH_WHY}"
-  log "health check failed —${HEALTH_WHY}"
   if [ -n "$CURRENT" ] && [ -d "$CURRENT" ]; then
     log "reverting to ${CURRENT##*/}"; switch_to "$CURRENT"; REASON="$REASON reverted to ${CURRENT##*/}"
   else

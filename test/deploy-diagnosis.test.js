@@ -5,25 +5,13 @@ import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// deploy.sh's healthy() is exercised on its own: the rest of the script builds releases and
-// moves symlinks, which a test has no business doing. It is lifted out of the real file
-// rather than duplicated here, so a change to it breaks this test instead of quietly
-// leaving the test exercising a stale copy.
-//
-// Lifted out between explicit markers in deploy.sh rather than by counting braces. An
-// earlier version of this file counted `}` lines, missed a one-line function, and so
-// eval'd the whole tail of deploy.sh -- switch_to, mail_result and a prune loop containing
-// `rm -rf`. It was harmless only because $ROOT happened to be unset. Hence both the markers
-// and the tripwire below: a harness that runs more than it means to must fail loudly.
+// The helpers are lifted out of deploy.sh between its two markers; awk exits non-zero if it
+// never reached the end marker, so an extraction that overran the block fails the run.
 const EXTRACT =
-  `awk '/^# --- health check helpers/{f=1} /^# --- end health check helpers/{exit} f' "$DEPLOY_SH"`;
+  `awk '/^# --- health check helpers/{f=1} /^# --- end health check helpers/{e=1; exit} f {print} END{exit !e}' "$DEPLOY_SH"`;
 
 const DRIVER = `
-block=$(${EXTRACT})
-case "$block" in
-  *switch_to*|*mail_result*|*"rm -rf"*|*as_builder*)
-    echo "EXTRACTION ESCAPED THE HELPER BLOCK" >&2; exit 90 ;;
-esac
+block=$(${EXTRACT}) || exit 90
 eval "$block"
 sleep() { SECONDS=$((SECONDS + 5)); }   # the 90s poll, without waiting 90 seconds for it
 HEALTH_WHY=""
@@ -31,9 +19,8 @@ if healthy "$SHA_IN"; then echo "HEALTHY=yes"; else echo "HEALTHY=no"; fi
 echo "WHY=$HEALTH_WHY"
 `;
 
-// systemctl show -p A -p B ... <unit>.service — answers with `Name=value` lines, in the
-// order asked for. The stub reads what to report from files beside itself, so no shell
-// variable indirection is needed.
+// systemctl show -p A -p B ... <unit>.service — answers with `Name=value` lines. The stub
+// reads what to report from files beside itself.
 const SYSTEMCTL = [
   '#!/bin/sh',
   'd=$(dirname "$0")',
@@ -56,10 +43,15 @@ const SYSTEMCTL = [
   'done',
 ].join('\n');
 
-function run({ files = {}, crews = '', units = 'clawcius-status clawcius hamachi' } = {}) {
+function run({
+  files = {},
+  crews = '',
+  units = 'clawcius-status clawcius hamachi',
+  systemctl = SYSTEMCTL,
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'deploy-diag-'));
   try {
-    writeFileSync(join(dir, 'systemctl'), SYSTEMCTL);
+    writeFileSync(join(dir, 'systemctl'), systemctl);
     chmodSync(join(dir, 'systemctl'), 0o755);
     for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
 
@@ -68,9 +60,7 @@ function run({ files = {}, crews = '', units = 'clawcius-status clawcius hamachi
       env: {
         ...process.env,
         PATH: `${dir}:${process.env.PATH}`,
-        // Overridable so the suite can be pointed at a deliberately broken copy, to check
-        // these tests still fail when the behaviour they describe is removed.
-        DEPLOY_SH: process.env.DEPLOY_SH ?? 'deploy/deploy.sh',
+        DEPLOY_SH: 'deploy/deploy.sh',
         SHA_IN: 'abc123',
         CREWS: crews,
         UNITS: units,
@@ -116,45 +106,24 @@ test('only the failing unit is reported, not the ones that were fine', () => {
 });
 
 test('properties are read by name, so the order systemd prints them in does not matter', () => {
-  // A systemctl that answers in a fixed, different order than it was asked in.
-  const dir = mkdtempSync(join(tmpdir(), 'deploy-order-'));
-  try {
-    writeFileSync(join(dir, 'systemctl'), [
+  const r = run({
+    units: 'clawcius',
+    systemctl: [
       '#!/bin/sh',
       'echo "Result=timeout"',
       'echo "NRestarts=7"',
       'echo "SubState=dead"',
       'echo "ActiveState=failed"',
-    ].join('\n'));
-    chmodSync(join(dir, 'systemctl'), 0o755);
-    const out = execFileSync('bash', ['-c', DRIVER], {
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`,
-             DEPLOY_SH: process.env.DEPLOY_SH ?? 'deploy/deploy.sh',
-             SHA_IN: 'abc123', CREWS: '', UNITS: 'clawcius' },
-    });
-    assert.match(out, /clawcius\(ActiveState=failed SubState=dead NRestarts=7 Result=timeout\)/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    ].join('\n'),
+  });
+  assert.equal(r.healthy, false);
+  assert.match(r.why, /clawcius\(ActiveState=failed SubState=dead NRestarts=7 Result=timeout\)/);
 });
 
 test('a systemctl that answers nothing degrades to unknown rather than to an empty tuple', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'deploy-silent-'));
-  try {
-    writeFileSync(join(dir, 'systemctl'), '#!/bin/sh\nexit 1\n');
-    chmodSync(join(dir, 'systemctl'), 0o755);
-    const out = execFileSync('bash', ['-c', DRIVER], {
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`,
-             DEPLOY_SH: process.env.DEPLOY_SH ?? 'deploy/deploy.sh',
-             SHA_IN: 'abc123', CREWS: '', UNITS: 'clawcius' },
-    });
-    assert.match(out, /HEALTHY=no/);
-    assert.match(out, /clawcius\(ActiveState=unknown SubState=unknown NRestarts=unknown Result=unknown\)/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  const r = run({ units: 'clawcius', systemctl: '#!/bin/sh\nexit 1\n' });
+  assert.equal(r.healthy, false);
+  assert.match(r.why, /clawcius\(ActiveState=unknown SubState=unknown NRestarts=unknown Result=unknown\)/);
 });
 
 test('the crew status-file conditions name the crew and say which of the two failed', () => {
