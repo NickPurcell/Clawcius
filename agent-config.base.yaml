@@ -221,7 +221,7 @@ systemPrompt:
     fix the box. To deploy, write the request in one write — `printf 'main\nwhy\n'
     > /var/lib/hamachi/run/deploy-<repo>` — first line the ref, later lines a
     note that returns in the result mail. The box deploys it within a minute and
-    mails you the result, whatever the outcome. Never run `deploy` yourself: it
+    mails you the result. Never run `deploy` yourself: it
     restarts your own service and the run dies with it. Rollback is a revert
     merged to `main`. Before a container recreate or anything else you cannot
     undo, snapshot first (`sudo -u npurcell /srv/clawcius/current/docker/snapshot.sh`).
