@@ -29,7 +29,9 @@ const spawnBoard = () => {
 
   const workspaceRoot = mkdtempSync(join(tmpdir(), 'clawsky-workspaces-'));
   const logged = [];
-  const spawnOf = (agentId, wakesOnMail = true) =>
+  const released = [];
+  const disarmed = [];
+  const toolsOf = (agentId, wakesOnMail = true) =>
     buildSpawnTools(agentId, {
       registry,
       mail,
@@ -38,9 +40,18 @@ const spawnBoard = () => {
       wakesOnMail,
       capacity: () => ({ live: 1, max: 4, idleTimeoutMinutes: 30 }),
       log: (line) => logged.push(line),
-    })[0];
+      disarm: (owner) => {
+        disarmed.push(owner);
+        return 2;
+      },
+      release: async (id) => {
+        released.push(id);
+      },
+    });
+  const spawnOf = (agentId, wakesOnMail = true) => toolsOf(agentId, wakesOnMail)[0];
+  const retireOf = (agentId) => toolsOf(agentId)[1];
 
-  return { registry, mail, spawnOf, workspaceRoot, logged };
+  return { registry, mail, spawnOf, retireOf, workspaceRoot, logged, released, disarmed };
 };
 
 /** The same crew with a waker wired the way daemon.ts wires it, and `start` recorded instead of run. */
@@ -294,4 +305,36 @@ test('a spawned agent survives the process that spawned it', async () => {
   assert.equal(started.length, 2);
   assert.match(started[1].context.mail, /second task/);
   registry.close();
+});
+
+test('a coordinator retires a crewmate: session released, wakes disarmed, mail no longer wakes it', async () => {
+  const board = wakingBoard();
+  await board.spawnOf('hamachi-coordinator').handler({ role: 'researcher', instructions: 'Look.' });
+  board.started.length = 0;
+
+  const result = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-researcher1' });
+  assert.equal(result.isError, undefined, result.content[0].text);
+  assert.equal(board.registry.get('hamachi-researcher1').status, 'dead');
+  assert.deepEqual(board.released, ['hamachi-researcher1']);
+  assert.deepEqual(board.disarmed, ['hamachi-researcher1']);
+
+  board.mail.deliver({ author: 'hamachi-coordinator', recipient: 'hamachi-researcher1', subject: 'more', body: 'x' });
+  assert.deepEqual(board.started, [], 'mail must not resurrect a retired agent');
+
+  const again = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-researcher1' });
+  assert.match(again.content[0].text, /already retired/);
+});
+
+test('retire is refused to non-coordinators, for coordinators, and for unknown ids', async () => {
+  const board = spawnBoard();
+  await board.spawnOf('hamachi-coordinator').handler({ role: 'engineer', instructions: 'Build.' });
+
+  const byPoster = await board.retireOf('hamachi-poster').handler({ id: 'hamachi-engineer1' });
+  assert.equal(byPoster.isError, true);
+  const self = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-coordinator' });
+  assert.equal(self.isError, true);
+  const unknown = await board.retireOf('hamachi-coordinator').handler({ id: 'hamachi-engineer9' });
+  assert.equal(unknown.isError, true);
+  assert.equal(board.registry.get('hamachi-engineer1').status, 'live');
+  assert.deepEqual(board.released, []);
 });

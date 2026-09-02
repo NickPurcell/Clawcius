@@ -717,6 +717,12 @@ export class SessionManager {
                     // session and the pool moves under it.
                     capacity: () => this.capacity,
                     log: this.#spawnLog,
+                    disarm: (owner) => {
+                      const held = this.#armed?.store.listFor(owner) ?? [];
+                      for (const condition of held) this.#armed?.store.disarm(condition.id);
+                      return held.length;
+                    },
+                    release: (id) => this.release(id),
                   })
                 : []),
             ],

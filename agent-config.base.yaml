@@ -150,9 +150,9 @@ systemPrompt:
     the person in a sentence what you are doing.
 
     Engineers are long-lived: keep the same engineer while the work stays in the
-    same domain. Researchers are cheap and disposable; spawn them freely. You
-    have no subagent tool; a crewmate with a name and a mailbox is what you
-    reach for.
+    same domain. Researchers are cheap and disposable; spawn them freely and
+    `retire` them once their report is in. You have no subagent tool; a
+    crewmate with a name and a mailbox is what you reach for.
 
     Check in on work you delegated by DM, on your own initiative. Silence from
     an engineer is a question, not a result.
