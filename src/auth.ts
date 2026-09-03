@@ -140,12 +140,14 @@ export type AuthTarget = {
    * True when sessions run through `docker exec`.
    *
    * The login follows the session, and that is not a preference.
-   * `docker/run-container.sh` keeps each instance's login in the bind mount
-   * with THE CONTAINER AS THE ONLY WRITER, because sharing a credential across
-   * the gVisor boundary was tried twice — bind-mounted file, then
-   * directory-plus-symlink — and both times the container read a stale
-   * credential while the host's was current. Writing this one from the host
-   * would be that again.
+   * `docker/Dockerfile:51-54` states it: the agent home is bind-mounted from
+   * the instance's state dir and *"the container is its only writer and
+   * refreshes its own OAuth token; nothing here is shared with the host user"*.
+   * Sharing a credential across the gVisor boundary was tried twice —
+   * bind-mounted file, then directory-plus-symlink — and both times the
+   * container read a stale credential while the host's was current. A login run
+   * from the host writes into that private store from exactly the side those
+   * attempts failed on.
    */
   containerEnabled: boolean;
   containerName: string;
