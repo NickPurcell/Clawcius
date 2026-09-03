@@ -545,7 +545,6 @@ export class AuthOutage {
     /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
-    /** Where a person goes to fix it: one click, no code to fetch and carry. */
     loginPageUrl: string;
     send: (channelId: string, text: string) => Promise<void>;
     log: (line: string) => void;
@@ -601,7 +600,9 @@ export class AuthOutage {
         target,
         `🔑 **${this.#crew} cannot authenticate.** ${dead.why}, so no retry and no ` +
           `respawn will fix it — every turn is being refused.${heard}\n` +
-          `**Log me back in:** ${this.#loginPageUrl}`,
+          `**On the tailnet:** ${this.#loginPageUrl}\n` +
+          '**Without it:** @ me with `!auth` and I will post a link here, ' +
+          'then `!auth <code>` with what it gives you.',
       );
     } catch (error) {
       this.#log(`could not announce the dead credential: ${String(error)}`);
