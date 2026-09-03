@@ -186,7 +186,7 @@ export function startDoor(deps: DoorDeps, port: number): Server {
 }
 
 /** The mount as a directory: the page is served at its root, so it ends in a slash. */
-export function apiBase(mount: string): string {
+function apiBase(mount: string): string {
   return mount.replace(/\/?$/, '/');
 }
 
@@ -194,9 +194,7 @@ export function apiBase(mount: string): string {
  * The request path with the mount removed.
  *
  * `tailscale serve --set-path /login` may or may not strip the mount before
- * forwarding. Removing it here when it is present answers the same under either,
- * including at `/login` with no trailing slash — which is the address every
- * config and the announcement give out.
+ * forwarding. Removing it here when it is present answers the same under either.
  */
 export function withoutMount(mount: string, path: string): string {
   const base = apiBase(mount);

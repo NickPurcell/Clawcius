@@ -48,7 +48,6 @@ export type AgentConfig = {
     name: string;
     /** In-container path to the claude binary. */
     claudePath: string;
-    loginCommand: string[];
     stateDir: string;
     /** The Claude config dir: bind-mounted into the container, or CLAUDE_CONFIG_DIR without one. */
     agentHome: string;
@@ -151,10 +150,7 @@ const Base = z.strictObject({
     messageWake: z.string(),
     messageLine: z.string(),
   }),
-  container: z.strictObject({
-    claudePath: z.string().min(1),
-    loginCommand: z.array(z.string().min(1)).min(1),
-  }),
+  container: z.strictObject({ claudePath: z.string().min(1) }),
   model: z.string().min(1),
   modelByRole: z.partialRecord(z.enum(AGENT_ROLES), z.string().min(1)),
   maxTurns: z.number().min(0),
@@ -333,7 +329,6 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       enabled: instance.container.enabled,
       name: derived.containerName,
       claudePath: base.container.claudePath,
-      loginCommand: base.container.loginCommand,
       stateDir: derived.stateDir,
       agentHome: derived.agentHome,
       execEnvDir: derived.execEnvDir,

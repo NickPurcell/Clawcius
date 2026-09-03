@@ -110,7 +110,6 @@ test('the login runs where the credential is written', () => {
     claudePath: '/usr/local/bin/claude',
     hostClaudePath: 'claude',
     home: '/var/lib/clawcius/agent-home',
-    loginCommand: ['setup-token'],
   };
   const inContainer = authArgv(target, ['auth', 'login', '--claudeai']);
   assert.equal(inContainer.file, 'docker');
@@ -173,7 +172,7 @@ function fakeChild() {
 }
 
 const URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW';
-/** As `setup-token` draws it: the visible text wrapped, the whole URL in the hyperlink. */
+/** The visible text wrapped, the whole URL in the hyperlink. */
 const URL_LINE =
   'Browser didn\u2019t open? Use the url below to sign in\r\n' +
   `\u001b]8;id=1;${URL}\u0007https://claude.com/cai/oauth/authorize?code=true&client_i\u001b]8;;\u0007\r\n` +
@@ -185,7 +184,6 @@ const TARGET = {
   claudePath: '/usr/local/bin/claude',
   hostClaudePath: 'claude',
   home: '/var/lib/clawcius/agent-home',
-  loginCommand: ['setup-token'],
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
@@ -222,7 +220,10 @@ test('begin reads the URL out of what the CLI printed', async () => {
   const result = await started(login, spawned);
   assert.equal(result.url, URL);
   assert.equal(spawned[0].file, 'script');
-  assert.ok(spawned[0].args[1].endsWith("'clawcius-agent' '/usr/local/bin/claude' 'setup-token'"));
+  assert.ok(
+    spawned[0].args[1].endsWith("'clawcius-agent' '/usr/local/bin/claude' 'auth' 'login' '--claudeai'"),
+    spawned[0].args[1],
+  );
   assert.ok(spawned[0].args[1].startsWith("'docker' 'exec' '-it'"));
 });
 
@@ -281,7 +282,6 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
-  // CR, not LF: the prompt reads a terminal in raw mode, where Enter is CR.
   assert.deepEqual(spawned[0].child.written, ['lJ8x-Ab_c0D3#9PGDW\r']);
   // Never on a command line: /proc/<pid>/cmdline is world-readable.
   assert.equal(
@@ -458,8 +458,6 @@ test('a send that throws does not escape the announcer', async () => {
 });
 
 test('a refused code is answered when the prompt says so, not when the window closes', async () => {
-  // The process does not exit on a refusal — it offers a retry — so waiting for
-  // an exit would spend the whole exchange window on an answer already given.
   const { login, spawned } = loginHarness();
   await started(login, spawned);
 

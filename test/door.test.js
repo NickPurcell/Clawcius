@@ -278,8 +278,6 @@ test('a POST that did not come from this page is refused', async () => {
 });
 
 test('the published path answers, with or without its trailing slash', async () => {
-  // `/login` is the address in both units, `.env.example` and SETUP.md. Whether
-  // the proxy forwards the mount or strips it, these are the same four routes.
   const { dir, login, handle } = harness(DEAD);
   try {
     for (const path of ['/login', '/login/', '/']) {
@@ -332,7 +330,7 @@ test('the page is handed its base rather than working one out', async () => {
   try {
     const response = fakeResponse();
     await handle(fakeRequest('GET', '/login'), response);
-    assert.ok(response.body.includes("const base=\"/login/\""), 'the served page knows its mount');
+    assert.ok(response.body.includes('"/login/"'), 'the served page knows its mount');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -40,6 +40,15 @@ const TURN_MS = 120_000;
 const CREDENTIAL_FILE = '.credentials.json';
 
 /**
+ * What mints a credential.
+ *
+ * Not `setup-token`: that prints a token for `CLAUDE_CODE_OAUTH_TOKEN` and
+ * leaves `.credentials.json` untouched, which is the file this module, `auth
+ * status` and every session read.
+ */
+const LOGIN_COMMAND: readonly string[] = ['auth', 'login', '--claudeai'];
+
+/**
  * Whether the credential on disk is one a retry or a respawn could fix.
  *
  * `terminal` is anything no running process can recover from: a blank refresh
@@ -113,8 +122,6 @@ export type AuthTarget = {
   hostClaudePath: string;
   /** The agent home, passed as CLAUDE_CONFIG_DIR on the host path. */
   home: string;
-  /** The subcommand that mints a credential. */
-  loginCommand: readonly string[];
 };
 
 /** The command that reaches the same `claude` the agent authenticates as. */
@@ -248,7 +255,7 @@ export class AuthLogin {
     this.#lastStart = this.#now();
     this.stop();
 
-    const inner = authArgv(this.#target, this.#target.loginCommand, true);
+    const inner = authArgv(this.#target, LOGIN_COMMAND, true);
     const { file, args } = ptyArgv([inner.file, ...inner.args]);
     const env = inner.env;
     let child: LoginProcess;
@@ -316,9 +323,8 @@ export class AuthLogin {
    * readable through `/proc`. The outcome comes from `auth status` rather than
    * from the exit code, which can be 0 with nothing usable written.
    *
-   * It ends in a carriage return, not a newline. The prompt reads a terminal in
-   * raw mode, where Enter is CR: with LF the code arrives, echoes as asterisks,
-   * and simply sits there unsubmitted.
+   * It ends in a carriage return: the prompt reads a terminal in raw mode,
+   * where Enter is CR.
    */
   async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
@@ -343,6 +349,7 @@ export class AuthLogin {
 
     // A refused code does not end the process — the prompt offers a retry — so
     // waiting for an exit would spend the whole window on a known answer.
+    let refusal = '';
     const exited = await new Promise<boolean>((resolve) => {
       let seen = '';
       const settle = (value: boolean): void => {
@@ -351,7 +358,10 @@ export class AuthLogin {
       };
       pending.child.stdout?.on('data', (chunk) => {
         seen = (seen + String(chunk)).slice(-4096);
-        if (REFUSED.test(seen)) settle(false);
+        if (REFUSED.test(seen)) {
+          refusal = seen.replace(/\s+/g, ' ').trim().slice(-200);
+          settle(false);
+        }
       });
       pending.child.once('exit', () => settle(true));
       const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
@@ -365,7 +375,7 @@ export class AuthLogin {
     const status = await this.status();
     if (status.loggedIn === true) return { ok: true };
     if (status.loggedIn === false) {
-      return { ok: false, reason: 'not-taken', detail: status.detail };
+      return { ok: false, reason: 'not-taken', detail: refusal || status.detail };
     }
     return { ok: false, reason: 'unreadable', detail: status.detail };
   }
@@ -408,9 +418,8 @@ export class AuthLogin {
   /**
    * Whether the credential can run an ordinary turn, not merely authenticate.
    *
-   * `setup-token` asks for `user:inference` alone where a full login asks for
-   * the scopes a turn uses, so authenticating is not the same answer. This runs
-   * a real prompt through the same path a session takes.
+   * Authenticating and being able to run a turn are different questions. This
+   * runs a real prompt through the same path a session takes.
    */
   async verify(): Promise<{ turnRan: boolean; detail: string }> {
     const { file, args, env } = authArgv(this.#target, ['-p', 'reply with the single word: ok']);
