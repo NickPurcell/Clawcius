@@ -189,9 +189,10 @@ const TARGET = {
 /** An `AuthLogin` whose children are handed back for the test to drive. */
 function loginHarness({ now = () => NOW, target = TARGET, exchangeMs, urlWaitMs } = {}) {
   const spawned = [];
+  const logged = [];
   const login = new AuthLogin({
     target,
-    log: () => {},
+    log: (line) => logged.push(line),
     now,
     ...(exchangeMs === undefined ? {} : { exchangeMs }),
     ...(urlWaitMs === undefined ? {} : { urlWaitMs }),
@@ -201,7 +202,7 @@ function loginHarness({ now = () => NOW, target = TARGET, exchangeMs, urlWaitMs 
       return child;
     },
   });
-  return { login, spawned };
+  return { login, spawned, logged };
 }
 
 /** Only the logins: `auth status` and the container reap are other subcommands. */
@@ -302,11 +303,15 @@ test('a good code goes in on stdin and the answer comes from auth status', async
   assert.deepEqual(await submitting, { ok: true });
 });
 
-test('a code with no login waiting is refused before anything is spawned', async () => {
-  const { login, spawned } = loginHarness();
+test('a code with no login waiting is refused, and says so in the journal', async () => {
+  // The case that most needs to be visible afterwards, and the one that used to
+  // return before reaching any log line.
+  const { login, spawned, logged } = loginHarness();
   const outcome = await login.submit('lJ8x-Ab_c0D3#9PGDW');
   assert.equal(outcome.reason, 'none-waiting');
   assert.deepEqual(spawned, []);
+  assert.equal(logged.length, 1, 'a paste into a closed window is not silent');
+  assert.equal(logged[0].includes('lJ8x'), false, 'and the code itself is not in it');
 });
 
 test('an exchange that did not take is reported as not taken', async () => {

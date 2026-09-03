@@ -15,8 +15,17 @@ import type { TurnSummary } from './types.js';
 /** Gap between repeat announcements while a credential stays dead. */
 const REPEAT_MS = 4 * 60 * 60 * 1000;
 
-/** How long a started login is held waiting for its code before it is killed. */
-const LOGIN_IDLE_MS = 15 * 60 * 1000;
+/**
+ * How long a started login is held waiting for its code.
+ *
+ * Bounded only so a forgotten one is not held for the life of the process; the
+ * authorize URL's own `state` is what really expires, and a stale child is
+ * killed inside the container as well as here. The two failures are not
+ * symmetrical — too long leaves a challenge nobody spends, too short puts a
+ * dead end in front of someone halfway through signing in on a phone — so this
+ * is set on the generous side.
+ */
+const LOGIN_IDLE_MS = 60 * 60 * 1000;
 
 /** How long to wait for the login to print its URL. */
 const URL_WAIT_MS = 60_000;
@@ -334,10 +343,15 @@ export class AuthLogin {
 
     const pending = this.#pending;
     if (pending === null || pending.exited) {
-      return { ok: false, reason: 'none-waiting', detail: 'no login is waiting' };
+      // Logged before the return, and deliberately unmissable: someone pasting
+      // a code into a window that has closed is the case that most needs to be
+      // visible afterwards, and it was the one that left no trace at all.
+      this.#log('A CODE ARRIVED WITH NO LOGIN WAITING — the link had expired before it was used');
+      return { ok: false, reason: 'none-waiting', detail: 'that link has expired' };
     }
     if (pending.child.stdin === null) {
-      return { ok: false, reason: 'no-stdin', detail: 'the login has no stdin' };
+      this.#log('a code arrived but the waiting login has no stdin to write to');
+      return { ok: false, reason: 'no-stdin', detail: 'the login cannot be written to' };
     }
 
     // Length only: an unspent code is a credential.

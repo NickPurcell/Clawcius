@@ -123,7 +123,7 @@ function submitReply(outcome: SubmitOutcome): string {
     case 'bad-code':
       return `Not sending that: ${outcome.detail}.`;
     case 'none-waiting':
-      return 'No login is waiting for a code. Run `!auth` to start one.';
+      return 'That link has expired. Run `!auth` for a fresh one.';
     case 'not-taken':
       return `That did not take: ${outcome.detail}. Run \`!auth\` for a fresh link.`;
     case 'unreadable':

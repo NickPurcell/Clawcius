@@ -261,6 +261,25 @@ test('every response refuses to be framed or sniffed', async () => {
   }
 });
 
+test('an expired link is offered a new one rather than a diagnosis', async () => {
+  // A dead end is worse than a failure: a failure says what to do next.
+  const { dir, handle } = harness(DEAD, {
+    login: fakeLogin({ submit: { ok: false, reason: 'none-waiting', detail: 'that link has expired' } }),
+  });
+  try {
+    const response = fakeResponse();
+    await handle(fakeRequest('POST', '/code', JSON.stringify({ code: 'lJ8x-Ab_c0D3' })), response);
+    assert.equal(response.json().reason, 'none-waiting', 'the page needs this to re-offer the button');
+
+    const page = fakeResponse();
+    await handle(fakeRequest('GET', '/login'), page);
+    assert.ok(page.body.includes("b.reason==='none-waiting'"), 'and the page acts on it');
+    assert.ok(page.body.includes("id=\"s1msg\""), 'into a message it can replace');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a POST that did not come from this page is refused', async () => {
   // `tailscale serve` authenticates the node, not the request: a page the
   // operator has open elsewhere could otherwise kill a login that is waiting.
