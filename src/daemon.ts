@@ -28,6 +28,8 @@ import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import { sweepEnvFiles } from './container.js';
+import { AuthLogin, AuthOutage, type DeadCredential } from './auth.js';
+import type { SubmitOutcome } from './auth.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
 /** What the Discord handlers need, and nothing else; each entry is a thing a test can substitute. */
@@ -42,6 +44,10 @@ export type HandlerDeps = {
   readonly github: PullRequestSource | null;
   readonly windows: ConversationWindows;
   readonly alwaysOnChannels: ReadonlySet<string>;
+  /** Decides whether a refusal is a dead credential, and says so. */
+  readonly authOutage: AuthOutage;
+  /** The login behind `!auth`. */
+  readonly authLogin: AuthLogin;
 };
 
 /** A message as `handleMessageUpdate` reads it — an edit arrives partial. */
@@ -52,7 +58,7 @@ export type DiscordHandlers = {
   readonly bundler: MessageBundler;
   handleMessage: (message: Message) => Promise<void>;
   handleMessageUpdate: (updated: UpdatedMessage) => void;
-  handleCommand: (message: Message, command: string) => Promise<boolean>;
+  handleCommand: (message: Message, command: string, rest?: string) => Promise<boolean>;
   deliver: (channelId: string, buffered: BufferedMessage[], afterRespawn?: boolean) => void;
   announceOutage: (channelId: string, summary: TurnSummary) => Promise<void>;
   announceAtCapacity: (channelId: string, error: AtCapacityError) => Promise<void>;
@@ -67,13 +73,15 @@ export function mailWakeEvents(opts: {
   err: (line: string) => void;
   /** The mail-wake journal, for the completion line. Same sink as `woke X with N`. */
   log: (line: string) => void;
+  /** A refused turn with no retry coming. This wiring has no channel; the daemon decides what to say. */
+  onRefused?: (summary: TurnSummary) => void;
   agentId: string;
 }): {
   onDone: (summary: TurnSummary) => void;
   onError: (error: Error) => void;
   onNeedsRespawn: () => void;
 } {
-  const { persist, release, err, log, agentId } = opts;
+  const { persist, release, err, log, onRefused, agentId } = opts;
   return {
     onDone: (summary) => {
       persist();
@@ -85,6 +93,7 @@ export function mailWakeEvents(opts: {
               ? `  retry ${summary.retryAttempt} queued`
               : '  not retrying — mail left unread for the next sweep'),
         );
+        if (!summary.retryScheduled) onRefused?.(summary);
         return;
       }
 
@@ -104,6 +113,30 @@ export function mailWakeEvents(opts: {
       release();
     },
   };
+}
+
+/** What `!auth <code>` says back. */
+function submitReply(outcome: SubmitOutcome): string {
+  if (outcome.ok) return '**Authenticated.** Sessions will pick the new credential up.';
+  switch (outcome.reason) {
+    case 'bad-code':
+      return `Not sending that: ${outcome.detail}.`;
+    case 'none-waiting':
+      return 'No login is waiting for a code. Run `!auth` to start one.';
+    case 'not-taken':
+      return 'That did not take — `auth status` still says logged out. Run `!auth` for a fresh link.';
+    case 'unreadable':
+      return `Code accepted, but \`auth status\` could not be read back: ${outcome.detail}`;
+    default:
+      return `Could not hand the code to the login: ${outcome.detail}`;
+  }
+}
+
+/** Post to a channel by id. Throws; every caller decides for itself what a failure to speak is worth. */
+async function sendToChannel(client: Client, channelId: string, text: string): Promise<void> {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased() || !('send' in channel)) return;
+  await channel.send(text);
 }
 
 /** Cut to `max`, at a word boundary, marking that something was removed. */
@@ -148,12 +181,12 @@ export function outageMessage(summary: TurnSummary): string {
         `was cleared before the retry ran.\n${heard} Send it again.`
       );
     case 'credential-dead':
-      // The auth ladder is spent and a respawn has already failed: the only thing the channel ever hears about a dead token.
+      // The auth ladder is spent and a respawn has already failed, with a
+      // credential file that still reads as refreshable.
       return (
-        `⚠️ I could not authenticate to the API, and retrying did not fix it — ` +
-        `the credential on the host is not usable` +
+        `⚠️ I could not authenticate to the API, and retrying did not fix it` +
         (detail ? `: ${detail}` : '.') +
-        `\n${heard} This needs a re-login on the host.`
+        `\n${heard} The credential on disk still reads as usable, so this needs a look at the host.`
       );
     default:
       // `not-retryable`: a standing condition a retry reproduces exactly.
@@ -169,7 +202,7 @@ export function outageMessage(summary: TurnSummary): string {
 
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   const { config, client, sessions, registry, mail, mailWaker } = deps;
-  const { armedStore, github, windows, alwaysOnChannels } = deps;
+  const { armedStore, github, windows, alwaysOnChannels, authOutage, authLogin } = deps;
 
   /** Anyone in the server may wake the agent — there is no per-user allowlist. */
   function isAuthorized(message: Message): boolean {
@@ -183,10 +216,39 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     return message.content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
   }
 
-  async function handleCommand(message: Message, command: string): Promise<boolean> {
+  async function handleCommand(message: Message, command: string, rest = ''): Promise<boolean> {
     const channelId = message.channelId;
 
     switch (command) {
+      /**
+       * Log this crew back in. Answered here rather than by the agent, which
+       * cannot run while the credential it authenticates with is dead. Gated on
+       * the channel check and nothing else: anyone in the room may log the crew
+       * in, with any Claude account.
+       */
+      case 'auth': {
+        const login = authLogin;
+
+        if (rest !== '') {
+          await message.reply(submitReply(await login.submit(rest)));
+          return true;
+        }
+
+        const status = await login.status();
+        if (status.loggedIn === true) {
+          await message.reply('Logged in already — `auth status` says so. Nothing to do.');
+          return true;
+        }
+        const started = await login.begin();
+        await message.reply(
+          'url' in started
+            ? `${status.loggedIn === false ? 'Logged out.' : `Could not read \`auth status\` (${status.detail}).`}` +
+                ` **Authorize here:** ${started.url}\nThen paste the code back with \`!auth <code>\`.`
+            : `Could not start a login: ${started.error}`,
+        );
+        return true;
+      }
+
       case 'stop': {
         if (!sessions.has(channelId)) {
           await message.reply('Nothing running here.');
@@ -290,7 +352,8 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
     // otherwise any '!' line in a live channel would hit them. An always-on
     // channel counts as addressed: the room exists to talk to the bot.
     if (addressed && content.startsWith('!')) {
-      const handled = await handleCommand(message, content.slice(1).split(/\s+/)[0] ?? '');
+      const words = content.slice(1).split(/\s+/);
+      const handled = await handleCommand(message, words[0] ?? '', words.slice(1).join(' '));
       if (handled) {
         windows.extend(message.channelId);
         return;
@@ -321,9 +384,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   /** Say, in the channel, that a turn was refused and will not be retried. */
   async function announceOutage(channelId: string, summary: TurnSummary): Promise<void> {
     try {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel || !channel.isTextBased() || !('send' in channel)) return;
-      await channel.send(outageMessage(summary));
+      await sendToChannel(client, channelId, outageMessage(summary));
     } catch (error) {
       // Best effort. If Discord is also unreachable the journal is the record,
       // and throwing out of a completion handler would take the process with it.
@@ -379,7 +440,11 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
             // a session's behalf, so the drain gate belongs here rather than in the
             // session, which cannot tell a channel wiring from the mail one. #264.
             if (!summary.retryScheduled && !respawnWillHandleIt && !summary.drained) {
-              void announceOutage(channelId, summary);
+              // A credential the disk says is finished gets the message that
+              // names it, in place of the generic one.
+              const dead = authOutage.owns(summary);
+              if (dead) void authOutage.announce(dead, channelId);
+              else void announceOutage(channelId, summary);
             }
           }
           process.stdout.write(
@@ -396,8 +461,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
         onNeedsRespawn: (acted) => {
           if (afterRespawn) {
             process.stderr.write(
-              `[clawcius ${channelId}] respawned session ALSO failed to authenticate — ` +
-                `the credential on disk is not usable. Needs a re-login on the host.\n`,
+              `[clawcius ${channelId}] respawned session ALSO failed to authenticate\n`,
             );
             return;
           }
@@ -433,9 +497,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   /** Say, in the channel, that there was no session slot. */
   async function announceAtCapacity(channelId: string, error: AtCapacityError): Promise<void> {
     try {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel || !channel.isTextBased() || !('send' in channel)) return;
-      await channel.send(atCapacityNotice(error));
+      await sendToChannel(client, channelId, atCapacityNotice(error));
     } catch (sendError) {
       // Best effort, as in announceOutage. If Discord is unreachable too, the
       // journal is the record, and throwing here would take the process down.
@@ -592,6 +654,10 @@ export async function main(): Promise<void> {
     (line) => process.stdout.write(`[sessions] ${line}\n`),
   );
 
+  // Assigned below, once there is a client to speak through: the mail waker is
+  // built before the Discord client and reads this from inside a callback.
+  let authOutage: AuthOutage | null = null;
+
   const mailWaker =
     mail && config.agent.clawsky.wakeOnMail
       ? new MailWaker({
@@ -607,6 +673,11 @@ export async function main(): Promise<void> {
                 release: () => void sessions.release(agent.id),
                 err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
                 log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
+                // No channel of its own, so the announcement goes to the crew's main one.
+                onRefused: (summary) => {
+                  const dead = authOutage?.owns(summary);
+                  if (dead) void authOutage?.announce(dead, null);
+                },
                 agentId: agent.id,
               }),
             });
@@ -694,6 +765,25 @@ export async function main(): Promise<void> {
     partials: [Partials.Channel],
   });
 
+  const authLogin = new AuthLogin({
+    target: {
+      containerEnabled: config.agent.container.enabled,
+      containerName: config.agent.container.name,
+      claudePath: config.agent.container.claudePath,
+      hostClaudePath: config.agent.paths.claudeCli,
+      home: config.agent.container.agentHome,
+    },
+    log: (line) => process.stdout.write(`[auth] ${line}\n`),
+  });
+  authOutage = new AuthOutage({
+    home: config.agent.container.agentHome,
+    // The crew's main channel. The schema requires at least one.
+    mainChannelId: config.agent.discord.allowedChannelIds[0]!,
+    crew: config.agent.displayName,
+    send: (channelId, text) => sendToChannel(client, channelId, text),
+    log: (line) => process.stdout.write(`[auth] ${line}\n`),
+  });
+
   const handlers = createHandlers({
     config,
     client,
@@ -705,6 +795,8 @@ export async function main(): Promise<void> {
     github,
     windows,
     alwaysOnChannels,
+    authOutage,
+    authLogin,
   });
   const { bundler } = handlers;
 
@@ -803,6 +895,7 @@ export async function main(): Promise<void> {
           );
         }
       }
+      authLogin.stop();
       await sessions.shutdown();
       registry.close();
       await client.destroy();

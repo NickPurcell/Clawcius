@@ -49,6 +49,8 @@ export type AgentConfig = {
     /** In-container path to the claude binary. */
     claudePath: string;
     stateDir: string;
+    /** The Claude config dir: bind-mounted into the container, or CLAUDE_CONFIG_DIR without one. */
+    agentHome: string;
     /** Where the per-exec `--env-file` is written (src/container.ts). */
     execEnvDir: string;
     /** Holds the App installation token for agents; mounted READ-ONLY. */
@@ -85,6 +87,7 @@ export type AgentConfig = {
   paths: {
     discordCli: string;
     skillsDir: string;
+    claudeCli: string;
   };
   git: {
     userName: string;
@@ -166,7 +169,11 @@ const Base = z.strictObject({
       path: ['bundleMaxWaitMs'],
       error: 'must be >= bundleDebounceMs',
     }),
-  paths: z.strictObject({ discordCli: z.string().min(1), skillsDir: z.string().min(1) }),
+  paths: z.strictObject({
+    discordCli: z.string().min(1),
+    skillsDir: z.string().min(1),
+    claudeCli: z.string().min(1),
+  }),
   clawsky: z.strictObject({
     enabled: z.boolean(),
     wakeOnMail: z.boolean(),
@@ -240,6 +247,7 @@ function deriveInstancePaths(crew: string, displayName: string) {
     containerName: `${crew}-agent`,
     stateDir,
     execEnvDir: join(stateDir, 'exec-env'),
+    agentHome: join(stateDir, 'agent-home'),
     githubTokenDir: join(stateDir, 'github-token'),
     workspaceRoot: join(stateDir, 'workspaces'),
     statusFile: join(stateDir, 'waker-status.json'),
@@ -291,9 +299,8 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discordCli = resolve(base.paths.discordCli);
   // What docker/run-container.sh bind-mounts into the agent container.
   const mounts: Array<[string, string]> = [
-    ...(['workspaces', 'agent-home'] as const).map(
-      (child): [string, string] => [`<stateDir>/${child}, bind-mounted read-write`, join(derived.stateDir, child)],
-    ),
+    ['<stateDir>/workspaces, bind-mounted read-write', join(derived.stateDir, 'workspaces')],
+    ['<stateDir>/agent-home, bind-mounted read-write', derived.agentHome],
     ['paths.skillsDir', skillsDir],
     ['the directory containing paths.discordCli', dirname(discordCli)],
     ['container.githubTokenDir', derived.githubTokenDir],
@@ -323,6 +330,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       name: derived.containerName,
       claudePath: base.container.claudePath,
       stateDir: derived.stateDir,
+      agentHome: derived.agentHome,
       execEnvDir: derived.execEnvDir,
       githubTokenDir: derived.githubTokenDir,
     },
@@ -336,7 +344,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     },
     sessions: { ...base.sessions, workspaceRoot: derived.workspaceRoot },
     discord: { ...base.discord, ...instance.discord },
-    paths: { discordCli, skillsDir },
+    paths: { discordCli, skillsDir, claudeCli: resolve(base.paths.claudeCli) },
     git: { userName: derived.gitUserName, userEmail: derived.gitUserEmail },
     clawsky: { ...base.clawsky, crew },
     armed: base.armed,
