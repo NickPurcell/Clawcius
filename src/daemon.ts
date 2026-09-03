@@ -772,6 +772,7 @@ export async function main(): Promise<void> {
       claudePath: config.agent.container.claudePath,
       hostClaudePath: config.agent.paths.claudeCli,
       home: config.agent.container.agentHome,
+      loginCommand: config.agent.container.loginCommand,
     },
     log: (line) => process.stdout.write(`[auth] ${line}\n`),
   });

@@ -110,6 +110,7 @@ test('the login runs where the credential is written', () => {
     claudePath: '/usr/local/bin/claude',
     hostClaudePath: 'claude',
     home: '/var/lib/clawcius/agent-home',
+    loginCommand: ['setup-token'],
   };
   const inContainer = authArgv(target, ['auth', 'login', '--claudeai']);
   assert.equal(inContainer.file, 'docker');
@@ -184,6 +185,7 @@ const TARGET = {
   claudePath: '/usr/local/bin/claude',
   hostClaudePath: 'claude',
   home: '/var/lib/clawcius/agent-home',
+  loginCommand: ['setup-token'],
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
@@ -219,7 +221,12 @@ test('begin reads the URL out of what the CLI printed', async () => {
   const { login, spawned } = loginHarness();
   const result = await started(login, spawned);
   assert.equal(result.url, URL);
-  assert.deepEqual(spawned[0].args.slice(-3), ['auth', 'login', '--claudeai']);
+  // Under a terminal, because `setup-token` writes nothing to a pipe.
+  assert.equal(spawned[0].file, 'script');
+  assert.ok(spawned[0].args[1].endsWith('clawcius-agent /usr/local/bin/claude setup-token'));
+  // `-t`, not just `-i`: `script` gives this process a terminal, and without
+  // `-t` the command inside the container still reads a pipe.
+  assert.ok(spawned[0].args[1].startsWith('docker exec -it '));
 });
 
 test('a second begin reuses the login already waiting', async () => {

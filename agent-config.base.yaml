@@ -16,6 +16,11 @@ prompts:
 
 container:
   claudePath: /usr/local/bin/claude
+  # What `!auth` and the login page run to mint a credential. `setup-token`
+  # produces a long-lived one and requires a Claude subscription;
+  # [auth, login, --claudeai] produces an ordinary OAuth credential that
+  # expires. Both print an authorize URL and then wait on stdin for the code.
+  loginCommand: [setup-token]
 
 # [1m] = the 1M-token context variant.
 model: claude-opus-5[1m]

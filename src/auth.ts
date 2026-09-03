@@ -8,6 +8,7 @@
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
+import { authorizeUrl, ptyArgv } from './pty.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TurnSummary } from './types.js';
@@ -101,18 +102,29 @@ export type AuthTarget = {
   hostClaudePath: string;
   /** The agent home, passed as CLAUDE_CONFIG_DIR on the host path. */
   home: string;
+  /**
+   * The subcommand that mints a credential — `['setup-token']`, or
+   * `['auth', 'login', '--claudeai']`. Both print an authorize URL and then wait
+   * on stdin; they differ in what they leave behind and how long it lasts.
+   */
+  loginCommand: readonly string[];
 };
 
 /** The command that reaches the same `claude` the agent authenticates as. */
 export function authArgv(
   target: AuthTarget,
   sub: readonly string[],
+  tty = false,
 ): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
   if (target.containerEnabled) {
     // The container carries CLAUDE_CONFIG_DIR from `docker run`.
+    //
+    // `-t` is what puts a terminal on the far side of the exec. Wrapping the
+    // whole thing in `script` gives the local process one, and without `-t` the
+    // command inside the container still reads a pipe and stays silent.
     return {
       file: 'docker',
-      args: ['exec', '-i', target.containerName, target.claudePath, ...sub],
+      args: ['exec', tty ? '-it' : '-i', target.containerName, target.claudePath, ...sub],
       env: process.env,
     };
   }
@@ -247,7 +259,9 @@ export class AuthLogin {
     this.#lastStart = this.#now();
     this.stop();
 
-    const { file, args, env } = authArgv(this.#target, ['auth', 'login', '--claudeai']);
+    const inner = authArgv(this.#target, this.#target.loginCommand, true);
+    const { file, args } = ptyArgv([inner.file, ...inner.args]);
+    const env = inner.env;
     let child: LoginProcess;
     try {
       child = this.#spawn(file, args, env);
@@ -266,9 +280,11 @@ export class AuthLogin {
       };
 
       const read = (chunk: unknown): void => {
-        // Capped: the URL arrives in the first few hundred bytes.
-        seen = (seen + String(chunk)).slice(-8192);
-        const url = findUrl(seen);
+        // Capped, and from the end: a full-screen interface redraws, so the
+        // hyperlink arrives after however much cursor movement it took to get
+        // there.
+        seen = (seen + String(chunk)).slice(-32768);
+        const url = authorizeUrl(seen) ?? findUrl(seen);
         if (url === null) return;
         this.#pending = {
           child,
