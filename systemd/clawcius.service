@@ -24,6 +24,10 @@ Group=npurcell
 WorkingDirectory=/srv/clawcius/current
 EnvironmentFile=/etc/clawcius/clawcius.env
 
+# The login page: loopback only, published on the tailnet by `tailscale serve`.
+Environment=LOGIN_PAGE_PORT=8479
+Environment=LOGIN_PAGE_URL=https://vmi3493307.tail872bb7.ts.net/login
+
 ExecStart=/usr/bin/node dist/index.js
 
 Restart=always

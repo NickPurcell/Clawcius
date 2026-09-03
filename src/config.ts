@@ -29,6 +29,13 @@ export type Config = {
 
   readonly storage: { readonly dbPath: string };
 
+  /**
+   * The login page. `port` is loopback-only; `url` is where `tailscale serve`
+   * puts it, and is what the outage announcement points at. Both are per
+   * instance, so two crews on one box do not collide.
+   */
+  readonly loginPage: { readonly port: number; readonly url: string };
+
   /** Agent behaviour, from agent-config.yaml. `AgentConfig` states its own. */
   readonly agent: AgentConfig;
 };
@@ -51,6 +58,10 @@ export function loadConfig(): Config {
     },
     storage: {
       dbPath: process.env['CLAWCIUS_DB_PATH'] ?? '/var/lib/clawcius/clawcius.db',
+    },
+    loginPage: {
+      port: Number(required('LOGIN_PAGE_PORT')),
+      url: required('LOGIN_PAGE_URL'),
     },
     agent: loadAgentConfig() satisfies AgentConfig,
   };

@@ -30,7 +30,28 @@ const START_FLOOR_MS = 60_000;
 /** How long to wait for `auth status`. */
 const STATUS_MS = 30_000;
 
+/** What the prompt prints when the exchange was refused, rather than exiting. */
+const REFUSED = /Login failed/i;
+
+/** How long to wait for the turn that proves the credential can do the job. */
+const TURN_MS = 120_000;
+
 const CREDENTIAL_FILE = '.credentials.json';
+
+/** What mints the credential everything here reads. */
+const LOGIN_COMMAND: readonly string[] = ['auth', 'login', '--claudeai'];
+
+/**
+ * The authorize URL, once the whole of it has arrived.
+ *
+ * Output arrives in chunks, and the trailing `\s` is what makes a read that
+ * stops mid-URL match nothing.
+ */
+const AUTHORIZE_URL = /visit:\s*(https:\/\/\S+)\s/;
+
+function authorizeUrl(output: string): string | null {
+  return AUTHORIZE_URL.exec(output)?.[1] ?? null;
+}
 
 /**
  * Whether the credential on disk is one a retry or a respawn could fix.
@@ -40,7 +61,10 @@ const CREDENTIAL_FILE = '.credentials.json';
  * or the wrong shape. A stale access token behind a live refresh token is not
  * terminal — dropping the session picks up the refreshed one.
  */
-export type CredentialVerdict = { terminal: false } | { terminal: true; why: string };
+export type CredentialVerdict = ({ terminal: false } | { terminal: true; why: string }) & {
+  /** `refreshTokenExpiresAt` as ISO, or null when the file does not state one. */
+  refreshExpiresAt: string | null;
+};
 
 export function credentialVerdict(home: string, now = Date.now()): CredentialVerdict {
   const path = join(home, CREDENTIAL_FILE);
@@ -49,20 +73,20 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
     raw = readFileSync(path, 'utf8');
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}` };
-    return { terminal: true, why: `${path} could not be read (${code ?? 'unknown error'})` };
+    if (code === 'ENOENT') return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}`, refreshExpiresAt: null };
+    return { terminal: true, why: `${path} could not be read (${code ?? 'unknown error'})`, refreshExpiresAt: null };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { terminal: true, why: `${CREDENTIAL_FILE} is not valid JSON` };
+    return { terminal: true, why: `${CREDENTIAL_FILE} is not valid JSON`, refreshExpiresAt: null };
   }
 
   const oauth = (parsed as { claudeAiOauth?: unknown })?.claudeAiOauth;
   if (typeof oauth !== 'object' || oauth === null) {
-    return { terminal: true, why: `${CREDENTIAL_FILE} has no claudeAiOauth block` };
+    return { terminal: true, why: `${CREDENTIAL_FILE} has no claudeAiOauth block`, refreshExpiresAt: null };
   }
   const { accessToken, refreshToken, refreshTokenExpiresAt } = oauth as {
     accessToken?: unknown;
@@ -70,24 +94,26 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
     refreshTokenExpiresAt?: unknown;
   };
 
+  // Absent and 0 both mean unstated, which is not the same as expired.
+  const stated = typeof refreshTokenExpiresAt === 'number' && refreshTokenExpiresAt > 0;
+  const refreshExpiresAt = stated ? new Date(refreshTokenExpiresAt as number).toISOString() : null;
+
   // A failed refresh blanks the tokens in place rather than removing them.
   if (typeof refreshToken !== 'string' || refreshToken === '') {
-    return { terminal: true, why: 'the refresh token is blank — there is nothing left to refresh' };
+    return {
+      terminal: true,
+      why: 'the refresh token is blank — there is nothing left to refresh',
+      refreshExpiresAt,
+    };
   }
   if (typeof accessToken !== 'string' || accessToken === '') {
-    return { terminal: true, why: 'the access token is blank' };
+    return { terminal: true, why: 'the access token is blank', refreshExpiresAt };
   }
-  // Absent and 0 both mean unstated, which is not the same as expired.
-  if (typeof refreshTokenExpiresAt === 'number' && refreshTokenExpiresAt > 0) {
-    if (refreshTokenExpiresAt <= now) {
-      return {
-        terminal: true,
-        why: `the refresh token expired at ${new Date(refreshTokenExpiresAt).toISOString()}`,
-      };
-    }
+  if (stated && (refreshTokenExpiresAt as number) <= now) {
+    return { terminal: true, why: `the refresh token expired at ${refreshExpiresAt}`, refreshExpiresAt };
   }
 
-  return { terminal: false };
+  return { terminal: false, refreshExpiresAt };
 }
 
 /** Where a login has to run so that it writes the credential the agent reads. */
@@ -140,20 +166,6 @@ export function authCodeProblem(code: string): string | null {
   return null;
 }
 
-/** Both forms the CLI prints its authorize URL in. */
-const URL_PATTERNS: readonly RegExp[] = [
-  /(https:\/\/\S*oauth\/authorize\S*)/,
-  /visit:\s*(https:\/\/\S+)/,
-];
-
-function findUrl(text: string): string | null {
-  for (const pattern of URL_PATTERNS) {
-    const match = pattern.exec(text);
-    if (match?.[1]) return match[1];
-  }
-  return null;
-}
-
 /** The part of `ChildProcess` this uses, so a test can substitute one. */
 export type LoginProcess = {
   stdout: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null;
@@ -196,7 +208,7 @@ type Pending = {
 };
 
 /**
- * At most one `claude auth login` at a time, held open waiting for its code.
+ * One login at a time, held open waiting for its code.
  *
  * The headless flow prints a URL and then blocks on stdin, so the process must
  * outlive the call that started it.
@@ -207,6 +219,7 @@ export class AuthLogin {
   readonly #log: (line: string) => void;
   readonly #now: () => number;
   readonly #exchangeMs: number;
+  readonly #urlWaitMs: number;
   #pending: Pending | null = null;
   #lastStart = 0;
 
@@ -216,12 +229,14 @@ export class AuthLogin {
     spawn?: Spawner;
     now?: () => number;
     exchangeMs?: number;
+    urlWaitMs?: number;
   }) {
     this.#target = opts.target;
     this.#spawn = opts.spawn ?? defaultSpawner;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
     this.#exchangeMs = opts.exchangeMs ?? EXCHANGE_MS;
+    this.#urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
   }
 
   /** The URL of a login that is waiting, if one is. */
@@ -247,7 +262,7 @@ export class AuthLogin {
     this.#lastStart = this.#now();
     this.stop();
 
-    const { file, args, env } = authArgv(this.#target, ['auth', 'login', '--claudeai']);
+    const { file, args, env } = authArgv(this.#target, LOGIN_COMMAND);
     let child: LoginProcess;
     try {
       child = this.#spawn(file, args, env);
@@ -266,9 +281,8 @@ export class AuthLogin {
       };
 
       const read = (chunk: unknown): void => {
-        // Capped: the URL arrives in the first few hundred bytes.
         seen = (seen + String(chunk)).slice(-8192);
-        const url = findUrl(seen);
+        const url = authorizeUrl(seen);
         if (url === null) return;
         this.#pending = {
           child,
@@ -299,8 +313,11 @@ export class AuthLogin {
         } catch {
           // Already gone.
         }
-        settle({ error: `no URL after ${URL_WAIT_MS / 1000}s — the login is not talking` });
-      }, URL_WAIT_MS);
+        // `#pending` is set only once a URL has been seen, so `stop` will never
+        // see this one.
+        this.#reapInContainer();
+        settle({ error: `no URL after ${this.#urlWaitMs / 1000}s — the login is not talking` });
+      }, this.#urlWaitMs);
     });
   }
 
@@ -332,12 +349,24 @@ export class AuthLogin {
       return { ok: false, reason: 'write-failed', detail: String(error) };
     }
 
+    // Watched for as well as the exit, because the prompt says why it refused
+    // and the exit does not.
+    let refusal = '';
     const exited = await new Promise<boolean>((resolve) => {
-      const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
-      pending.child.once('exit', () => {
+      let seen = '';
+      const settle = (value: boolean): void => {
         clearTimeout(timeout);
-        resolve(true);
+        resolve(value);
+      };
+      pending.child.stdout?.on('data', (chunk) => {
+        seen = (seen + String(chunk)).slice(-4096);
+        if (REFUSED.test(seen)) {
+          refusal = seen.replace(/\s+/g, ' ').trim().slice(-200);
+          settle(false);
+        }
       });
+      pending.child.once('exit', () => settle(true));
+      const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
     });
     pending.exited = exited;
     // The idle timer was cleared above, so a login still running here would be
@@ -348,7 +377,7 @@ export class AuthLogin {
     const status = await this.status();
     if (status.loggedIn === true) return { ok: true };
     if (status.loggedIn === false) {
-      return { ok: false, reason: 'not-taken', detail: status.detail };
+      return { ok: false, reason: 'not-taken', detail: refusal || status.detail };
     }
     return { ok: false, reason: 'unreadable', detail: status.detail };
   }
@@ -388,7 +417,50 @@ export class AuthLogin {
     return { loggedIn: readLoggedIn(output), detail: output.replace(/\s+/g, ' ').trim().slice(0, 200) };
   }
 
-  /** Kill whatever is waiting. */
+  /**
+   * Whether the credential can run an ordinary turn, not merely authenticate.
+   *
+   * Authenticating and being able to run a turn are different questions. This
+   * runs a real prompt through the same path a session takes.
+   */
+  async verify(): Promise<{ turnRan: boolean; detail: string }> {
+    const { file, args, env } = authArgv(this.#target, ['-p', 'reply with the single word: ok']);
+    let child: LoginProcess;
+    try {
+      child = this.#spawn(file, args, env);
+    } catch (error) {
+      return { turnRan: false, detail: `the turn could not start: ${String(error)}` };
+    }
+
+    const out = await new Promise<{ text: string; code: number | null }>((resolve) => {
+      let text = '';
+      const settle = (code: number | null): void => {
+        clearTimeout(timeout);
+        resolve({ text, code });
+      };
+      child.stdout?.on('data', (chunk) => {
+        text = (text + String(chunk)).slice(0, 4096);
+      });
+      child.stderr?.on('data', (chunk) => {
+        text = (text + String(chunk)).slice(0, 4096);
+      });
+      child.once('exit', (...a: never[]) => settle(typeof a[0] === 'number' ? a[0] : null));
+      child.once('error', () => settle(null));
+      const timeout = detachedTimer(() => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Already gone.
+        }
+        settle(null);
+      }, TURN_MS);
+    });
+
+    const detail = out.text.replace(/\s+/g, ' ').trim().slice(0, 300);
+    return { turnRan: out.code === 0, detail: detail || 'the turn produced nothing' };
+  }
+
+  /** Kill whatever is waiting, on both sides of the container boundary. */
   stop(): void {
     const pending = this.#pending;
     this.#pending = null;
@@ -398,6 +470,31 @@ export class AuthLogin {
       pending.child.kill('SIGTERM');
     } catch {
       // Already gone.
+    }
+    this.#reapInContainer();
+  }
+
+  /**
+   * Kill the login inside the container.
+   *
+   * `docker exec` does not forward signals: killing the local process leaves
+   * the one it started running.
+   */
+  #reapInContainer(): void {
+    if (!this.#target.containerEnabled) return;
+    const pattern = [this.#target.claudePath, ...LOGIN_COMMAND].join(' ');
+    try {
+      const child = this.#spawn(
+        'docker',
+        ['exec', this.#target.containerName, 'pkill', '-f', pattern],
+        process.env,
+      );
+      child.once('error', (...args: never[]) =>
+        this.#log(`could not reap the login inside the container: ${String(args[0])}`),
+      );
+    } catch {
+      // Best effort: a login left running is worth a line, not a throw.
+      this.#log('could not reap the login inside the container');
     }
   }
 }
@@ -435,6 +532,7 @@ export class AuthOutage {
   readonly #home: string;
   readonly #mainChannelId: string;
   readonly #crew: string;
+  readonly #loginPageUrl: string;
   readonly #send: (channelId: string, text: string) => Promise<void>;
   readonly #log: (line: string) => void;
   readonly #now: () => number;
@@ -446,6 +544,8 @@ export class AuthOutage {
     /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
+    /** Where a person goes to fix it: one click, no code to fetch and carry. */
+    loginPageUrl: string;
     send: (channelId: string, text: string) => Promise<void>;
     log: (line: string) => void;
     now?: () => number;
@@ -454,6 +554,7 @@ export class AuthOutage {
     this.#home = opts.home;
     this.#mainChannelId = opts.mainChannelId;
     this.#crew = opts.crew;
+    this.#loginPageUrl = opts.loginPageUrl;
     this.#send = opts.send;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
@@ -499,8 +600,7 @@ export class AuthOutage {
         target,
         `🔑 **${this.#crew} cannot authenticate.** ${dead.why}, so no retry and no ` +
           `respawn will fix it — every turn is being refused.${heard}\n` +
-          `The credential is \`${this.#home}\` on the host. This one needs a person; ` +
-          'nothing about it clears on its own.',
+          `**Log me back in:** ${this.#loginPageUrl}`,
       );
     } catch (error) {
       this.#log(`could not announce the dead credential: ${String(error)}`);

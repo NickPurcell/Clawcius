@@ -119,8 +119,13 @@ resume from SQLite on the next wake.
 - **Wedged sandbox**: `docker/up.sh --recreate` (nightly snapshots: `docker images clawcius-agent`).
 - **Disaster**: restore the VPS from the provider's backup.
 - `!status`, `!stop`, `!reset` in a channel: what's running, interrupt the turn, drop the session.
+- **Login page**: `https://vmi3493307.tail872bb7.ts.net/login` (Clawcius) and `/hamachi-login`
+  (Hamachi), tailnet only. Loading it runs nothing — it reports the credential on disk. The button
+  starts a login, the field takes the code it gives back, and it confirms with `claude auth status`
+  and a real turn before it says the crew is back. `LOGIN_PAGE_PORT` and `LOGIN_PAGE_URL` in each
+  crew's unit; publish with `tailscale serve --bg --set-path /login 8479`.
 - **Dead Claude credential**: the daemon posts one message to the crew's first `allowedChannelIds`
-  channel, then every four hours while it stays dead, naming the fault and the agent home. It runs
+  channel, then every four hours while it stays dead, naming the fault. It runs
   in the waker, so it does not need a working model. `@bot !auth` reports `claude auth status` and
   posts an authorize link; `@bot !auth <code>` feeds the code in and confirms. Anyone in the
   channel may use either, with any Claude account. The login runs inside the container for a crew

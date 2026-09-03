@@ -171,12 +171,12 @@ function fakeChild() {
   return child;
 }
 
-/** What the CLI prints under `docker exec -i` before it blocks on stdin. */
-const URL_LINE =
-  "Opening browser to sign in…\nIf the browser didn't open, visit: " +
-  'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW\n' +
-  'Paste code here if prompted >';
 const URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW';
+/** What the command prints through a pipe, before it blocks on stdin. */
+const URL_LINE =
+  'Opening browser to sign in\u2026\n' +
+  `If the browser didn't open, visit: ${URL}\n` +
+  'Paste code here if prompted > ';
 
 const TARGET = {
   containerEnabled: true,
@@ -187,12 +187,14 @@ const TARGET = {
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
-function loginHarness({ now = () => NOW } = {}) {
+function loginHarness({ now = () => NOW, target = TARGET, exchangeMs, urlWaitMs } = {}) {
   const spawned = [];
   const login = new AuthLogin({
-    target: TARGET,
+    target,
     log: () => {},
     now,
+    ...(exchangeMs === undefined ? {} : { exchangeMs }),
+    ...(urlWaitMs === undefined ? {} : { urlWaitMs }),
     spawn: (file, args) => {
       const child = fakeChild();
       spawned.push({ file, args: [...args], child });
@@ -201,6 +203,11 @@ function loginHarness({ now = () => NOW } = {}) {
   });
   return { login, spawned };
 }
+
+/** Only the logins: `auth status` and the container reap are other subcommands. */
+const logins = (spawned) => spawned.filter((s) => s.args.at(-1) === '--claudeai');
+/** The `auth status` run, wherever it lands in the sequence. */
+const statusRun = (spawned) => spawned.find((s) => s.args.at(-1) === 'status');
 
 /** Let the promise chains inside `AuthLogin` settle. */
 async function settle(times = 20) {
@@ -219,6 +226,7 @@ test('begin reads the URL out of what the CLI printed', async () => {
   const { login, spawned } = loginHarness();
   const result = await started(login, spawned);
   assert.equal(result.url, URL);
+  assert.equal(spawned[0].file, 'docker');
   assert.deepEqual(spawned[0].args.slice(-3), ['auth', 'login', '--claudeai']);
 });
 
@@ -226,7 +234,7 @@ test('a second begin reuses the login already waiting', async () => {
   const { login, spawned } = loginHarness();
   const first = await started(login, spawned);
   assert.deepEqual(await login.begin(), first);
-  assert.equal(spawned.length, 1);
+  assert.equal(logins(spawned).length, 1);
 });
 
 test('a login that dies before printing a URL is reported, not held', async () => {
@@ -247,7 +255,7 @@ test('an expired login mints a fresh one rather than refusing', async () => {
   clock += 3 * 60 * 60 * 1000;
 
   assert.equal((await started(login, spawned)).url, URL);
-  assert.equal(spawned.length, 2);
+  assert.equal(logins(spawned).length, 2);
 });
 
 test('two begins a moment apart do not start two logins', async () => {
@@ -257,7 +265,7 @@ test('two begins a moment apart do not start two logins', async () => {
 
   const immediate = await login.begin();
   assert.ok('error' in immediate);
-  assert.equal(spawned.length, 1);
+  assert.equal(logins(spawned).length, 1);
 });
 
 test('a bad code never reaches stdin', async () => {
@@ -268,7 +276,7 @@ test('a bad code never reaches stdin', async () => {
   assert.equal(outcome.ok, false);
   assert.equal(outcome.reason, 'bad-code');
   assert.deepEqual(spawned[0].child.written, []);
-  assert.equal(spawned.length, 1, 'auth status was never reached');
+  assert.equal(statusRun(spawned), undefined, 'auth status was never reached');
 });
 
 test('a good code goes in on stdin and the answer comes from auth status', async () => {
@@ -286,10 +294,10 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 
   spawned[0].child.emit('exit', 0);
   await settle();
-  const statusRun = spawned[1];
-  assert.deepEqual(statusRun.args.slice(-2), ['auth', 'status']);
-  statusRun.child.say('{"loggedIn":true}');
-  statusRun.child.emit('exit', 0);
+  const status = statusRun(spawned);
+  assert.deepEqual(status.args.slice(-2), ['auth', 'status']);
+  status.child.say('{"loggedIn":true}');
+  status.child.emit('exit', 0);
 
   assert.deepEqual(await submitting, { ok: true });
 });
@@ -298,7 +306,7 @@ test('a code with no login waiting is refused before anything is spawned', async
   const { login, spawned } = loginHarness();
   const outcome = await login.submit('lJ8x-Ab_c0D3#9PGDW');
   assert.equal(outcome.reason, 'none-waiting');
-  assert.equal(spawned.length, 0);
+  assert.deepEqual(spawned, []);
 });
 
 test('an exchange that did not take is reported as not taken', async () => {
@@ -309,25 +317,14 @@ test('an exchange that did not take is reported as not taken', async () => {
   await Promise.resolve();
   spawned[0].child.emit('exit', 1);
   await settle();
-  spawned[1].child.say('{"loggedIn":false}');
-  spawned[1].child.emit('exit', 0);
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).reason, 'not-taken');
 });
 
 test('a login still running when the exchange window closes is killed, not left holding', async () => {
   // Its idle timer is cleared when the code goes in, so nothing else reaps it.
-  const spawned = [];
-  const login = new AuthLogin({
-    target: TARGET,
-    log: () => {},
-    now: () => NOW,
-    exchangeMs: 0,
-    spawn: (file, args) => {
-      const child = fakeChild();
-      spawned.push({ file, args: [...args], child });
-      return child;
-    },
-  });
+  const { login, spawned } = loginHarness({ exchangeMs: 0 });
   await started(login, spawned);
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
@@ -337,18 +334,37 @@ test('a login still running when the exchange window closes is killed, not left 
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the login that never exited was killed');
   assert.equal(login.pendingUrl, null);
 
-  spawned[1].child.say('{"loggedIn":false}');
-  spawned[1].child.emit('exit', 0);
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).ok, false);
 });
 
-test('stop kills a login that is holding a URL nobody used', async () => {
+test('stop kills a login on both sides of the container boundary', async () => {
   const { login, spawned } = loginHarness();
   await started(login, spawned);
 
   login.stop();
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM']);
   assert.equal(login.pendingUrl, null);
+
+  const reap = spawned.find((s) => s.args[2] === 'pkill');
+  assert.ok(reap, 'the container is told to reap it');
+  assert.equal(reap.file, 'docker');
+  assert.deepEqual(reap.args, [
+    'exec',
+    'clawcius-agent',
+    'pkill',
+    '-f',
+    '/usr/local/bin/claude auth login --claudeai',
+  ]);
+});
+
+test('a crew with no container has nothing on the far side to reap', async () => {
+  const { login, spawned } = loginHarness({ target: { ...TARGET, containerEnabled: false } });
+  await started(login, spawned);
+
+  login.stop();
+  assert.equal(spawned.length, 1, 'the local kill is the whole of it');
 });
 
 const deadTurn = (overrides = {}) => ({
@@ -365,6 +381,7 @@ function outageHarness(oauth, { now = () => NOW } = {}) {
     home: dir,
     mainChannelId: 'C-main',
     crew: 'Clawcius',
+    loginPageUrl: 'https://box.example.ts.net/login',
     send: async (channelId, text) => sent.push({ channelId, text }),
     log: () => {},
     now,
@@ -392,14 +409,14 @@ test('owns answers only for a credential the disk says is finished', () => {
   }
 });
 
-test('the announcement goes to the main channel and names the home', async () => {
+test('the announcement goes to the main channel and points at the page', async () => {
   const { outage, sent, dir } = outageHarness(DEAD);
   try {
     await outage.announce(outage.owns(deadTurn()), null);
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
-    assert.ok(sent[0].text.includes(dir), 'whoever acts is told where to act');
+    assert.ok(sent[0].text.includes('https://box.example.ts.net/login'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -437,6 +454,7 @@ test('a send that throws does not escape the announcer', async () => {
     home: dir,
     mainChannelId: 'C-main',
     crew: 'Clawcius',
+    loginPageUrl: 'https://box.example.ts.net/login',
     send: async () => {
       throw new Error('Unknown Channel');
     },
@@ -448,4 +466,42 @@ test('a send that throws does not escape the announcer', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a refused code is answered when the prompt says so, not when the window closes', async () => {
+  const { login, spawned } = loginHarness();
+  await started(login, spawned);
+
+  const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
+  await Promise.resolve();
+  spawned[0].child.say('Login failed: Request failed with status code 400');
+  await settle();
+
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
+  assert.equal((await submitting).reason, 'not-taken');
+});
+
+test('a URL that has not finished arriving is not offered', async () => {
+  const { login, spawned } = loginHarness();
+  const pending = login.begin();
+  await Promise.resolve();
+  const cut = URL_LINE.slice(0, URL_LINE.indexOf(URL) + 40);
+  spawned[0].child.say(cut);
+  await settle(3);
+
+  assert.equal(login.pendingUrl, null, 'nothing is handed over half-read');
+  spawned[0].child.say(URL_LINE.slice(cut.length));
+  assert.equal((await pending).url, URL);
+});
+
+test('a login that hangs before its URL is reaped', async () => {
+  const { login, spawned } = loginHarness({ urlWaitMs: 0 });
+  const pending = login.begin();
+
+  assert.ok('error' in (await pending));
+  assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the local process is killed');
+  const reap = spawned.find((s) => s.args[2] === 'pkill');
+  assert.ok(reap, 'and the container is told to kill its own');
+  assert.deepEqual(reap.args.slice(0, 2), ['exec', 'clawcius-agent']);
 });
