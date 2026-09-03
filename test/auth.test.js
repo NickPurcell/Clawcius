@@ -187,13 +187,14 @@ const TARGET = {
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
-function loginHarness({ now = () => NOW, target = TARGET, exchangeMs } = {}) {
+function loginHarness({ now = () => NOW, target = TARGET, exchangeMs, urlWaitMs } = {}) {
   const spawned = [];
   const login = new AuthLogin({
     target,
     log: () => {},
     now,
     ...(exchangeMs === undefined ? {} : { exchangeMs }),
+    ...(urlWaitMs === undefined ? {} : { urlWaitMs }),
     spawn: (file, args) => {
       const child = fakeChild();
       spawned.push({ file, args: [...args], child });
@@ -494,19 +495,16 @@ test('a URL that has not finished arriving is not offered', async () => {
   assert.equal((await pending).url, URL);
 });
 
-test('a login that never prints a URL is reaped too', async () => {
-  // It is never in `#pending`, so `stop` cannot reach it: if `begin` does not
-  // reap it here, nothing does.
-  const { login, spawned } = loginHarness();
+test('a login that hangs before its URL is reaped', async () => {
+  // It never reaches `#pending`, so `stop` cannot see it: if the timeout does
+  // not reap it, nothing does.
+  const { login, spawned } = loginHarness({ urlWaitMs: 0 });
   const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.emit('exit', 1);
-  await pending;
+  await new Promise((resolve) => setImmediate(resolve));
 
-  login.stop();
-  assert.equal(
-    spawned.some((s) => s.args[2] === 'pkill'),
-    false,
-    'a login that exited on its own needs no reap',
-  );
+  assert.ok('error' in (await pending));
+  assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the local process is killed');
+  const reap = spawned.find((s) => s.args[2] === 'pkill');
+  assert.ok(reap, 'and the container is told to kill its own');
+  assert.deepEqual(reap.args.slice(0, 2), ['exec', 'clawcius-agent']);
 });

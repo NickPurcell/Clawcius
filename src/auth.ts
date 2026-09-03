@@ -219,6 +219,7 @@ export class AuthLogin {
   readonly #log: (line: string) => void;
   readonly #now: () => number;
   readonly #exchangeMs: number;
+  readonly #urlWaitMs: number;
   #pending: Pending | null = null;
   #lastStart = 0;
 
@@ -228,12 +229,14 @@ export class AuthLogin {
     spawn?: Spawner;
     now?: () => number;
     exchangeMs?: number;
+    urlWaitMs?: number;
   }) {
     this.#target = opts.target;
     this.#spawn = opts.spawn ?? defaultSpawner;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
     this.#exchangeMs = opts.exchangeMs ?? EXCHANGE_MS;
+    this.#urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
   }
 
   /** The URL of a login that is waiting, if one is. */
@@ -313,8 +316,8 @@ export class AuthLogin {
         // `#pending` is set only once a URL has been seen, so `stop` will never
         // see this one.
         this.#reapInContainer();
-        settle({ error: `no URL after ${URL_WAIT_MS / 1000}s — the login is not talking` });
-      }, URL_WAIT_MS);
+        settle({ error: `no URL after ${this.#urlWaitMs / 1000}s — the login is not talking` });
+      }, this.#urlWaitMs);
     });
   }
 
