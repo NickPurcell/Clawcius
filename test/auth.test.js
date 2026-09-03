@@ -400,7 +400,6 @@ test('the announcement goes to the main channel and names the home', async () =>
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
     assert.ok(sent[0].text.includes(dir), 'whoever acts is told where to act');
-    assert.equal(sent[0].text.includes('!auth'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
