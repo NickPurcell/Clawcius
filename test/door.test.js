@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { apiBase, doorHandler, doorState } from '../dist/door.js';
+import { doorHandler, doorState, withoutMount } from '../dist/door.js';
 
 const NOW = 1_788_400_000_000;
 
@@ -93,6 +93,7 @@ function harness(oauth, opts = {}) {
   const handle = doorHandler({
     crew: 'Clawcius',
     home: dir,
+    mount: opts.mount ?? '/login',
     login,
     log: () => {},
     onAuthenticated: (v) => announced.push(v),
@@ -276,39 +277,62 @@ test('a POST that did not come from this page is refused', async () => {
   }
 });
 
-test('the page fetches inside its own mount, wherever it is published', () => {
-  // Under `--set-path /login` a bare `fetch('state')` resolves against the
-  // parent and lands on whatever is at `/`, which is a different service. The
-  // page is served at the root of its mount, so a path with no trailing slash
-  // is still a directory.
-  for (const served of ['/login', '/login/', '/hamachi-login', '/hamachi-login/', '/']) {
-    const resolved = new URL('state', 'https://h.ts.net' + apiBase(served)).pathname;
-    assert.ok(resolved.startsWith(served.replace(/\/$/, '') + '/'), `${served} -> ${resolved}`);
-    assert.ok(resolved.endsWith('/state'), resolved);
-  }
-});
-
-test('the routes answer whether or not the proxy strips the mount', async () => {
-  // `tailscale serve --set-path` may forward with the mount still on the front.
+test('the published path answers, with or without its trailing slash', async () => {
+  // `/login` is the address in both units, `.env.example` and SETUP.md. Whether
+  // the proxy forwards the mount or strips it, these are the same four routes.
   const { dir, login, handle } = harness(DEAD);
   try {
-    for (const path of ['/state', '/login/state', '/hamachi-login/state']) {
+    for (const path of ['/login', '/login/', '/']) {
+      const response = fakeResponse();
+      await handle(fakeRequest('GET', path), response);
+      assert.equal(response.status, 200, path);
+    }
+    for (const path of ['/login/state', '/state']) {
       const response = fakeResponse();
       await handle(fakeRequest('GET', path), response);
       assert.equal(response.status, 200, path);
       assert.equal(response.json().crew, 'Clawcius', path);
     }
-    for (const path of ['/', '/login/', '/hamachi-login/']) {
-      const response = fakeResponse();
-      await handle(fakeRequest('GET', path), response);
-      assert.equal(response.status, 200, path);
-    }
-    for (const path of ['/start', '/login/start']) {
+    for (const path of ['/login/start', '/start']) {
       const response = fakeResponse();
       await handle(fakeRequest('POST', path), response);
       assert.equal(response.status, 200, path);
     }
     assert.deepEqual(login.calls, ['begin', 'begin']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a crew mounted at the root is unaffected', async () => {
+  const { dir, handle } = harness(DEAD, { mount: '/' });
+  try {
+    for (const [path, status] of [['/', 200], ['/state', 200], ['/login', 404]]) {
+      const response = fakeResponse();
+      await handle(fakeRequest('GET', path), response);
+      assert.equal(response.status, status, path);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the mount is removed only where it is actually the mount', () => {
+  assert.equal(withoutMount('/login', '/login'), '/');
+  assert.equal(withoutMount('/login', '/login/'), '/');
+  assert.equal(withoutMount('/login', '/login/state'), '/state');
+  assert.equal(withoutMount('/login', '/state'), '/state');
+  // Not a prefix match on the string: a different mount that starts the same way.
+  assert.equal(withoutMount('/login', '/login-other/state'), '/login-other/state');
+  assert.equal(withoutMount('/', '/state'), '/state');
+});
+
+test('the page is handed its base rather than working one out', async () => {
+  const { dir, handle } = harness(DEAD);
+  try {
+    const response = fakeResponse();
+    await handle(fakeRequest('GET', '/login'), response);
+    assert.ok(response.body.includes("const base=\"/login/\""), 'the served page knows its mount');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -53,7 +53,7 @@ mkdir -p "$WORKSPACES"
 # create a missing source as root-owned.
 mkdir -p "$GITHUB_TOKEN_DIR"
 chmod 700 "$GITHUB_TOKEN_DIR"
-# Created, not asserted: the login page populates it.
+# Created, not asserted.
 mkdir -p "$AGENT_HOME/projects"
 
 # Existence and status asked separately: on a missing container `inspect -f`
