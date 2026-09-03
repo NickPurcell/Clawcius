@@ -304,8 +304,6 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 });
 
 test('a code with no login waiting is refused, and says so in the journal', async () => {
-  // The case that most needs to be visible afterwards, and the one that used to
-  // return before reaching any log line.
   const { login, spawned, logged } = loginHarness();
   const outcome = await login.submit('lJ8x-Ab_c0D3#9PGDW');
   assert.equal(outcome.reason, 'none-waiting');

@@ -267,7 +267,7 @@ $('send').onclick=async()=>{
   if(!r.ok||!b.ok){
     $('send').disabled=false;$('send').textContent='Finish';
     if(b.reason==='none-waiting'){
-      $('s1msg').textContent='That link expired before the code came back. Start another \u2014 a link is good for an hour.';
+      $('s1msg').textContent='No login is waiting for that code. Start another.';
       $('go').disabled=false;$('go').textContent='Start a login';show('s1');await load();return}
     $('done').textContent=(b.detail||b.error||'that did not take');show('s3');await load();return}
   const v=b.verification;
