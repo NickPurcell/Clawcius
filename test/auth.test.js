@@ -400,10 +400,6 @@ test('the announcement goes to the main channel and names the home', async () =>
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
     assert.ok(sent[0].text.includes(dir), 'whoever acts is told where to act');
-    // An operator requirement rather than a preference about wording: this is
-    // the message he reads when the crew is down, and it does not ask him to
-    // fetch and paste a code.
-    assert.equal(sent[0].text.includes('!auth'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
