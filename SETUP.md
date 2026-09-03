@@ -119,6 +119,14 @@ resume from SQLite on the next wake.
 - **Wedged sandbox**: `docker/up.sh --recreate` (nightly snapshots: `docker images clawcius-agent`).
 - **Disaster**: restore the VPS from the provider's backup.
 - `!status`, `!stop`, `!reset` in a channel: what's running, interrupt the turn, drop the session.
+- **Dead Claude credential**: nothing to do on the host. The daemon posts to the crew's first
+  `allowedChannelIds` channel with an authorize link — once, then every four hours while it stays
+  dead — and `@bot !auth <code>` pastes the code back and confirms with `claude auth status`. The
+  waker answers both, so neither needs a working model. Anyone in the channel may do it, with their
+  own Claude account if they like; that is deliberate (#369). `@bot !auth` on its own reports the
+  status and starts a login if there is not one waiting. The login runs inside the container for a
+  crew that has one and on the host (`paths.claudeCli`) for a crew that does not, because the
+  credential must be written by whoever reads it.
 
 ## 8. Cutover from the previous layout (one-time)
 

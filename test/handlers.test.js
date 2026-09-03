@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createHandlers } from '../dist/daemon.js';
+import { createHandlers, mailWakeEvents } from '../dist/daemon.js';
 import { classifyRetry } from '../dist/agent.js';
 import { ConversationWindows } from '../dist/window.js';
 import { AtCapacityError } from '../dist/agent.js';
@@ -126,6 +126,7 @@ function harness(overrides = {}) {
     github: overrides.github ?? null,
     windows,
     alwaysOnChannels: new Set(config.agent.discord.alwaysOnChannelIds),
+    authOutage: overrides.authOutage ?? null,
   });
 
   /** What `handleMessage` buffered, before `deliver` reshapes it. */
@@ -137,6 +138,37 @@ function harness(overrides = {}) {
   };
 
   return { handlers, config, sessions, registry, windows, client, sent, fetched, bundled };
+}
+
+/**
+ * An `AuthOutage` stand-in that records rather than reading a disk or spawning.
+ *
+ * `owns` is a plain flag here because what it decides is tested against real
+ * credential files in `test/auth.test.js`; what this file is about is whether
+ * the handlers route to it.
+ */
+function fakeAuthOutage({ owns = true, loggedIn = false, url = 'https://claude.com/cai/oauth/authorize?x=1' } = {}) {
+  const outage = {
+    announced: [],
+    submitted: [],
+    began: 0,
+    owns: () => owns,
+    announce: async (channelId) => {
+      outage.announced.push(channelId);
+    },
+    login: {
+      status: async () => ({ loggedIn, detail: 'a status line' }),
+      begin: async () => {
+        outage.began += 1;
+        return url === null ? { error: 'docker is not running' } : { url };
+      },
+      submit: async (code) => {
+        outage.submitted.push(code);
+        return 'submitted-reply';
+      },
+    },
+  };
+  return outage;
 }
 
 /** A Discord message, as much of one as the handler touches. */
@@ -806,3 +838,121 @@ test('an edit with no author at all is survivable — an edit arrives partial', 
   assert.equal(windows.isOpen(CHANNEL), false);
 });
 
+
+// ── a dead credential: who announces it, and how the code gets back in ──────
+// Clawcius #369.
+
+test('a credential the disk says is finished gets the message with the link, not the generic one', async () => {
+  const authOutage = fakeAuthOutage();
+  const { handlers, sessions, sent } = harness({ authOutage });
+  // `afterRespawn`, so the respawn gate is spent and this is the final word.
+  handlers.deliver(CHANNEL, buffered(), true);
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
+    await settle();
+  });
+
+  // One message in the channel, and it is the one that can be acted on.
+  assert.deepEqual(authOutage.announced, [CHANNEL]);
+  assert.deepEqual(sent, []);
+});
+
+test('an auth failure the announcer does not own keeps the generic outage message', async () => {
+  // A token that is merely stale in a live process: the disk is healthy, #266's
+  // respawn gate owns it, and nothing about the credential is worth a link.
+  const authOutage = fakeAuthOutage({ owns: false });
+  const { handlers, sessions, sent } = harness({ authOutage });
+  handlers.deliver(CHANNEL, buffered(), true);
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
+    await settle();
+  });
+
+  assert.deepEqual(authOutage.announced, []);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /could not authenticate/);
+});
+
+test('the first attempt is still left to the respawn, dead credential or not', async () => {
+  const authOutage = fakeAuthOutage();
+  const { handlers, sessions, sent } = harness({ authOutage });
+  handlers.deliver(CHANNEL, buffered());
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
+    await settle();
+  });
+
+  assert.deepEqual(authOutage.announced, []);
+  assert.deepEqual(sent, []);
+});
+
+test('!auth with a code hands the rest of the line over verbatim', async () => {
+  const authOutage = fakeAuthOutage();
+  const { handlers } = harness({ authOutage });
+  const msg = message({ content: '!auth lJ8x-Ab_c0D3#9PGDW', mentioned: true });
+
+  await handlers.handleMessage(msg);
+
+  assert.deepEqual(authOutage.submitted, ['lJ8x-Ab_c0D3#9PGDW']);
+  assert.deepEqual(msg.replies, ['submitted-reply']);
+});
+
+test('!auth on its own starts a login and posts the link', async () => {
+  const authOutage = fakeAuthOutage({ loggedIn: false });
+  const { handlers } = harness({ authOutage });
+  const msg = message({ content: '!auth', mentioned: true });
+
+  await handlers.handleMessage(msg);
+
+  assert.equal(authOutage.began, 1);
+  assert.match(msg.replies[0], /https:\/\/claude\.com\/cai\/oauth\/authorize/);
+  assert.match(msg.replies[0], /!auth <code>/);
+});
+
+test('!auth when the credential is fine spawns nothing', async () => {
+  const authOutage = fakeAuthOutage({ loggedIn: true });
+  const { handlers } = harness({ authOutage });
+  const msg = message({ content: '!auth', mentioned: true });
+
+  await handlers.handleMessage(msg);
+
+  assert.equal(authOutage.began, 0);
+  assert.match(msg.replies[0], /Logged in already/);
+});
+
+test('!auth is the waker answering — it never reaches the agent', async () => {
+  // The whole point: the model is what is dead, so the model cannot be the one
+  // to fix it. No session is acquired and nothing is bundled.
+  const authOutage = fakeAuthOutage();
+  const { handlers, sessions, bundled } = harness({ authOutage });
+
+  await handlers.handleMessage(message({ content: '!auth lJ8x-Ab_c0D3#9PGDW', mentioned: true }));
+
+  assert.deepEqual(sessions.acquired, []);
+  assert.deepEqual(bundled, []);
+});
+
+test('a mail wake hands a refused turn on, and only when nothing is coming', () => {
+  const refused = [];
+  const events = mailWakeEvents({
+    persist: () => {},
+    release: () => {},
+    err: () => {},
+    log: () => {},
+    onRefused: (summary) => refused.push(summary.apiErrorKind),
+    agentId: 'clawcius-engineer1',
+  });
+
+  events.onDone(authFailure({ retryScheduled: true, retryAttempt: 1 }));
+  assert.deepEqual(refused, [], 'a queued retry is not the final word');
+
+  events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
+  assert.deepEqual(refused, ['authentication_failed']);
+
+  // A turn that ran is not a refusal.
+  events.onDone({ ...authFailure(), apiError: null, apiErrorKind: null });
+  assert.deepEqual(refused, ['authentication_failed']);
+});

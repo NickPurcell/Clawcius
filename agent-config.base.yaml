@@ -326,6 +326,11 @@ discord:
 paths:
   discordCli: /srv/clawcius/current/discord-cli/discord
   skillsDir: /srv/clawcius/current/.claude
+  # `!auth` runs the login where the credential is written. A crew with a
+  # container uses container.claudePath inside it and ignores this; a crew
+  # without one runs this on the host, so it must be executable by the user in
+  # that crew's unit. Bare, so it resolves on PATH.
+  claudeCli: claude
 
 clawsky:
   enabled: true

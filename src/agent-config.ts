@@ -85,6 +85,13 @@ export type AgentConfig = {
   paths: {
     discordCli: string;
     skillsDir: string;
+    /**
+     * Host `claude` CLI, used by `!auth` on a crew whose sessions do NOT run in
+     * a container — the login has to run wherever the credential is written.
+     * Left as a bare name so it resolves on the daemon's PATH; a crew with a
+     * container never reads it.
+     */
+    claudeCli: string;
   };
   git: {
     userName: string;
@@ -166,7 +173,11 @@ const Base = z.strictObject({
       path: ['bundleMaxWaitMs'],
       error: 'must be >= bundleDebounceMs',
     }),
-  paths: z.strictObject({ discordCli: z.string().min(1), skillsDir: z.string().min(1) }),
+  paths: z.strictObject({
+    discordCli: z.string().min(1),
+    skillsDir: z.string().min(1),
+    claudeCli: z.string().min(1).default('claude'),
+  }),
   clawsky: z.strictObject({
     enabled: z.boolean(),
     wakeOnMail: z.boolean(),
@@ -336,7 +347,10 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     },
     sessions: { ...base.sessions, workspaceRoot: derived.workspaceRoot },
     discord: { ...base.discord, ...instance.discord },
-    paths: { discordCli, skillsDir },
+    // `claudeCli` is deliberately NOT resolved: a bare `claude` has to stay a
+    // PATH lookup, and `resolve()` would turn it into a path under the daemon's
+    // working directory that has never existed.
+    paths: { discordCli, skillsDir, claudeCli: base.paths.claudeCli },
     git: { userName: derived.gitUserName, userEmail: derived.gitUserEmail },
     clawsky: { ...base.clawsky, crew },
     armed: base.armed,
