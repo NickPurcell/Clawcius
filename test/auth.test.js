@@ -187,10 +187,10 @@ const TARGET = {
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
-function loginHarness({ now = () => NOW } = {}) {
+function loginHarness({ now = () => NOW, target = TARGET } = {}) {
   const spawned = [];
   const login = new AuthLogin({
-    target: TARGET,
+    target,
     log: () => {},
     now,
     spawn: (file, args) => {
@@ -349,8 +349,6 @@ test('a login still running when the exchange window closes is killed, not left 
 });
 
 test('stop kills a login on both sides of the container boundary', async () => {
-  // `docker exec` does not forward signals, so killing the local process leaves
-  // the one inside the container running and holding a challenge.
   const { login, spawned } = loginHarness();
   await started(login, spawned);
 
@@ -371,21 +369,8 @@ test('stop kills a login on both sides of the container boundary', async () => {
 });
 
 test('a crew with no container has nothing on the far side to reap', async () => {
-  const spawned = [];
-  const login = new AuthLogin({
-    target: { ...TARGET, containerEnabled: false },
-    log: () => {},
-    now: () => NOW,
-    spawn: (file, args) => {
-      const child = fakeChild();
-      spawned.push({ file, args: [...args], child });
-      return child;
-    },
-  });
-  const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await pending;
+  const { login, spawned } = loginHarness({ target: { ...TARGET, containerEnabled: false } });
+  await started(login, spawned);
 
   login.stop();
   assert.equal(spawned.length, 1, 'the local kill is the whole of it');
@@ -519,4 +504,21 @@ test('a URL that has not finished arriving is not offered', async () => {
   assert.equal(login.pendingUrl, null, 'nothing is handed over half-read');
   spawned[0].child.say(URL_LINE.slice(cut.length));
   assert.equal((await pending).url, URL);
+});
+
+test('a login that never prints a URL is reaped too', async () => {
+  // It is never in `#pending`, so `stop` cannot reach it: if `begin` does not
+  // reap it here, nothing does.
+  const { login, spawned } = loginHarness();
+  const pending = login.begin();
+  await Promise.resolve();
+  spawned[0].child.emit('exit', 1);
+  await pending;
+
+  login.stop();
+  assert.equal(
+    spawned.some((s) => s.args[2] === 'pkill'),
+    false,
+    'a login that exited on its own needs no reap',
+  );
 });

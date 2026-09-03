@@ -31,7 +31,7 @@ const START_FLOOR_MS = 60_000;
 const STATUS_MS = 30_000;
 
 /** What the prompt prints when the exchange was refused, rather than exiting. */
-const REFUSED = /Login failed|OAuth error/i;
+const REFUSED = /Login failed/i;
 
 /** How long to wait for the turn that proves the credential can do the job. */
 const TURN_MS = 120_000;
@@ -311,6 +311,9 @@ export class AuthLogin {
         } catch {
           // Already gone.
         }
+        // `#pending` is set only once a URL has been seen, so `stop` will never
+        // see this one.
+        this.#reapInContainer();
         settle({ error: `no URL after ${URL_WAIT_MS / 1000}s — the login is not talking` });
       }, URL_WAIT_MS);
     });
@@ -474,15 +477,20 @@ export class AuthLogin {
    * Kill the login inside the container.
    *
    * `docker exec` does not forward signals: killing the local process leaves
-   * the one it started running. Without this every abandoned login — an idle
-   * timeout, a second `begin`, a shutdown — leaves a process holding an unspent
-   * challenge, and they accumulate for the life of the container.
+   * the one it started running.
    */
   #reapInContainer(): void {
     if (!this.#target.containerEnabled) return;
     const pattern = [this.#target.claudePath, ...LOGIN_COMMAND].join(' ');
     try {
-      this.#spawn('docker', ['exec', this.#target.containerName, 'pkill', '-f', pattern], process.env);
+      const child = this.#spawn(
+        'docker',
+        ['exec', this.#target.containerName, 'pkill', '-f', pattern],
+        process.env,
+      );
+      child.once('error', (...args: never[]) =>
+        this.#log(`could not reap the login inside the container: ${String(args[0])}`),
+      );
     } catch {
       // Best effort: a login left running is worth a line, not a throw.
       this.#log('could not reap the login inside the container');
