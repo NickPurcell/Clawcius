@@ -172,11 +172,11 @@ function fakeChild() {
 }
 
 const URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW';
-/** The visible text wrapped, the whole URL in the hyperlink. */
+/** What the command prints through a pipe, before it blocks on stdin. */
 const URL_LINE =
-  'Browser didn\u2019t open? Use the url below to sign in\r\n' +
-  `\u001b]8;id=1;${URL}\u0007https://claude.com/cai/oauth/authorize?code=true&client_i\u001b]8;;\u0007\r\n` +
-  'Paste code here if prompted >';
+  'Opening browser to sign in\u2026\n' +
+  `If the browser didn't open, visit: ${URL}\n` +
+  'Paste code here if prompted > ';
 
 const TARGET = {
   containerEnabled: true,
@@ -202,8 +202,8 @@ function loginHarness({ now = () => NOW } = {}) {
   return { login, spawned };
 }
 
-/** Only the logins: `auth status` and the container reap are `docker` spawns. */
-const logins = (spawned) => spawned.filter((s) => s.file === 'script');
+/** Only the logins: `auth status` and the container reap are other subcommands. */
+const logins = (spawned) => spawned.filter((s) => s.args.at(-1) === '--claudeai');
 /** The `auth status` run, wherever it lands in the sequence. */
 const statusRun = (spawned) => spawned.find((s) => s.args.at(-1) === 'status');
 
@@ -224,12 +224,8 @@ test('begin reads the URL out of what the CLI printed', async () => {
   const { login, spawned } = loginHarness();
   const result = await started(login, spawned);
   assert.equal(result.url, URL);
-  assert.equal(spawned[0].file, 'script');
-  assert.ok(
-    spawned[0].args[1].endsWith("'clawcius-agent' '/usr/local/bin/claude' 'auth' 'login' '--claudeai'"),
-    spawned[0].args[1],
-  );
-  assert.ok(spawned[0].args[1].startsWith("'docker' 'exec' '-it'"));
+  assert.equal(spawned[0].file, 'docker');
+  assert.deepEqual(spawned[0].args.slice(-3), ['auth', 'login', '--claudeai']);
 });
 
 test('a second begin reuses the login already waiting', async () => {
@@ -287,7 +283,7 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
-  assert.deepEqual(spawned[0].child.written, ['lJ8x-Ab_c0D3#9PGDW\r']);
+  assert.deepEqual(spawned[0].child.written, ['lJ8x-Ab_c0D3#9PGDW\n']);
   // Never on a command line: /proc/<pid>/cmdline is world-readable.
   assert.equal(
     spawned.some(({ args }) => args.some((arg) => arg.includes('lJ8x'))),
@@ -508,4 +504,19 @@ test('a refused code is answered when the prompt says so, not when the window cl
   statusRun(spawned).child.say('{"loggedIn":false}');
   statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).reason, 'not-taken');
+});
+
+test('a URL that has not finished arriving is not offered', async () => {
+  // Output comes in chunks. Without requiring what follows the URL, a read that
+  // stops partway matches a prefix — a link that looks right and fails on click.
+  const { login, spawned } = loginHarness();
+  const pending = login.begin();
+  await Promise.resolve();
+  const cut = URL_LINE.slice(0, URL_LINE.indexOf(URL) + 40);
+  spawned[0].child.say(cut);
+  await settle(3);
+
+  assert.equal(login.pendingUrl, null, 'nothing is handed over half-read');
+  spawned[0].child.say(URL_LINE.slice(cut.length));
+  assert.equal((await pending).url, URL);
 });

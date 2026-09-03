@@ -8,7 +8,6 @@
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { authorizeUrl, ptyArgv } from './pty.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TurnSummary } from './types.js';
@@ -31,28 +30,29 @@ const START_FLOOR_MS = 60_000;
 /** How long to wait for `auth status`. */
 const STATUS_MS = 30_000;
 
-/**
- * What the prompt prints when the exchange was refused, rather than exiting.
- *
- * Both wordings are measured against the container:
- *   auth login --claudeai   Login failed: Request failed with status code 400
- *   setup-token             OAuth error: …  /  Press Enter to retry.
- */
-const REFUSED = /OAuth error|Login failed|Press Enter to retry/i;
+/** What the prompt prints when the exchange was refused, rather than exiting. */
+const REFUSED = /Login failed|OAuth error/i;
 
 /** How long to wait for the turn that proves the credential can do the job. */
 const TURN_MS = 120_000;
 
 const CREDENTIAL_FILE = '.credentials.json';
 
-/**
- * What mints a credential.
- *
- * Not `setup-token`: that prints a token for `CLAUDE_CODE_OAUTH_TOKEN` and
- * leaves `.credentials.json` untouched, which is the file this module, `auth
- * status` and every session read.
- */
+/** What mints the credential everything here reads. */
 const LOGIN_COMMAND: readonly string[] = ['auth', 'login', '--claudeai'];
+
+/**
+ * The authorize URL, once the whole of it has arrived.
+ *
+ * The trailing `\s` is the point: output arrives in chunks, and without a
+ * terminator a read that stops mid-URL matches a prefix — a plausible-looking
+ * link that fails when it is clicked.
+ */
+const AUTHORIZE_URL = /visit:\s*(https:\/\/\S+)\s/;
+
+export function authorizeUrl(output: string): string | null {
+  return AUTHORIZE_URL.exec(output)?.[1] ?? null;
+}
 
 /**
  * Whether the credential on disk is one a retry or a respawn could fix.
@@ -134,13 +134,12 @@ export type AuthTarget = {
 export function authArgv(
   target: AuthTarget,
   sub: readonly string[],
-  tty = false,
 ): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
   if (target.containerEnabled) {
     // The container carries CLAUDE_CONFIG_DIR from `docker run`.
     return {
       file: 'docker',
-      args: ['exec', tty ? '-it' : '-i', target.containerName, target.claudePath, ...sub],
+      args: ['exec', '-i', target.containerName, target.claudePath, ...sub],
       env: process.env,
     };
   }
@@ -261,9 +260,7 @@ export class AuthLogin {
     this.#lastStart = this.#now();
     this.stop();
 
-    const inner = authArgv(this.#target, LOGIN_COMMAND, true);
-    const { file, args } = ptyArgv([inner.file, ...inner.args]);
-    const env = inner.env;
+    const { file, args, env } = authArgv(this.#target, LOGIN_COMMAND);
     let child: LoginProcess;
     try {
       child = this.#spawn(file, args, env);
@@ -282,10 +279,7 @@ export class AuthLogin {
       };
 
       const read = (chunk: unknown): void => {
-        // Capped, and from the end: a full-screen interface redraws, so the
-        // hyperlink arrives after however much cursor movement it took to get
-        // there.
-        seen = (seen + String(chunk)).slice(-32768);
+        seen = (seen + String(chunk)).slice(-8192);
         const url = authorizeUrl(seen);
         if (url === null) return;
         this.#pending = {
@@ -329,8 +323,6 @@ export class AuthLogin {
    * readable through `/proc`. The outcome comes from `auth status` rather than
    * from the exit code, which can be 0 with nothing usable written.
    *
-   * It ends in a carriage return: the prompt reads a terminal in raw mode,
-   * where Enter is CR.
    */
   async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
@@ -348,7 +340,7 @@ export class AuthLogin {
     this.#log(`code submitted (${code.length} chars) — waiting for the exchange`);
     clearTimeout(pending.idle);
     try {
-      pending.child.stdin.write(`${code}\r`);
+      pending.child.stdin.write(`${code}\n`);
     } catch (error) {
       return { ok: false, reason: 'write-failed', detail: String(error) };
     }
@@ -365,7 +357,7 @@ export class AuthLogin {
       pending.child.stdout?.on('data', (chunk) => {
         seen = (seen + String(chunk)).slice(-4096);
         if (REFUSED.test(seen)) {
-          refusal = seen.replace(/\s+/g, ' ').trim().slice(-200);
+          refusal = seen.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\s+/g, ' ').trim().slice(-200);
           settle(false);
         }
       });
