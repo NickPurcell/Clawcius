@@ -31,6 +31,9 @@ const START_FLOOR_MS = 60_000;
 /** How long to wait for `auth status`. */
 const STATUS_MS = 30_000;
 
+/** What the prompt prints when the exchange was refused, rather than exiting. */
+const REFUSED = /OAuth error|Press Enter to retry/i;
+
 /** How long to wait for the turn that proves the credential can do the job. */
 const TURN_MS = 120_000;
 
@@ -312,6 +315,10 @@ export class AuthLogin {
    * The code goes in on stdin and never on a command line, which is world
    * readable through `/proc`. The outcome comes from `auth status` rather than
    * from the exit code, which can be 0 with nothing usable written.
+   *
+   * It ends in a carriage return, not a newline. The prompt reads a terminal in
+   * raw mode, where Enter is CR: with LF the code arrives, echoes as asterisks,
+   * and simply sits there unsubmitted.
    */
   async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
@@ -329,17 +336,25 @@ export class AuthLogin {
     this.#log(`code submitted (${code.length} chars) — waiting for the exchange`);
     clearTimeout(pending.idle);
     try {
-      pending.child.stdin.write(`${code}\n`);
+      pending.child.stdin.write(`${code}\r`);
     } catch (error) {
       return { ok: false, reason: 'write-failed', detail: String(error) };
     }
 
+    // A refused code does not end the process — the prompt offers a retry — so
+    // waiting for an exit would spend the whole window on a known answer.
     const exited = await new Promise<boolean>((resolve) => {
-      const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
-      pending.child.once('exit', () => {
+      let seen = '';
+      const settle = (value: boolean): void => {
         clearTimeout(timeout);
-        resolve(true);
+        resolve(value);
+      };
+      pending.child.stdout?.on('data', (chunk) => {
+        seen = (seen + String(chunk)).slice(-4096);
+        if (REFUSED.test(seen)) settle(false);
       });
+      pending.child.once('exit', () => settle(true));
+      const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
     });
     pending.exited = exited;
     // The idle timer was cleared above, so a login still running here would be

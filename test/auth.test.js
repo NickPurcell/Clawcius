@@ -281,7 +281,8 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
-  assert.deepEqual(spawned[0].child.written, ['lJ8x-Ab_c0D3#9PGDW\n']);
+  // CR, not LF: the prompt reads a terminal in raw mode, where Enter is CR.
+  assert.deepEqual(spawned[0].child.written, ['lJ8x-Ab_c0D3#9PGDW\r']);
   // Never on a command line: /proc/<pid>/cmdline is world-readable.
   assert.equal(
     spawned.some(({ args }) => args.some((arg) => arg.includes('lJ8x'))),
@@ -454,4 +455,20 @@ test('a send that throws does not escape the announcer', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a refused code is answered when the prompt says so, not when the window closes', async () => {
+  // The process does not exit on a refusal — it offers a retry — so waiting for
+  // an exit would spend the whole exchange window on an answer already given.
+  const { login, spawned } = loginHarness();
+  await started(login, spawned);
+
+  const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
+  await Promise.resolve();
+  spawned[0].child.say('OAuth error: Request failed with status code 400\r\rPress Enter to retry.');
+  await settle();
+
+  spawned[1].child.say('{"loggedIn":false}');
+  spawned[1].child.emit('exit', 0);
+  assert.equal((await submitting).reason, 'not-taken');
 });
