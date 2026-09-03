@@ -349,8 +349,8 @@ export class AuthLogin {
       return { ok: false, reason: 'write-failed', detail: String(error) };
     }
 
-    // A refused code does not end the process — the prompt offers a retry — so
-    // waiting for an exit would spend the whole window on a known answer.
+    // Watched for as well as the exit, because the prompt says why it refused
+    // and the exit does not.
     let refusal = '';
     const exited = await new Promise<boolean>((resolve) => {
       let seen = '';
