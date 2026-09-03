@@ -433,7 +433,8 @@ export type DeadCredential = { why: string };
 
 /**
  * Announces a dead credential in Discord, at most once per `repeatMs` unless
- * somebody is waiting on an answer.
+ * somebody is waiting on an answer. It holds no `AuthLogin`, so the message it
+ * sends cannot carry a login link.
  *
  * `owns` is separate from `announce` and synchronous because the callers are
  * session completion handlers that decide whether the ordinary outage message
@@ -441,7 +442,6 @@ export type DeadCredential = { why: string };
  */
 export class AuthOutage {
   readonly #home: string;
-  readonly #login: AuthLogin;
   readonly #mainChannelId: string;
   readonly #crew: string;
   readonly #send: (channelId: string, text: string) => Promise<void>;
@@ -452,7 +452,6 @@ export class AuthOutage {
 
   constructor(opts: {
     home: string;
-    login: AuthLogin;
     /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
@@ -462,17 +461,12 @@ export class AuthOutage {
     repeatMs?: number;
   }) {
     this.#home = opts.home;
-    this.#login = opts.login;
     this.#mainChannelId = opts.mainChannelId;
     this.#crew = opts.crew;
     this.#send = opts.send;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
     this.#repeatMs = opts.repeatMs ?? REPEAT_MS;
-  }
-
-  get login(): AuthLogin {
-    return this.#login;
   }
 
   /**
@@ -510,9 +504,6 @@ export class AuthOutage {
     this.#log(`announcing a dead credential in ${target}: ${dead.why}`);
 
     try {
-      // The fault and nothing else. There is no one-click flow to point at, and
-      // a message naming a next step it cannot deliver is worse than one naming
-      // none.
       await this.#send(
         target,
         `🔑 **${this.#crew} cannot authenticate.** ${dead.why}, so no retry and no ` +

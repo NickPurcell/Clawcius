@@ -110,6 +110,10 @@ function harness(overrides = {}) {
     },
   };
 
+  // A healthy credential by default: only the tests about a dead one hand in an
+  // announcer that claims the refusal.
+  const authOutage = overrides.authOutage ?? fakeAuthOutage({ owns: false });
+
   const windows = new ConversationWindows(
     config.agent.discord.followUpWindowSeconds,
     config.agent.discord.followUpChannelIds,
@@ -126,9 +130,8 @@ function harness(overrides = {}) {
     github: overrides.github ?? null,
     windows,
     alwaysOnChannels: new Set(config.agent.discord.alwaysOnChannelIds),
-    // A healthy credential by default: only the tests about a dead one hand in
-    // an announcer that claims the refusal.
-    authOutage: overrides.authOutage ?? fakeAuthOutage({ owns: false }),
+    authOutage,
+    authLogin: authOutage.login,
   });
 
   /** What `handleMessage` buffered, before `deliver` reshapes it. */
@@ -837,7 +840,7 @@ test('an edit with no author at all is survivable — an edit arrives partial', 
 
 // ── a dead credential: who announces it, and how the code gets back in ──────
 
-test('a credential the disk says is finished gets the announcer, not the generic message', async () => {
+test('a dead credential is routed to the announcer, not the generic message', async () => {
   const authOutage = fakeAuthOutage();
   const { handlers, sessions, sent } = harness({ authOutage });
   // `afterRespawn`, so the respawn gate is spent and this is the final word.
@@ -947,17 +950,3 @@ test('a mail wake hands a refused turn on, and only when nothing is coming', () 
   assert.deepEqual(refused, ['authentication_failed']);
 });
 
-test('the announcement is the announcer\'s, and mints no link', async () => {
-  const authOutage = fakeAuthOutage();
-  const { handlers, sessions, sent } = harness({ authOutage });
-  handlers.deliver(CHANNEL, buffered(), true);
-
-  await captureStderr(async () => {
-    sessions.acquired[0].events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
-    await settle();
-  });
-
-  assert.deepEqual(authOutage.announced, [CHANNEL]);
-  assert.equal(authOutage.began, 0);
-  assert.deepEqual(sent, []);
-});

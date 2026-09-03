@@ -326,11 +326,10 @@ discord:
 paths:
   discordCli: /srv/clawcius/current/discord-cli/discord
   skillsDir: /srv/clawcius/current/.claude
-  # `!auth` runs the login where the credential is written. A crew with a
-  # container uses container.claudePath inside it and ignores this; a crew
-  # without one runs this on the host, so it must be executable by the user in
-  # that crew's unit. Bare, so it resolves on PATH.
-  claudeCli: claude
+  # `!auth` runs the login where the credential is written: inside the container
+  # for a crew that has one, and this binary for a crew that does not. It is the
+  # same CLI the SDK spawns for a host session.
+  claudeCli: /srv/clawcius/current/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude
 
 clawsky:
   enabled: true

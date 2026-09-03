@@ -44,8 +44,10 @@ export type HandlerDeps = {
   readonly github: PullRequestSource | null;
   readonly windows: ConversationWindows;
   readonly alwaysOnChannels: ReadonlySet<string>;
-  /** The dead-credential announcement, and the login behind `!auth`. */
+  /** Decides whether a refusal is a dead credential, and says so. */
   readonly authOutage: AuthOutage;
+  /** The login behind `!auth`. */
+  readonly authLogin: AuthLogin;
 };
 
 /** A message as `handleMessageUpdate` reads it — an edit arrives partial. */
@@ -200,7 +202,7 @@ export function outageMessage(summary: TurnSummary): string {
 
 export function createHandlers(deps: HandlerDeps): DiscordHandlers {
   const { config, client, sessions, registry, mail, mailWaker } = deps;
-  const { armedStore, github, windows, alwaysOnChannels, authOutage } = deps;
+  const { armedStore, github, windows, alwaysOnChannels, authOutage, authLogin } = deps;
 
   /** Anyone in the server may wake the agent — there is no per-user allowlist. */
   function isAuthorized(message: Message): boolean {
@@ -225,7 +227,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
        * in, with any Claude account.
        */
       case 'auth': {
-        const login = authOutage.login;
+        const login = authLogin;
 
         if (rest !== '') {
           await message.reply(submitReply(await login.submit(rest)));
@@ -775,7 +777,6 @@ export async function main(): Promise<void> {
   });
   authOutage = new AuthOutage({
     home: config.agent.container.agentHome,
-    login: authLogin,
     // The crew's main channel. The schema requires at least one.
     mainChannelId: config.agent.discord.allowedChannelIds[0]!,
     crew: config.agent.displayName,
@@ -795,6 +796,7 @@ export async function main(): Promise<void> {
     windows,
     alwaysOnChannels,
     authOutage,
+    authLogin,
   });
   const { bundler } = handlers;
 

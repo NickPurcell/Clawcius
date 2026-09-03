@@ -361,17 +361,15 @@ const deadTurn = (overrides = {}) => ({
 function outageHarness(oauth, { now = () => NOW } = {}) {
   const dir = credentialDir(oauth);
   const sent = [];
-  const { login, spawned } = loginHarness({ now });
   const outage = new AuthOutage({
     home: dir,
-    login,
     mainChannelId: 'C-main',
     crew: 'Clawcius',
     send: async (channelId, text) => sent.push({ channelId, text }),
     log: () => {},
     now,
   });
-  return { outage, sent, spawned, dir };
+  return { outage, sent, dir };
 }
 
 const DEAD = { accessToken: '', refreshToken: '' };
@@ -394,17 +392,14 @@ test('owns answers only for a credential the disk says is finished', () => {
   }
 });
 
-test('the announcement goes to the main channel and mints nothing', async () => {
-  // No link, because there is no one-click flow to point at, and `!auth` is not
-  // offered: the operator does not paste codes.
-  const { outage, sent, spawned, dir } = outageHarness(DEAD);
+test('the announcement goes to the main channel and names the home', async () => {
+  const { outage, sent, dir } = outageHarness(DEAD);
   try {
     await outage.announce(outage.owns(deadTurn()), null);
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
-    assert.deepEqual(spawned, [], 'no login is started to produce a link');
-    assert.equal(sent[0].text.includes('!auth'), false);
+    assert.ok(sent[0].text.includes(dir), 'whoever acts is told where to act');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -440,7 +435,6 @@ test('a send that throws does not escape the announcer', async () => {
   const dir = credentialDir(DEAD);
   const outage = new AuthOutage({
     home: dir,
-    login: new AuthLogin({ target: TARGET, log: () => {}, now: () => NOW, spawn: () => fakeChild() }),
     mainChannelId: 'C-main',
     crew: 'Clawcius',
     send: async () => {
