@@ -28,7 +28,8 @@ import { MessageBundler, type BufferedMessage } from './bundler.js';
 import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import { sweepEnvFiles } from './container.js';
-import { AuthLogin, AuthOutage, agentHome } from './auth.js';
+import { AuthLogin, AuthOutage, type DeadCredential } from './auth.js';
+import type { SubmitOutcome } from './auth.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
 /** What the Discord handlers need, and nothing else; each entry is a thing a test can substitute. */
@@ -43,8 +44,8 @@ export type HandlerDeps = {
   readonly github: PullRequestSource | null;
   readonly windows: ConversationWindows;
   readonly alwaysOnChannels: ReadonlySet<string>;
-  /** The dead-credential announcement and the login behind `!auth`. Null in a test that is not about either. */
-  readonly authOutage: AuthOutage | null;
+  /** The dead-credential announcement, and the login behind `!auth`. */
+  readonly authOutage: AuthOutage;
 };
 
 /** A message as `handleMessageUpdate` reads it — an edit arrives partial. */
@@ -70,13 +71,7 @@ export function mailWakeEvents(opts: {
   err: (line: string) => void;
   /** The mail-wake journal, for the completion line. Same sink as `woke X with N`. */
   log: (line: string) => void;
-  /**
-   * A refused turn, handed on so the daemon can decide whether it is the dead
-   * credential of #369. This wiring still has no channel of its own and still
-   * announces nothing itself — every journal line below is unchanged, which is
-   * #266 — but a mail-only agent dying in silence was the actual incident, and
-   * the daemon above does have somewhere to say so.
-   */
+  /** A refused turn with no retry coming. This wiring has no channel; the daemon decides what to say. */
   onRefused?: (summary: TurnSummary) => void;
   agentId: string;
 }): {
@@ -116,6 +111,23 @@ export function mailWakeEvents(opts: {
       release();
     },
   };
+}
+
+/** What `!auth <code>` says back. */
+export function submitReply(outcome: SubmitOutcome): string {
+  if (outcome.ok) return '**Authenticated.** Sessions will pick the new credential up.';
+  switch (outcome.reason) {
+    case 'bad-code':
+      return `Not sending that: ${outcome.detail}.`;
+    case 'none-waiting':
+      return 'No login is waiting for a code. Run `!auth` to start one.';
+    case 'not-taken':
+      return 'That did not take — `auth status` still says logged out. Run `!auth` for a fresh link.';
+    case 'unreadable':
+      return `Code accepted, but \`auth status\` could not be read back: ${outcome.detail}`;
+    default:
+      return `Could not hand the code to the login: ${outcome.detail}`;
+  }
 }
 
 /** Post to a channel by id. Throws; every caller decides for itself what a failure to speak is worth. */
@@ -167,12 +179,12 @@ export function outageMessage(summary: TurnSummary): string {
         `was cleared before the retry ran.\n${heard} Send it again.`
       );
     case 'credential-dead':
-      // The auth ladder is spent and a respawn has already failed: the only thing the channel ever hears about a dead token.
+      // The auth ladder is spent and a respawn has already failed, with a
+      // credential file that still reads as refreshable.
       return (
-        `⚠️ I could not authenticate to the API, and retrying did not fix it — ` +
-        `the credential on the host is not usable` +
+        `⚠️ I could not authenticate to the API, and retrying did not fix it` +
         (detail ? `: ${detail}` : '.') +
-        `\n${heard} This needs a re-login on the host.`
+        `\n${heard} Run \`!auth\` to log in again.`
       );
     default:
       // `not-retryable`: a standing condition a retry reproduces exactly.
@@ -207,30 +219,16 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
 
     switch (command) {
       /**
-       * Log this crew back in, from Discord, with no model turn involved.
-       *
-       * This is the second half of #369 and it is here — beside `!stop` and
-       * `!reset`, in the waker — for the same reason the announcement is: the
-       * agent is what is broken, so the agent cannot be the one to fix it. This
-       * process is alive, holds the gateway connection, and can spawn a login.
-       *
-       * There is no authorization on it beyond `isAuthorized`'s channel check,
-       * and that is the operator's explicit decision rather than an oversight:
-       * *"I don't care about security if somebody else wants to auth with their
-       * account and use their tokens instead of mine, they can feel free"*
-       * (2026-09-03). A gate here would mean a crew that stays dead because the
-       * one person who could revive it is asleep. Do not add one back without
-       * asking him.
+       * Log this crew back in. Answered here rather than by the agent, which
+       * cannot run while the credential it authenticates with is dead. Gated on
+       * the channel check and nothing else: anyone in the room may log the crew
+       * in, with any Claude account.
        */
       case 'auth': {
-        if (!authOutage) {
-          await message.reply('Auth is not wired on this instance.');
-          return true;
-        }
         const login = authOutage.login;
 
         if (rest !== '') {
-          await message.reply(await login.submit(rest));
+          await message.reply(submitReply(await login.submit(rest)));
           return true;
         }
 
@@ -440,11 +438,10 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
             // a session's behalf, so the drain gate belongs here rather than in the
             // session, which cannot tell a channel wiring from the mail one. #264.
             if (!summary.retryScheduled && !respawnWillHandleIt && !summary.drained) {
-              // A credential the disk says is finished gets the message with the
-              // link in it instead of the generic one — same channel, same
-              // moment, one message rather than two. `owns` is synchronous
-              // because this decision cannot await anything. #369.
-              if (authOutage?.owns(summary)) void authOutage.announce(channelId);
+              // A credential the disk says is finished gets the message that
+              // names it, in place of the generic one.
+              const dead = authOutage.owns(summary);
+              if (dead) void authOutage.announce(dead, channelId);
               else void announceOutage(channelId, summary);
             }
           }
@@ -462,8 +459,7 @@ export function createHandlers(deps: HandlerDeps): DiscordHandlers {
         onNeedsRespawn: (acted) => {
           if (afterRespawn) {
             process.stderr.write(
-              `[clawcius ${channelId}] respawned session ALSO failed to authenticate — ` +
-                `the credential on disk is not usable. Needs a re-login on the host.\n`,
+              `[clawcius ${channelId}] respawned session ALSO failed to authenticate\n`,
             );
             return;
           }
@@ -656,15 +652,8 @@ export async function main(): Promise<void> {
     (line) => process.stdout.write(`[sessions] ${line}\n`),
   );
 
-  /**
-   * Assigned below, once there is a client for it to speak through.
-   *
-   * `let` and not `const` because of an ordering the wakers impose: the mail
-   * waker is built before the Discord client, and the mail waker is the one
-   * wiring that most needs this — an agent whose only traffic is mail was
-   * exactly what died in silence in #369. Every read of it happens inside a
-   * callback that runs long after the assignment.
-   */
+  // Assigned below, once there is a client to speak through: the mail waker is
+  // built before the Discord client and reads this from inside a callback.
   let authOutage: AuthOutage | null = null;
 
   const mailWaker =
@@ -682,10 +671,10 @@ export async function main(): Promise<void> {
                 release: () => void sessions.release(agent.id),
                 err: (line) => process.stderr.write(`[clawcius ${agent.id}] ${line}\n`),
                 log: (line) => process.stdout.write(`[mail-wake] ${line}\n`),
-                // The gap #369 names: this path has no channel of its own, so
-                // the announcement is the daemon's, in the crew's main channel.
+                // No channel of its own, so the announcement goes to the crew's main one.
                 onRefused: (summary) => {
-                  if (authOutage?.owns(summary)) void authOutage.announce(null);
+                  const dead = authOutage?.owns(summary);
+                  if (dead) void authOutage?.announce(dead, null);
                 },
                 agentId: agent.id,
               }),
@@ -780,21 +769,15 @@ export async function main(): Promise<void> {
       containerName: config.agent.container.name,
       claudePath: config.agent.container.claudePath,
       hostClaudePath: config.agent.paths.claudeCli,
-      home: agentHome(config.agent.container.stateDir),
+      home: config.agent.container.agentHome,
     },
     log: (line) => process.stdout.write(`[auth] ${line}\n`),
   });
   authOutage = new AuthOutage({
-    home: agentHome(config.agent.container.stateDir),
+    home: config.agent.container.agentHome,
     login: authLogin,
-    // `outageChannelId` when a crew names one, else the first channel it is
-    // allowed to speak in — which the schema guarantees exists. Both instances
-    // leave the key empty on purpose: for Clawcius the fallback already resolves
-    // to 1105739162230984735, the only channel it answers in, and writing that
-    // id a second time would be a copy that can drift out of step with the list
-    // it duplicates. The key is here for a crew whose first allowed channel is
-    // not where it wants to be told.
-    mainChannelId: config.agent.discord.outageChannelId || (config.agent.discord.allowedChannelIds[0] ?? ''),
+    // The crew's main channel. The schema requires at least one.
+    mainChannelId: config.agent.discord.allowedChannelIds[0]!,
     crew: config.agent.displayName,
     send: (channelId, text) => sendToChannel(client, channelId, text),
     log: (line) => process.stdout.write(`[auth] ${line}\n`),
@@ -910,9 +893,6 @@ export async function main(): Promise<void> {
           );
         }
       }
-      // A login held open waiting for a code is a child process of this one; a
-      // restart that left it running would leave a URL in the channel whose
-      // process is gone, and `!auth <code>` answering nothing.
       authLogin.stop();
       await sessions.shutdown();
       registry.close();

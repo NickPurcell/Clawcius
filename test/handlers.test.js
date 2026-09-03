@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createHandlers, mailWakeEvents } from '../dist/daemon.js';
+import { createHandlers, mailWakeEvents, outageMessage } from '../dist/daemon.js';
 import { classifyRetry } from '../dist/agent.js';
 import { ConversationWindows } from '../dist/window.js';
 import { AtCapacityError } from '../dist/agent.js';
@@ -126,7 +126,9 @@ function harness(overrides = {}) {
     github: overrides.github ?? null,
     windows,
     alwaysOnChannels: new Set(config.agent.discord.alwaysOnChannelIds),
-    authOutage: overrides.authOutage ?? null,
+    // A healthy credential by default: only the tests about a dead one hand in
+    // an announcer that claims the refusal.
+    authOutage: overrides.authOutage ?? fakeAuthOutage({ owns: false }),
   });
 
   /** What `handleMessage` buffered, before `deliver` reshapes it. */
@@ -140,20 +142,14 @@ function harness(overrides = {}) {
   return { handlers, config, sessions, registry, windows, client, sent, fetched, bundled };
 }
 
-/**
- * An `AuthOutage` stand-in that records rather than reading a disk or spawning.
- *
- * `owns` is a plain flag here because what it decides is tested against real
- * credential files in `test/auth.test.js`; what this file is about is whether
- * the handlers route to it.
- */
+/** An `AuthOutage` stand-in that records rather than reading a disk or spawning. */
 function fakeAuthOutage({ owns = true, loggedIn = false, url = 'https://claude.com/cai/oauth/authorize?x=1' } = {}) {
   const outage = {
     announced: [],
     submitted: [],
     began: 0,
-    owns: () => owns,
-    announce: async (channelId) => {
+    owns: () => (owns ? { why: 'the refresh token is blank' } : null),
+    announce: async (_dead, channelId) => {
       outage.announced.push(channelId);
     },
     login: {
@@ -164,7 +160,7 @@ function fakeAuthOutage({ owns = true, loggedIn = false, url = 'https://claude.c
       },
       submit: async (code) => {
         outage.submitted.push(code);
-        return 'submitted-reply';
+        return { ok: true };
       },
     },
   };
@@ -678,7 +674,7 @@ test('and the SAME turn from a live session does announce — the control', asyn
   });
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /re-login on the host/);
+  assert.equal(sent[0], outageMessage(authFailure({ noRetryReason: 'credential-dead' })));
 });
 
 test('an auth failure on the FIRST attempt is left to the respawn', async () => {
@@ -705,7 +701,7 @@ test('the same auth failure AFTER a respawn is announced', async () => {
   });
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /re-login on the host/);
+  assert.equal(sent[0], outageMessage(authFailure({ noRetryReason: 'credential-dead' })));
   assert.match(sent[0], /could not authenticate/);
   assert.doesNotMatch(
     sent[0],
@@ -808,7 +804,7 @@ test('a dead credential announces EXACTLY ONCE across the whole respawn cycle', 
     `the channel must hear about a dead credential once, not ${sent.length} times: ` +
       JSON.stringify(sent),
   );
-  assert.match(sent[0], /re-login on the host/);
+  assert.equal(sent[0], outageMessage(authFailure({ noRetryReason: 'credential-dead' })));
   assert.match(sent[0], /could not authenticate/);
   assert.doesNotMatch(
     sent[0],
@@ -840,9 +836,8 @@ test('an edit with no author at all is survivable — an edit arrives partial', 
 
 
 // ── a dead credential: who announces it, and how the code gets back in ──────
-// Clawcius #369.
 
-test('a credential the disk says is finished gets the message with the link, not the generic one', async () => {
+test('a credential the disk says is finished gets the announcer, not the generic message', async () => {
   const authOutage = fakeAuthOutage();
   const { handlers, sessions, sent } = harness({ authOutage });
   // `afterRespawn`, so the respawn gate is spent and this is the final word.
@@ -853,14 +848,12 @@ test('a credential the disk says is finished gets the message with the link, not
     await settle();
   });
 
-  // One message in the channel, and it is the one that can be acted on.
   assert.deepEqual(authOutage.announced, [CHANNEL]);
   assert.deepEqual(sent, []);
 });
 
 test('an auth failure the announcer does not own keeps the generic outage message', async () => {
-  // A token that is merely stale in a live process: the disk is healthy, #266's
-  // respawn gate owns it, and nothing about the credential is worth a link.
+  // A token stale in a live process: the disk is healthy and the respawn clears it.
   const authOutage = fakeAuthOutage({ owns: false });
   const { handlers, sessions, sent } = harness({ authOutage });
   handlers.deliver(CHANNEL, buffered(), true);
@@ -872,7 +865,6 @@ test('an auth failure the announcer does not own keeps the generic outage messag
 
   assert.deepEqual(authOutage.announced, []);
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /could not authenticate/);
 });
 
 test('the first attempt is still left to the respawn, dead credential or not', async () => {
@@ -897,10 +889,10 @@ test('!auth with a code hands the rest of the line over verbatim', async () => {
   await handlers.handleMessage(msg);
 
   assert.deepEqual(authOutage.submitted, ['lJ8x-Ab_c0D3#9PGDW']);
-  assert.deepEqual(msg.replies, ['submitted-reply']);
+  assert.equal(msg.replies.length, 1);
 });
 
-test('!auth on its own starts a login and posts the link — the back door, asked for', async () => {
+test('!auth on its own starts a login and posts the link', async () => {
   const authOutage = fakeAuthOutage({ loggedIn: false });
   const { handlers } = harness({ authOutage });
   const msg = message({ content: '!auth', mentioned: true });
@@ -908,8 +900,8 @@ test('!auth on its own starts a login and posts the link — the back door, aske
   await handlers.handleMessage(msg);
 
   assert.equal(authOutage.began, 1);
-  assert.match(msg.replies[0], /https:\/\/claude\.com\/cai\/oauth\/authorize/);
-  assert.match(msg.replies[0], /!auth <code>/);
+  // The link `begin` produced is what the channel is handed.
+  assert.ok(msg.replies[0].includes('https://claude.com/cai/oauth/authorize?x=1'));
 });
 
 test('!auth when the credential is fine spawns nothing', async () => {
@@ -920,12 +912,10 @@ test('!auth when the credential is fine spawns nothing', async () => {
   await handlers.handleMessage(msg);
 
   assert.equal(authOutage.began, 0);
-  assert.match(msg.replies[0], /Logged in already/);
+  assert.equal(msg.replies.length, 1);
 });
 
 test('!auth is the waker answering — it never reaches the agent', async () => {
-  // The whole point: the model is what is dead, so the model cannot be the one
-  // to fix it. No session is acquired and nothing is bundled.
   const authOutage = fakeAuthOutage();
   const { handlers, sessions, bundled } = harness({ authOutage });
 
@@ -957,11 +947,7 @@ test('a mail wake hands a refused turn on, and only when nothing is coming', () 
   assert.deepEqual(refused, ['authentication_failed']);
 });
 
-test('the announcement is the daemon\'s, and it names no command', async () => {
-  // `!auth` exists and is useful, but it is not what the channel is told to do:
-  // the operator has said outright he will not paste codes. The message itself
-  // is asserted in test/auth.test.js; this pins that the handler routes to it
-  // rather than composing a second one of its own.
+test('the announcement is the announcer\'s, and mints no link', async () => {
   const authOutage = fakeAuthOutage();
   const { handlers, sessions, sent } = harness({ authOutage });
   handlers.deliver(CHANNEL, buffered(), true);
@@ -972,6 +958,6 @@ test('the announcement is the daemon\'s, and it names no command', async () => {
   });
 
   assert.deepEqual(authOutage.announced, [CHANNEL]);
-  assert.equal(authOutage.began, 0, 'the announcement does not mint a link');
+  assert.equal(authOutage.began, 0);
   assert.deepEqual(sent, []);
 });

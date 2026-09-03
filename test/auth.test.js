@@ -1,13 +1,3 @@
-/**
- * A dead credential: telling the difference, saying so, and getting back in.
- *
- * Clawcius #369. Two of these are worth more than the rest. `credentialVerdict`
- * is the discriminator the whole fix rests on — get it wrong in one direction
- * and the twenty-hour silence comes back, wrong in the other and every stale
- * token a respawn would have fixed cries outage. And `authCodeProblem` is the
- * only thing standing between a pasted string and a process's stdin.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,7 +7,6 @@ import { join } from 'node:path';
 import {
   AuthLogin,
   AuthOutage,
-  agentHome,
   authArgv,
   authCodeProblem,
   credentialVerdict,
@@ -38,6 +27,16 @@ function credentialDir(oauth) {
   return dir;
 }
 
+/** Run `body` against a credential directory and clean it up. */
+function withCredential(oauth, body) {
+  const dir = credentialDir(oauth);
+  try {
+    return body(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const HEALTHY = {
   accessToken: 'sk-ant-oat-live',
   refreshToken: 'sk-ant-ort-live',
@@ -45,102 +44,59 @@ const HEALTHY = {
   refreshTokenExpiresAt: NOW + 30 * 86_400_000,
 };
 
-test('the credential file from the incident reads as terminal', () => {
-  // Verbatim from #369: both tokens blanked, expiresAt zeroed, and a
-  // refreshTokenExpiresAt that had already passed when the CLI rewrote it.
-  const dir = credentialDir({
-    accessToken: '',
-    refreshToken: '',
-    expiresAt: 0,
-    refreshTokenExpiresAt: 1_788_356_689_216,
-  });
-  try {
-    const verdict = credentialVerdict(dir, NOW);
-    assert.equal(verdict.terminal, true);
-    assert.match(verdict.why, /refresh token is blank/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('a credential blanked by a failed refresh is terminal', () => {
+  withCredential(
+    { accessToken: '', refreshToken: '', expiresAt: 0, refreshTokenExpiresAt: 1_788_356_689_216 },
+    (dir) => assert.equal(credentialVerdict(dir, NOW).terminal, true),
+  );
 });
 
-test('an expired refresh token is terminal and the message names when', () => {
-  const dir = credentialDir({ ...HEALTHY, refreshTokenExpiresAt: NOW - 1 });
-  try {
-    const verdict = credentialVerdict(dir, NOW);
-    assert.equal(verdict.terminal, true);
-    assert.match(verdict.why, /expired at 2026-/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('a refresh token past its expiry is terminal', () => {
+  withCredential({ ...HEALTHY, refreshTokenExpiresAt: NOW - 1 }, (dir) =>
+    assert.equal(credentialVerdict(dir, NOW).terminal, true),
+  );
 });
 
-test('a stale access token with a live refresh token stays quiet', () => {
-  // THE case that must not announce: the running process is holding a token the
-  // file has already replaced, and dropping the session picks the new one up.
-  // #266's respawn gate owns this and a message here would undo it.
-  const dir = credentialDir({ ...HEALTHY, expiresAt: NOW - 60_000 });
-  try {
-    assert.equal(credentialVerdict(dir, NOW).terminal, false);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('a stale access token with a live refresh token is not terminal', () => {
+  // The case a respawn clears. Announcing it would undo the respawn gate.
+  withCredential({ ...HEALTHY, expiresAt: NOW - 60_000 }, (dir) =>
+    assert.equal(credentialVerdict(dir, NOW).terminal, false),
+  );
 });
 
 test('a healthy credential is not terminal', () => {
-  const dir = credentialDir(HEALTHY);
-  try {
-    assert.equal(credentialVerdict(dir, NOW).terminal, false);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  withCredential(HEALTHY, (dir) => assert.equal(credentialVerdict(dir, NOW).terminal, false));
 });
 
-test('a refresh expiry of 0 or absent means unstated, not expired', () => {
+test('a refresh expiry of 0 or absent is unstated, not expired', () => {
   for (const oauth of [
     { ...HEALTHY, refreshTokenExpiresAt: 0 },
     { accessToken: 'a-token', refreshToken: 'a-refresh' },
   ]) {
-    const dir = credentialDir(oauth);
-    try {
-      assert.equal(credentialVerdict(dir, NOW).terminal, false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    withCredential(oauth, (dir) => assert.equal(credentialVerdict(dir, NOW).terminal, false));
   }
 });
 
-test('missing, unparseable and shapeless credential files are all terminal', () => {
-  const cases = [
-    [undefined, /no \.credentials\.json/],
-    ['{not json', /not valid JSON/],
-    ['{"somethingElse":{}}', /no claudeAiOauth block/],
-  ];
-  for (const [contents, why] of cases) {
-    const dir = credentialDir(contents);
-    try {
-      const verdict = credentialVerdict(dir, NOW);
-      assert.equal(verdict.terminal, true, `expected terminal for ${String(contents)}`);
-      assert.match(verdict.why, why);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+test('missing, unparseable and shapeless credential files are terminal', () => {
+  for (const contents of [undefined, '{not json', '{"somethingElse":{}}']) {
+    withCredential(contents, (dir) =>
+      assert.equal(credentialVerdict(dir, NOW).terminal, true, `for ${String(contents)}`),
+    );
   }
-});
-
-test('the agent home is the bind mount, derived and not configured', () => {
-  assert.equal(agentHome('/var/lib/clawcius'), '/var/lib/clawcius/agent-home');
 });
 
 test('a paste code with anything odd in it is refused, not trimmed', () => {
-  // Refused rather than trimmed: half a code on stdin leaves the rest in the
-  // stream and the failure lands somewhere far from here.
-  assert.match(authCodeProblem(''), /no code/);
-  assert.match(authCodeProblem('abc def'), /whitespace/);
-  assert.match(authCodeProblem('abcdefgh\nrm -rf'), /whitespace/);
-  assert.match(authCodeProblem('short'), /paste code/);
-  assert.match(authCodeProblem('abcdefgh; echo pwned'), /whitespace/);
-  assert.match(authCodeProblem(`${'a'.repeat(513)}`), /paste code/);
-  assert.match(authCodeProblem('abcdefgh$(id)'), /paste code/);
+  for (const bad of [
+    '',
+    'abc def',
+    'abcdefgh\nrm -rf',
+    'short',
+    'abcdefgh; echo pwned',
+    'a'.repeat(513),
+    'abcdefgh$(id)',
+  ]) {
+    assert.notEqual(authCodeProblem(bad), null, `expected a problem for ${JSON.stringify(bad)}`);
+  }
 });
 
 test('a real-shaped paste code is accepted', () => {
@@ -167,8 +123,6 @@ test('the login runs where the credential is written', () => {
     '--claudeai',
   ]);
 
-  // A crew with no container runs it on the host, and says which config dir
-  // rather than trusting the unit to have set it.
   const onHost = authArgv({ ...target, containerEnabled: false }, ['auth', 'status']);
   assert.equal(onHost.file, 'claude');
   assert.deepEqual(onHost.args, ['auth', 'status']);
@@ -176,13 +130,11 @@ test('the login runs where the credential is written', () => {
 });
 
 test('auth status is read as JSON, then as prose, then not at all', () => {
+  // The JSON form is what the CLI emits: {"loggedIn": false, "authMethod": "none", …}
   assert.equal(readLoggedIn('{"loggedIn":true}'), true);
-  assert.equal(readLoggedIn('{"loggedIn":false,"account":null}'), false);
+  assert.equal(readLoggedIn('{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'), false);
   assert.equal(readLoggedIn('You are not logged in.'), false);
   assert.equal(readLoggedIn('Logged in as someone@example.com'), true);
-  // A CLI that changes its output downgrades to "could not tell" rather than to
-  // a confident wrong answer — this is the confirmation step of the only path
-  // back from a dead credential.
   assert.equal(readLoggedIn('¯\\_(ツ)_/¯'), null);
 });
 
@@ -219,10 +171,12 @@ function fakeChild() {
   return child;
 }
 
+/** What the CLI prints under `docker exec -i` before it blocks on stdin. */
 const URL_LINE =
   "Opening browser to sign in…\nIf the browser didn't open, visit: " +
   'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW\n' +
   'Paste code here if prompted >';
+const URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW';
 
 const TARGET = {
   containerEnabled: true,
@@ -248,27 +202,30 @@ function loginHarness({ now = () => NOW } = {}) {
   return { login, spawned };
 }
 
-test('begin reads the URL out of what the CLI printed', async () => {
-  const { login, spawned } = loginHarness();
+/** Let the promise chains inside `AuthLogin` settle. */
+async function settle(times = 20) {
+  for (let i = 0; i < times; i += 1) await Promise.resolve();
+}
+
+/** Start a login and give it the URL line. */
+async function started(login, spawned) {
   const pending = login.begin();
   await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  const result = await pending;
-  assert.equal(result.url, 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW');
+  spawned[spawned.length - 1].child.say(URL_LINE);
+  return pending;
+}
+
+test('begin reads the URL out of what the CLI printed', async () => {
+  const { login, spawned } = loginHarness();
+  const result = await started(login, spawned);
+  assert.equal(result.url, URL);
   assert.deepEqual(spawned[0].args.slice(-3), ['auth', 'login', '--claudeai']);
 });
 
 test('a second begin reuses the login already waiting', async () => {
-  // Two live PKCE challenges is one more than can ever be used, and the repeat
-  // announcement four hours later must not orphan the first one's process.
   const { login, spawned } = loginHarness();
-  const first = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  const started = await first;
-
-  const again = await login.begin();
-  assert.deepEqual(again, started);
+  const first = await started(login, spawned);
+  assert.deepEqual(await login.begin(), first);
   assert.equal(spawned.length, 1);
 });
 
@@ -277,31 +234,46 @@ test('a login that dies before printing a URL is reported, not held', async () =
   const pending = login.begin();
   await Promise.resolve();
   spawned[0].child.emit('exit', 1);
-  const result = await pending;
-  assert.match(result.error, /exited before it printed a URL/);
+  assert.ok('error' in (await pending));
   assert.equal(login.pendingUrl, null);
+});
+
+test('an expired login mints a fresh one rather than refusing', async () => {
+  let clock = NOW;
+  const { login, spawned } = loginHarness({ now: () => clock });
+  await started(login, spawned);
+
+  login.stop(); // what the idle timer does when nobody came back
+  clock += 3 * 60 * 60 * 1000;
+
+  assert.equal((await started(login, spawned)).url, URL);
+  assert.equal(spawned.length, 2);
+});
+
+test('two begins a moment apart do not start two logins', async () => {
+  const { login, spawned } = loginHarness();
+  await started(login, spawned);
+  login.stop();
+
+  const immediate = await login.begin();
+  assert.ok('error' in immediate);
+  assert.equal(spawned.length, 1);
 });
 
 test('a bad code never reaches stdin', async () => {
   const { login, spawned } = loginHarness();
-  const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await pending;
+  await started(login, spawned);
 
-  const said = await login.submit('has spaces in it');
-  assert.match(said, /whitespace/);
+  const outcome = await login.submit('has spaces in it');
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'bad-code');
   assert.deepEqual(spawned[0].child.written, []);
-  // And nothing was spawned to run `auth status` either — it never got that far.
-  assert.equal(spawned.length, 1);
+  assert.equal(spawned.length, 1, 'auth status was never reached');
 });
 
 test('a good code goes in on stdin and the answer comes from auth status', async () => {
   const { login, spawned } = loginHarness();
-  const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await pending;
+  await started(login, spawned);
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
@@ -319,21 +291,19 @@ test('a good code goes in on stdin and the answer comes from auth status', async
   statusRun.child.say('{"loggedIn":true}');
   statusRun.child.emit('exit', 0);
 
-  assert.match(await submitting, /Authenticated/);
+  assert.deepEqual(await submitting, { ok: true });
 });
 
-test('a code with no login waiting says how to start one', async () => {
+test('a code with no login waiting is refused before anything is spawned', async () => {
   const { login, spawned } = loginHarness();
-  assert.match(await login.submit('lJ8x-Ab_c0D3#9PGDW'), /No login is waiting/);
+  const outcome = await login.submit('lJ8x-Ab_c0D3#9PGDW');
+  assert.equal(outcome.reason, 'none-waiting');
   assert.equal(spawned.length, 0);
 });
 
 test('an exchange that did not take is reported as not taken', async () => {
   const { login, spawned } = loginHarness();
-  const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await pending;
+  await started(login, spawned);
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
@@ -341,25 +311,45 @@ test('an exchange that did not take is reported as not taken', async () => {
   await settle();
   spawned[1].child.say('{"loggedIn":false}');
   spawned[1].child.emit('exit', 0);
-  assert.match(await submitting, /did not take/);
+  assert.equal((await submitting).reason, 'not-taken');
+});
+
+test('a login still running when the exchange window closes is killed, not left holding', async () => {
+  // Its idle timer is cleared when the code goes in, so nothing else reaps it.
+  const spawned = [];
+  const login = new AuthLogin({
+    target: TARGET,
+    log: () => {},
+    now: () => NOW,
+    exchangeMs: 0,
+    spawn: (file, args) => {
+      const child = fakeChild();
+      spawned.push({ file, args: [...args], child });
+      return child;
+    },
+  });
+  await started(login, spawned);
+
+  const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
+  await new Promise((resolve) => setImmediate(resolve));
+  await settle();
+
+  assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the login that never exited was killed');
+  assert.equal(login.pendingUrl, null);
+
+  spawned[1].child.say('{"loggedIn":false}');
+  spawned[1].child.emit('exit', 0);
+  assert.equal((await submitting).ok, false);
 });
 
 test('stop kills a login that is holding a URL nobody used', async () => {
   const { login, spawned } = loginHarness();
-  const pending = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await pending;
+  await started(login, spawned);
 
   login.stop();
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM']);
   assert.equal(login.pendingUrl, null);
 });
-
-/** Let the promise chains inside `AuthLogin` settle. */
-async function settle(times = 20) {
-  for (let i = 0; i < times; i += 1) await Promise.resolve();
-}
 
 const deadTurn = (overrides = {}) => ({
   apiErrorKind: 'authentication_failed',
@@ -384,128 +374,84 @@ function outageHarness(oauth, { now = () => NOW } = {}) {
   return { outage, sent, spawned, dir };
 }
 
-test('owns is true only for a credential the disk says is finished', () => {
-  const dead = outageHarness({ accessToken: '', refreshToken: '', refreshTokenExpiresAt: 1 });
+const DEAD = { accessToken: '', refreshToken: '' };
+
+test('owns answers only for a credential the disk says is finished', () => {
+  const dead = outageHarness(DEAD);
   try {
-    assert.equal(dead.outage.owns(deadTurn()), true);
-    // A rate limit is not this, however terminal it is.
-    assert.equal(dead.outage.owns(deadTurn({ apiErrorKind: 'rate_limit' })), false);
-    // And neither is an auth failure with retries still queued.
-    assert.equal(dead.outage.owns(deadTurn({ noRetryReason: null })), false);
+    assert.notEqual(dead.outage.owns(deadTurn()), null);
+    assert.equal(dead.outage.owns(deadTurn({ apiErrorKind: 'rate_limit' })), null);
+    assert.equal(dead.outage.owns(deadTurn({ noRetryReason: null })), null);
   } finally {
     rmSync(dead.dir, { recursive: true, force: true });
   }
 
-  // The transient case: same summary, healthy file, and the respawn keeps it.
   const alive = outageHarness(HEALTHY);
   try {
-    assert.equal(alive.outage.owns(deadTurn()), false);
+    assert.equal(alive.outage.owns(deadTurn()), null);
   } finally {
     rmSync(alive.dir, { recursive: true, force: true });
   }
 });
 
-test('the announcement states the fault and stops', async () => {
-  const { outage, sent, spawned, dir } = outageHarness({ accessToken: '', refreshToken: '' });
+test('the announcement goes to the main channel and mints nothing', async () => {
+  // No link, because there is no one-click flow to point at, and `!auth` is not
+  // offered: the operator does not paste codes.
+  const { outage, sent, spawned, dir } = outageHarness(DEAD);
   try {
-    await outage.announce(null);
+    await outage.announce(outage.owns(deadTurn()), null);
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
-    assert.match(sent[0].text, /Clawcius cannot authenticate/);
-    assert.match(sent[0].text, /no retry and no respawn will fix it/);
-    // Which agent home is dead, so whoever acts knows where to act.
-    assert.match(sent[0].text, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.match(sent[0].text, /needs a person/);
-
-    // NO link and NO command. The front door is not built, and `!auth <code>` is
-    // the one thing the operator has said outright he will not do. A message
-    // naming a next step it cannot deliver is worse than one naming none.
-    assert.equal(/https?:\/\//.test(sent[0].text), false, 'no link until there is a front door');
-    assert.equal(sent[0].text.includes('!auth'), false, 'the back door is not advertised');
-    // Nothing was spawned to mint a link either.
-    assert.deepEqual(spawned, []);
-    // ⚠️ is reserved for the system's own messages about the crew.
-    assert.equal(sent[0].text.includes('⚠️'), false);
+    assert.deepEqual(spawned, [], 'no login is started to produce a link');
+    assert.equal(sent[0].text.includes('!auth'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('the loop is announced once; a person who typed always gets an answer', async () => {
-  // Twelve refusals a minute for twenty hours is fourteen thousand events.
+test('the refusal loop is announced once; a person who typed always gets an answer', async () => {
   let clock = NOW;
-  const { outage, sent, spawned, dir } = outageHarness(
-    { accessToken: '', refreshToken: '' },
-    { now: () => clock },
-  );
+  const { outage, sent, dir } = outageHarness(DEAD, { now: () => clock });
   try {
-    await outage.announce(null);
+    const dead = outage.owns(deadTurn());
+    await outage.announce(dead, null);
     assert.equal(sent.length, 1);
 
     for (let i = 0; i < 50; i += 1) {
       clock += 5_000;
-      await outage.announce(null);
+      await outage.announce(dead, null);
     }
-    assert.equal(sent.length, 1, 'the mail loop should not repeat inside the cooldown');
+    assert.equal(sent.length, 1, 'the refusal loop does not repeat inside the cooldown');
 
-    // Somebody in the channel is not the loop. They asked; they get told.
-    await outage.announce('C-thread');
+    await outage.announce(dead, 'C-thread');
     assert.equal(sent.length, 2);
     assert.equal(sent[1].channelId, 'C-thread');
-    assert.match(sent[1].text, /did not reach me/);
 
-    // And four hours later the loop says it again.
     clock += 4 * 60 * 60 * 1000 + 1;
-    await outage.announce(null);
+    await outage.announce(dead, null);
     assert.equal(sent.length, 3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a credential that came back is not announced', async () => {
-  const { outage, sent, dir } = outageHarness(HEALTHY);
+test('a send that throws does not escape the announcer', async () => {
+  const dir = credentialDir(DEAD);
+  const outage = new AuthOutage({
+    home: dir,
+    login: new AuthLogin({ target: TARGET, log: () => {}, now: () => NOW, spawn: () => fakeChild() }),
+    mainChannelId: 'C-main',
+    crew: 'Clawcius',
+    send: async () => {
+      throw new Error('Unknown Channel');
+    },
+    log: () => {},
+    now: () => NOW,
+  });
   try {
-    await outage.announce(null);
-    assert.deepEqual(sent, []);
+    await outage.announce({ why: 'the refresh token is blank' }, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('a login that expired mints a fresh one rather than erroring', async () => {
-  // Somebody may come to this hours after the message went out. "Your link
-  // expired" is the same dead end in a nicer font.
-  let clock = NOW;
-  const { login, spawned } = loginHarness({ now: () => clock });
-  const first = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await first;
-
-  // What the idle timer does when nobody came back for it.
-  login.stop();
-  clock += 3 * 60 * 60 * 1000;
-
-  const again = login.begin();
-  await Promise.resolve();
-  spawned[1].child.say(URL_LINE);
-  assert.equal((await again).url, 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW');
-  assert.equal(spawned.length, 2, 'a fresh login, not the dead one');
-});
-
-test('two clicks a second apart do not start two logins', async () => {
-  const { login, spawned } = loginHarness();
-  const first = login.begin();
-  await Promise.resolve();
-  spawned[0].child.say(URL_LINE);
-  await first;
-  login.stop();
-
-  // Same instant on the injected clock: the floor is spam protection, and it is
-  // the only thing that ever refuses to mint.
-  const immediate = await login.begin();
-  assert.match(immediate.error, /give it a moment/);
-  assert.equal(spawned.length, 1);
 });

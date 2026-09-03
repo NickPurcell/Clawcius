@@ -49,6 +49,8 @@ export type AgentConfig = {
     /** In-container path to the claude binary. */
     claudePath: string;
     stateDir: string;
+    /** The Claude config dir: bind-mounted into the container, or CLAUDE_CONFIG_DIR without one. */
+    agentHome: string;
     /** Where the per-exec `--env-file` is written (src/container.ts). */
     execEnvDir: string;
     /** Holds the App installation token for agents; mounted READ-ONLY. */
@@ -72,18 +74,6 @@ export type AgentConfig = {
   };
   discord: {
     allowedChannelIds: string[];
-    /**
-     * Where a dead credential is announced when nobody is waiting on a channel —
-     * the mail path has none of its own. Empty falls back to
-     * `allowedChannelIds[0]`, which the schema guarantees exists.
-     *
-     * Both instances leave it empty today, and that is the recommendation:
-     * naming a channel here that `allowedChannelIds` already names first is a
-     * second copy of one id, and the failure mode of a drifted copy is an
-     * outage announced into a room nobody is in. Set it only when the first
-     * allowed channel is not where you want to be told.
-     */
-    outageChannelId: string;
     /** After the bot is addressed, seconds during which ordinary messages in that channel also reach the agent. */
     followUpWindowSeconds: number;
     /** Channels where a follow-up window may open at all. Empty means every channel. */
@@ -97,12 +87,6 @@ export type AgentConfig = {
   paths: {
     discordCli: string;
     skillsDir: string;
-    /**
-     * Host `claude` CLI, used by `!auth` on a crew whose sessions do NOT run in
-     * a container — the login has to run wherever the credential is written.
-     * Left as a bare name so it resolves on the daemon's PATH; a crew with a
-     * container never reads it.
-     */
     claudeCli: string;
   };
   git: {
@@ -154,7 +138,6 @@ const Instance = z.strictObject({
       allowedChannelIds: z.array(z.string()).min(1, { error: 'must name at least one channel' }),
       followUpChannelIds: z.array(z.string()).default([]),
       alwaysOnChannelIds: z.array(z.string()).default([]),
-      outageChannelId: z.string().default(''),
     }),
   container: z.strictObject({ enabled: z.boolean().default(true) }).prefault({}),
 });
@@ -189,7 +172,7 @@ const Base = z.strictObject({
   paths: z.strictObject({
     discordCli: z.string().min(1),
     skillsDir: z.string().min(1),
-    claudeCli: z.string().min(1).default('claude'),
+    claudeCli: z.string().min(1),
   }),
   clawsky: z.strictObject({
     enabled: z.boolean(),
@@ -264,6 +247,7 @@ function deriveInstancePaths(crew: string, displayName: string) {
     containerName: `${crew}-agent`,
     stateDir,
     execEnvDir: join(stateDir, 'exec-env'),
+    agentHome: join(stateDir, 'agent-home'),
     githubTokenDir: join(stateDir, 'github-token'),
     workspaceRoot: join(stateDir, 'workspaces'),
     statusFile: join(stateDir, 'waker-status.json'),
@@ -315,9 +299,8 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
   const discordCli = resolve(base.paths.discordCli);
   // What docker/run-container.sh bind-mounts into the agent container.
   const mounts: Array<[string, string]> = [
-    ...(['workspaces', 'agent-home'] as const).map(
-      (child): [string, string] => [`<stateDir>/${child}, bind-mounted read-write`, join(derived.stateDir, child)],
-    ),
+    ['<stateDir>/workspaces, bind-mounted read-write', join(derived.stateDir, 'workspaces')],
+    ['<stateDir>/agent-home, bind-mounted read-write', derived.agentHome],
     ['paths.skillsDir', skillsDir],
     ['the directory containing paths.discordCli', dirname(discordCli)],
     ['container.githubTokenDir', derived.githubTokenDir],
@@ -347,6 +330,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
       name: derived.containerName,
       claudePath: base.container.claudePath,
       stateDir: derived.stateDir,
+      agentHome: derived.agentHome,
       execEnvDir: derived.execEnvDir,
       githubTokenDir: derived.githubTokenDir,
     },
@@ -360,9 +344,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     },
     sessions: { ...base.sessions, workspaceRoot: derived.workspaceRoot },
     discord: { ...base.discord, ...instance.discord },
-    // `claudeCli` is deliberately NOT resolved: a bare `claude` has to stay a
-    // PATH lookup, and `resolve()` would turn it into a path under the daemon's
-    // working directory that has never existed.
+    // Unresolved: a bare name has to stay a PATH lookup.
     paths: { discordCli, skillsDir, claudeCli: base.paths.claudeCli },
     git: { userName: derived.gitUserName, userEmail: derived.gitUserEmail },
     clawsky: { ...base.clawsky, crew },

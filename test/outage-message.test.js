@@ -179,7 +179,7 @@ test('a spent AUTH ladder is a dead credential, not a transient that ran out of 
     apiError: 'OAuth token revoked',
     noRetryReason: 'credential-dead',
   });
-  assert.match(text, /re-login on the host/, 'the action is specific, not "go and look"');
+  assert.match(text, /!auth/, 'the action is specific, not "go and look"');
   assert.match(text, /did not reach me/);
   assert.doesNotMatch(text, /Anthropic's API/, 'the fault is ours, not upstream');
   assert.doesNotMatch(text, /try again in a few minutes/i, 'waiting never fixes a dead token');

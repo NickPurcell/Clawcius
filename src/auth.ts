@@ -1,21 +1,10 @@
 /**
- * The one failure the agent cannot report for itself: a Claude credential that
- * is gone and cannot be refreshed.
+ * Detecting a Claude credential that cannot be refreshed, saying so in Discord,
+ * and logging back in.
  *
- * Clawcius #369. A refresh token expired, the CLI tried to refresh anyway,
- * failed, and wrote the credential file back with both tokens blanked. Every
- * turn for the next twenty and a half hours was refused about twelve times a
- * minute and not one refusal reached Discord, because three silences stack: the
- * mail path has no channel to speak in, the first `authentication_failed` on a
- * Discord turn is deliberately left to the respawn, and `announceOutage` is
- * reached from a session event — so announcing needs the model that just died.
- *
- * The daemon is the thing that is still alive and still holds `DISCORD_TOKEN`.
- * So everything here is the daemon speaking: the verdict is read off disk, the
- * message goes out through the gateway client, and no model turn is involved at
- * any point. The same is true of `!auth`, which is why the way back in is a
- * waker command beside `!stop` and `!reset` rather than something the agent
- * does — the agent is what is broken.
+ * Everything here runs in the daemon rather than in a session: the credential
+ * being dead is exactly the state in which no agent turn can run, so nothing
+ * that depends on one can report it or repair it.
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -23,77 +12,45 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TurnSummary } from './types.js';
 
-/**
- * How long a dead credential goes unmentioned after it has been mentioned once.
- *
- * Twelve refusals a minute for twenty hours is fourteen thousand events and the
- * channel needed one message. Four hours is "still broken, still nobody has
- * fixed it" without being a thing people learn to scroll past. A human who
- * actually typed something bypasses this — see `AuthOutage.announce`.
- */
+/** Gap between repeat announcements while a credential stays dead. */
 const REPEAT_MS = 4 * 60 * 60 * 1000;
 
-/**
- * How long a started login is held waiting for its code.
- *
- * The OAuth `state` and PKCE challenge in the URL expire on Anthropic's side
- * anyway, so a child held longer than this is a process nobody is coming back
- * to. Fifteen minutes is long enough to notice the message on a phone.
- */
+/** How long a started login is held waiting for its code before it is killed. */
 const LOGIN_IDLE_MS = 15 * 60 * 1000;
 
-/** How long to wait for the login to print its URL before giving up on it. */
+/** How long to wait for the login to print its URL. */
 const URL_WAIT_MS = 60_000;
 
-/** How long to wait for the exchange after a code goes in. */
+/** How long to wait for the login to exit after a code goes in. */
 const EXCHANGE_MS = 120_000;
 
-/** Floor between two `!auth` invocations that would each start a login. */
+/** Gap below which `begin` refuses to spawn a second login. */
 const START_FLOOR_MS = 60_000;
+
+/** How long to wait for `auth status`. */
+const STATUS_MS = 30_000;
 
 const CREDENTIAL_FILE = '.credentials.json';
 
 /**
- * Where this instance's Claude login lives.
+ * Whether the credential on disk is one a retry or a respawn could fix.
  *
- * `docker/run-container.sh` bind-mounts `<stateDir>/agent-home` in as the
- * container's `CLAUDE_CONFIG_DIR`, and a crew with no container has the same
- * path in its unit. `src/agent-config.ts` already derives it once for the
- * containment check; this is the same derivation and there is no config key for
- * it on purpose, because a second copy is a thing that drifts.
- */
-export function agentHome(stateDir: string): string {
-  return join(stateDir, 'agent-home');
-}
-
-/**
- * Whether the credential on disk is one a retry or a respawn could ever fix.
- *
- * This is the discriminator #369 asks for, and it is the whole reason the
- * transient case stays quiet. A stale access token with a live refresh token is
- * `refreshable`: the running process is holding a token the file has already
- * replaced, and dropping the session picks up the new one — that is #266's gate
- * doing its job and it must not be announced. Everything else is terminal: no
- * amount of respawning invents a refresh token that has expired.
- *
- * Anything unreadable or unparseable counts as terminal too, and the `why` says
- * which. That is a deliberate lean: the only caller has already established
- * that the API refused to authenticate and the retry ladder is spent, so a
- * credential file the daemon cannot make sense of is not a reason to say
- * nothing — saying nothing is the defect being fixed.
+ * `terminal` is anything no running process can recover from: a blank refresh
+ * token, a refresh token past its expiry, or a file that is absent, unparseable
+ * or the wrong shape. A stale access token behind a live refresh token is not
+ * terminal — dropping the session picks up the refreshed one.
  */
 export type CredentialVerdict = { terminal: false } | { terminal: true; why: string };
 
 export function credentialVerdict(home: string, now = Date.now()): CredentialVerdict {
+  const path = join(home, CREDENTIAL_FILE);
   let raw: string;
   try {
-    raw = readFileSync(join(home, CREDENTIAL_FILE), 'utf8');
+    raw = readFileSync(path, 'utf8');
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') {
-      return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}` };
-    }
-    return { terminal: true, why: `${join(home, CREDENTIAL_FILE)} could not be read (${code ?? 'unknown error'})` };
+    if (code === 'ENOENT') return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}` };
+    return { terminal: true, why: `${path} could not be read (${code ?? 'unknown error'})` };
   }
 
   let parsed: unknown;
@@ -113,15 +70,14 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
     refreshTokenExpiresAt?: unknown;
   };
 
-  // Blanked to empty strings rather than removed — which is what a failed
-  // refresh actually leaves behind, and what #369 found on disk.
+  // A failed refresh blanks the tokens in place rather than removing them.
   if (typeof refreshToken !== 'string' || refreshToken === '') {
     return { terminal: true, why: 'the refresh token is blank — there is nothing left to refresh' };
   }
   if (typeof accessToken !== 'string' || accessToken === '') {
     return { terminal: true, why: 'the access token is blank' };
   }
-  // 0 and absent both mean "not stated", which is not the same as "expired".
+  // Absent and 0 both mean unstated, which is not the same as expired.
   if (typeof refreshTokenExpiresAt === 'number' && refreshTokenExpiresAt > 0) {
     if (refreshTokenExpiresAt <= now) {
       return {
@@ -139,23 +95,17 @@ export type AuthTarget = {
   /**
    * True when sessions run through `docker exec`.
    *
-   * The login follows the session, and that is not a preference.
-   * `docker/Dockerfile:51-54` states it: the agent home is bind-mounted from
-   * the instance's state dir and *"the container is its only writer and
-   * refreshes its own OAuth token; nothing here is shared with the host user"*.
-   * Sharing a credential across the gVisor boundary was tried twice —
-   * bind-mounted file, then directory-plus-symlink — and both times the
-   * container read a stale credential while the host's was current. A login run
-   * from the host writes into that private store from exactly the side those
-   * attempts failed on.
+   * The container is the only writer of its own agent home and refreshes its own
+   * token there; a login run from the host writes into that store from the other
+   * side of the sandbox boundary, where reads and writes are not coherent.
    */
   containerEnabled: boolean;
   containerName: string;
-  /** In-container path to the claude binary; used only when `containerEnabled`. */
+  /** In-container path to the claude binary, used when `containerEnabled`. */
   claudePath: string;
-  /** Host claude CLI, for a crew with no container. A bare name is a PATH lookup. */
+  /** Host claude CLI for a crew with no container. A bare name resolves on PATH. */
   hostClaudePath: string;
-  /** `agentHome(stateDir)` — passed as CLAUDE_CONFIG_DIR on the host path. */
+  /** The agent home, passed as CLAUDE_CONFIG_DIR on the host path. */
   home: string;
 };
 
@@ -165,16 +115,13 @@ export function authArgv(
   sub: readonly string[],
 ): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
   if (target.containerEnabled) {
-    // No `-e` and no env file: the container already carries CLAUDE_CONFIG_DIR
-    // from `docker run`, and nothing here needs a secret on the command line.
+    // The container carries CLAUDE_CONFIG_DIR from `docker run`.
     return {
       file: 'docker',
       args: ['exec', '-i', target.containerName, target.claudePath, ...sub],
       env: process.env,
     };
   }
-  // Explicit rather than inherited, so this does not depend on the unit having
-  // remembered to set it.
   return {
     file: target.hostClaudePath,
     args: [...sub],
@@ -182,17 +129,14 @@ export function authArgv(
   };
 }
 
-/**
- * The shape of a paste code, checked before anything is written to a process.
- *
- * Refused rather than trimmed, which is the posture `renderEnvFile` takes for
- * the same reason: a value with a newline in it would submit the first half as
- * the code and leave the rest sitting in the stream, and a login that failed
- * because half a code went in is a much worse afternoon than one that was told
- * no. The code itself is never included in the message — only the complaint.
- */
 const AUTH_CODE = /^[A-Za-z0-9._~#/+=-]{8,512}$/;
 
+/**
+ * Why a string cannot be a paste code, or null.
+ *
+ * Refused rather than trimmed: a value containing a newline would send its first
+ * line as the code and leave the rest in the stream.
+ */
 export function authCodeProblem(code: string): string | null {
   if (code === '') return 'no code followed the command';
   if (/\s/.test(code)) return 'that has whitespace in it — paste the code as one word';
@@ -216,7 +160,7 @@ function findUrl(text: string): string | null {
   return null;
 }
 
-/** The part of `ChildProcess` this uses, so a test can hand over something else. */
+/** The part of `ChildProcess` this uses, so a test can substitute one. */
 export type LoginProcess = {
   stdout: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null;
   stderr: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null;
@@ -234,17 +178,27 @@ export type Spawner = (
 const defaultSpawner: Spawner = (file, args, env) =>
   nodeSpawn(file, [...args], { stdio: ['pipe', 'pipe', 'pipe'], env }) as unknown as LoginProcess;
 
-/** A timer that must never be the reason this process is still alive. */
+/** A timer that must never hold the process open. */
 function detachedTimer(fn: () => void, ms: number): NodeJS.Timeout {
   const timer = setTimeout(fn, ms);
   timer.unref();
   return timer;
 }
 
+/** What came of handing a code to a waiting login. */
+export type SubmitOutcome =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: 'bad-code' | 'none-waiting' | 'no-stdin' | 'write-failed' | 'not-taken' | 'unreadable';
+      detail: string;
+      /** Whether the login process has ended, so a fresh one is needed. */
+      exited: boolean;
+    };
+
 type Pending = {
   child: LoginProcess;
   url: string;
-  startedAt: number;
   idle: NodeJS.Timeout;
   exited: boolean;
 };
@@ -252,17 +206,15 @@ type Pending = {
 /**
  * At most one `claude auth login` at a time, held open waiting for its code.
  *
- * The flow is headless, so there is no callback to catch: the CLI prints a URL
- * and then blocks on stdin for the code the browser hands back. That means the
- * process has to stay alive between the message going out and someone typing
- * `!auth <code>`, which is the whole reason this class exists rather than a
- * function.
+ * The headless flow prints a URL and then blocks on stdin, so the process must
+ * outlive the call that started it.
  */
 export class AuthLogin {
   readonly #target: AuthTarget;
   readonly #spawn: Spawner;
   readonly #log: (line: string) => void;
   readonly #now: () => number;
+  readonly #exchangeMs: number;
   #pending: Pending | null = null;
   #lastStart = 0;
 
@@ -271,14 +223,16 @@ export class AuthLogin {
     log: (line: string) => void;
     spawn?: Spawner;
     now?: () => number;
+    exchangeMs?: number;
   }) {
     this.#target = opts.target;
     this.#spawn = opts.spawn ?? defaultSpawner;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
+    this.#exchangeMs = opts.exchangeMs ?? EXCHANGE_MS;
   }
 
-  /** The URL of a login that is already waiting, if one is. */
+  /** The URL of a login that is waiting, if one is. */
   get pendingUrl(): string | null {
     return this.#pending && !this.#pending.exited ? this.#pending.url : null;
   }
@@ -286,20 +240,14 @@ export class AuthLogin {
   /**
    * Start a login and read back the URL it prints, or reuse one already waiting.
    *
-   * Reuse matters in one direction and freshness in the other. A second call
-   * while a login is genuinely waiting must not orphan the first — two live PKCE
-   * challenges is one more than can ever be used. But a call hours after one
-   * expired must MINT, not fail: whoever is asking is asking now, and "your link
-   * expired" is the same dead end in a nicer font. The idle timer clears
-   * `#pending` when it kills a child, so an expired login is indistinguishable
-   * here from never having had one.
+   * A login whose idle timer has fired leaves no pending state, so it is
+   * indistinguishable here from never having existed and this mints a fresh one.
+   * The start floor is the only thing that refuses.
    */
   async begin(): Promise<{ url: string } | { error: string }> {
     const waiting = this.pendingUrl;
     if (waiting !== null) return { url: waiting };
 
-    // Only ever bites on a double-click a minute apart. Anything older than the
-    // floor mints, which is the whole point of the paragraph above.
     const since = this.#now() - this.#lastStart;
     if (this.#lastStart > 0 && since < START_FLOOR_MS) {
       return { error: `a login was started ${Math.round(since / 1000)}s ago — give it a moment` };
@@ -326,15 +274,13 @@ export class AuthLogin {
       };
 
       const read = (chunk: unknown): void => {
-        // Capped: the URL is in the first few hundred bytes, and a CLI that
-        // decides to stream something long must not grow this without bound.
+        // Capped: the URL arrives in the first few hundred bytes.
         seen = (seen + String(chunk)).slice(-8192);
         const url = findUrl(seen);
         if (url === null) return;
         this.#pending = {
           child,
           url,
-          startedAt: this.#now(),
           idle: detachedTimer(() => {
             this.#log('login expired unused — killing it');
             this.stop();
@@ -359,7 +305,7 @@ export class AuthLogin {
         try {
           child.kill('SIGTERM');
         } catch {
-          // Already gone. The point was to not leave it running.
+          // Already gone.
         }
         settle({ error: `no URL after ${URL_WAIT_MS / 1000}s — the login is not talking` });
       }, URL_WAIT_MS);
@@ -367,58 +313,55 @@ export class AuthLogin {
   }
 
   /**
-   * Hand a code to the waiting login and say what came of it.
+   * Hand a code to the waiting login and report what came of it.
    *
-   * The code goes in on STDIN and never on a command line. `/proc/<pid>/cmdline`
-   * is world-readable, which is the whole argument `src/container.ts` makes for
-   * passing the session environment through a file; a one-time authorization
-   * code is not as valuable as a bot token but it is not free either, and there
-   * is no reason to put it somewhere every local account can read.
+   * The code goes in on stdin and never on a command line, which is world
+   * readable through `/proc`. The outcome comes from `auth status` rather than
+   * from the exit code, which can be 0 with nothing usable written.
    */
-  async submit(code: string): Promise<string> {
+  async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
-    if (problem !== null) return `Not sending that: ${problem}.`;
+    if (problem !== null) return { ok: false, reason: 'bad-code', detail: problem, exited: false };
 
     const pending = this.#pending;
     if (pending === null || pending.exited) {
-      return 'No login is waiting for a code. Run `!auth` to start one and I will post the link.';
+      return { ok: false, reason: 'none-waiting', detail: 'no login is waiting', exited: true };
     }
     if (pending.child.stdin === null) {
-      return 'The waiting login has no stdin to write to — starting a fresh one is the way out.';
+      return { ok: false, reason: 'no-stdin', detail: 'the login has no stdin', exited: true };
     }
 
-    // Length only. The code is a credential for as long as it is unspent.
+    // Length only: an unspent code is a credential.
     this.#log(`code submitted (${code.length} chars) — waiting for the exchange`);
     clearTimeout(pending.idle);
     try {
       pending.child.stdin.write(`${code}\n`);
     } catch (error) {
-      return `Could not hand the code to the login: ${String(error)}`;
+      return { ok: false, reason: 'write-failed', detail: String(error), exited: false };
     }
 
     const exited = await new Promise<boolean>((resolve) => {
-      const timeout = detachedTimer(() => resolve(false), EXCHANGE_MS);
+      const timeout = detachedTimer(() => resolve(false), this.#exchangeMs);
       pending.child.once('exit', () => {
         clearTimeout(timeout);
         resolve(true);
       });
     });
     pending.exited = exited;
+    // The idle timer was cleared above, so a login still running here would be
+    // held with nothing left to reap it.
     if (exited) this.#pending = null;
+    else this.stop();
 
-    // The exit code is not the answer — a CLI that exits 0 having written
-    // nothing usable would read as success. Ask the credential.
     const status = await this.status();
-    if (status.loggedIn === true) return '**Authenticated.** Sessions will pick the new credential up.';
+    if (status.loggedIn === true) return { ok: true };
     if (status.loggedIn === false) {
-      return `That did not take: \`auth status\` still says logged out. ${
-        exited ? 'The login has exited, so run `!auth` for a fresh link.' : 'Try the code again.'
-      }`;
+      return { ok: false, reason: 'not-taken', detail: status.detail, exited: true };
     }
-    return `Code accepted, but I could not read \`auth status\` back: ${status.detail}`;
+    return { ok: false, reason: 'unreadable', detail: status.detail, exited: true };
   }
 
-  /** `claude auth status`, as a tri-state: yes, no, or could not tell. */
+  /** `claude auth status`, as yes, no, or could not tell. */
   async status(): Promise<{ loggedIn: boolean | null; detail: string }> {
     const { file, args, env } = authArgv(this.#target, ['auth', 'status']);
     let child: LoginProcess;
@@ -446,14 +389,14 @@ export class AuthLogin {
           // Already gone.
         }
         settle(null);
-      }, 30_000);
+      }, STATUS_MS);
     });
 
     if (output === null) return { loggedIn: null, detail: 'the status command did not run' };
     return { loggedIn: readLoggedIn(output), detail: output.replace(/\s+/g, ' ').trim().slice(0, 200) };
   }
 
-  /** Kill whatever is waiting. Called by `begin` and by the daemon's shutdown. */
+  /** Kill whatever is waiting. */
   stop(): void {
     const pending = this.#pending;
     this.#pending = null;
@@ -462,37 +405,39 @@ export class AuthLogin {
     try {
       pending.child.kill('SIGTERM');
     } catch {
-      // Already gone, which is the state this wanted.
+      // Already gone.
     }
   }
 }
 
 /**
- * Read `loggedIn` out of whatever `auth status` printed.
+ * Read `loggedIn` out of `auth status` output.
  *
- * JSON first, because that is what it emits today and it is unambiguous. The
- * prose fallback exists because this is the confirmation step of the only path
- * back from a dead credential, and a CLI that changes its output format should
- * downgrade that to "could not tell" rather than to a confident wrong answer.
+ * JSON is what it emits; the prose fallback keeps an output change from turning
+ * into a confident wrong answer rather than into "could not tell".
  */
 export function readLoggedIn(output: string): boolean | null {
   try {
     const parsed = JSON.parse(output) as { loggedIn?: unknown };
     if (typeof parsed.loggedIn === 'boolean') return parsed.loggedIn;
   } catch {
-    // Not JSON, or not only JSON. Fall through.
+    // Not JSON. Fall through.
   }
   if (/\bnot\s+logged\s+in\b|\blogged\s+out\b/i.test(output)) return false;
   if (/\blogged\s+in\b/i.test(output)) return true;
   return null;
 }
 
+/** A credential that no respawn will fix, as `owns` reports it. */
+export type DeadCredential = { why: string };
+
 /**
- * Says once, in the channel, that the credential is dead — and posts the link.
+ * Announces a dead credential in Discord, at most once per `repeatMs` unless
+ * somebody is waiting on an answer.
  *
- * Split into a synchronous `owns` and an async `announce` because the callers
- * are session completion handlers, which have to decide whether the ordinary
- * outage message applies before they can await anything.
+ * `owns` is separate from `announce` and synchronous because the callers are
+ * session completion handlers that decide whether the ordinary outage message
+ * applies before they can await anything.
  */
 export class AuthOutage {
   readonly #home: string;
@@ -508,7 +453,7 @@ export class AuthOutage {
   constructor(opts: {
     home: string;
     login: AuthLogin;
-    /** Where an outage nobody is waiting on gets announced. */
+    /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
     send: (channelId: string, text: string) => Promise<void>;
@@ -531,69 +476,51 @@ export class AuthOutage {
   }
 
   /**
-   * Is this refusal a credential that no respawn will ever fix?
+   * The dead credential behind this refusal, or null.
    *
-   * `credential-dead` alone is not enough: the retry ladder reports it for a
-   * token that is merely stale in a live process, which is exactly the case
-   * #266's respawn gate handles and which must stay quiet. The disk is what
-   * separates the two, and it is only read once the cheap checks have passed —
-   * so the twelve-a-minute loop that started all this costs two comparisons.
+   * `credential-dead` alone does not mean the file is finished: the retry ladder
+   * reports it for a token that is only stale in a live process, which a respawn
+   * clears. The disk separates the two, and is read only once the two cheap
+   * fields match.
    */
-  owns(summary: TurnSummary): boolean {
-    if (summary.apiErrorKind !== 'authentication_failed') return false;
-    if (summary.noRetryReason !== 'credential-dead') return false;
+  owns(summary: TurnSummary): DeadCredential | null {
+    if (summary.apiErrorKind !== 'authentication_failed') return null;
+    if (summary.noRetryReason !== 'credential-dead') return null;
     const verdict = credentialVerdict(this.#home, this.#now());
     if (!verdict.terminal) {
-      this.#log('auth failure, but the credential on disk is refreshable — leaving it to the respawn');
-      return false;
+      this.#log('auth failure with a refreshable credential — leaving it to the respawn');
+      return null;
     }
-    return true;
+    return { why: verdict.why };
   }
 
   /**
    * Say it, unless it has been said recently and nobody is waiting.
    *
-   * `channelId` is the channel a person actually typed in, or null when this
-   * came off the mail path where there is nobody to answer. A person always
-   * gets an answer — they are their own rate limit — and the loop does not.
+   * `channelId` is the channel a person typed in, or null for a wake with no
+   * audience. A person is their own rate limit; the refusal loop is not.
    */
-  async announce(channelId: string | null): Promise<void> {
-    const verdict = credentialVerdict(this.#home, this.#now());
-    if (!verdict.terminal) return;
-
+  async announce(dead: DeadCredential, channelId: string | null): Promise<void> {
     const since = this.#now() - this.#lastAnnounced;
-    if (channelId === null && this.#lastAnnounced > 0 && since < this.#repeatMs) {
-      return;
-    }
+    if (channelId === null && this.#lastAnnounced > 0 && since < this.#repeatMs) return;
     this.#lastAnnounced = this.#now();
 
     const target = channelId ?? this.#mainChannelId;
-    if (!target) {
-      this.#log('credential is dead and there is no channel to say so in');
-      return;
-    }
-
     const heard = channelId === null ? '' : ' **Your message did not reach me.**';
-    this.#log(`announcing a dead credential in ${target}: ${verdict.why}`);
+    this.#log(`announcing a dead credential in ${target}: ${dead.why}`);
 
     try {
-      // States what is wrong and STOPS. There is deliberately no link and no
-      // command here: the front door — one click on a page this box serves — is
-      // not built yet, and `!auth <code>` is a back door rather than the way in,
-      // because the operator has said plainly that he is not pasting codes. A
-      // message that names a next step it cannot deliver is worse than one that
-      // names none, so this names none until there is one to name.
+      // The fault and nothing else. There is no one-click flow to point at, and
+      // a message naming a next step it cannot deliver is worse than one naming
+      // none.
       await this.#send(
         target,
-        `🔑 **${this.#crew} cannot authenticate.** ${verdict.why}, so no retry and no ` +
+        `🔑 **${this.#crew} cannot authenticate.** ${dead.why}, so no retry and no ` +
           `respawn will fix it — every turn is being refused.${heard}\n` +
           `The credential is \`${this.#home}\` on the host. This one needs a person; ` +
           'nothing about it clears on its own.',
       );
     } catch (error) {
-      // Best effort, like every other thing here that talks to Discord. If the
-      // gateway is down too then the journal is the record and there was never
-      // going to be a message.
       this.#log(`could not announce the dead credential: ${String(error)}`);
     }
   }
