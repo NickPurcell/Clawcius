@@ -72,6 +72,18 @@ export type AgentConfig = {
   };
   discord: {
     allowedChannelIds: string[];
+    /**
+     * Where a dead credential is announced when nobody is waiting on a channel —
+     * the mail path has none of its own. Empty falls back to
+     * `allowedChannelIds[0]`, which the schema guarantees exists.
+     *
+     * Both instances leave it empty today, and that is the recommendation:
+     * naming a channel here that `allowedChannelIds` already names first is a
+     * second copy of one id, and the failure mode of a drifted copy is an
+     * outage announced into a room nobody is in. Set it only when the first
+     * allowed channel is not where you want to be told.
+     */
+    outageChannelId: string;
     /** After the bot is addressed, seconds during which ordinary messages in that channel also reach the agent. */
     followUpWindowSeconds: number;
     /** Channels where a follow-up window may open at all. Empty means every channel. */
@@ -142,6 +154,7 @@ const Instance = z.strictObject({
       allowedChannelIds: z.array(z.string()).min(1, { error: 'must name at least one channel' }),
       followUpChannelIds: z.array(z.string()).default([]),
       alwaysOnChannelIds: z.array(z.string()).default([]),
+      outageChannelId: z.string().default(''),
     }),
   container: z.strictObject({ enabled: z.boolean().default(true) }).prefault({}),
 });

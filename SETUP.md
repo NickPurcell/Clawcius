@@ -119,14 +119,16 @@ resume from SQLite on the next wake.
 - **Wedged sandbox**: `docker/up.sh --recreate` (nightly snapshots: `docker images clawcius-agent`).
 - **Disaster**: restore the VPS from the provider's backup.
 - `!status`, `!stop`, `!reset` in a channel: what's running, interrupt the turn, drop the session.
-- **Dead Claude credential**: nothing to do on the host. The daemon posts to the crew's first
-  `allowedChannelIds` channel with an authorize link — once, then every four hours while it stays
-  dead — and `@bot !auth <code>` pastes the code back and confirms with `claude auth status`. The
-  waker answers both, so neither needs a working model. Anyone in the channel may do it, with their
-  own Claude account if they like; that is deliberate (#369). `@bot !auth` on its own reports the
-  status and starts a login if there is not one waiting. The login runs inside the container for a
-  crew that has one and on the host (`paths.claudeCli`) for a crew that does not, because the
-  credential must be written by whoever reads it.
+- **Dead Claude credential**: the daemon says so itself, without a model turn — one message in the
+  crew's `discord.outageChannelId` (empty everywhere, so: its first `allowedChannelIds` channel),
+  then every four hours while it stays dead. It names the fault and the agent-home and stops.
+  **There is no one-click flow yet**; the front door is undecided (#369). Until there is one:
+  `@bot !auth` reports `claude auth status` and posts an authorize link, and `@bot !auth <code>`
+  feeds the code in and confirms. Both are the waker answering, so neither needs a working model,
+  and anyone in the channel may use them — with their own Claude account if they like, which is
+  deliberate. The announcement deliberately does **not** name them. The login runs inside the
+  container for a crew that has one and on the host (`paths.claudeCli`) for a crew that does not,
+  because the credential must be written by whoever reads it (`docker/Dockerfile:51-54`).
 
 ## 8. Cutover from the previous layout (one-time)
 

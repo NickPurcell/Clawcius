@@ -900,7 +900,7 @@ test('!auth with a code hands the rest of the line over verbatim', async () => {
   assert.deepEqual(msg.replies, ['submitted-reply']);
 });
 
-test('!auth on its own starts a login and posts the link', async () => {
+test('!auth on its own starts a login and posts the link — the back door, asked for', async () => {
   const authOutage = fakeAuthOutage({ loggedIn: false });
   const { handlers } = harness({ authOutage });
   const msg = message({ content: '!auth', mentioned: true });
@@ -955,4 +955,23 @@ test('a mail wake hands a refused turn on, and only when nothing is coming', () 
   // A turn that ran is not a refusal.
   events.onDone({ ...authFailure(), apiError: null, apiErrorKind: null });
   assert.deepEqual(refused, ['authentication_failed']);
+});
+
+test('the announcement is the daemon\'s, and it names no command', async () => {
+  // `!auth` exists and is useful, but it is not what the channel is told to do:
+  // the operator has said outright he will not paste codes. The message itself
+  // is asserted in test/auth.test.js; this pins that the handler routes to it
+  // rather than composing a second one of its own.
+  const authOutage = fakeAuthOutage();
+  const { handlers, sessions, sent } = harness({ authOutage });
+  handlers.deliver(CHANNEL, buffered(), true);
+
+  await captureStderr(async () => {
+    sessions.acquired[0].events.onDone(authFailure({ noRetryReason: 'credential-dead' }));
+    await settle();
+  });
+
+  assert.deepEqual(authOutage.announced, [CHANNEL]);
+  assert.equal(authOutage.began, 0, 'the announcement does not mint a link');
+  assert.deepEqual(sent, []);
 });

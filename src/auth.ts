@@ -286,14 +286,20 @@ export class AuthLogin {
   /**
    * Start a login and read back the URL it prints, or reuse one already waiting.
    *
-   * Reuse matters: the repeat announcement four hours later must not orphan the
-   * process the first one is still holding, and two live PKCE challenges is one
-   * more than can ever be used.
+   * Reuse matters in one direction and freshness in the other. A second call
+   * while a login is genuinely waiting must not orphan the first — two live PKCE
+   * challenges is one more than can ever be used. But a call hours after one
+   * expired must MINT, not fail: whoever is asking is asking now, and "your link
+   * expired" is the same dead end in a nicer font. The idle timer clears
+   * `#pending` when it kills a child, so an expired login is indistinguishable
+   * here from never having had one.
    */
   async begin(): Promise<{ url: string } | { error: string }> {
     const waiting = this.pendingUrl;
     if (waiting !== null) return { url: waiting };
 
+    // Only ever bites on a double-click a minute apart. Anything older than the
+    // floor mints, which is the whole point of the paragraph above.
     const since = this.#now() - this.#lastStart;
     if (this.#lastStart > 0 && since < START_FLOOR_MS) {
       return { error: `a login was started ${Math.round(since / 1000)}s ago — give it a moment` };
@@ -567,23 +573,22 @@ export class AuthOutage {
       return;
     }
 
-    const started = await this.#login.begin();
-    const link =
-      'url' in started
-        ? `**Authorize here:** ${started.url}\nThen paste the code back: \`!auth <code>\` ` +
-          '(with an @ so it reaches me, not the agent).'
-        : `I could not start a login to give you a link: ${started.error}`;
-
-    const heard = channelId === null ? '' : '\n**Your message did not reach me.**';
+    const heard = channelId === null ? '' : ' **Your message did not reach me.**';
     this.#log(`announcing a dead credential in ${target}: ${verdict.why}`);
 
     try {
+      // States what is wrong and STOPS. There is deliberately no link and no
+      // command here: the front door — one click on a page this box serves — is
+      // not built yet, and `!auth <code>` is a back door rather than the way in,
+      // because the operator has said plainly that he is not pasting codes. A
+      // message that names a next step it cannot deliver is worse than one that
+      // names none, so this names none until there is one to name.
       await this.#send(
         target,
         `🔑 **${this.#crew} cannot authenticate.** ${verdict.why}, so no retry and no ` +
-          `respawn will fix it — every turn is being refused until someone logs in.` +
-          `${heard}\n\n${link}\n` +
-          '_Anyone can do this; it can be your own Claude account rather than the operator\'s._',
+          `respawn will fix it — every turn is being refused.${heard}\n` +
+          `The credential is \`${this.#home}\` on the host. This one needs a person; ` +
+          'nothing about it clears on its own.',
       );
     } catch (error) {
       // Best effort, like every other thing here that talks to Discord. If the

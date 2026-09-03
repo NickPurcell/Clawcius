@@ -405,19 +405,26 @@ test('owns is true only for a credential the disk says is finished', () => {
   }
 });
 
-test('the announcement carries the link and how to answer it', async () => {
+test('the announcement states the fault and stops', async () => {
   const { outage, sent, spawned, dir } = outageHarness({ accessToken: '', refreshToken: '' });
   try {
-    const announcing = outage.announce(null);
-    await settle();
-    spawned[0].child.say(URL_LINE);
-    await announcing;
+    await outage.announce(null);
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
     assert.match(sent[0].text, /Clawcius cannot authenticate/);
-    assert.match(sent[0].text, /https:\/\/claude\.com\/cai\/oauth\/authorize/);
-    assert.match(sent[0].text, /!auth <code>/);
+    assert.match(sent[0].text, /no retry and no respawn will fix it/);
+    // Which agent home is dead, so whoever acts knows where to act.
+    assert.match(sent[0].text, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(sent[0].text, /needs a person/);
+
+    // NO link and NO command. The front door is not built, and `!auth <code>` is
+    // the one thing the operator has said outright he will not do. A message
+    // naming a next step it cannot deliver is worse than one naming none.
+    assert.equal(/https?:\/\//.test(sent[0].text), false, 'no link until there is a front door');
+    assert.equal(sent[0].text.includes('!auth'), false, 'the back door is not advertised');
+    // Nothing was spawned to mint a link either.
+    assert.deepEqual(spawned, []);
     // ⚠️ is reserved for the system's own messages about the crew.
     assert.equal(sent[0].text.includes('⚠️'), false);
   } finally {
@@ -433,10 +440,7 @@ test('the loop is announced once; a person who typed always gets an answer', asy
     { now: () => clock },
   );
   try {
-    const first = outage.announce(null);
-    await settle();
-    spawned[0].child.say(URL_LINE);
-    await first;
+    await outage.announce(null);
     assert.equal(sent.length, 1);
 
     for (let i = 0; i < 50; i += 1) {
@@ -470,33 +474,38 @@ test('a credential that came back is not announced', async () => {
   }
 });
 
-test('no link is still a message', async () => {
-  // The container is down, or `paths.claudeCli` is not executable by this unit's
-  // user. The channel still has to hear that the crew is dead.
-  const dir = credentialDir({ accessToken: '', refreshToken: '' });
-  const sent = [];
-  const outage = new AuthOutage({
-    home: dir,
-    login: new AuthLogin({
-      target: TARGET,
-      log: () => {},
-      now: () => NOW,
-      spawn: () => {
-        throw new Error('spawn docker ENOENT');
-      },
-    }),
-    mainChannelId: 'C-main',
-    crew: 'Clawcius',
-    send: async (channelId, text) => sent.push({ channelId, text }),
-    log: () => {},
-    now: () => NOW,
-  });
-  try {
-    await outage.announce(null);
-    assert.equal(sent.length, 1);
-    assert.match(sent[0].text, /cannot authenticate/);
-    assert.match(sent[0].text, /could not start a login/i);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('a login that expired mints a fresh one rather than erroring', async () => {
+  // Somebody may come to this hours after the message went out. "Your link
+  // expired" is the same dead end in a nicer font.
+  let clock = NOW;
+  const { login, spawned } = loginHarness({ now: () => clock });
+  const first = login.begin();
+  await Promise.resolve();
+  spawned[0].child.say(URL_LINE);
+  await first;
+
+  // What the idle timer does when nobody came back for it.
+  login.stop();
+  clock += 3 * 60 * 60 * 1000;
+
+  const again = login.begin();
+  await Promise.resolve();
+  spawned[1].child.say(URL_LINE);
+  assert.equal((await again).url, 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW');
+  assert.equal(spawned.length, 2, 'a fresh login, not the dead one');
+});
+
+test('two clicks a second apart do not start two logins', async () => {
+  const { login, spawned } = loginHarness();
+  const first = login.begin();
+  await Promise.resolve();
+  spawned[0].child.say(URL_LINE);
+  await first;
+  login.stop();
+
+  // Same instant on the injected clock: the floor is spam protection, and it is
+  // the only thing that ever refuses to mint.
+  const immediate = await login.begin();
+  assert.match(immediate.error, /give it a moment/);
+  assert.equal(spawned.length, 1);
 });

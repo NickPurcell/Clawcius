@@ -787,12 +787,14 @@ export async function main(): Promise<void> {
   authOutage = new AuthOutage({
     home: agentHome(config.agent.container.stateDir),
     login: authLogin,
-    // The crew's main channel: the first one it is allowed to speak in. The
-    // schema requires at least one, so this is always a real channel, and both
-    // instances name exactly one. There is deliberately no second key holding
-    // the same id — a copy is a thing that drifts, and the failure mode of a
-    // drifted one is an outage announced into a room nobody is in.
-    mainChannelId: config.agent.discord.allowedChannelIds[0] ?? '',
+    // `outageChannelId` when a crew names one, else the first channel it is
+    // allowed to speak in — which the schema guarantees exists. Both instances
+    // leave the key empty on purpose: for Clawcius the fallback already resolves
+    // to 1105739162230984735, the only channel it answers in, and writing that
+    // id a second time would be a copy that can drift out of step with the list
+    // it duplicates. The key is here for a crew whose first allowed channel is
+    // not where it wants to be told.
+    mainChannelId: config.agent.discord.outageChannelId || (config.agent.discord.allowedChannelIds[0] ?? ''),
     crew: config.agent.displayName,
     send: (channelId, text) => sendToChannel(client, channelId, text),
     log: (line) => process.stdout.write(`[auth] ${line}\n`),
