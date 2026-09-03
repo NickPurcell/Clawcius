@@ -229,7 +229,7 @@ const page = (base: string): string => `<!doctype html>
 <div class="card" id="state"></div>
 
 <div class="card step on" id="s1">
-  <p>Nothing has started. This page has run nothing so far.</p>
+  <p id="s1msg">Nothing has started. This page has run nothing so far.</p>
   <button id="go">Start a login</button>
 </div>
 
@@ -264,7 +264,12 @@ $('send').onclick=async()=>{
   $('send').disabled=true;$('send').textContent='checking…';
   const r=await fetch(base+'code',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:$('code').value.trim()})});
   const b=await r.json();
-  if(!r.ok||!b.ok){$('send').disabled=false;$('send').textContent='Finish';$('done').textContent=(b.detail||b.error||'that did not take');show('s3');await load();return}
+  if(!r.ok||!b.ok){
+    $('send').disabled=false;$('send').textContent='Finish';
+    if(b.reason==='none-waiting'){
+      $('s1msg').textContent='No login is waiting for that code. Start another.';
+      $('go').disabled=false;$('go').textContent='Start a login';show('s1');await load();return}
+    $('done').textContent=(b.detail||b.error||'that did not take');show('s3');await load();return}
   const v=b.verification;
   $('done').textContent=v.turnRan===true
     ?'Authenticated, and a real turn ran under it. The crew is back.'

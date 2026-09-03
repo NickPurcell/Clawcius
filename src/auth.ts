@@ -16,7 +16,7 @@ import type { TurnSummary } from './types.js';
 const REPEAT_MS = 4 * 60 * 60 * 1000;
 
 /** How long a started login is held waiting for its code before it is killed. */
-const LOGIN_IDLE_MS = 15 * 60 * 1000;
+const LOGIN_IDLE_MS = 60 * 60 * 1000;
 
 /** How long to wait for the login to print its URL. */
 const URL_WAIT_MS = 60_000;
@@ -334,6 +334,7 @@ export class AuthLogin {
 
     const pending = this.#pending;
     if (pending === null || pending.exited) {
+      this.#log('a code arrived with no login waiting');
       return { ok: false, reason: 'none-waiting', detail: 'no login is waiting' };
     }
     if (pending.child.stdin === null) {

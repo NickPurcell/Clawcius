@@ -261,6 +261,7 @@ test('every response refuses to be framed or sniffed', async () => {
   }
 });
 
+
 test('a POST that did not come from this page is refused', async () => {
   // `tailscale serve` authenticates the node, not the request: a page the
   // operator has open elsewhere could otherwise kill a login that is waiting.
