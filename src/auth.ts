@@ -44,13 +44,12 @@ const LOGIN_COMMAND: readonly string[] = ['auth', 'login', '--claudeai'];
 /**
  * The authorize URL, once the whole of it has arrived.
  *
- * The trailing `\s` is the point: output arrives in chunks, and without a
- * terminator a read that stops mid-URL matches a prefix — a plausible-looking
- * link that fails when it is clicked.
+ * Output arrives in chunks, and the trailing `\s` is what makes a read that
+ * stops mid-URL match nothing.
  */
 const AUTHORIZE_URL = /visit:\s*(https:\/\/\S+)\s/;
 
-export function authorizeUrl(output: string): string | null {
+function authorizeUrl(output: string): string | null {
   return AUTHORIZE_URL.exec(output)?.[1] ?? null;
 }
 
@@ -325,7 +324,6 @@ export class AuthLogin {
    * The code goes in on stdin and never on a command line, which is world
    * readable through `/proc`. The outcome comes from `auth status` rather than
    * from the exit code, which can be 0 with nothing usable written.
-   *
    */
   async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
@@ -360,7 +358,7 @@ export class AuthLogin {
       pending.child.stdout?.on('data', (chunk) => {
         seen = (seen + String(chunk)).slice(-4096);
         if (REFUSED.test(seen)) {
-          refusal = seen.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\s+/g, ' ').trim().slice(-200);
+          refusal = seen.replace(/\s+/g, ' ').trim().slice(-200);
           settle(false);
         }
       });

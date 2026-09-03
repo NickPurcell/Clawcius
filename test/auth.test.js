@@ -187,12 +187,13 @@ const TARGET = {
 };
 
 /** An `AuthLogin` whose children are handed back for the test to drive. */
-function loginHarness({ now = () => NOW, target = TARGET } = {}) {
+function loginHarness({ now = () => NOW, target = TARGET, exchangeMs } = {}) {
   const spawned = [];
   const login = new AuthLogin({
     target,
     log: () => {},
     now,
+    ...(exchangeMs === undefined ? {} : { exchangeMs }),
     spawn: (file, args) => {
       const child = fakeChild();
       spawned.push({ file, args: [...args], child });
@@ -322,18 +323,7 @@ test('an exchange that did not take is reported as not taken', async () => {
 
 test('a login still running when the exchange window closes is killed, not left holding', async () => {
   // Its idle timer is cleared when the code goes in, so nothing else reaps it.
-  const spawned = [];
-  const login = new AuthLogin({
-    target: TARGET,
-    log: () => {},
-    now: () => NOW,
-    exchangeMs: 0,
-    spawn: (file, args) => {
-      const child = fakeChild();
-      spawned.push({ file, args: [...args], child });
-      return child;
-    },
-  });
+  const { login, spawned } = loginHarness({ exchangeMs: 0 });
   await started(login, spawned);
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
@@ -492,8 +482,6 @@ test('a refused code is answered when the prompt says so, not when the window cl
 });
 
 test('a URL that has not finished arriving is not offered', async () => {
-  // Output comes in chunks. Without requiring what follows the URL, a read that
-  // stops partway matches a prefix — a link that looks right and fails on click.
   const { login, spawned } = loginHarness();
   const pending = login.begin();
   await Promise.resolve();
