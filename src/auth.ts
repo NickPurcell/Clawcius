@@ -31,8 +31,14 @@ const START_FLOOR_MS = 60_000;
 /** How long to wait for `auth status`. */
 const STATUS_MS = 30_000;
 
-/** What the prompt prints when the exchange was refused, rather than exiting. */
-const REFUSED = /OAuth error|Press Enter to retry/i;
+/**
+ * What the prompt prints when the exchange was refused, rather than exiting.
+ *
+ * Both wordings are measured against the container:
+ *   auth login --claudeai   Login failed: Request failed with status code 400
+ *   setup-token             OAuth error: …  /  Press Enter to retry.
+ */
+const REFUSED = /OAuth error|Login failed|Press Enter to retry/i;
 
 /** How long to wait for the turn that proves the credential can do the job. */
 const TURN_MS = 120_000;

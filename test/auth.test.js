@@ -463,7 +463,7 @@ test('a refused code is answered when the prompt says so, not when the window cl
 
   const submitting = login.submit('lJ8x-Ab_c0D3#9PGDW');
   await Promise.resolve();
-  spawned[0].child.say('OAuth error: Request failed with status code 400\r\rPress Enter to retry.');
+  spawned[0].child.say('Login failed: Request failed with status code 400');
   await settle();
 
   spawned[1].child.say('{"loggedIn":false}');
