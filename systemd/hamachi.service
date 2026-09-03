@@ -18,6 +18,10 @@ EnvironmentFile=/etc/clawcius/hamachi.env
 Environment=AGENT_CONFIG_PATH=/srv/clawcius/current/agent-config.hamachi.yaml
 # The crew's Claude login; sessions inherit the waker's environment.
 Environment=CLAUDE_CONFIG_DIR=/var/lib/hamachi/agent-home
+# The login page: loopback only, published on the tailnet by `tailscale serve`.
+Environment=LOGIN_PAGE_PORT=8480
+Environment=LOGIN_PAGE_URL=https://vmi3493307.tail872bb7.ts.net/hamachi-login
+
 ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5

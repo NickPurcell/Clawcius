@@ -372,6 +372,7 @@ function outageHarness(oauth, { now = () => NOW } = {}) {
     home: dir,
     mainChannelId: 'C-main',
     crew: 'Clawcius',
+    loginPageUrl: 'https://box.example.ts.net/login',
     send: async (channelId, text) => sent.push({ channelId, text }),
     log: () => {},
     now,
@@ -399,14 +400,15 @@ test('owns answers only for a credential the disk says is finished', () => {
   }
 });
 
-test('the announcement goes to the main channel and names the home', async () => {
+test('the announcement goes to the main channel and points at the page', async () => {
   const { outage, sent, dir } = outageHarness(DEAD);
   try {
     await outage.announce(outage.owns(deadTurn()), null);
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
-    assert.ok(sent[0].text.includes(dir), 'whoever acts is told where to act');
+    // It can name a next step now, because there is one it can deliver.
+    assert.ok(sent[0].text.includes('https://box.example.ts.net/login'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -444,6 +446,7 @@ test('a send that throws does not escape the announcer', async () => {
     home: dir,
     mainChannelId: 'C-main',
     crew: 'Clawcius',
+    loginPageUrl: 'https://box.example.ts.net/login',
     send: async () => {
       throw new Error('Unknown Channel');
     },

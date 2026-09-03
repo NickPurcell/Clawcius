@@ -29,6 +29,7 @@ import { systemd } from './systemd.js';
 import { preflight } from './preflight.js';
 import { sweepEnvFiles } from './container.js';
 import { AuthLogin, AuthOutage, type DeadCredential } from './auth.js';
+import { startDoor } from './door.js';
 import type { SubmitOutcome } from './auth.js';
 import type { TurnSummary, WakeContext } from './types.js';
 
@@ -781,9 +782,36 @@ export async function main(): Promise<void> {
     // The crew's main channel. The schema requires at least one.
     mainChannelId: config.agent.discord.allowedChannelIds[0]!,
     crew: config.agent.displayName,
+    loginPageUrl: config.loginPage.url,
     send: (channelId, text) => sendToChannel(client, channelId, text),
     log: (line) => process.stdout.write(`[auth] ${line}\n`),
   });
+
+  const door = startDoor(
+    {
+      crew: config.agent.displayName,
+      home: config.agent.container.agentHome,
+      login: authLogin,
+      verify: () => authLogin.verify(),
+      log: (line) => process.stdout.write(`[door] ${line}\n`),
+      // A login that lands says so in the channel, so nobody has to come back
+      // and ask whether it worked.
+      onAuthenticated: (v) => {
+        const target = config.agent.discord.allowedChannelIds[0]!;
+        const text =
+          v.turnRan === true
+            ? `🔑 **${config.agent.displayName} is authenticated again**, and a real turn ran under the new credential.`
+            : `🔑 **${config.agent.displayName} is authenticated**, but a test turn did not run: ${v.detail}`;
+        void sendToChannel(client, target, text).catch((error) =>
+          process.stdout.write(`[door] could not say so in ${target}: ${String(error)}\n`),
+        );
+      },
+    },
+    config.loginPage.port,
+  );
+  process.stdout.write(
+    `[door] login page on 127.0.0.1:${config.loginPage.port}, reachable at ${config.loginPage.url}\n`,
+  );
 
   const handlers = createHandlers({
     config,
@@ -897,6 +925,7 @@ export async function main(): Promise<void> {
         }
       }
       authLogin.stop();
+      door.close();
       await sessions.shutdown();
       registry.close();
       await client.destroy();

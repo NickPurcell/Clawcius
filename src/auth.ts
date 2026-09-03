@@ -31,6 +31,9 @@ const START_FLOOR_MS = 60_000;
 /** How long to wait for `auth status`. */
 const STATUS_MS = 30_000;
 
+/** How long to wait for the turn that proves the credential can do the job. */
+const TURN_MS = 120_000;
+
 const CREDENTIAL_FILE = '.credentials.json';
 
 /**
@@ -404,6 +407,55 @@ export class AuthLogin {
     return { loggedIn: readLoggedIn(output), detail: output.replace(/\s+/g, ' ').trim().slice(0, 200) };
   }
 
+  /**
+   * Whether the credential can run an ordinary turn, not merely authenticate.
+   *
+   * `setup-token` asks for `user:inference` alone where a full login asks for
+   * the scopes a turn uses, so `auth status` answering yes is not the same
+   * answer. This runs a real prompt through the same path a session takes.
+   */
+  async verify(): Promise<{ loggedIn: boolean | null; turnRan: boolean | null; detail: string }> {
+    const status = await this.status();
+    if (status.loggedIn !== true) {
+      return { loggedIn: status.loggedIn, turnRan: null, detail: status.detail };
+    }
+
+    const { file, args, env } = authArgv(this.#target, ['-p', 'reply with the single word: ok']);
+    let child: LoginProcess;
+    try {
+      child = this.#spawn(file, args, env);
+    } catch (error) {
+      return { loggedIn: true, turnRan: false, detail: `the turn could not start: ${String(error)}` };
+    }
+
+    const out = await new Promise<{ text: string; code: number | null }>((resolve) => {
+      let text = '';
+      const settle = (code: number | null): void => {
+        clearTimeout(timeout);
+        resolve({ text, code });
+      };
+      child.stdout?.on('data', (chunk) => {
+        text = (text + String(chunk)).slice(0, 4096);
+      });
+      child.stderr?.on('data', (chunk) => {
+        text = (text + String(chunk)).slice(0, 4096);
+      });
+      child.once('exit', (...a: never[]) => settle(typeof a[0] === 'number' ? a[0] : null));
+      child.once('error', () => settle(null));
+      const timeout = detachedTimer(() => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Already gone.
+        }
+        settle(null);
+      }, TURN_MS);
+    });
+
+    const detail = out.text.replace(/\s+/g, ' ').trim().slice(0, 300);
+    return { loggedIn: true, turnRan: out.code === 0, detail: detail || 'the turn produced nothing' };
+  }
+
   /** Kill whatever is waiting. */
   stop(): void {
     const pending = this.#pending;
@@ -451,6 +503,7 @@ export class AuthOutage {
   readonly #home: string;
   readonly #mainChannelId: string;
   readonly #crew: string;
+  readonly #loginPageUrl: string;
   readonly #send: (channelId: string, text: string) => Promise<void>;
   readonly #log: (line: string) => void;
   readonly #now: () => number;
@@ -462,6 +515,8 @@ export class AuthOutage {
     /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
+    /** Where a person goes to fix it: one click, no code to fetch and carry. */
+    loginPageUrl: string;
     send: (channelId: string, text: string) => Promise<void>;
     log: (line: string) => void;
     now?: () => number;
@@ -470,6 +525,7 @@ export class AuthOutage {
     this.#home = opts.home;
     this.#mainChannelId = opts.mainChannelId;
     this.#crew = opts.crew;
+    this.#loginPageUrl = opts.loginPageUrl;
     this.#send = opts.send;
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
@@ -515,8 +571,7 @@ export class AuthOutage {
         target,
         `🔑 **${this.#crew} cannot authenticate.** ${dead.why}, so no retry and no ` +
           `respawn will fix it — every turn is being refused.${heard}\n` +
-          `The credential is \`${this.#home}\` on the host. This one needs a person; ` +
-          'nothing about it clears on its own.',
+          `**Log me back in:** ${this.#loginPageUrl}`,
       );
     } catch (error) {
       this.#log(`could not announce the dead credential: ${String(error)}`);
