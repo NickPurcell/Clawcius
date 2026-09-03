@@ -73,7 +73,6 @@ async function readBody(request: IncomingMessage): Promise<string | null> {
   });
 }
 
-/** `connect-src` is what lets the page call its own API; without it `fetch` falls back to `default-src`. */
 const HEADERS: Readonly<Record<string, string>> = {
   'cache-control': 'no-store',
   'content-security-policy':
@@ -99,7 +98,7 @@ export function doorHandler(deps: DoorDeps) {
     const route = path.slice(path.lastIndexOf('/') + 1);
 
     try {
-      if (method === 'GET' && (route === '' || route === 'index.html')) {
+      if (method === 'GET' && route === '') {
         response.writeHead(200, { ...HEADERS, 'content-type': 'text/html; charset=utf-8' });
         response.end(PAGE);
         return;
@@ -182,8 +181,6 @@ export function startDoor(deps: DoorDeps, port: number): Server {
   const server = createServer((request, response) => {
     void handle(request, response);
   });
-  // Without this a port already in use is an unhandled event, and the login page
-  // takes the crew down rather than merely being absent.
   server.on('error', (error) => deps.log(`the login page could not listen: ${String(error)}`));
   server.listen(port, '127.0.0.1');
   return server;
@@ -200,10 +197,9 @@ export function startDoor(deps: DoorDeps, port: number): Server {
  * test of the handler can reach.
  */
 export function apiBase(pathname: string): string {
-  return pathname.endsWith('/') ? pathname : `${pathname}/`;
+  return pathname.replace(/\/?$/, '/');
 }
 
-/** The page. */
 const PAGE = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -243,7 +239,7 @@ const PAGE = `<!doctype html>
 <script>
 const $=id=>document.getElementById(id);
 const show=id=>{for(const s of document.querySelectorAll('.step'))s.classList.remove('on');$(id).classList.add('on')};
-const base=location.pathname.endsWith('/')?location.pathname:location.pathname+'/';
+const base=location.pathname.replace(/\/?$/,'/');
 async function load(){
   const s=await (await fetch(base+'state')).json();
   $('who').textContent=s.crew+' · '+s.home;

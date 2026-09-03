@@ -18,14 +18,8 @@ test('the URL comes out of the real output whole', () => {
 });
 
 test('a read that ends inside the escape yields nothing, not a prefix', () => {
-  // The output arrives in chunks. Without requiring the terminator this returns
-  // a proper prefix of the real URL — the same truncation by another route,
-  // and one that looks entirely correct.
   const cut = REAL.slice(0, REAL.indexOf('\u001b]8;') + 120);
-  const partial = authorizeUrl(cut);
-
-  assert.notEqual(partial, EXPECTED, 'a half-read hyperlink is not the URL');
-  assert.equal(partial, null, 'and it is withheld rather than handed over truncated');
+  assert.equal(authorizeUrl(cut), null);
 });
 
 test('one hyperlink, however many lines it was drawn across', () => {

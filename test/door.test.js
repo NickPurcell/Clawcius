@@ -103,7 +103,7 @@ function harness(oauth, opts = {}) {
 test('loading the page runs nothing', async () => {
   const { dir, login, handle } = harness(DEAD);
   try {
-    for (const path of ['/', '/index.html', '/state']) {
+    for (const path of ['/', '/state']) {
       const response = fakeResponse();
       await handle(fakeRequest('GET', path), response);
       assert.equal(response.status, 200, path);

@@ -122,7 +122,6 @@ export function authArgv(
 ): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
   if (target.containerEnabled) {
     // The container carries CLAUDE_CONFIG_DIR from `docker run`.
-    //
     return {
       file: 'docker',
       args: ['exec', tty ? '-it' : '-i', target.containerName, target.claudePath, ...sub],
@@ -149,20 +148,6 @@ export function authCodeProblem(code: string): string | null {
   if (/\s/.test(code)) return 'that has whitespace in it — paste the code as one word';
   if (!AUTH_CODE.test(code)) {
     return 'that does not look like a paste code (8–512 characters of letters, digits and `._~#/+=-`)';
-  }
-  return null;
-}
-
-/** Both forms the CLI prints its authorize URL in. */
-const URL_PATTERNS: readonly RegExp[] = [
-  /(https:\/\/\S*oauth\/authorize\S*)/,
-  /visit:\s*(https:\/\/\S+)/,
-];
-
-function findUrl(text: string): string | null {
-  for (const pattern of URL_PATTERNS) {
-    const match = pattern.exec(text);
-    if (match?.[1]) return match[1];
   }
   return null;
 }
@@ -220,11 +205,6 @@ export class AuthLogin {
   readonly #log: (line: string) => void;
   readonly #now: () => number;
   readonly #exchangeMs: number;
-  /**
-   * Whether this command draws its URL as a hyperlink, in which case the
-   * visible text is soft-wrapped and reading it would yield a prefix.
-   */
-  readonly #drawsHyperlinks: boolean;
   #pending: Pending | null = null;
   #lastStart = 0;
 
@@ -240,7 +220,6 @@ export class AuthLogin {
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
     this.#exchangeMs = opts.exchangeMs ?? EXCHANGE_MS;
-    this.#drawsHyperlinks = !opts.target.loginCommand.includes('login');
   }
 
   /** The URL of a login that is waiting, if one is. */
@@ -291,7 +270,7 @@ export class AuthLogin {
         // hyperlink arrives after however much cursor movement it took to get
         // there.
         seen = (seen + String(chunk)).slice(-32768);
-        const url = authorizeUrl(seen) ?? (this.#drawsHyperlinks ? null : findUrl(seen));
+        const url = authorizeUrl(seen);
         if (url === null) return;
         this.#pending = {
           child,

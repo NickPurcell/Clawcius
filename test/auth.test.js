@@ -455,34 +455,3 @@ test('a send that throws does not escape the announcer', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-
-test('a line-oriented login may read its URL from the text; a drawn one may not', async () => {
-  // The drawn one soft-wraps, so the visible text is a prefix. `auth login` does
-  // not draw, so it has no hyperlink to read and the text is all there is.
-  const plain =
-    "If the browser didn't open, visit: " +
-    'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW\n';
-
-  const drawn = loginHarness();
-  const drawnPending = drawn.login.begin();
-  await Promise.resolve();
-  drawn.spawned[0].child.say(plain);
-  drawn.spawned[0].child.emit('exit', 1);
-  assert.ok('error' in (await drawnPending), 'a drawn login ignores the wrapped text');
-
-  const lineOriented = new AuthLogin({
-    target: { ...TARGET, loginCommand: ['auth', 'login', '--claudeai'] },
-    log: () => {},
-    now: () => NOW,
-    spawn: (file, args) => {
-      const child = fakeChild();
-      lineOriented.spawned.push({ file, args: [...args], child });
-      return child;
-    },
-  });
-  lineOriented.spawned = [];
-  const pending = lineOriented.begin();
-  await Promise.resolve();
-  lineOriented.spawned[0].child.say(plain);
-  assert.equal((await pending).url, URL);
-});
