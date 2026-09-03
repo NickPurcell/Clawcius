@@ -126,8 +126,7 @@ resume from SQLite on the next wake.
   crew's unit; publish with `tailscale serve --bg --set-path /login 8479`.
 - **Dead Claude credential**: the daemon posts one message to the crew's first `allowedChannelIds`
   channel, then every four hours while it stays dead, naming the fault and both ways back in.
-  It runs in the waker, so it does not need a working model. The page needs the tailnet; the
-  commands need only Discord, which is the difference the message states. `@bot !auth` reports `claude auth status` and
+  It runs in the waker, so it does not need a working model. `@bot !auth` reports `claude auth status` and
   posts an authorize link; `@bot !auth <code>` feeds the code in and confirms. Anyone in the
   channel may use either, with any Claude account. The login runs inside the container for a crew
   that has one and on the host (`paths.claudeCli`) for a crew that does not.

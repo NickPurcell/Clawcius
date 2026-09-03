@@ -545,7 +545,6 @@ export class AuthOutage {
     /** Where an outage nobody is waiting on is announced. */
     mainChannelId: string;
     crew: string;
-    /** Where a person goes to fix it: one click, no code to fetch and carry. */
     loginPageUrl: string;
     send: (channelId: string, text: string) => Promise<void>;
     log: (line: string) => void;
