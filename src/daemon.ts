@@ -116,7 +116,7 @@ export function mailWakeEvents(opts: {
 }
 
 /** What `!auth <code>` says back. */
-export function submitReply(outcome: SubmitOutcome): string {
+function submitReply(outcome: SubmitOutcome): string {
   if (outcome.ok) return '**Authenticated.** Sessions will pick the new credential up.';
   switch (outcome.reason) {
     case 'bad-code':

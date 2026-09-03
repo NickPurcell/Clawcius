@@ -92,13 +92,7 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
 
 /** Where a login has to run so that it writes the credential the agent reads. */
 export type AuthTarget = {
-  /**
-   * True when sessions run through `docker exec`.
-   *
-   * The container is the only writer of its own agent home and refreshes its own
-   * token there; a login run from the host writes into that store from the other
-   * side of the sandbox boundary, where reads and writes are not coherent.
-   */
+  /** True when sessions run through `docker exec`. */
   containerEnabled: boolean;
   containerName: string;
   /** In-container path to the claude binary, used when `containerEnabled`. */
@@ -192,8 +186,6 @@ export type SubmitOutcome =
       ok: false;
       reason: 'bad-code' | 'none-waiting' | 'no-stdin' | 'write-failed' | 'not-taken' | 'unreadable';
       detail: string;
-      /** Whether the login process has ended, so a fresh one is needed. */
-      exited: boolean;
     };
 
 type Pending = {
@@ -321,14 +313,14 @@ export class AuthLogin {
    */
   async submit(code: string): Promise<SubmitOutcome> {
     const problem = authCodeProblem(code);
-    if (problem !== null) return { ok: false, reason: 'bad-code', detail: problem, exited: false };
+    if (problem !== null) return { ok: false, reason: 'bad-code', detail: problem };
 
     const pending = this.#pending;
     if (pending === null || pending.exited) {
-      return { ok: false, reason: 'none-waiting', detail: 'no login is waiting', exited: true };
+      return { ok: false, reason: 'none-waiting', detail: 'no login is waiting' };
     }
     if (pending.child.stdin === null) {
-      return { ok: false, reason: 'no-stdin', detail: 'the login has no stdin', exited: true };
+      return { ok: false, reason: 'no-stdin', detail: 'the login has no stdin' };
     }
 
     // Length only: an unspent code is a credential.
@@ -337,7 +329,7 @@ export class AuthLogin {
     try {
       pending.child.stdin.write(`${code}\n`);
     } catch (error) {
-      return { ok: false, reason: 'write-failed', detail: String(error), exited: false };
+      return { ok: false, reason: 'write-failed', detail: String(error) };
     }
 
     const exited = await new Promise<boolean>((resolve) => {
@@ -356,9 +348,9 @@ export class AuthLogin {
     const status = await this.status();
     if (status.loggedIn === true) return { ok: true };
     if (status.loggedIn === false) {
-      return { ok: false, reason: 'not-taken', detail: status.detail, exited: true };
+      return { ok: false, reason: 'not-taken', detail: status.detail };
     }
-    return { ok: false, reason: 'unreadable', detail: status.detail, exited: true };
+    return { ok: false, reason: 'unreadable', detail: status.detail };
   }
 
   /** `claude auth status`, as yes, no, or could not tell. */
