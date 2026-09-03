@@ -125,7 +125,7 @@ function submitReply(outcome: SubmitOutcome): string {
     case 'none-waiting':
       return 'No login is waiting for a code. Run `!auth` to start one.';
     case 'not-taken':
-      return 'That did not take — `auth status` still says logged out. Run `!auth` for a fresh link.';
+      return `That did not take: ${outcome.detail}. Run \`!auth\` for a fresh link.`;
     case 'unreadable':
       return `Code accepted, but \`auth status\` could not be read back: ${outcome.detail}`;
     default:
