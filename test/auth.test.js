@@ -202,6 +202,11 @@ function loginHarness({ now = () => NOW } = {}) {
   return { login, spawned };
 }
 
+/** Only the logins: `auth status` and the container reap are `docker` spawns. */
+const logins = (spawned) => spawned.filter((s) => s.file === 'script');
+/** The `auth status` run, wherever it lands in the sequence. */
+const statusRun = (spawned) => spawned.find((s) => s.args.at(-1) === 'status');
+
 /** Let the promise chains inside `AuthLogin` settle. */
 async function settle(times = 20) {
   for (let i = 0; i < times; i += 1) await Promise.resolve();
@@ -231,7 +236,7 @@ test('a second begin reuses the login already waiting', async () => {
   const { login, spawned } = loginHarness();
   const first = await started(login, spawned);
   assert.deepEqual(await login.begin(), first);
-  assert.equal(spawned.length, 1);
+  assert.equal(logins(spawned).length, 1);
 });
 
 test('a login that dies before printing a URL is reported, not held', async () => {
@@ -252,7 +257,7 @@ test('an expired login mints a fresh one rather than refusing', async () => {
   clock += 3 * 60 * 60 * 1000;
 
   assert.equal((await started(login, spawned)).url, URL);
-  assert.equal(spawned.length, 2);
+  assert.equal(logins(spawned).length, 2);
 });
 
 test('two begins a moment apart do not start two logins', async () => {
@@ -262,7 +267,7 @@ test('two begins a moment apart do not start two logins', async () => {
 
   const immediate = await login.begin();
   assert.ok('error' in immediate);
-  assert.equal(spawned.length, 1);
+  assert.equal(logins(spawned).length, 1);
 });
 
 test('a bad code never reaches stdin', async () => {
@@ -273,7 +278,7 @@ test('a bad code never reaches stdin', async () => {
   assert.equal(outcome.ok, false);
   assert.equal(outcome.reason, 'bad-code');
   assert.deepEqual(spawned[0].child.written, []);
-  assert.equal(spawned.length, 1, 'auth status was never reached');
+  assert.equal(statusRun(spawned), undefined, 'auth status was never reached');
 });
 
 test('a good code goes in on stdin and the answer comes from auth status', async () => {
@@ -291,10 +296,10 @@ test('a good code goes in on stdin and the answer comes from auth status', async
 
   spawned[0].child.emit('exit', 0);
   await settle();
-  const statusRun = spawned[1];
-  assert.deepEqual(statusRun.args.slice(-2), ['auth', 'status']);
-  statusRun.child.say('{"loggedIn":true}');
-  statusRun.child.emit('exit', 0);
+  const status = statusRun(spawned);
+  assert.deepEqual(status.args.slice(-2), ['auth', 'status']);
+  status.child.say('{"loggedIn":true}');
+  status.child.emit('exit', 0);
 
   assert.deepEqual(await submitting, { ok: true });
 });
@@ -303,7 +308,7 @@ test('a code with no login waiting is refused before anything is spawned', async
   const { login, spawned } = loginHarness();
   const outcome = await login.submit('lJ8x-Ab_c0D3#9PGDW');
   assert.equal(outcome.reason, 'none-waiting');
-  assert.equal(spawned.length, 0);
+  assert.deepEqual(spawned, []);
 });
 
 test('an exchange that did not take is reported as not taken', async () => {
@@ -314,8 +319,8 @@ test('an exchange that did not take is reported as not taken', async () => {
   await Promise.resolve();
   spawned[0].child.emit('exit', 1);
   await settle();
-  spawned[1].child.say('{"loggedIn":false}');
-  spawned[1].child.emit('exit', 0);
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).reason, 'not-taken');
 });
 
@@ -342,18 +347,52 @@ test('a login still running when the exchange window closes is killed, not left 
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the login that never exited was killed');
   assert.equal(login.pendingUrl, null);
 
-  spawned[1].child.say('{"loggedIn":false}');
-  spawned[1].child.emit('exit', 0);
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).ok, false);
 });
 
-test('stop kills a login that is holding a URL nobody used', async () => {
+test('stop kills a login on both sides of the container boundary', async () => {
+  // `docker exec` does not forward signals, so killing the local process leaves
+  // the one inside the container running and holding a challenge.
   const { login, spawned } = loginHarness();
   await started(login, spawned);
 
   login.stop();
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM']);
   assert.equal(login.pendingUrl, null);
+
+  const reap = spawned.find((s) => s.args[2] === 'pkill');
+  assert.ok(reap, 'the container is told to reap it');
+  assert.equal(reap.file, 'docker');
+  assert.deepEqual(reap.args, [
+    'exec',
+    'clawcius-agent',
+    'pkill',
+    '-f',
+    '/usr/local/bin/claude auth login --claudeai',
+  ]);
+});
+
+test('a crew with no container has nothing on the far side to reap', async () => {
+  const spawned = [];
+  const login = new AuthLogin({
+    target: { ...TARGET, containerEnabled: false },
+    log: () => {},
+    now: () => NOW,
+    spawn: (file, args) => {
+      const child = fakeChild();
+      spawned.push({ file, args: [...args], child });
+      return child;
+    },
+  });
+  const pending = login.begin();
+  await Promise.resolve();
+  spawned[0].child.say(URL_LINE);
+  await pending;
+
+  login.stop();
+  assert.equal(spawned.length, 1, 'the local kill is the whole of it');
 });
 
 const deadTurn = (overrides = {}) => ({
@@ -466,7 +505,7 @@ test('a refused code is answered when the prompt says so, not when the window cl
   spawned[0].child.say('Login failed: Request failed with status code 400');
   await settle();
 
-  spawned[1].child.say('{"loggedIn":false}');
-  spawned[1].child.emit('exit', 0);
+  statusRun(spawned).child.say('{"loggedIn":false}');
+  statusRun(spawned).child.emit('exit', 0);
   assert.equal((await submitting).reason, 'not-taken');
 });

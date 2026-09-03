@@ -464,7 +464,7 @@ export class AuthLogin {
     return { turnRan: out.code === 0, detail: detail || 'the turn produced nothing' };
   }
 
-  /** Kill whatever is waiting. */
+  /** Kill whatever is waiting, on both sides of the container boundary. */
   stop(): void {
     const pending = this.#pending;
     this.#pending = null;
@@ -474,6 +474,26 @@ export class AuthLogin {
       pending.child.kill('SIGTERM');
     } catch {
       // Already gone.
+    }
+    this.#reapInContainer();
+  }
+
+  /**
+   * Kill the login inside the container.
+   *
+   * `docker exec` does not forward signals: killing the local process leaves
+   * the one it started running. Without this every abandoned login — an idle
+   * timeout, a second `begin`, a shutdown — leaves a process holding an unspent
+   * challenge, and they accumulate for the life of the container.
+   */
+  #reapInContainer(): void {
+    if (!this.#target.containerEnabled) return;
+    const pattern = [this.#target.claudePath, ...LOGIN_COMMAND].join(' ');
+    try {
+      this.#spawn('docker', ['exec', this.#target.containerName, 'pkill', '-f', pattern], process.env);
+    } catch {
+      // Best effort: a login left running is worth a line, not a throw.
+      this.#log('could not reap the login inside the container');
     }
   }
 }
