@@ -94,15 +94,18 @@ export function doorHandler(deps: DoorDeps) {
   return async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? 'GET';
     const path = (request.url ?? '/').split('?')[0] ?? '/';
+    // `tailscale serve --set-path` may forward with the mount still on the
+    // front. Routing on the last segment answers the same under either.
+    const route = path.slice(path.lastIndexOf('/') + 1);
 
     try {
-      if (method === 'GET' && (path === '/' || path === '/index.html')) {
+      if (method === 'GET' && (route === '' || route === 'index.html')) {
         response.writeHead(200, { ...HEADERS, 'content-type': 'text/html; charset=utf-8' });
         response.end(PAGE);
         return;
       }
 
-      if (method === 'GET' && path === '/state') {
+      if (method === 'GET' && route === 'state') {
         json(response, 200, doorState({
           crew: deps.crew,
           home: deps.home,
@@ -119,7 +122,7 @@ export function doorHandler(deps: DoorDeps) {
         }
       }
 
-      if (method === 'POST' && path === '/start') {
+      if (method === 'POST' && route === 'start') {
         const started = await deps.login.begin();
         if ('error' in started) {
           deps.log(`could not start a login: ${started.error}`);
@@ -131,7 +134,7 @@ export function doorHandler(deps: DoorDeps) {
         return;
       }
 
-      if (method === 'POST' && path === '/code') {
+      if (method === 'POST' && route === 'code') {
         const body = await readBody(request);
         if (body === null) {
           json(response, 413, { error: 'that is too long to be a code' });
@@ -186,6 +189,20 @@ export function startDoor(deps: DoorDeps, port: number): Server {
   return server;
 }
 
+/**
+ * Where the page's own requests go, given the path it was served at.
+ *
+ * The page is always served at the root of its mount, so a path with no
+ * trailing slash is still a directory. Resolving `state` against `/login`
+ * would give `/state`, which belongs to whatever is mounted at `/`.
+ *
+ * Exported and tested because the script that uses it is a string, which no
+ * test of the handler can reach.
+ */
+export function apiBase(pathname: string): string {
+  return pathname.endsWith('/') ? pathname : `${pathname}/`;
+}
+
 /** The page. */
 const PAGE = `<!doctype html>
 <html lang="en"><head>
@@ -226,7 +243,7 @@ const PAGE = `<!doctype html>
 <script>
 const $=id=>document.getElementById(id);
 const show=id=>{for(const s of document.querySelectorAll('.step'))s.classList.remove('on');$(id).classList.add('on')};
-const base=location.pathname.replace(/[^/]*$/,'');
+const base=location.pathname.endsWith('/')?location.pathname:location.pathname+'/';
 async function load(){
   const s=await (await fetch(base+'state')).json();
   $('who').textContent=s.crew+' · '+s.home;

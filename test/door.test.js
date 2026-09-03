@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { doorHandler, doorState } from '../dist/door.js';
+import { apiBase, doorHandler, doorState } from '../dist/door.js';
 
 const NOW = 1_788_400_000_000;
 
@@ -271,6 +271,44 @@ test('a POST that did not come from this page is refused', async () => {
     await handle(request, response);
     assert.equal(response.status, 403);
     assert.deepEqual(login.calls, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the page fetches inside its own mount, wherever it is published', () => {
+  // Under `--set-path /login` a bare `fetch('state')` resolves against the
+  // parent and lands on whatever is at `/`, which is a different service. The
+  // page is served at the root of its mount, so a path with no trailing slash
+  // is still a directory.
+  for (const served of ['/login', '/login/', '/hamachi-login', '/hamachi-login/', '/']) {
+    const resolved = new URL('state', 'https://h.ts.net' + apiBase(served)).pathname;
+    assert.ok(resolved.startsWith(served.replace(/\/$/, '') + '/'), `${served} -> ${resolved}`);
+    assert.ok(resolved.endsWith('/state'), resolved);
+  }
+});
+
+test('the routes answer whether or not the proxy strips the mount', async () => {
+  // `tailscale serve --set-path` may forward with the mount still on the front.
+  const { dir, login, handle } = harness(DEAD);
+  try {
+    for (const path of ['/state', '/login/state', '/hamachi-login/state']) {
+      const response = fakeResponse();
+      await handle(fakeRequest('GET', path), response);
+      assert.equal(response.status, 200, path);
+      assert.equal(response.json().crew, 'Clawcius', path);
+    }
+    for (const path of ['/', '/login/', '/hamachi-login/']) {
+      const response = fakeResponse();
+      await handle(fakeRequest('GET', path), response);
+      assert.equal(response.status, 200, path);
+    }
+    for (const path of ['/start', '/login/start']) {
+      const response = fakeResponse();
+      await handle(fakeRequest('POST', path), response);
+      assert.equal(response.status, 200, path);
+    }
+    assert.deepEqual(login.calls, ['begin', 'begin']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
