@@ -496,11 +496,8 @@ test('a URL that has not finished arriving is not offered', async () => {
 });
 
 test('a login that hangs before its URL is reaped', async () => {
-  // It never reaches `#pending`, so `stop` cannot see it: if the timeout does
-  // not reap it, nothing does.
   const { login, spawned } = loginHarness({ urlWaitMs: 0 });
   const pending = login.begin();
-  await new Promise((resolve) => setImmediate(resolve));
 
   assert.ok('error' in (await pending));
   assert.deepEqual(spawned[0].child.signals, ['SIGTERM'], 'the local process is killed');
