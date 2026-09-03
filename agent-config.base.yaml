@@ -20,6 +20,7 @@ container:
 # [1m] = the 1M-token context variant.
 model: claude-opus-5[1m]
 modelByRole:
+  coordinator: claude-fable-5
   updater: claude-haiku-4-5
 # 0 = no per-turn cap; the agent decides when a turn is done.
 maxTurns: 0
