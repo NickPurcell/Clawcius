@@ -1,12 +1,3 @@
-/**
- * Reading the authorize URL out of what the login draws.
- *
- * Every assertion here runs against `test/fixtures/setup-token-real-output.ansi`,
- * which is what the command actually wrote under a pty rather than a rendering
- * of what it was expected to write. The difference is the whole test: in that
- * output the visible URL is soft-wrapped across five lines.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -26,16 +17,15 @@ test('the URL comes out of the real output whole', () => {
   assert.equal(authorizeUrl(REAL), EXPECTED);
 });
 
-test('the drawn text alone would give a truncated URL', () => {
-  // This is why the hyperlink is read instead. Stripping the escapes and
-  // matching the visible characters yields a prefix that ends mid-parameter and
-  // is a perfectly plausible URL to hand someone.
-  const visible = REAL.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][B0]|\x1b[78]/g, '');
-  const naive = /https:\/\/\S*oauth\/authorize\S*/.exec(visible);
+test('a read that ends inside the escape yields nothing, not a prefix', () => {
+  // The output arrives in chunks. Without requiring the terminator this returns
+  // a proper prefix of the real URL — the same truncation by another route,
+  // and one that looks entirely correct.
+  const cut = REAL.slice(0, REAL.indexOf('\u001b]8;') + 120);
+  const partial = authorizeUrl(cut);
 
-  assert.notEqual(naive, null, 'the visible text does contain something URL-shaped');
-  assert.notEqual(naive[0], EXPECTED, 'and it is not the URL');
-  assert.ok(EXPECTED.startsWith(naive[0]), 'it is a prefix of it — which is why it looks right');
+  assert.notEqual(partial, EXPECTED, 'a half-read hyperlink is not the URL');
+  assert.equal(partial, null, 'and it is withheld rather than handed over truncated');
 });
 
 test('one hyperlink, however many lines it was drawn across', () => {
@@ -58,14 +48,8 @@ test('a non-authorize hyperlink is not offered as the authorize URL', () => {
   assert.equal(authorizeUrl('\x1b]8;;https://claude.com/settings\x07settings\x1b]8;;\x07'), null);
 });
 
-test('the command runs under a terminal it does not have', () => {
-  // The daemon has no controlling terminal, so `docker exec -it` refuses on its
-  // own and `script` is what supplies one.
-  const { file, args } = ptyArgv(['docker', 'exec', '-it', 'clawcius-agent', '/usr/local/bin/claude', 'setup-token']);
+test('each word is quoted, because script hands its string to a shell', () => {
+  const { file, args } = ptyArgv(['docker', 'exec', '-it', 'a b;rm -rf /', 'claude']);
   assert.equal(file, 'script');
-  assert.deepEqual(args, [
-    '-qec',
-    'docker exec -it clawcius-agent /usr/local/bin/claude setup-token',
-    '/dev/null',
-  ]);
+  assert.deepEqual(args, ["-qec", "'docker' 'exec' '-it' 'a b;rm -rf /' 'claude'", '/dev/null']);
 });

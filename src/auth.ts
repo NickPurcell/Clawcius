@@ -44,7 +44,10 @@ const CREDENTIAL_FILE = '.credentials.json';
  * or the wrong shape. A stale access token behind a live refresh token is not
  * terminal — dropping the session picks up the refreshed one.
  */
-export type CredentialVerdict = { terminal: false } | { terminal: true; why: string };
+export type CredentialVerdict = ({ terminal: false } | { terminal: true; why: string }) & {
+  /** `refreshTokenExpiresAt` as ISO, or null when the file does not state one. */
+  refreshExpiresAt: string | null;
+};
 
 export function credentialVerdict(home: string, now = Date.now()): CredentialVerdict {
   const path = join(home, CREDENTIAL_FILE);
@@ -53,20 +56,20 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
     raw = readFileSync(path, 'utf8');
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}` };
-    return { terminal: true, why: `${path} could not be read (${code ?? 'unknown error'})` };
+    if (code === 'ENOENT') return { terminal: true, why: `there is no ${CREDENTIAL_FILE} in ${home}`, refreshExpiresAt: null };
+    return { terminal: true, why: `${path} could not be read (${code ?? 'unknown error'})`, refreshExpiresAt: null };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { terminal: true, why: `${CREDENTIAL_FILE} is not valid JSON` };
+    return { terminal: true, why: `${CREDENTIAL_FILE} is not valid JSON`, refreshExpiresAt: null };
   }
 
   const oauth = (parsed as { claudeAiOauth?: unknown })?.claudeAiOauth;
   if (typeof oauth !== 'object' || oauth === null) {
-    return { terminal: true, why: `${CREDENTIAL_FILE} has no claudeAiOauth block` };
+    return { terminal: true, why: `${CREDENTIAL_FILE} has no claudeAiOauth block`, refreshExpiresAt: null };
   }
   const { accessToken, refreshToken, refreshTokenExpiresAt } = oauth as {
     accessToken?: unknown;
@@ -74,24 +77,26 @@ export function credentialVerdict(home: string, now = Date.now()): CredentialVer
     refreshTokenExpiresAt?: unknown;
   };
 
+  // Absent and 0 both mean unstated, which is not the same as expired.
+  const stated = typeof refreshTokenExpiresAt === 'number' && refreshTokenExpiresAt > 0;
+  const refreshExpiresAt = stated ? new Date(refreshTokenExpiresAt as number).toISOString() : null;
+
   // A failed refresh blanks the tokens in place rather than removing them.
   if (typeof refreshToken !== 'string' || refreshToken === '') {
-    return { terminal: true, why: 'the refresh token is blank — there is nothing left to refresh' };
+    return {
+      terminal: true,
+      why: 'the refresh token is blank — there is nothing left to refresh',
+      refreshExpiresAt,
+    };
   }
   if (typeof accessToken !== 'string' || accessToken === '') {
-    return { terminal: true, why: 'the access token is blank' };
+    return { terminal: true, why: 'the access token is blank', refreshExpiresAt };
   }
-  // Absent and 0 both mean unstated, which is not the same as expired.
-  if (typeof refreshTokenExpiresAt === 'number' && refreshTokenExpiresAt > 0) {
-    if (refreshTokenExpiresAt <= now) {
-      return {
-        terminal: true,
-        why: `the refresh token expired at ${new Date(refreshTokenExpiresAt).toISOString()}`,
-      };
-    }
+  if (stated && (refreshTokenExpiresAt as number) <= now) {
+    return { terminal: true, why: `the refresh token expired at ${refreshExpiresAt}`, refreshExpiresAt };
   }
 
-  return { terminal: false };
+  return { terminal: false, refreshExpiresAt };
 }
 
 /** Where a login has to run so that it writes the credential the agent reads. */
@@ -105,11 +110,7 @@ export type AuthTarget = {
   hostClaudePath: string;
   /** The agent home, passed as CLAUDE_CONFIG_DIR on the host path. */
   home: string;
-  /**
-   * The subcommand that mints a credential — `['setup-token']`, or
-   * `['auth', 'login', '--claudeai']`. Both print an authorize URL and then wait
-   * on stdin; they differ in what they leave behind and how long it lasts.
-   */
+  /** The subcommand that mints a credential. */
   loginCommand: readonly string[];
 };
 
@@ -122,9 +123,6 @@ export function authArgv(
   if (target.containerEnabled) {
     // The container carries CLAUDE_CONFIG_DIR from `docker run`.
     //
-    // `-t` is what puts a terminal on the far side of the exec. Wrapping the
-    // whole thing in `script` gives the local process one, and without `-t` the
-    // command inside the container still reads a pipe and stays silent.
     return {
       file: 'docker',
       args: ['exec', tty ? '-it' : '-i', target.containerName, target.claudePath, ...sub],
@@ -211,7 +209,7 @@ type Pending = {
 };
 
 /**
- * At most one `claude auth login` at a time, held open waiting for its code.
+ * One login at a time, held open waiting for its code.
  *
  * The headless flow prints a URL and then blocks on stdin, so the process must
  * outlive the call that started it.
@@ -222,6 +220,11 @@ export class AuthLogin {
   readonly #log: (line: string) => void;
   readonly #now: () => number;
   readonly #exchangeMs: number;
+  /**
+   * Whether this command draws its URL as a hyperlink, in which case the
+   * visible text is soft-wrapped and reading it would yield a prefix.
+   */
+  readonly #drawsHyperlinks: boolean;
   #pending: Pending | null = null;
   #lastStart = 0;
 
@@ -237,6 +240,7 @@ export class AuthLogin {
     this.#log = opts.log;
     this.#now = opts.now ?? Date.now;
     this.#exchangeMs = opts.exchangeMs ?? EXCHANGE_MS;
+    this.#drawsHyperlinks = !opts.target.loginCommand.includes('login');
   }
 
   /** The URL of a login that is waiting, if one is. */
@@ -287,7 +291,7 @@ export class AuthLogin {
         // hyperlink arrives after however much cursor movement it took to get
         // there.
         seen = (seen + String(chunk)).slice(-32768);
-        const url = authorizeUrl(seen) ?? findUrl(seen);
+        const url = authorizeUrl(seen) ?? (this.#drawsHyperlinks ? null : findUrl(seen));
         if (url === null) return;
         this.#pending = {
           child,
@@ -411,21 +415,16 @@ export class AuthLogin {
    * Whether the credential can run an ordinary turn, not merely authenticate.
    *
    * `setup-token` asks for `user:inference` alone where a full login asks for
-   * the scopes a turn uses, so `auth status` answering yes is not the same
-   * answer. This runs a real prompt through the same path a session takes.
+   * the scopes a turn uses, so authenticating is not the same answer. This runs
+   * a real prompt through the same path a session takes.
    */
-  async verify(): Promise<{ loggedIn: boolean | null; turnRan: boolean | null; detail: string }> {
-    const status = await this.status();
-    if (status.loggedIn !== true) {
-      return { loggedIn: status.loggedIn, turnRan: null, detail: status.detail };
-    }
-
+  async verify(): Promise<{ turnRan: boolean; detail: string }> {
     const { file, args, env } = authArgv(this.#target, ['-p', 'reply with the single word: ok']);
     let child: LoginProcess;
     try {
       child = this.#spawn(file, args, env);
     } catch (error) {
-      return { loggedIn: true, turnRan: false, detail: `the turn could not start: ${String(error)}` };
+      return { turnRan: false, detail: `the turn could not start: ${String(error)}` };
     }
 
     const out = await new Promise<{ text: string; code: number | null }>((resolve) => {
@@ -453,7 +452,7 @@ export class AuthLogin {
     });
 
     const detail = out.text.replace(/\s+/g, ' ').trim().slice(0, 300);
-    return { loggedIn: true, turnRan: out.code === 0, detail: detail || 'the turn produced nothing' };
+    return { turnRan: out.code === 0, detail: detail || 'the turn produced nothing' };
   }
 
   /** Kill whatever is waiting. */

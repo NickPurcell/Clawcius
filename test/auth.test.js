@@ -172,12 +172,12 @@ function fakeChild() {
   return child;
 }
 
-/** What the CLI prints under `docker exec -i` before it blocks on stdin. */
-const URL_LINE =
-  "Opening browser to sign in…\nIf the browser didn't open, visit: " +
-  'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW\n' +
-  'Paste code here if prompted >';
 const URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW';
+/** As `setup-token` draws it: the visible text wrapped, the whole URL in the hyperlink. */
+const URL_LINE =
+  'Browser didn\u2019t open? Use the url below to sign in\r\n' +
+  `\u001b]8;id=1;${URL}\u0007https://claude.com/cai/oauth/authorize?code=true&client_i\u001b]8;;\u0007\r\n` +
+  'Paste code here if prompted >';
 
 const TARGET = {
   containerEnabled: true,
@@ -221,12 +221,9 @@ test('begin reads the URL out of what the CLI printed', async () => {
   const { login, spawned } = loginHarness();
   const result = await started(login, spawned);
   assert.equal(result.url, URL);
-  // Under a terminal, because `setup-token` writes nothing to a pipe.
   assert.equal(spawned[0].file, 'script');
-  assert.ok(spawned[0].args[1].endsWith('clawcius-agent /usr/local/bin/claude setup-token'));
-  // `-t`, not just `-i`: `script` gives this process a terminal, and without
-  // `-t` the command inside the container still reads a pipe.
-  assert.ok(spawned[0].args[1].startsWith('docker exec -it '));
+  assert.ok(spawned[0].args[1].endsWith("'clawcius-agent' '/usr/local/bin/claude' 'setup-token'"));
+  assert.ok(spawned[0].args[1].startsWith("'docker' 'exec' '-it'"));
 });
 
 test('a second begin reuses the login already waiting', async () => {
@@ -407,7 +404,6 @@ test('the announcement goes to the main channel and points at the page', async (
 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, 'C-main');
-    // It can name a next step now, because there is one it can deliver.
     assert.ok(sent[0].text.includes('https://box.example.ts.net/login'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -458,4 +454,35 @@ test('a send that throws does not escape the announcer', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a line-oriented login may read its URL from the text; a drawn one may not', async () => {
+  // The drawn one soft-wraps, so the visible text is a prefix. `auth login` does
+  // not draw, so it has no hyperlink to read and the text is all there is.
+  const plain =
+    "If the browser didn't open, visit: " +
+    'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&state=9PGDW\n';
+
+  const drawn = loginHarness();
+  const drawnPending = drawn.login.begin();
+  await Promise.resolve();
+  drawn.spawned[0].child.say(plain);
+  drawn.spawned[0].child.emit('exit', 1);
+  assert.ok('error' in (await drawnPending), 'a drawn login ignores the wrapped text');
+
+  const lineOriented = new AuthLogin({
+    target: { ...TARGET, loginCommand: ['auth', 'login', '--claudeai'] },
+    log: () => {},
+    now: () => NOW,
+    spawn: (file, args) => {
+      const child = fakeChild();
+      lineOriented.spawned.push({ file, args: [...args], child });
+      return child;
+    },
+  });
+  lineOriented.spawned = [];
+  const pending = lineOriented.begin();
+  await Promise.resolve();
+  lineOriented.spawned[0].child.say(plain);
+  assert.equal((await pending).url, URL);
 });

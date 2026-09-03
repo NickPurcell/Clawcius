@@ -1,11 +1,3 @@
-/**
- * The login page: what a read does, what a write does, and the line between.
- *
- * The rule the first two tests exist for: loading the page must never start a
- * login. An always-on recovery page that logs the crew out by being looked at
- * is worse than one that is only reachable during an outage.
- */
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -32,10 +24,14 @@ const HEALTHY = {
 const DEAD = { accessToken: '', refreshToken: '' };
 
 /** A login that records every call, so a test can prove one did not happen. */
-function fakeLogin({ url = 'https://claude.com/cai/oauth/authorize?x=1', submit } = {}) {
+function fakeLogin({ url = 'https://claude.com/cai/oauth/authorize?x=1', submit, verification } = {}) {
   const login = {
     calls: [],
     pendingUrl: null,
+    verify: async () => {
+      login.calls.push('verify');
+      return verification ?? { turnRan: true, detail: 'ok' };
+    },
     begin: async () => {
       login.calls.push('begin');
       return url === null ? { error: 'docker is not running' } : { url };
@@ -75,6 +71,7 @@ function fakeRequest(method, url, body) {
   const request = {
     method,
     url,
+    headers: { 'sec-fetch-site': 'same-origin' },
     on(event, cb) {
       (listeners[event] ??= []).push(cb);
       if (event === 'end') {
@@ -91,21 +88,16 @@ function fakeRequest(method, url, body) {
 
 function harness(oauth, opts = {}) {
   const dir = credentialDir(oauth);
-  const login = opts.login ?? fakeLogin();
-  const verified = [];
+  const login = opts.login ?? fakeLogin({ verification: opts.verification });
   const announced = [];
   const handle = doorHandler({
     crew: 'Clawcius',
     home: dir,
     login,
-    verify: async () => {
-      verified.push(1);
-      return opts.verification ?? { loggedIn: true, turnRan: true, detail: 'ok' };
-    },
     log: () => {},
     onAuthenticated: (v) => announced.push(v),
   });
-  return { dir, login, handle, verified, announced };
+  return { dir, login, handle, announced };
 }
 
 test('loading the page runs nothing', async () => {
@@ -116,7 +108,6 @@ test('loading the page runs nothing', async () => {
       await handle(fakeRequest('GET', path), response);
       assert.equal(response.status, 200, path);
     }
-    // The whole point of the page being always-on.
     assert.deepEqual(login.calls, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -185,14 +176,13 @@ test('a login that cannot start says why instead of pretending', async () => {
 });
 
 test('a code that lands is verified by a real turn, not just by auth status', async () => {
-  const { dir, login, handle, verified, announced } = harness(DEAD);
+  const { dir, login, handle, announced } = harness(DEAD);
   try {
     const response = fakeResponse();
     await handle(fakeRequest('POST', '/code', JSON.stringify({ code: 'lJ8x-Ab_c0D3' })), response);
 
     assert.equal(response.status, 200);
-    assert.deepEqual(login.calls, ['submit:lJ8x-Ab_c0D3']);
-    assert.equal(verified.length, 1, 'the credential is exercised, not just accepted');
+    assert.deepEqual(login.calls, ['submit:lJ8x-Ab_c0D3', 'verify'], 'exercised, not just accepted');
     assert.equal(response.json().verification.turnRan, true);
     assert.equal(announced.length, 1, 'the channel hears about it without anyone typing');
   } finally {
@@ -201,10 +191,8 @@ test('a code that lands is verified by a real turn, not just by auth status', as
 });
 
 test('a credential that authenticates but cannot run a turn is not called success', async () => {
-  // `setup-token` asks for `user:inference` alone. Authenticating and being able
-  // to run an agent turn are different questions and the page answers the second.
   const { dir, handle } = harness(DEAD, {
-    verification: { loggedIn: true, turnRan: false, detail: 'the turn was refused' },
+    verification: { turnRan: false, detail: 'the turn was refused' },
   });
   try {
     const response = fakeResponse();
@@ -216,7 +204,7 @@ test('a credential that authenticates but cannot run a turn is not called succes
 });
 
 test('a rejected code is reported and nothing is verified', async () => {
-  const { dir, handle, verified } = harness(DEAD, {
+  const { dir, login, handle } = harness(DEAD, {
     login: fakeLogin({ submit: { ok: false, reason: 'bad-code', detail: 'whitespace' } }),
   });
   try {
@@ -224,7 +212,7 @@ test('a rejected code is reported and nothing is verified', async () => {
     await handle(fakeRequest('POST', '/code', JSON.stringify({ code: 'no good' })), response);
     assert.equal(response.status, 400);
     assert.equal(response.json().reason, 'bad-code');
-    assert.equal(verified.length, 0);
+    assert.equal(login.calls.includes('verify'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -267,6 +255,22 @@ test('every response refuses to be framed or sniffed', async () => {
       assert.equal(response.headers['x-content-type-options'], 'nosniff', path);
       assert.equal(response.headers['cache-control'], 'no-store', path);
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a POST that did not come from this page is refused', async () => {
+  // `tailscale serve` authenticates the node, not the request: a page the
+  // operator has open elsewhere could otherwise kill a login that is waiting.
+  const { dir, login, handle } = harness(DEAD);
+  try {
+    const request = fakeRequest('POST', '/start');
+    request.headers = { 'sec-fetch-site': 'cross-site' };
+    const response = fakeResponse();
+    await handle(request, response);
+    assert.equal(response.status, 403);
+    assert.deepEqual(login.calls, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -792,7 +792,6 @@ export async function main(): Promise<void> {
       crew: config.agent.displayName,
       home: config.agent.container.agentHome,
       login: authLogin,
-      verify: () => authLogin.verify(),
       log: (line) => process.stdout.write(`[door] ${line}\n`),
       // A login that lands says so in the channel, so nobody has to come back
       // and ask whether it worked.

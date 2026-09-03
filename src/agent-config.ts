@@ -48,7 +48,6 @@ export type AgentConfig = {
     name: string;
     /** In-container path to the claude binary. */
     claudePath: string;
-    /** The subcommand that mints a credential, run under a pty by `!auth` and the login page. */
     loginCommand: string[];
     stateDir: string;
     /** The Claude config dir: bind-mounted into the container, or CLAUDE_CONFIG_DIR without one. */

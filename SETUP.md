@@ -125,7 +125,7 @@ resume from SQLite on the next wake.
   and a real turn before it says the crew is back. `LOGIN_PAGE_PORT` and `LOGIN_PAGE_URL` in each
   crew's unit; publish with `tailscale serve --bg --set-path /login 8479`.
 - **Dead Claude credential**: the daemon posts one message to the crew's first `allowedChannelIds`
-  channel, then every four hours while it stays dead, naming the fault and the agent home. It runs
+  channel, then every four hours while it stays dead, naming the fault. It runs
   in the waker, so it does not need a working model. `@bot !auth` reports `claude auth status` and
   posts an authorize link; `@bot !auth <code>` feeds the code in and confirms. Anyone in the
   channel may use either, with any Claude account. The login runs inside the container for a crew

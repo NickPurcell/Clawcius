@@ -1,20 +1,12 @@
 /**
  * The login page: a loopback HTTP server the operator reaches over the tailnet.
  *
- * It exists because the Claude Code OAuth client cannot redirect anywhere we
- * control — the CLI has no callback option, the client id is Anthropic's, and a
- * loopback redirect lands on the operator's machine rather than on this box. So
- * the browser half of the flow ends on Anthropic's own code screen and the code
- * comes back through a field here instead of through Discord.
- *
  * Reads never act. Loading the page runs no subprocess and mints no login: it
  * reports the credential on disk and nothing else, so looking at the page can
  * never be the thing that logs the crew out. Only `POST /start` spawns.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { credentialVerdict, type AuthLogin, type SubmitOutcome } from './auth.js';
 
 /** Largest body accepted on any route; a paste code is a few hundred bytes. */
@@ -47,49 +39,18 @@ export function doorState(opts: {
     home: opts.home,
     usable: !verdict.terminal,
     why: verdict.terminal ? verdict.why : null,
-    refreshExpiresAt: refreshExpiry(opts.home),
+    refreshExpiresAt: verdict.refreshExpiresAt,
     pendingUrl: opts.pendingUrl,
   };
 }
-
-/** `refreshTokenExpiresAt` as an ISO string, or null when it is absent or unstated. */
-function refreshExpiry(home: string): string | null {
-  try {
-    const parsed = JSON.parse(readFileSync(join(home, '.credentials.json'), 'utf8')) as {
-      claudeAiOauth?: { refreshTokenExpiresAt?: unknown };
-    };
-    const at = parsed.claudeAiOauth?.refreshTokenExpiresAt;
-    if (typeof at !== 'number' || at <= 0) return null;
-    return new Date(at).toISOString();
-  } catch {
-    return null;
-  }
-}
-
-/** Whether a credential can run an ordinary turn, which is a stronger question than whether it authenticates. */
-export type Verification = {
-  loggedIn: boolean | null;
-  /** Whether a real turn ran. Null when it was not attempted. */
-  turnRan: boolean | null;
-  detail: string;
-};
 
 export type DoorDeps = {
   crew: string;
   home: string;
   login: AuthLogin;
-  /**
-   * Run a real turn under the credential and say whether it worked.
-   *
-   * `auth status` is not enough on its own: `setup-token` asks for
-   * `user:inference` alone, where an ordinary login asks for the scopes a turn
-   * uses, so a credential can authenticate and still fail at everything the
-   * agent does.
-   */
-  verify: () => Promise<Verification>;
   log: (line: string) => void;
   /** Told when a login lands, so the channel hears about it without anyone typing. */
-  onAuthenticated?: (verification: Verification) => void;
+  onAuthenticated?: (verification: Awaited<ReturnType<AuthLogin['verify']>>) => void;
 };
 
 /** Read a request body, refusing anything larger than a paste code needs. */
@@ -112,18 +73,19 @@ async function readBody(request: IncomingMessage): Promise<string | null> {
   });
 }
 
+/** `connect-src` is what lets the page call its own API; without it `fetch` falls back to `default-src`. */
+const HEADERS: Readonly<Record<string, string>> = {
+  'cache-control': 'no-store',
+  'content-security-policy':
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+  'x-frame-options': 'DENY',
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+};
+
 function json(response: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
-  response.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    // Nothing here is meant to be framed or sniffed, and the page loads no
-    // third-party anything.
-    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
-    'x-frame-options': 'DENY',
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-  });
+  response.writeHead(status, { ...HEADERS, 'content-type': 'application/json; charset=utf-8' });
   response.end(text);
 }
 
@@ -135,20 +97,11 @@ export function doorHandler(deps: DoorDeps) {
 
     try {
       if (method === 'GET' && (path === '/' || path === '/index.html')) {
-        response.writeHead(200, {
-          'content-type': 'text/html; charset=utf-8',
-          'cache-control': 'no-store',
-          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
-          'x-frame-options': 'DENY',
-          'x-content-type-options': 'nosniff',
-          'referrer-policy': 'no-referrer',
-        });
+        response.writeHead(200, { ...HEADERS, 'content-type': 'text/html; charset=utf-8' });
         response.end(PAGE);
         return;
       }
 
-      // A read. No subprocess runs on this path, so refreshing the page cannot
-      // be what starts a login.
       if (method === 'GET' && path === '/state') {
         json(response, 200, doorState({
           crew: deps.crew,
@@ -156,6 +109,14 @@ export function doorHandler(deps: DoorDeps) {
           pendingUrl: deps.login.pendingUrl,
         }));
         return;
+      }
+
+      if (method === 'POST') {
+        const site = request.headers['sec-fetch-site'];
+        if (site !== undefined && site !== 'same-origin') {
+          json(response, 403, { error: 'not from this page' });
+          return;
+        }
       }
 
       if (method === 'POST' && path === '/start') {
@@ -195,10 +156,8 @@ export function doorHandler(deps: DoorDeps) {
         }
 
         // The credential is in. Whether it is any good is a separate question.
-        const verification = await deps.verify();
-        deps.log(
-          `login landed: loggedIn=${String(verification.loggedIn)} turnRan=${String(verification.turnRan)}`,
-        );
+        const verification = await deps.login.verify();
+        deps.log(`login landed: turnRan=${String(verification.turnRan)}`);
         deps.onAuthenticated?.(verification);
         json(response, 200, { ok: true, verification });
         return;
@@ -216,17 +175,18 @@ export function doorHandler(deps: DoorDeps) {
 
 /** Listen on loopback. `tailscale serve` is what makes it reachable. */
 export function startDoor(deps: DoorDeps, port: number): Server {
+  const handle = doorHandler(deps);
   const server = createServer((request, response) => {
-    void doorHandler(deps)(request, response);
+    void handle(request, response);
   });
+  // Without this a port already in use is an unhandled event, and the login page
+  // takes the crew down rather than merely being absent.
+  server.on('error', (error) => deps.log(`the login page could not listen: ${String(error)}`));
   server.listen(port, '127.0.0.1');
   return server;
 }
 
-/**
- * The page, inline because it is one file and shipping it as an asset would put
- * a second path in the deploy that can go missing.
- */
+/** The page. */
 const PAGE = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -266,8 +226,9 @@ const PAGE = `<!doctype html>
 <script>
 const $=id=>document.getElementById(id);
 const show=id=>{for(const s of document.querySelectorAll('.step'))s.classList.remove('on');$(id).classList.add('on')};
+const base=location.pathname.replace(/[^/]*$/,'');
 async function load(){
-  const s=await (await fetch('state')).json();
+  const s=await (await fetch(base+'state')).json();
   $('who').textContent=s.crew+' · '+s.home;
   $('state').className='card '+(s.usable?'ok':'bad');
   $('state').innerHTML=s.usable
@@ -277,13 +238,13 @@ async function load(){
 }
 $('go').onclick=async()=>{
   $('go').disabled=true;$('go').textContent='starting…';
-  const r=await fetch('start',{method:'POST'});const b=await r.json();
+  const r=await fetch(base+'start',{method:'POST'});const b=await r.json();
   if(!r.ok){$('go').disabled=false;$('go').textContent='Start a login';$('done').textContent=b.error;show('s3');return}
   $('link').href=b.url;show('s2');
 };
 $('send').onclick=async()=>{
   $('send').disabled=true;$('send').textContent='checking…';
-  const r=await fetch('code',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:$('code').value.trim()})});
+  const r=await fetch(base+'code',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:$('code').value.trim()})});
   const b=await r.json();
   if(!r.ok||!b.ok){$('send').disabled=false;$('send').textContent='Finish';$('done').textContent=(b.detail||b.error||'that did not take');show('s3');await load();return}
   const v=b.verification;
