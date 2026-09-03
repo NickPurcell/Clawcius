@@ -113,6 +113,7 @@ function harness(overrides = {}) {
   // A healthy credential by default: only the tests about a dead one hand in an
   // announcer that claims the refusal.
   const authOutage = overrides.authOutage ?? fakeAuthOutage({ owns: false });
+  const authLogin = overrides.authLogin ?? fakeAuthLogin();
 
   const windows = new ConversationWindows(
     config.agent.discord.followUpWindowSeconds,
@@ -131,7 +132,7 @@ function harness(overrides = {}) {
     windows,
     alwaysOnChannels: new Set(config.agent.discord.alwaysOnChannelIds),
     authOutage,
-    authLogin: authOutage.login,
+    authLogin,
   });
 
   /** What `handleMessage` buffered, before `deliver` reshapes it. */
@@ -142,32 +143,37 @@ function harness(overrides = {}) {
     addToBundler(channelId, buffered);
   };
 
-  return { handlers, config, sessions, registry, windows, client, sent, fetched, bundled };
+  return { handlers, config, sessions, registry, windows, client, sent, fetched, bundled, authLogin };
 }
 
 /** An `AuthOutage` stand-in that records rather than reading a disk or spawning. */
-function fakeAuthOutage({ owns = true, loggedIn = false, url = 'https://claude.com/cai/oauth/authorize?x=1' } = {}) {
+function fakeAuthOutage({ owns = true } = {}) {
   const outage = {
     announced: [],
-    submitted: [],
-    began: 0,
     owns: () => (owns ? { why: 'the refresh token is blank' } : null),
     announce: async (_dead, channelId) => {
       outage.announced.push(channelId);
     },
-    login: {
-      status: async () => ({ loggedIn, detail: 'a status line' }),
-      begin: async () => {
-        outage.began += 1;
-        return url === null ? { error: 'docker is not running' } : { url };
-      },
-      submit: async (code) => {
-        outage.submitted.push(code);
-        return { ok: true };
-      },
-    },
   };
   return outage;
+}
+
+/** An `AuthLogin` stand-in, handed in as its own dep the way `main` does. */
+function fakeAuthLogin({ loggedIn = false, url = 'https://claude.com/cai/oauth/authorize?x=1' } = {}) {
+  const login = {
+    submitted: [],
+    began: 0,
+    status: async () => ({ loggedIn, detail: 'a status line' }),
+    begin: async () => {
+      login.began += 1;
+      return url === null ? { error: 'docker is not running' } : { url };
+    },
+    submit: async (code) => {
+      login.submitted.push(code);
+      return { ok: true };
+    },
+  };
+  return login;
 }
 
 /** A Discord message, as much of one as the handler touches. */
@@ -885,42 +891,38 @@ test('the first attempt is still left to the respawn, dead credential or not', a
 });
 
 test('!auth with a code hands the rest of the line over verbatim', async () => {
-  const authOutage = fakeAuthOutage();
-  const { handlers } = harness({ authOutage });
+  const { handlers, authLogin } = harness();
   const msg = message({ content: '!auth lJ8x-Ab_c0D3#9PGDW', mentioned: true });
 
   await handlers.handleMessage(msg);
 
-  assert.deepEqual(authOutage.submitted, ['lJ8x-Ab_c0D3#9PGDW']);
+  assert.deepEqual(authLogin.submitted, ['lJ8x-Ab_c0D3#9PGDW']);
   assert.equal(msg.replies.length, 1);
 });
 
 test('!auth on its own starts a login and posts the link', async () => {
-  const authOutage = fakeAuthOutage({ loggedIn: false });
-  const { handlers } = harness({ authOutage });
+  const { handlers, authLogin } = harness({ authLogin: fakeAuthLogin({ loggedIn: false }) });
   const msg = message({ content: '!auth', mentioned: true });
 
   await handlers.handleMessage(msg);
 
-  assert.equal(authOutage.began, 1);
+  assert.equal(authLogin.began, 1);
   // The link `begin` produced is what the channel is handed.
   assert.ok(msg.replies[0].includes('https://claude.com/cai/oauth/authorize?x=1'));
 });
 
 test('!auth when the credential is fine spawns nothing', async () => {
-  const authOutage = fakeAuthOutage({ loggedIn: true });
-  const { handlers } = harness({ authOutage });
+  const { handlers, authLogin } = harness({ authLogin: fakeAuthLogin({ loggedIn: true }) });
   const msg = message({ content: '!auth', mentioned: true });
 
   await handlers.handleMessage(msg);
 
-  assert.equal(authOutage.began, 0);
+  assert.equal(authLogin.began, 0);
   assert.equal(msg.replies.length, 1);
 });
 
 test('!auth is the waker answering — it never reaches the agent', async () => {
-  const authOutage = fakeAuthOutage();
-  const { handlers, sessions, bundled } = harness({ authOutage });
+  const { handlers, sessions, bundled } = harness();
 
   await handlers.handleMessage(message({ content: '!auth lJ8x-Ab_c0D3#9PGDW', mentioned: true }));
 

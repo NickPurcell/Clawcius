@@ -425,8 +425,7 @@ export type DeadCredential = { why: string };
 
 /**
  * Announces a dead credential in Discord, at most once per `repeatMs` unless
- * somebody is waiting on an answer. It holds no `AuthLogin`, so the message it
- * sends cannot carry a login link.
+ * somebody is waiting on an answer.
  *
  * `owns` is separate from `announce` and synchronous because the callers are
  * session completion handlers that decide whether the ordinary outage message

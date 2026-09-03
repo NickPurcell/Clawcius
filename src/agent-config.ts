@@ -344,8 +344,7 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     },
     sessions: { ...base.sessions, workspaceRoot: derived.workspaceRoot },
     discord: { ...base.discord, ...instance.discord },
-    // Unresolved: a bare name has to stay a PATH lookup.
-    paths: { discordCli, skillsDir, claudeCli: base.paths.claudeCli },
+    paths: { discordCli, skillsDir, claudeCli: resolve(base.paths.claudeCli) },
     git: { userName: derived.gitUserName, userEmail: derived.gitUserEmail },
     clawsky: { ...base.clawsky, crew },
     armed: base.armed,

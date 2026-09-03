@@ -186,7 +186,7 @@ export function outageMessage(summary: TurnSummary): string {
       return (
         `⚠️ I could not authenticate to the API, and retrying did not fix it` +
         (detail ? `: ${detail}` : '.') +
-        `\n${heard} Run \`!auth\` to log in again.`
+        `\n${heard} The credential on disk still reads as usable, so this needs a look at the host.`
       );
     default:
       // `not-retryable`: a standing condition a retry reproduces exactly.
