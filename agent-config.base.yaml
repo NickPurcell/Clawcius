@@ -25,6 +25,27 @@ modelByRole:
 # 0 = no per-turn cap; the agent decides when a turn is done.
 maxTurns: 0
 
+# Which API a seat authenticates against. `anthropic` is the Claude Code login
+# in the crew's agent-home, and is what every seat uses unless an entry below
+# says otherwise; `model`/`modelByRole` name that seat's model. Any other name
+# must match a `providers` key, and takes its model from there instead.
+provider: anthropic
+providerByRole: {}
+providers:
+  # Moonshot's Anthropic-compatible endpoint: the Claude CLI drives it through
+  # ANTHROPIC_BASE_URL with no code change. Put the seat on it with, say,
+  #   providerByRole: {researcher: kimi}
+  # and put the key in the crew's env file (/etc/clawcius/<crew>.env) as
+  #   MOONSHOT_API_KEY=sk-...
+  # A seat that asks for kimi while that line is missing refuses to start and
+  # says so in the journal, rather than quietly spending the subscription.
+  kimi:
+    baseUrl: https://api.moonshot.ai/anthropic
+    apiKeyEnv: MOONSHOT_API_KEY
+    model: kimi-k3[1m]
+    # Claude Code's background model: titles, summaries, the cheap calls.
+    smallFastModel: kimi-k2.7-code
+
 systemPrompt:
   useClaudeCodeDefault: true
   append: |
