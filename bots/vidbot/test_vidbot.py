@@ -789,6 +789,121 @@ class PostingWiringTest(unittest.TestCase):
         self.assertNotIn(vidbot.POSTING_ENABLED, vidbot.POSTING_DISABLED)
 
 
+YTDLP = '''#!/usr/bin/env python3
+"""A yt-dlp that answers a quote tweet the way X really does.
+
+Two entries -- the tweet's own video first, the quoted tweet's second, and the
+quoted one longer, which is the ordinary shape rather than a contrived one: a
+quote tweet is usually a short reaction to a longer clip. --no-playlist is
+ignored here because the real tool ignores it here, and that is the bug.
+"""
+import json, sys
+from pathlib import Path
+
+CONF = json.loads(Path("{conf}").read_text())
+
+argv, opts, url = sys.argv[1:], {{}}, None
+i = 0
+while i < len(argv):
+    if argv[i] == "--print-to-file":
+        opts["--print-to-file"] = argv[i + 1:i + 3]
+        i += 3
+    elif argv[i].startswith("-") and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+        opts[argv[i]] = argv[i + 1]
+        i += 2
+    else:
+        url = url or (None if argv[i].startswith("-") else argv[i])
+        i += 1
+
+entries = [("own", CONF["own"]), ("quoted", CONF["quoted"])]
+if opts.get("-I") == "1" and CONF["honour_selection"]:
+    entries = entries[:1]
+
+written = []
+for name, size in entries:
+    if not size:          # a text-only tweet: exit 0 having written nothing
+        continue
+    path = Path(opts["-o"].replace("%(id)s", name).replace("%(ext)s", "mp4"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\\0" * size)
+    written.append(path)
+
+if CONF["name_them"] and "--print-to-file" in opts:
+    template, dest = opts["--print-to-file"]
+    assert template == "after_move:filepath", template
+    Path(dest).write_text("".join(str(p) + chr(10) for p in written))
+sys.exit(0)
+'''
+
+
+class QuoteTweetTest(unittest.TestCase):
+    """vidbot posted the quoted tweet's video instead of the tweet's own.
+
+    yt-dlp hands back a real two-entry playlist for a quote tweet and
+    --no-playlist does not collapse it, so both videos landed in the work
+    directory and the biggest-file pick took the quoted one -- the wrong video,
+    reliably, because the quoted clip is normally the longer.
+
+    The double is a real binary on PATH rather than a patched vidbot.run, so
+    these drive the argv that production builds, flags and all.
+    """
+
+    def fetch(self, own=1000, quoted=9000, honour_selection=True, name_them=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = Path(tmp.name) / "bin"
+        bindir.mkdir()
+        conf = Path(tmp.name) / "conf.json"
+        conf.write_text(json.dumps({"own": own, "quoted": quoted,
+                                    "honour_selection": honour_selection,
+                                    "name_them": name_them}))
+        fake = bindir / "yt-dlp"
+        fake.write_text(YTDLP.format(conf=conf))
+        fake.chmod(0o755)
+
+        path = os.environ["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", path)
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{path}"
+
+        self.workdir = Path(tmp.name) / "work"
+        self.workdir.mkdir()
+        return vidbot.fetch_video("https://x.com/v/status/2095387856332005501",
+                                  str(self.workdir), 100_000_000)
+
+    def test_the_tweets_own_video_is_the_one_returned(self):
+        video = self.fetch()
+        self.assertEqual(video.name, "own.mp4")
+        self.assertEqual(video.stat().st_size, 1000)
+
+    def test_only_the_first_entry_is_downloaded_at_all(self):
+        """-I 1 is the half of the fix that saves the bandwidth: the quoted
+        clip should never come down the wire, not merely lose the pick."""
+        self.fetch()
+        got = sorted(p.name for p in (self.workdir / "dl").iterdir())
+        self.assertEqual(got, ["own.mp4"])
+
+    def test_the_larger_wrong_entry_still_loses_when_both_land(self):
+        """The other half. If a yt-dlp or a site change ever puts both files
+        back on disk, selection alone has to hold -- so the double ignores -I
+        here and writes both, with the wrong one nine times the size."""
+        video = self.fetch(honour_selection=False)
+        self.assertEqual(
+            sorted(p.name for p in (self.workdir / "dl").iterdir()),
+            ["own.mp4", "quoted.mp4"], "the double was meant to write both")
+        self.assertEqual(video.name, "own.mp4")
+
+    def test_an_unnamed_download_is_posted_rather_than_lost(self):
+        """A None here makes handle_message mark the tweet done forever, so an
+        empty manifest with a file on disk must not read as 'no video'."""
+        video = self.fetch(name_them=False)
+        self.assertIsNotNone(video)
+        self.assertEqual(video.name, "own.mp4")
+
+    def test_a_tweet_with_no_video_is_still_none(self):
+        video = self.fetch(own=0, quoted=0, name_them=False)
+        self.assertIsNone(video)
+
+
 class CursorTest(unittest.TestCase):
     """The cursor now has two writers, so it needs to be monotonic."""
 

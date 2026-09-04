@@ -242,6 +242,33 @@ class Discord:
         ).stdout)
 
 
+def _downloaded(manifest, dl_dir, url):
+    """The file yt-dlp says it wrote, or None if it wrote nothing.
+
+    The directory scan below is not the old max-by-size pick returning by
+    another name. It exists because the caller treats None as "this tweet has
+    no video" and marks the tweet done forever, so a manifest that is somehow
+    empty while a file sits on disk must not become a silent, permanent loss.
+    With -I 1 capping the download at one entry there is nothing to choose
+    between, which is exactly what was not true before.
+    """
+    try:
+        named = manifest.read_text().splitlines()
+    except OSError:
+        named = []
+    for line in named:
+        path = Path(line.strip())
+        if line.strip() and path.is_file():
+            return path
+
+    found = sorted(p for p in dl_dir.iterdir() if p.is_file()) if dl_dir.is_dir() else []
+    if not found:
+        return None
+    log.warning("yt-dlp named no output for %s; falling back to %s of %d on disk",
+                url, found[0].name, len(found))
+    return found[0]
+
+
 def fetch_video(url, workdir, max_bytes):
     """Download the video for `url`, returning a path, or None if there is none.
 
@@ -249,15 +276,28 @@ def fetch_video(url, workdir, max_bytes):
     re-encoding it afterwards: the re-encode below is a fallback for when a
     short-but-dense clip still overshoots, not the normal path.
     """
-    out_tmpl = str(Path(workdir) / "%(id)s.%(ext)s")
+    dl_dir = Path(workdir) / "dl"
+    manifest = Path(workdir) / "downloaded.txt"
+    out_tmpl = str(dl_dir / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        # --no-playlist does not cover a quote tweet. X hands back a genuine
+        # two-entry playlist -- the tweet's own video, then the quoted tweet's
+        # -- and yt-dlp downloads both, because neither entry is the "playlist
+        # alongside a video" case that --no-playlist collapses. -I 1 is what
+        # actually stops at the video the link was for.
+        "-I", "1",
         "--no-warnings",
         "--no-progress",
         # Sort toward <=720p and smaller files before falling back to best.
         "-S", "res:720,+size",
         "--merge-output-format", "mp4",
+        # Which file to upload has to come from yt-dlp, not from the directory:
+        # this is the final path after any merge, so there is nothing left to
+        # infer. Guessing at the biggest file is what posted the quoted tweet's
+        # clip, since the quoted video is routinely the longer of the two.
+        "--print-to-file", "after_move:filepath", str(manifest),
         "-o", out_tmpl,
         url,
     ]
@@ -269,10 +309,9 @@ def fetch_video(url, workdir, max_bytes):
             return None
         raise RuntimeError(best_error_line(blob))
 
-    files = [p for p in Path(workdir).iterdir() if p.is_file()]
-    if not files:
+    video = _downloaded(manifest, dl_dir, url)
+    if video is None:
         return None
-    video = max(files, key=lambda p: p.stat().st_size)
     if video.stat().st_size > max_bytes:
         video = shrink(video, max_bytes)
     return video
