@@ -38,6 +38,21 @@ When you are done or blocked, DM {spawnedBy} and say which in the first line.
 If work is still in motion when your turn ends, arm \`remindMe\` before it ends.
 Push the branch, open the pull request or file the issue before you stop; nothing asks you first.`;
 
+/** The name of the built-in provider: the Claude Code login, and what every seat uses unless it says otherwise. */
+export const DEFAULT_PROVIDER = 'anthropic';
+
+/** An Anthropic-compatible API a seat can be pointed at. */
+export type ProviderConfig = {
+  /** What ANTHROPIC_BASE_URL becomes for that seat. */
+  baseUrl: string;
+  /** The variable holding the key, read from the process environment at spawn. NEVER the key itself. */
+  apiKeyEnv: string;
+  /** The model a seat on this provider runs, in place of `model`/`modelByRole`. */
+  model: string;
+  /** Claude Code's background model — its cheap calls would otherwise ask this API for a Claude name it does not have. */
+  smallFastModel: string;
+};
+
 export type AgentConfig = {
   crew: string;
   /** The crew's name as it says it — `Clawcius`, `Hamachi`. */
@@ -59,6 +74,11 @@ export type AgentConfig = {
   prompts: PromptTemplates;
   model: string;
   modelByRole: Readonly<Partial<Record<AgentRole, string>>>;
+  /** The API every seat authenticates against unless `providerByRole` says otherwise. `anthropic` is the Claude Code login. */
+  provider: string;
+  providerByRole: Readonly<Partial<Record<AgentRole, string>>>;
+  /** Every non-Anthropic API a seat may name. Keys, never secrets: the token comes from `apiKeyEnv` in the crew's env file. */
+  providers: Readonly<Record<string, ProviderConfig>>;
   /** 0 means unlimited — no turn cap is sent to the SDK at all. */
   maxTurns: number;
   systemPrompt: {
@@ -153,6 +173,21 @@ const Base = z.strictObject({
   container: z.strictObject({ claudePath: z.string().min(1) }),
   model: z.string().min(1),
   modelByRole: z.partialRecord(z.enum(AGENT_ROLES), z.string().min(1)),
+  provider: z.string().min(1),
+  providerByRole: z.partialRecord(z.enum(AGENT_ROLES), z.string().min(1)),
+  providers: z.record(
+    z.string().min(1),
+    z.strictObject({
+      baseUrl: z.string().regex(/^https:\/\/\S+$/, { error: 'must be an https URL' }),
+      // A name, and the shape of one: a value that looks like a key is a key
+      // pasted into git, which is the one thing this indirection exists to stop.
+      apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/, {
+        error: 'must be the NAME of an environment variable, not a key',
+      }),
+      model: z.string().min(1),
+      smallFastModel: z.string().min(1),
+    }),
+  ),
   maxTurns: z.number().min(0),
   systemPrompt: z.strictObject({ useClaudeCodeDefault: z.boolean(), append: z.string() }),
   sessions: z.strictObject({
@@ -289,6 +324,20 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     );
   }
 
+  // A provider name with no entry would otherwise only be found the first time
+  // that seat is woken, which may be days later and in the journal alone.
+  const named: Array<[string, string]> = [
+    ['provider', base.provider],
+    ...Object.entries(base.providerByRole).map(
+      ([role, name]): [string, string] => [`providerByRole.${role}`, name],
+    ),
+  ];
+  for (const [key, name] of named) {
+    if (name === DEFAULT_PROVIDER || base.providers[name]) continue;
+    const known = [DEFAULT_PROVIDER, ...Object.keys(base.providers)].join(', ');
+    throw new Error(`${baseFile}: ${key} names provider "${name}", which is not one of: ${known}`);
+  }
+
   for (const { id } of base.clawsky.agents) {
     if (!id.startsWith(`${crew}-`)) {
       throw new Error(`${baseFile}: clawsky.agents id "${id}" must start with "${crew}-"`);
@@ -337,6 +386,9 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     prompts,
     model: base.model,
     modelByRole: base.modelByRole,
+    provider: base.provider,
+    providerByRole: base.providerByRole,
+    providers: base.providers,
     maxTurns: base.maxTurns,
     systemPrompt: {
       useClaudeCodeDefault: base.systemPrompt.useClaudeCodeDefault,
