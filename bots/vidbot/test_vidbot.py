@@ -809,14 +809,16 @@ while i < len(argv):
         url = url or (None if argv[i].startswith("-") else argv[i])
         i += 1
 
-entries = [("own", CONF["own"]), ("quoted", CONF["quoted"])]
+entries = [(n, s) for n, s in (("own", CONF["own"]), ("quoted", CONF["quoted"])) if s]
+if not entries:
+    sys.stderr.write("ERROR: [twitter] 2095387856332005501: "
+                     "No video could be found in this tweet" + chr(10))
+    sys.exit(1)
 if opts.get("-I") == "1" and CONF["honour_selection"]:
     entries = entries[:1]
 
 written = []
 for name, size in entries:
-    if not size:          # a text-only tweet: exit 0 having written nothing
-        continue
     path = Path(opts["-o"].replace("%(id)s", name).replace("%(ext)s", "mp4"))
     path.write_bytes(b"\\0" * size)
     written.append(path)
@@ -871,11 +873,8 @@ class QuoteTweetTest(unittest.TestCase):
                       "the double was meant to write both")
         self.assertEqual(video.name, "own.mp4")
 
-    def test_a_tweet_with_no_video_is_still_none(self):
-        with self.assertLogs(vidbot.log, "WARNING") as caught:
-            video = self.fetch(own=0, quoted=0)
-        self.assertIsNone(video)
-        self.assertIn("named no output", "".join(caught.output))
+    def test_a_tweet_with_no_video_is_none(self):
+        self.assertIsNone(self.fetch(own=0, quoted=0))
 
 
 class CursorTest(unittest.TestCase):

@@ -275,14 +275,7 @@ def fetch_video(url, workdir, max_bytes):
             return None
         raise RuntimeError(best_error_line(blob))
 
-    named = manifest.read_text().splitlines() if manifest.is_file() else []
-    if not named:
-        # A missing video exits non-zero above, so an empty manifest instead
-        # means yt-dlp stopped writing it ahead of the after_move
-        # post-processors -- the ordering this read depends on.
-        log.warning("yt-dlp exited 0 but named no output for %s", url)
-        return None
-    video = Path(named[0])
+    video = Path(manifest.read_text().splitlines()[0])
     if video.stat().st_size > max_bytes:
         video = shrink(video, max_bytes)
     return video
