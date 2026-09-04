@@ -873,8 +873,10 @@ class QuoteTweetTest(unittest.TestCase):
         self.assertEqual(video.name, "own.mp4")
 
     def test_a_tweet_with_no_video_is_still_none(self):
-        video = self.fetch(own=0, quoted=0)
+        with self.assertLogs(vidbot.log, "WARNING") as caught:
+            video = self.fetch(own=0, quoted=0)
         self.assertIsNone(video)
+        self.assertIn("named no output", "".join(caught.output))
 
 
 class CursorTest(unittest.TestCase):

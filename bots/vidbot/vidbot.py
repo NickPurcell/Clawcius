@@ -279,6 +279,10 @@ def fetch_video(url, workdir, max_bytes):
 
     named = manifest.read_text().splitlines() if manifest.is_file() else []
     if not named:
+        # Nothing to post either way, but a missing video normally exits
+        # non-zero above. This is the only tell if a yt-dlp release stops
+        # writing the manifest ahead of its after_move post-processors.
+        log.warning("yt-dlp exited 0 but named no output for %s", url)
         return None
     video = Path(named[0])
     if video.stat().st_size > max_bytes:
