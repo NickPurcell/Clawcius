@@ -253,8 +253,6 @@ def fetch_video(url, workdir, max_bytes):
     out_tmpl = str(Path(workdir) / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
-        # Still load-bearing: a tweet with no media but an external link
-        # resolves to the linked site, where this flag does apply.
         "--no-playlist",
         # A quote tweet is a two-entry playlist, the tweet's own video first;
         # --no-playlist leaves it alone.
@@ -279,9 +277,9 @@ def fetch_video(url, workdir, max_bytes):
 
     named = manifest.read_text().splitlines() if manifest.is_file() else []
     if not named:
-        # Nothing to post either way, but a missing video normally exits
-        # non-zero above. This is the only tell if a yt-dlp release stops
-        # writing the manifest ahead of its after_move post-processors.
+        # A missing video exits non-zero above, so an empty manifest instead
+        # means yt-dlp stopped writing it ahead of the after_move
+        # post-processors -- the ordering this read depends on.
         log.warning("yt-dlp exited 0 but named no output for %s", url)
         return None
     video = Path(named[0])

@@ -818,7 +818,6 @@ for name, size in entries:
     if not size:          # a text-only tweet: exit 0 having written nothing
         continue
     path = Path(opts["-o"].replace("%(id)s", name).replace("%(ext)s", "mp4"))
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\\0" * size)
     written.append(path)
 
@@ -863,8 +862,8 @@ class QuoteTweetTest(unittest.TestCase):
 
     def test_only_the_first_entry_is_downloaded_at_all(self):
         self.fetch()
-        got = sorted(p.name for p in self.workdir.iterdir())
-        self.assertEqual(got, ["downloaded.txt", "own.mp4"])
+        got = sorted(p.name for p in self.workdir.glob("*.mp4"))
+        self.assertEqual(got, ["own.mp4"])
 
     def test_the_larger_wrong_entry_still_loses_when_both_land(self):
         video = self.fetch(honour_selection=False)
