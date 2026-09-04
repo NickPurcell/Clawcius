@@ -339,6 +339,69 @@ test('the ceiling is three offers PER WINDOW, not three ever', () => {
   assert.equal(mail.unread('hamachi-engineer1').length, 1, 'and was never lost while paused');
 });
 
+/** Drive `count` sweeps, settling every offer with `why`, and return how many offers were made. */
+function grind(board_, why, count, stepMs = 61_000) {
+  const { waker, started } = board_;
+  const realNow = Date.now;
+  let offers = 0;
+  try {
+    let clock = realNow();
+    Date.now = () => clock;
+    for (let i = 0; i < count; i += 1) {
+      for (const s of started.splice(0)) {
+        offers += 1;
+        s.settle(false, why);
+      }
+      // Past the re-offer window, so the soft ceiling is back to zero every time.
+      clock += stepMs;
+      waker.sweep();
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  offers += started.splice(0).length;
+  return offers;
+}
+
+test('one message cannot be offered without bound, however its turns end', () => {
+  // #382: a one-shot reminder was re-offered ~230 times across one evening. Each
+  // offer is a model call with the whole session attached, so an unbounded count
+  // is the whole cost of the bug.
+  for (const why of [SUPERSEDED, 'API refused: billing_error', 'the turn died: ECONNRESET']) {
+    const b = board();
+    b.mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'the one that would not die'));
+
+    const offers = grind(b, why, 100);
+
+    assert.ok(
+      offers <= 20,
+      `settling every turn with "${why}" produced ${offers} offers of one message — unbounded`,
+    );
+    assert.equal(
+      b.mail.unread('hamachi-engineer1').length,
+      1,
+      'giving up must park the message, never consume it — nothing is lost',
+    );
+  }
+});
+
+test('new mail does not resurrect a message the waker has given up on', () => {
+  // The pause releases when `overdue.length === pending.length` stops holding, so
+  // before #382 any later message handed the parked one back to the sweep. An
+  // agent on a watchPr poll gets mail every few minutes forever.
+  const b = board();
+  b.mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'the stuck one'));
+  grind(b, SUPERSEDED, 100);
+  b.started.length = 0;
+
+  b.mail.deliver(note('hamachi-coordinator', 'hamachi-engineer1', 'a fresh one'));
+
+  assert.equal(b.started.length, 1, 'the new message is still delivered');
+  assert.equal(b.started[0].context.count, 1, 'and it arrives ALONE — the parked one is not back');
+  assert.match(b.started[0].context.mail, /a fresh one/);
+  assert.doesNotMatch(b.started[0].context.mail, /the stuck one/);
+});
+
 // ── mailWakeEvents ──────────────────────────────────────────────────────────
 
 const summary = (over = {}) => ({
