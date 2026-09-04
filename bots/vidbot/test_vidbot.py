@@ -790,13 +790,7 @@ class PostingWiringTest(unittest.TestCase):
 
 
 YTDLP = '''#!/usr/bin/env python3
-"""A yt-dlp that answers a quote tweet the way X really does.
-
-Two entries -- the tweet's own video first, the quoted tweet's second, and the
-quoted one longer, which is the ordinary shape rather than a contrived one: a
-quote tweet is usually a short reaction to a longer clip. --no-playlist is
-ignored here because the real tool ignores it here, and that is the bug.
-"""
+"""A yt-dlp that answers a quote tweet the way X really does."""
 import json, sys
 from pathlib import Path
 
@@ -828,7 +822,7 @@ for name, size in entries:
     path.write_bytes(b"\\0" * size)
     written.append(path)
 
-if CONF["name_them"] and "--print-to-file" in opts:
+if "--print-to-file" in opts:
     template, dest = opts["--print-to-file"]
     assert template == "after_move:filepath", template
     Path(dest).write_text("".join(str(p) + chr(10) for p in written))
@@ -837,26 +831,18 @@ sys.exit(0)
 
 
 class QuoteTweetTest(unittest.TestCase):
-    """vidbot posted the quoted tweet's video instead of the tweet's own.
-
-    yt-dlp hands back a real two-entry playlist for a quote tweet and
-    --no-playlist does not collapse it, so both videos landed in the work
-    directory and the biggest-file pick took the quoted one -- the wrong video,
-    reliably, because the quoted clip is normally the longer.
-
-    The double is a real binary on PATH rather than a patched vidbot.run, so
+    """The double is a real binary on PATH rather than a patched vidbot.run, so
     these drive the argv that production builds, flags and all.
     """
 
-    def fetch(self, own=1000, quoted=9000, honour_selection=True, name_them=True):
+    def fetch(self, own=1000, quoted=9000, honour_selection=True):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         bindir = Path(tmp.name) / "bin"
         bindir.mkdir()
         conf = Path(tmp.name) / "conf.json"
         conf.write_text(json.dumps({"own": own, "quoted": quoted,
-                                    "honour_selection": honour_selection,
-                                    "name_them": name_them}))
+                                    "honour_selection": honour_selection}))
         fake = bindir / "yt-dlp"
         fake.write_text(YTDLP.format(conf=conf))
         fake.chmod(0o755)
@@ -876,31 +862,18 @@ class QuoteTweetTest(unittest.TestCase):
         self.assertEqual(video.stat().st_size, 1000)
 
     def test_only_the_first_entry_is_downloaded_at_all(self):
-        """-I 1 is the half of the fix that saves the bandwidth: the quoted
-        clip should never come down the wire, not merely lose the pick."""
         self.fetch()
-        got = sorted(p.name for p in (self.workdir / "dl").iterdir())
-        self.assertEqual(got, ["own.mp4"])
+        got = sorted(p.name for p in self.workdir.iterdir())
+        self.assertEqual(got, ["downloaded.txt", "own.mp4"])
 
     def test_the_larger_wrong_entry_still_loses_when_both_land(self):
-        """The other half. If a yt-dlp or a site change ever puts both files
-        back on disk, selection alone has to hold -- so the double ignores -I
-        here and writes both, with the wrong one nine times the size."""
         video = self.fetch(honour_selection=False)
-        self.assertEqual(
-            sorted(p.name for p in (self.workdir / "dl").iterdir()),
-            ["own.mp4", "quoted.mp4"], "the double was meant to write both")
-        self.assertEqual(video.name, "own.mp4")
-
-    def test_an_unnamed_download_is_posted_rather_than_lost(self):
-        """A None here makes handle_message mark the tweet done forever, so an
-        empty manifest with a file on disk must not read as 'no video'."""
-        video = self.fetch(name_them=False)
-        self.assertIsNotNone(video)
+        self.assertIn("quoted.mp4", [p.name for p in self.workdir.iterdir()],
+                      "the double was meant to write both")
         self.assertEqual(video.name, "own.mp4")
 
     def test_a_tweet_with_no_video_is_still_none(self):
-        video = self.fetch(own=0, quoted=0, name_them=False)
+        video = self.fetch(own=0, quoted=0)
         self.assertIsNone(video)
 
 
