@@ -249,15 +249,21 @@ def fetch_video(url, workdir, max_bytes):
     re-encoding it afterwards: the re-encode below is a fallback for when a
     short-but-dense clip still overshoots, not the normal path.
     """
+    manifest = Path(workdir) / "downloaded.txt"
     out_tmpl = str(Path(workdir) / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        # A quote tweet is a two-entry playlist, the tweet's own video first;
+        # --no-playlist leaves it alone.
+        "-I", "1",
         "--no-warnings",
         "--no-progress",
         # Sort toward <=720p and smaller files before falling back to best.
         "-S", "res:720,+size",
         "--merge-output-format", "mp4",
+        # The final path, after any merge, as yt-dlp reports it.
+        "--print-to-file", "after_move:filepath", str(manifest),
         "-o", out_tmpl,
         url,
     ]
@@ -269,10 +275,7 @@ def fetch_video(url, workdir, max_bytes):
             return None
         raise RuntimeError(best_error_line(blob))
 
-    files = [p for p in Path(workdir).iterdir() if p.is_file()]
-    if not files:
-        return None
-    video = max(files, key=lambda p: p.stat().st_size)
+    video = Path(manifest.read_text().splitlines()[0])
     if video.stat().st_size > max_bytes:
         video = shrink(video, max_bytes)
     return video

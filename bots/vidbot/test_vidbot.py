@@ -789,6 +789,94 @@ class PostingWiringTest(unittest.TestCase):
         self.assertNotIn(vidbot.POSTING_ENABLED, vidbot.POSTING_DISABLED)
 
 
+YTDLP = '''#!/usr/bin/env python3
+"""A yt-dlp that answers a quote tweet the way X really does."""
+import json, sys
+from pathlib import Path
+
+CONF = json.loads(Path("{conf}").read_text())
+
+argv, opts, url = sys.argv[1:], {{}}, None
+i = 0
+while i < len(argv):
+    if argv[i] == "--print-to-file":
+        opts["--print-to-file"] = argv[i + 1:i + 3]
+        i += 3
+    elif argv[i].startswith("-") and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+        opts[argv[i]] = argv[i + 1]
+        i += 2
+    else:
+        url = url or (None if argv[i].startswith("-") else argv[i])
+        i += 1
+
+entries = [(n, s) for n, s in (("own", CONF["own"]), ("quoted", CONF["quoted"])) if s]
+if not entries:
+    sys.stderr.write("ERROR: [twitter] 2095387856332005501: "
+                     "No video could be found in this tweet" + chr(10))
+    sys.exit(1)
+if opts.get("-I") == "1" and CONF["honour_selection"]:
+    entries = entries[:1]
+
+written = []
+for name, size in entries:
+    path = Path(opts["-o"].replace("%(id)s", name).replace("%(ext)s", "mp4"))
+    path.write_bytes(b"\\0" * size)
+    written.append(path)
+
+if "--print-to-file" in opts:
+    template, dest = opts["--print-to-file"]
+    assert template == "after_move:filepath", template
+    Path(dest).write_text("".join(str(p) + chr(10) for p in written))
+sys.exit(0)
+'''
+
+
+class QuoteTweetTest(unittest.TestCase):
+    """The double is a real binary on PATH rather than a patched vidbot.run, so
+    these drive the argv that production builds, flags and all.
+    """
+
+    def fetch(self, own=1000, quoted=9000, honour_selection=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = Path(tmp.name) / "bin"
+        bindir.mkdir()
+        conf = Path(tmp.name) / "conf.json"
+        conf.write_text(json.dumps({"own": own, "quoted": quoted,
+                                    "honour_selection": honour_selection}))
+        fake = bindir / "yt-dlp"
+        fake.write_text(YTDLP.format(conf=conf))
+        fake.chmod(0o755)
+
+        path = os.environ["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", path)
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{path}"
+
+        self.workdir = Path(tmp.name) / "work"
+        self.workdir.mkdir()
+        return vidbot.fetch_video("https://x.com/v/status/2095387856332005501",
+                                  str(self.workdir), 100_000_000)
+
+    def test_the_tweets_own_video_is_the_one_returned(self):
+        video = self.fetch()
+        self.assertEqual(video.name, "own.mp4")
+        self.assertEqual(video.stat().st_size, 1000)
+
+    def test_only_the_first_entry_is_downloaded_at_all(self):
+        self.fetch()
+        got = sorted(p.name for p in self.workdir.glob("*.mp4"))
+        self.assertEqual(got, ["own.mp4"])
+
+    def test_the_larger_wrong_entry_still_loses_when_both_land(self):
+        video = self.fetch(honour_selection=False)
+        self.assertIn("quoted.mp4", [p.name for p in self.workdir.iterdir()],
+                      "the double was meant to write both")
+        self.assertEqual(video.name, "own.mp4")
+
+    def test_a_tweet_with_no_video_is_none(self):
+        self.assertIsNone(self.fetch(own=0, quoted=0))
+
+
 class CursorTest(unittest.TestCase):
     """The cursor now has two writers, so it needs to be monotonic."""
 
