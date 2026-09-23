@@ -89,10 +89,10 @@ switch_to() {   # switch_to <release dir>
     install -m 0644 -o root -g root "$1"/systemd/*.service "$1"/systemd/*.timer "$1"/systemd/*.path /etc/systemd/system/ 2>/dev/null || true
     install -d -m 0755 /usr/local/lib/clawcius
     install -m 0755 -o root -g root "$1"/docker/netguard.sh /usr/local/lib/clawcius/netguard.sh
+    install -m 0755 -o root -g root "$1/deploy/deploy.sh" /usr/local/sbin/deploy   # the next run uses the release's own copy
   else
     install -m 0644 -o root -g root "$1"/systemd/oj.service /etc/systemd/system/
   fi
-  install -m 0755 -o root -g root "$1/deploy/deploy.sh" /usr/local/sbin/deploy   # the next run uses the release's own copy
   systemctl daemon-reload
   for u in $UNITS; do systemctl restart $u.service || true; done   # the health check decides
   # Reload the bots supervisor if the container runs one; an older container has none to signal.
