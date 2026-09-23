@@ -19,7 +19,15 @@ function tempDir(prefix) {
 }
 
 /** Only the keys the pool reads, and deliberately so. */
-function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, modelByRole = {} }) {
+function installConfig({
+  maxConcurrent,
+  idleTimeoutMinutes,
+  workspaceRoot,
+  modelByRole = {},
+  provider,
+  providerByRole,
+  providers,
+}) {
   setConfig({
     discord: { token: 'unused-by-the-pool', guildId: 'unused-by-the-pool' },
     github: { token: '' },
@@ -28,6 +36,11 @@ function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, model
       clawsky: { crew: CREW, wakeOnMail: true },
       model: 'model-for-everyone-else',
       modelByRole,
+      // Left off entirely unless a test asks: the shape a deployment on the
+      // Claude subscription has, which is every seat today.
+      ...(provider === undefined ? {} : { provider }),
+      ...(providerByRole === undefined ? {} : { providerByRole }),
+      ...(providers === undefined ? {} : { providers }),
       sessions: { maxConcurrent, idleTimeoutMinutes, workspaceRoot },
     },
   });
@@ -35,11 +48,13 @@ function installConfig({ maxConcurrent, idleTimeoutMinutes, workspaceRoot, model
 
 /** A session that is a session in every way the pool cares about, and starts no container. */
 class FakeSession {
-  constructor(channelId, workspacePath, resumeSessionId, events, mcpServers, model) {
+  constructor(channelId, workspacePath, resumeSessionId, events, mcpServers, model, identity, providerEnv) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
     /** What `acquire` resolved from the row's role — undefined means "use `model`". */
     this.model = model;
+    /** The provider overrides for this seat; `{}` for the Claude Code login. */
+    this.providerEnv = providerEnv;
     this.sessionId = resumeSessionId ?? `pending-${channelId}`;
     this.busy = false;
     this.lastActiveAt = Date.now();
@@ -124,12 +139,22 @@ function recordingRegistry(rows = {}) {
 
 /** A manager over a stubbed registry — no database, no config beyond the pool's. */
 function stubbedPool(rows, options = {}) {
-  const { maxConcurrent = 4, idleTimeoutMinutes = 0, modelByRole = {} } = options;
+  const {
+    maxConcurrent = 4,
+    idleTimeoutMinutes = 0,
+    modelByRole = {},
+    provider,
+    providerByRole,
+    providers,
+  } = options;
   installConfig({
     maxConcurrent,
     idleTimeoutMinutes,
     workspaceRoot: tempDir('clawsky-ws-'),
     modelByRole,
+    provider,
+    providerByRole,
+    providers,
   });
   const registry = recordingRegistry(rows);
   const built = [];
@@ -347,6 +372,109 @@ test('a role with an override gets that model; every other role gets undefined',
   assert.equal(built[0].model, 'claude-haiku-4-5');
   // undefined rather than the top-level model: the fallback lives in `#buildOptions`.
   assert.equal(built[1].model, undefined);
+});
+
+// ── per-role providers ──────────────────────────────────────────────────────
+
+const KIMI = {
+  kimi: {
+    baseUrl: 'https://api.moonshot.ai/anthropic',
+    apiKeyEnv: 'TEST_MOONSHOT_API_KEY',
+    model: 'kimi-k3[1m]',
+    smallFastModel: 'kimi-k2.7-code',
+  },
+};
+
+/** Set an env var for one test and put the environment back afterwards. */
+function withEnv(name, value, body) {
+  const before = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  try {
+    body();
+  } finally {
+    if (before === undefined) delete process.env[name];
+    else process.env[name] = before;
+  }
+}
+
+test('a seat on another provider gets that base URL, key and model', () => {
+  withEnv('TEST_MOONSHOT_API_KEY', 'sk-test-key', () => {
+    const { manager, built } = stubbedPool(
+      {
+        'hamachi-researcher1': { id: 'hamachi-researcher1', role: 'researcher', sessionId: '' },
+        'hamachi-engineer1': { id: 'hamachi-engineer1', role: 'engineer', sessionId: '' },
+      },
+      { providerByRole: { researcher: 'kimi' }, providers: KIMI },
+    );
+
+    manager.acquire('hamachi-researcher1', events);
+    manager.acquire('hamachi-engineer1', events);
+
+    // The provider's model, not the Claude one: --model has to name something
+    // this API serves.
+    assert.equal(built[0].model, 'kimi-k3[1m]');
+    assert.equal(built[0].providerEnv.ANTHROPIC_BASE_URL, 'https://api.moonshot.ai/anthropic');
+    assert.equal(built[0].providerEnv.ANTHROPIC_AUTH_TOKEN, 'sk-test-key');
+    assert.equal(built[0].providerEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'kimi-k2.7-code');
+    // An ambient Anthropic key would be sent to a base URL that does not know it.
+    assert.equal(built[0].providerEnv.ANTHROPIC_API_KEY, '');
+
+    // The seat that was not moved is untouched — no base URL, no model override.
+    assert.deepEqual(built[1].providerEnv, {});
+    assert.equal(built[1].model, undefined);
+  });
+});
+
+test('every seat is on the subscription when nothing names a provider', () => {
+  const { manager, built } = stubbedPool({
+    'hamachi-engineer1': { id: 'hamachi-engineer1', role: 'engineer', sessionId: '' },
+  });
+  manager.acquire('hamachi-engineer1', events);
+  assert.deepEqual(built[0].providerEnv, {});
+});
+
+test('a seat whose provider key is missing refuses to start rather than falling back', () => {
+  withEnv('TEST_MOONSHOT_API_KEY', undefined, () => {
+    const { manager, built } = stubbedPool(
+      { 'hamachi-researcher1': { id: 'hamachi-researcher1', role: 'researcher', sessionId: '' } },
+      { providerByRole: { researcher: 'kimi' }, providers: KIMI },
+    );
+
+    assert.throws(() => manager.acquire('hamachi-researcher1', events), {
+      name: 'ProviderKeyError',
+      // Names the variable to add and where, since the journal line is all anyone gets.
+      message: /TEST_MOONSHOT_API_KEY/,
+    });
+    // No half-built seat left holding a slot.
+    assert.equal(built.length, 0);
+    assert.equal(manager.capacity.live, 0);
+  });
+});
+
+test('a global provider moves every seat that has no role of its own', () => {
+  withEnv('TEST_MOONSHOT_API_KEY', 'sk-test-key', () => {
+    const { manager, built } = stubbedPool(
+      {
+        'hamachi-engineer1': { id: 'hamachi-engineer1', role: 'engineer', sessionId: '' },
+        'hamachi-updater1': { id: 'hamachi-updater1', role: 'updater', sessionId: '' },
+      },
+      {
+        provider: 'kimi',
+        providerByRole: { updater: 'anthropic' },
+        providers: KIMI,
+        modelByRole: { updater: 'claude-haiku-4-5' },
+      },
+    );
+
+    manager.acquire('hamachi-engineer1', events);
+    manager.acquire('hamachi-updater1', events);
+
+    assert.equal(built[0].model, 'kimi-k3[1m]');
+    // Named back onto the default: its Claude model, and nothing injected.
+    assert.equal(built[1].model, 'claude-haiku-4-5');
+    assert.deepEqual(built[1].providerEnv, {});
+  });
 });
 
 // ── what the user is told ────────────────────────────────────────────────────

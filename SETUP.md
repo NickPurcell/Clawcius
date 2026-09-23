@@ -63,7 +63,23 @@ GITHUB_APP_ID=            # optional: agents open PRs as the App instead of a PA
 GITHUB_APP_INSTALLATION_ID=
 GITHUB_APP_PRIVATE_KEY_PATH=/etc/clawcius/<crew>-app.pem
 # ANTHROPIC_API_KEY=      # unset: the crew uses its Claude Code login in /var/lib/<crew>/agent-home
+# MOONSHOT_API_KEY=       # only for a seat on `provider: kimi`; see below
 ```
+
+A seat can run against another Anthropic-compatible API instead of the
+subscription — `providers` in `agent-config.base.yaml` describes them, and
+`provider` / `providerByRole` say which seats use which. Only Moonshot's Kimi
+is described today, and no seat is on it. To put one there, add the key to the
+crew's env file:
+
+```
+MOONSHOT_API_KEY=sk-...
+```
+
+then name the seat in `agent-config.base.yaml` — `providerByRole: {researcher:
+kimi}` — and restart that crew's waker. A seat configured for a provider whose
+key is missing refuses to start and says so in the journal, rather than falling
+back to the subscription it was moved off.
 
 Discord app: create it at discord.com/developers, enable **Message Content
 Intent**, invite with scopes `bot` and permissions Send Messages, Read Message

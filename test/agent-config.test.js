@@ -90,6 +90,60 @@ test('both shipped instance files load, each onto its own state directory', () =
   assert.deepEqual(clawcius.modelByRole, hamachi.modelByRole);
 });
 
+test('the shipped base puts every seat on the subscription, with kimi described but unused', () => {
+  const config = loadAgentConfig(writeInstance(['crew: x']));
+  assert.equal(config.provider, 'anthropic');
+  assert.deepEqual(config.providerByRole, {});
+  assert.deepEqual(config.providers['kimi'], {
+    baseUrl: 'https://api.moonshot.ai/anthropic',
+    apiKeyEnv: 'MOONSHOT_API_KEY',
+    model: 'kimi-k3[1m]',
+    smallFastModel: 'kimi-k2.7-code',
+  });
+});
+
+test('a provider name with no entry is a startup error, not a surprise at the first wake', () => {
+  assert.throws(
+    () => loadAgentConfig(writeLayered((b) => (b.provider = 'kimmy'))),
+    /provider names provider "kimmy".*anthropic, kimi/s,
+  );
+  assert.throws(
+    () => loadAgentConfig(writeLayered((b) => (b.providerByRole = { researcher: 'kimmy' }))),
+    /providerByRole\.researcher/,
+  );
+  // The default needs no entry, at either level.
+  assert.equal(
+    loadAgentConfig(writeLayered((b) => (b.providerByRole = { researcher: 'anthropic' })))
+      .providerByRole.researcher,
+    'anthropic',
+  );
+});
+
+test('a provider must name an env var for its key, never carry one', () => {
+  const withKey = (value) =>
+    writeLayered((b) => {
+      b.providers['kimi'].apiKeyEnv = value;
+    });
+  assert.throws(() => loadAgentConfig(withKey('sk-or-v1-abcdef')), /not a key/);
+  assert.throws(() => loadAgentConfig(withKey('moonshot_api_key')), /not a key/);
+  assert.equal(
+    loadAgentConfig(withKey('OTHER_KEY_VAR')).providers['kimi'].apiKeyEnv,
+    'OTHER_KEY_VAR',
+  );
+});
+
+test('a provider base URL must be https', () => {
+  assert.throws(
+    () =>
+      loadAgentConfig(
+        writeLayered((b) => {
+          b.providers['kimi'].baseUrl = 'http://api.moonshot.ai/anthropic';
+        }),
+      ),
+    /https/,
+  );
+});
+
 test('an instance file may carry container.enabled, and it defaults to true', () => {
   assert.equal(loadAgentConfig(writeInstance(['crew: x'])).container.enabled, true);
   assert.equal(

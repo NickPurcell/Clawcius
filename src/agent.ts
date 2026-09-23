@@ -4,6 +4,7 @@ import { query, type McpServerConfig, type Options, type Query, type SDKMessage,
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
+import { DEFAULT_PROVIDER } from './agent-config.js';
 import { tokenFilePath } from './token-file.js';
 import { buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import type { PromptIdentity } from './prompt.js';
@@ -142,6 +143,84 @@ export function gitEnv(): Record<string, string> {
   return env;
 }
 
+/** A seat asked for a provider whose key is not in this process's environment. */
+export class ProviderKeyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderKeyError';
+  }
+}
+
+/** What a seat runs and how it authenticates, resolved from its role. */
+export type SeatAuth = {
+  /** The model for this seat, or undefined to fall back to `config().agent.model`. */
+  model: string | undefined;
+  /** Environment overrides that point the CLI at a non-Anthropic API. Empty for the default. */
+  env: Record<string, string>;
+};
+
+/**
+ * Resolve a role's provider into the model and the environment its session runs
+ * with. `anthropic` — the default, and every seat's answer unless the config
+ * says otherwise — adds nothing at all: the CLI authenticates with the crew's
+ * Claude Code login exactly as it did before this existed.
+ *
+ * Throws when the named provider's key is missing, so the seat refuses to start
+ * rather than falling through to the subscription it was moved off.
+ */
+export function seatAuth(role: string): SeatAuth {
+  const agent = config().agent;
+  // Absent keys mean the default, not a failure: loadAgentConfig always fills
+  // all three in, and a test that installs only what it exercises still
+  // describes the deployment every seat has today.
+  const byRole = agent.providerByRole as Readonly<Record<string, string | undefined>> | undefined;
+  const name = byRole?.[role] ?? agent.provider ?? DEFAULT_PROVIDER;
+  if (name === DEFAULT_PROVIDER) {
+    const models = agent.modelByRole as Readonly<Record<string, string | undefined>>;
+    return { model: models[role], env: {} };
+  }
+
+  const provider = agent.providers?.[name];
+  // loadAgentConfig refuses an undefined name at startup; a row whose role is
+  // outside AGENT_ROLES cannot reach here either, since byRole is keyed by role.
+  if (!provider) {
+    throw new ProviderKeyError(
+      `role "${role}" is configured for provider "${name}", which agent-config defines no providers entry for`,
+    );
+  }
+
+  const key = process.env[provider.apiKeyEnv];
+  if (!key) {
+    throw new ProviderKeyError(
+      `role "${role}" is configured for provider "${name}", but ${provider.apiKeyEnv} is not set ` +
+        `in this process's environment. Add "${provider.apiKeyEnv}=<key>" to the crew's env file ` +
+        `(/etc/clawcius/<crew>.env) and restart the waker, or take the role off this provider. ` +
+        'Refusing to start the seat rather than silently billing the Claude subscription.',
+    );
+  }
+
+  return {
+    model: provider.model,
+    env: {
+      ANTHROPIC_BASE_URL: provider.baseUrl,
+      ANTHROPIC_AUTH_TOKEN: key,
+      // The CLI reaches for a model by name in more places than --model: every
+      // one it can pick for itself has to name something this API serves.
+      ANTHROPIC_MODEL: provider.model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: provider.model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: provider.model,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: provider.model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.smallFastModel,
+      ANTHROPIC_SMALL_FAST_MODEL: provider.smallFastModel,
+      CLAUDE_CODE_SUBAGENT_MODEL: provider.model,
+      // An ambient Anthropic key would be sent to this base URL, which does not
+      // know it. Blanked rather than deleted: the env we build is a plain
+      // object the SDK passes on, and an empty value reads as unset.
+      ANTHROPIC_API_KEY: '',
+    },
+  };
+}
+
 /** `acquire` had no session slot left. */
 export class AtCapacityError extends Error {
   readonly live: number;
@@ -253,6 +332,8 @@ export class AgentSession {
   #model: string | undefined;
   /** Who this session is, for the system prompt's opening line. */
   #identity: PromptIdentity;
+  /** Base URL, token and model names for a seat on a non-Anthropic API; empty for the default. */
+  #providerEnv: Readonly<Record<string, string>>;
   #consuming: Promise<void> | null = null;
   #closed = false;
   /** Reset at each wake; set when a discord CLI call *succeeds*. */
@@ -300,6 +381,8 @@ export class AgentSession {
     // can follow it. `newSession` -- the only caller -- already passes both.
     model: string | undefined,
     identity: PromptIdentity,
+    /** Provider overrides from `seatAuth`; empty for the Claude Code login. */
+    providerEnv: Readonly<Record<string, string>> = {},
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
@@ -307,6 +390,7 @@ export class AgentSession {
     this.#mcpServers = mcpServers;
     this.#model = model;
     this.#identity = identity;
+    this.#providerEnv = providerEnv;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
@@ -333,6 +417,9 @@ export class AgentSession {
         DISCORD_GUILD_ID: config().discord.guildId,
         DISCORD_CLI_HOME: join(this.workspacePath, '.discord-cli'),
         ...gitEnv(),
+        // Last, so a seat pinned to another API wins over whatever the service
+        // inherited for the subscription.
+        ...this.#providerEnv,
       },
       stderr: (data: string) => {
         process.stderr.write(`[agent ${this.channelId}] ${data}`);
@@ -653,6 +740,7 @@ export class SessionManager {
     mcpServers: Record<string, McpServerConfig> | null,
     model: string | undefined,
     identity: PromptIdentity,
+    providerEnv: Readonly<Record<string, string>>,
   ) => AgentSession = (
     channelId,
     workspacePath,
@@ -661,8 +749,18 @@ export class SessionManager {
     mcpServers,
     model,
     identity,
+    providerEnv,
   ) =>
-    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model, identity);
+    new AgentSession(
+      channelId,
+      workspacePath,
+      resumeSessionId,
+      events,
+      mcpServers,
+      model,
+      identity,
+      providerEnv,
+    );
 
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
@@ -696,6 +794,23 @@ export class SessionManager {
       channelId,
       this.#identityFor(channelId, workspacePath),
     );
+
+    // Resolved from the ROW's role, not from the id or the caller. A role with
+    // no entry anywhere gets the default provider and an undefined model, so
+    // the default deployment is unchanged by any of this existing at all.
+    // Thrown here rather than deeper: `acquire`'s callers all treat a throw as
+    // "no turn ran", and leave the wake to be retried.
+    let seat: SeatAuth;
+    try {
+      seat = seatAuth(identity.role);
+    } catch (error) {
+      if (error instanceof ProviderKeyError) {
+        process.stderr.write(
+          `[clawcius ${channelId}] REFUSING TO START THIS SEAT — ${error.message}\n`,
+        );
+      }
+      throw error;
+    }
 
     const session = this.newSession(
       channelId,
@@ -734,13 +849,13 @@ export class SessionManager {
             ],
           )
         : null,
-      // Resolved from the ROW's role, not from the id or the caller. A role
-      // with no entry gets undefined and falls back to `model`, so the default
-      // deployment is unchanged by this existing at all.
-      config().agent.modelByRole[identity.role],
+      // Undefined falls back to `model`; a seat on another provider carries
+      // that provider's model instead of the Claude one.
+      seat.model,
       // Identity for the system prompt's opening line. `channelId` IS the
       // agent id; crew and role come off the row `ensure` just wrote.
       { id: channelId, crew: identity.crew, role: identity.role },
+      seat.env,
     );
 
     session.onBusyChanged = () => this.onCountsChanged();
