@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Node for anything the agent writes in JS. The claude binary is static and needs none of it.
+# Node for anything the agent writes in JS. The claude binary bundles its own runtime and needs none of it.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -32,7 +32,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH}
 
-# Statically linked, so no glibc coupling to the base image.
+# Dynamically linked against glibc (PT_INTERP /lib64/ld-linux-x86-64.so.2), so the
+# base image has to keep providing one: bookworm does.
 COPY claude /usr/local/bin/claude
 RUN chmod 0755 /usr/local/bin/claude
 
