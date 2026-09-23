@@ -89,8 +89,6 @@ switch_to() {   # switch_to <release dir>
     install -m 0644 -o root -g root "$1"/systemd/*.service "$1"/systemd/*.timer "$1"/systemd/*.path /etc/systemd/system/ 2>/dev/null || true
     install -d -m 0755 /usr/local/lib/clawcius
     install -m 0755 -o root -g root "$1"/docker/netguard.sh /usr/local/lib/clawcius/netguard.sh
-    # The script lives in this repo only, so only a clawcius release carries a copy to install:
-    # an oj release has none, and under set -e the missing file ended the run half-switched.
     install -m 0755 -o root -g root "$1/deploy/deploy.sh" /usr/local/sbin/deploy   # the next run uses the release's own copy
   else
     install -m 0644 -o root -g root "$1"/systemd/oj.service /etc/systemd/system/
