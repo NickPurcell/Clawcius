@@ -33,8 +33,7 @@ RUN apt-get update \
     && chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH}
 
 # Dynamically linked against glibc (PT_INTERP /lib64/ld-linux-x86-64.so.2), so the
-# base image has to keep providing one: bookworm does, a musl base would not run
-# this without a loader package.
+# base image has to keep providing one: bookworm does.
 COPY claude /usr/local/bin/claude
 RUN chmod 0755 /usr/local/bin/claude
 
