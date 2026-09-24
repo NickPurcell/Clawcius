@@ -24,6 +24,8 @@ export type WakeContext =
       /** `renderMail` output — the tool's own text, not a paraphrase of it. */
       mail: string;
       count: number;
+      /** Who sent each message and when, so a safety stop can name them without the content. */
+      senders?: Array<{ author: string; at: number }>;
     };
 
 /** Why a refused turn has no retry coming. See `TurnSummary.noRetryReason`. */
@@ -31,7 +33,9 @@ export type NoRetryReason =
   | 'not-retryable'
   | 'exhausted'
   | 'abandoned'
-  | 'credential-dead';
+  | 'credential-dead'
+  /** Anthropic's safety classifier stopped the turn. Never retried: the session forks from before it instead. */
+  | 'safety-stop';
 
 export type TurnSummary = {
   /** Set when the turn ended because the API refused it — a revoked OAuth token, an exhausted rate limit. */

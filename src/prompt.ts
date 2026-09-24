@@ -2,7 +2,7 @@
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
-import { isAgentRole } from './store.js';
+import { isAgentRole, type SafetyStop } from './store.js';
 import type { WakeContext } from './types.js';
 import { zonedStamp, DEFAULT_TIMEZONE } from './schedule.js';
 
@@ -56,6 +56,23 @@ export function buildSpawnCharter(vars: {
 /** The clock an agent reads beside every Discord message. */
 function clockOf(at: number): string {
   return zonedStamp(at, DEFAULT_TIMEZONE, 'time');
+}
+
+/** Opens the first turn after a safety stop. Names who and when, never what: the point is that the content is gone. */
+export function buildSafetyStopNotice(stop: SafetyStop, forked: boolean): string {
+  const what = stop.kind === 'mail' ? 'mail' : 'a Discord message';
+  const who = stop.from.length > 0 ? stop.from.join(', ') : 'an unknown sender';
+  return [
+    `SYSTEM: your previous turn was stopped by Anthropic's safety classifier while answering ${what} from ${who} at ${clockOf(stop.at)}.`,
+    'This is the waker speaking, not the user.',
+    '',
+    forked
+      ? 'That turn has been removed from your context; everything before it is intact.'
+      : 'That turn has been removed from your context, and no earlier point could be kept, so this is a fresh session. Your working directory and mailbox are untouched.',
+    'Anything it had already done (a file written, a message sent) is still real, but you no longer see it.' +
+      (stop.kind === 'mail' ? ' The mail has been marked read.' : ''),
+    'It was most likely a false positive. Carry on with what follows, and do not repeat or go looking for the flagged content.',
+  ].join('\n');
 }
 
 /** The per-wake message handed to the agent. */

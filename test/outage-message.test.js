@@ -240,3 +240,14 @@ test('an auth failure racing a !reset really does reach the abandoned exit', () 
   assert.equal(willRetry, false);
   assert.equal(noRetryReason, 'abandoned', 'a plan existed and a rung was left');
 });
+
+test('a safety stop is one line that says the exchange was dropped, and never sends anyone to the host', () => {
+  const text = outageMessage(summary({ apiErrorKind: 'refusal', apiError: 'stopped', noRetryReason: 'safety-stop' }));
+
+  assert.match(text, /safety classifier/);
+  assert.match(text, /dropped/);
+  assert.match(text, /carries on/);
+  assert.equal(text.split('\n').length, 1, 'one line');
+  assert.doesNotMatch(text, /host/);
+  assert.match(noRetryJournalReason(summary({ noRetryReason: 'safety-stop' })), /forks/);
+});

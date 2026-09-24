@@ -5,14 +5,14 @@ import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
 import { tokenFilePath } from './token-file.js';
-import { buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
+import { buildSafetyStopNotice, buildSpawnCharter, buildSystemPrompt, buildWakeMessage } from './prompt.js';
 import type { PromptIdentity } from './prompt.js';
 import { containerSpawner } from './container.js';
 import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
-import { type AgentIdentity, type AgentRegistry } from './store.js';
+import { type AgentIdentity, type AgentRegistry, type SafetyStop } from './store.js';
 import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
@@ -61,7 +61,10 @@ export function classifyRetry(state: {
   closed: boolean;
   /** A wake with no stored context has nothing to re-send. */
   hasContext: boolean;
+  /** Anthropic's safety classifier stopped the turn. Never retried, whatever the error kind says. */
+  safetyStop?: boolean;
 }): { willRetry: boolean; delayMs: number | undefined; noRetryReason: NoRetryReason | null } {
+  if (state.safetyStop) return { willRetry: false, delayMs: undefined, noRetryReason: 'safety-stop' };
   const plan = state.errorKind !== null ? retryPlanFor(state.errorKind) : null;
   const delay = plan?.delays[state.retriesSpent];
   const willRetry = delay !== undefined && !state.closed && state.hasContext;
@@ -90,6 +93,34 @@ const CONTINUATION_PROMPT = [
   'Check what actually landed before acting. Then finish what you were doing —',
   'do not repeat completed work, and do not re-post anything.',
 ].join('\n');
+
+/** Where a resumed session picks up, beyond its session id. */
+export type ResumePoint = {
+  /** The last chain entry of the last clean turn in the resumed session, or '' when unknown. */
+  resumeAt: string;
+  /** Set when the previous turn was stopped by the safety classifier: the session forks at `resumeAt` instead of resuming the whole transcript, and the next turn opens with this. */
+  safetyNotice: string | null;
+};
+
+const NO_RESUME_POINT: ResumePoint = { resumeAt: '', safetyNotice: null };
+
+/** Who a stopped turn was answering, and when. */
+export function safetyStopFrom(context: WakeContext | null, now = Date.now()): SafetyStop {
+  if (context === null) return { kind: 'messages', from: [], at: now };
+  if (context.kind === 'mail') {
+    const senders = context.senders ?? [];
+    return {
+      kind: 'mail',
+      from: [...new Set(senders.map((sender) => sender.author))],
+      at: senders.reduce((latest, sender) => Math.max(latest, sender.at), 0) || now,
+    };
+  }
+  return {
+    kind: 'messages',
+    from: [...new Set(context.messages.map((message) => message.authorTag))],
+    at: context.messages.reduce((latest, message) => Math.max(latest, message.at), 0) || now,
+  };
+}
 
 /** Make the project's skills visible from inside the workspace. */
 function linkSkills(workspacePath: string): void {
@@ -267,6 +298,16 @@ export class AgentSession {
   /** Retries already spent on #lastContext. Reset by wake(), not by retries. */
   #retries = 0;
   #retryTimer: NodeJS.Timeout | null = null;
+  /** The newest top-level chain entry seen, committed to `#lastGood` only when a turn ends cleanly. */
+  #tip: string | null = null;
+  /** Where a safety stop forks from: the last clean turn's last entry, and the session holding it. */
+  #lastGood: string | null;
+  #forkBase: string | null;
+  /** Opens the next wake after a safety stop, until a turn ends cleanly. */
+  #safetyNotice: string | null;
+  #safetyStopThisTurn = false;
+  /** Set when the last turn was stopped by the safety classifier; this session must not take another. */
+  #safetyStop: SafetyStop | null = null;
 
   lastActiveAt = Date.now();
 
@@ -300,6 +341,7 @@ export class AgentSession {
     // can follow it. `newSession` -- the only caller -- already passes both.
     model: string | undefined,
     identity: PromptIdentity,
+    resume: ResumePoint = NO_RESUME_POINT,
   ) {
     this.channelId = channelId;
     this.workspacePath = workspacePath;
@@ -308,6 +350,9 @@ export class AgentSession {
     this.#model = model;
     this.#identity = identity;
     this.#sessionId = resumeSessionId ?? `pending-${channelId}`;
+    this.#forkBase = isResumable(resumeSessionId) ? resumeSessionId : null;
+    this.#lastGood = resume.resumeAt || null;
+    this.#safetyNotice = resume.safetyNotice;
     mkdirSync(workspacePath, { recursive: true });
     linkSkills(workspacePath);
     this.#start(resumeSessionId);
@@ -315,6 +360,16 @@ export class AgentSession {
 
   get sessionId(): string {
     return this.#sessionId;
+  }
+
+  /** The stop that ended the last turn, or null. A session holding one is spent: `SessionManager.persist` records it and releases the session. */
+  get safetyStop(): SafetyStop | null {
+    return this.#safetyStop;
+  }
+
+  /** Where a fork would be taken from: the session holding the last clean turn, and that turn's last entry. */
+  get resumePoint(): { sessionId: string; resumeAt: string } {
+    return { sessionId: this.#forkBase ?? '', resumeAt: this.#lastGood ?? '' };
   }
 
   #buildOptions(resumeSessionId: string | undefined): Options {
@@ -354,6 +409,13 @@ export class AgentSession {
 
     if (isResumable(resumeSessionId)) {
       options.resume = resumeSessionId;
+      // After a safety stop, branch from the last clean point rather than
+      // resume a transcript that still holds the flagged turn: resuming it
+      // re-sends that turn, trips the classifier again, and does so forever.
+      if (this.#safetyNotice !== null && this.#lastGood !== null) {
+        options.resumeSessionAt = this.#lastGood;
+        options.forkSession = true;
+      }
     }
 
     // A crew in a sandbox runs its sessions through docker exec; Hamachi runs them on the host.
@@ -401,7 +463,14 @@ export class AgentSession {
       case 'system': {
         if (message.subtype === 'init') {
           this.#sessionId = message.session_id;
+        } else if (message.subtype === 'model_refusal_no_fallback') {
+          this.#safetyStopThisTurn = true;
         }
+        break;
+      }
+
+      case 'user': {
+        if (message.parent_tool_use_id === null && message.uuid) this.#tip = message.uuid;
         break;
       }
 
@@ -420,6 +489,12 @@ export class AgentSession {
           this.#apiErrorKindThisTurn = message.error;
         }
 
+        // The safety classifier's stop, on the main thread. A subagent's does not end the turn.
+        if (message.parent_tool_use_id === null) {
+          if (message.message.stop_reason === 'refusal') this.#safetyStopThisTurn = true;
+          else if (message.error === undefined) this.#tip = message.uuid;
+        }
+
         for (const block of message.message.content) {
           if (block.type !== 'tool_use') continue;
 
@@ -436,17 +511,33 @@ export class AgentSession {
 
       case 'result': {
         // ── ORDER IS LOAD-BEARING: SETTLE BEFORE PUBLISHING `busy` ───────────
+        if (this.#safetyStopThisTurn) {
+          // However the SDK dressed it — an error kind, or none — this turn failed.
+          this.#apiErrorThisTurn ??= "stopped by Anthropic's safety classifier";
+          this.#apiErrorKindThisTurn ??= 'refusal';
+          this.#safetyStop = safetyStopFrom(this.#lastContext);
+        }
         const { willRetry, delayMs: delay, noRetryReason } = classifyRetry({
           errorKind: this.#apiErrorKindThisTurn,
           failed: this.#apiErrorThisTurn !== null,
           retriesSpent: this.#retries,
           closed: this.#closed,
           hasContext: this.#lastContext !== null,
+          safetyStop: this.#safetyStopThisTurn,
         });
 
         // SETTLED HERE, at the one place a turn ends, rather than in three callbacks the caller wires.
         if (this.#apiErrorThisTurn === null) {
           this.#settle.done(true, 'turn completed');
+          if (this.#tip !== null) {
+            this.#lastGood = this.#tip;
+            this.#forkBase = this.#sessionId;
+          }
+          this.#safetyNotice = null;
+        } else if (this.#safetyStop !== null) {
+          // TRUE, so a mail wake marks its mail read: offering it again would
+          // put the flagged content straight back in front of the classifier.
+          this.#settle.done(true, 'stopped by the safety classifier — dropped, not retried');
         } else if (!willRetry) {
           this.#settle.done(false, `API refused: ${this.#apiErrorKindThisTurn}`);
         }
@@ -501,7 +592,12 @@ export class AgentSession {
     this.#retries = 0;
     // Only a genuine wake clears this: a retry must continue rather than replay.
     this.#actedSinceWake = false;
-    this.#push(buildWakeMessage(context), context.kind === 'mail');
+    this.#push(this.#withNotice(buildWakeMessage(context)), context.kind === 'mail');
+  }
+
+  /** Open with the safety-stop notice while one is owed. */
+  #withNotice(text: string): string {
+    return this.#safetyNotice === null ? text : `${this.#safetyNotice}\n\n${text}`;
   }
 
   /** Re-send the current wake after an API refusal. */
@@ -509,7 +605,7 @@ export class AgentSession {
     if (this.#closed || this.#lastContext === null) return;
     const text = this.#actedSinceWake
       ? CONTINUATION_PROMPT
-      : buildWakeMessage(this.#lastContext);
+      : this.#withNotice(buildWakeMessage(this.#lastContext));
     this.#push(text, this.#lastContext.kind === 'mail' && !this.#actedSinceWake);
   }
 
@@ -519,6 +615,7 @@ export class AgentSession {
     this.busy = true;
     this.#apiErrorThisTurn = null;
     this.#apiErrorKindThisTurn = null;
+    this.#safetyStopThisTurn = false;
     try {
       this.#queue.push(text, this.#sessionId, synthetic);
     } catch (error) {
@@ -653,6 +750,7 @@ export class SessionManager {
     mcpServers: Record<string, McpServerConfig> | null,
     model: string | undefined,
     identity: PromptIdentity,
+    resume: ResumePoint,
   ) => AgentSession = (
     channelId,
     workspacePath,
@@ -661,8 +759,9 @@ export class SessionManager {
     mcpServers,
     model,
     identity,
+    resume,
   ) =>
-    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model, identity);
+    new AgentSession(channelId, workspacePath, resumeSessionId, events, mcpServers, model, identity, resume);
 
   has(channelId: string): boolean {
     return this.#sessions.has(channelId);
@@ -689,7 +788,14 @@ export class SessionManager {
 
     const persisted = this.#registry.get(channelId);
     const workspacePath = persisted?.workspacePath ?? join(config().agent.sessions.workspaceRoot, channelId);
-    const resumeFrom = isResumable(persisted?.sessionId) ? persisted.sessionId : undefined;
+    const stop = persisted?.safetyStop ?? null;
+    const resumeAt = persisted?.resumeAt ?? '';
+    // Never resume past a safety stop without a point to fork at: the whole
+    // transcript still holds the flagged turn.
+    const resumeFrom =
+      isResumable(persisted?.sessionId) && (stop === null || resumeAt !== '')
+        ? persisted.sessionId
+        : undefined;
 
     // Registered before the turn rather than after it.
     const identity = this.#registry.ensure(
@@ -741,6 +847,10 @@ export class SessionManager {
       // Identity for the system prompt's opening line. `channelId` IS the
       // agent id; crew and role come off the row `ensure` just wrote.
       { id: channelId, crew: identity.crew, role: identity.role },
+      {
+        resumeAt,
+        safetyNotice: stop === null ? null : buildSafetyStopNotice(stop, resumeFrom !== undefined),
+      },
     );
 
     session.onBusyChanged = () => this.onCountsChanged();
@@ -755,7 +865,8 @@ export class SessionManager {
   persist(channelId: string): void {
     const session = this.#sessions.get(channelId);
     if (!session) return;
-    if (!isResumable(session.sessionId)) return;
+    const stop = session.safetyStop;
+    if (stop === null && !isResumable(session.sessionId)) return;
 
     if (this.#registry.get(channelId) === undefined) {
       process.stderr.write(
@@ -766,12 +877,35 @@ export class SessionManager {
       return;
     }
 
-    this.#registry.recordSession(
-      channelId,
-      session.sessionId,
-      session.workspacePath,
-      this.#identityFor(channelId, session.workspacePath),
-    );
+    const identity = this.#identityFor(channelId, session.workspacePath);
+    const point = session.resumePoint;
+
+    if (stop !== null) {
+      // Written as the fork's parent, not the session that tripped: the next
+      // start branches from the last clean entry and never re-sends the turn.
+      // No clean point means a fresh session, which is still better than a loop.
+      const forkable = isResumable(point.sessionId) && point.resumeAt !== '';
+      this.#registry.recordSession(
+        channelId,
+        forkable ? point.sessionId : '',
+        session.workspacePath,
+        identity,
+        { resumeAt: forkable ? point.resumeAt : '', safetyStop: stop },
+      );
+      this.#evictLog?.(
+        `${channelId}: safety stop — ${forkable ? `forking before it at ${point.resumeAt}` : 'no clean point, starting fresh'}`,
+      );
+      // This session's transcript holds the flagged turn; the next wake builds the fork.
+      void this.release(channelId);
+      return;
+    }
+
+    this.#registry.recordSession(channelId, session.sessionId, session.workspacePath, identity, {
+      // A fork point belongs to one session. Until this one has a clean turn of
+      // its own, the point it has is its parent's.
+      resumeAt: point.sessionId === session.sessionId ? point.resumeAt : '',
+      safetyStop: null,
+    });
   }
 
   async release(channelId: string): Promise<void> {
