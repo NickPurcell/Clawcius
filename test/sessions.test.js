@@ -49,6 +49,10 @@ class FakeSession {
     this.onBusyChanged = () => {};
     /** Every `wake` this session was given, with the per-turn settle. */
     this.wakes = [];
+    /** What `persist` reads for a safety stop: none, and a fork point in this session. */
+    this.safetyStop = null;
+    this.resumePoint = { sessionId: this.sessionId, resumeAt: '' };
+    this.safetyNoticeOwed = false;
   }
 
   wake(context, onSettled = null) {
@@ -604,4 +608,127 @@ test('the at-capacity notice carries the numbers', () => {
   const notice = atCapacityNotice(new AtCapacityError(4, 4));
   assert.match(notice, /4 of 4 are in use/);
   assert.match(notice, /not queued/);
+});
+
+// ── safety classifier stops ──────────────────────────────────────────────────
+
+const STOP = { kind: 'messages', from: ['someone'], at: 1_700_000_000_000 };
+
+/** A pool whose sessions record every constructor argument, with the stop and fork point settable. */
+function stopPool() {
+  const p = pool();
+  p.manager.newSession = (channelId, workspacePath, resumeSessionId, _events, _mcp, _model, _identity, resume) => {
+    const session = new FakeSession(channelId, workspacePath, resumeSessionId);
+    session.resume = resume;
+    session.safetyStop = null;
+    session.resumePoint = { sessionId: resumeSessionId ?? '', resumeAt: resume.resumeAt };
+    session.safetyNoticeOwed = false;
+    p.built.push(session);
+    return session;
+  };
+  p.registry.ensure('a', { crew: CREW, role: 'engineer', workspacePath: '/tmp/a', spawnedBy: null });
+  return p;
+}
+
+test('a stopped session is written as its fork parent and released, and the next acquire forks with a notice', async () => {
+  const { manager, registry, built } = stopPool();
+  const first = manager.acquire('a', events);
+  first.sessionId = OTHER_UUID; // the session that tripped
+  first.resumePoint = { sessionId: UUID, resumeAt: 'good-3' };
+  first.safetyStop = STOP;
+
+  manager.persist('a');
+
+  const row = registry.get('a');
+  assert.equal(row.sessionId, UUID, 'the parent, not the session holding the flagged turn');
+  assert.equal(row.resumeAt, 'good-3');
+  assert.deepEqual(row.safetyStop, STOP);
+  assert.equal(manager.has('a'), false, 'a session whose transcript holds the stop is spent');
+  assert.equal(first.closed, true);
+
+  const second = manager.acquire('a', events);
+  assert.equal(second.sessionId, UUID);
+  assert.equal(second.resume.resumeAt, 'good-3');
+  assert.notEqual(second.resume.safetyNotice, null);
+
+  // Its first clean turn clears the stop, so the notice is not owed again.
+  second.sessionId = OTHER_UUID;
+  second.resumePoint = { sessionId: OTHER_UUID, resumeAt: 'fork-1' };
+  manager.persist('a');
+  assert.equal(registry.get('a').safetyStop, null);
+  assert.equal(registry.get('a').sessionId, OTHER_UUID);
+  assert.equal(registry.get('a').resumeAt, 'fork-1');
+  await manager.shutdown();
+});
+
+test('a stop with no clean point to fork at starts fresh rather than resume the flagged turn', async () => {
+  const { manager, registry } = stopPool();
+  const first = manager.acquire('a', events);
+  first.sessionId = UUID;
+  first.resumePoint = { sessionId: UUID, resumeAt: '' };
+  first.safetyStop = STOP;
+
+  manager.persist('a');
+  assert.equal(registry.get('a').sessionId, '');
+
+  const second = manager.acquire('a', events);
+  assert.equal(second.sessionId, 'pending-a', 'never a plain resume past a stop');
+  assert.notEqual(second.resume.safetyNotice, null);
+  await manager.shutdown();
+});
+
+test("a fork point is only written for the session it belongs to", async () => {
+  const { manager, registry } = stopPool();
+  const session = manager.acquire('a', events);
+  // A fork whose first turn failed for an ordinary reason: its id is new, its point is still the parent's.
+  session.sessionId = OTHER_UUID;
+  session.resumePoint = { sessionId: UUID, resumeAt: 'good-3' };
+  manager.persist('a');
+  assert.equal(registry.get('a').sessionId, OTHER_UUID);
+  assert.equal(registry.get('a').resumeAt, '');
+  await manager.shutdown();
+});
+
+test('an existing board gains the fork columns, and !reset clears them', () => {
+  const dbPath = join(tempDir('clawsky-migrate-'), 'clawcius.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE agents (
+    id TEXT PRIMARY KEY, crew TEXT NOT NULL, role TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '', workspace_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'live', spawned_by TEXT,
+    spawned_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL)`);
+  db.prepare(`INSERT INTO agents VALUES ('a', ?, 'engineer', ?, '/tmp/a', 'live', NULL, 0, 0)`).run(CREW, UUID);
+  db.close();
+
+  const registry = new AgentRegistry(dbPath, { crew: CREW });
+  assert.equal(registry.get('a').sessionId, UUID);
+  assert.equal(registry.get('a').resumeAt, '');
+  assert.equal(registry.get('a').safetyStop, null);
+
+  registry.recordSession('a', UUID, '/tmp/a', { crew: CREW, role: 'engineer', workspacePath: '/tmp/a' }, {
+    resumeAt: 'good-3',
+    safetyStop: STOP,
+  });
+  registry.clearSession('a');
+  assert.equal(registry.get('a').resumeAt, '');
+  assert.equal(registry.get('a').safetyStop, null);
+  registry.close();
+});
+
+test('a fork with no clean turn yet leaves the row on its parent, so a respawn forks again', async () => {
+  const { manager, registry } = stopPool();
+  registry.recordSession('a', UUID, '/tmp/a', { crew: CREW, role: 'engineer', workspacePath: '/tmp/a' }, {
+    resumeAt: 'good-3',
+    safetyStop: STOP,
+  });
+  const fork = manager.acquire('a', events);
+  fork.sessionId = OTHER_UUID;
+  fork.safetyNoticeOwed = true;
+
+  manager.persist('a');
+  const row = registry.get('a');
+  assert.equal(row.sessionId, UUID);
+  assert.equal(row.resumeAt, 'good-3');
+  assert.deepEqual(row.safetyStop, STOP);
+  await manager.shutdown();
 });

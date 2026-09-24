@@ -92,7 +92,9 @@ export function mailWakeEvents(opts: {
             `  ${String(summary.apiError).replace(/\s+/g, ' ').slice(0, 300)}\n` +
             (summary.retryScheduled
               ? `  retry ${summary.retryAttempt} queued`
-              : '  not retrying — mail left unread for the next sweep'),
+              : summary.noRetryReason === 'safety-stop'
+                ? '  safety stop — mail marked read, the session forks from before it'
+                : '  not retrying — mail left unread for the next sweep'),
         );
         if (!summary.retryScheduled) onRefused?.(summary);
         return;
@@ -157,6 +159,8 @@ export function noRetryJournalReason(summary: TurnSummary): string {
       return 'retries left — the session was closed or cleared under it';
     case 'credential-dead':
       return 'the auth retry was spent — the credential itself is dead';
+    case 'safety-stop':
+      return 'a safety classifier stop — the next wake forks from before it';
     default:
       return 'this one does not clear on its own';
   }
@@ -168,6 +172,10 @@ export function outageMessage(summary: TurnSummary): string {
   const detail = truncate((summary.apiError ?? '').replace(/\s+/g, ' ').trim(), 200);
 
   switch (summary.noRetryReason) {
+    case 'safety-stop':
+      // Nothing is broken and nobody needs to look at anything: the flagged
+      // exchange is gone from the context and the next message carries on.
+      return "⚠️ Anthropic's safety classifier stopped that turn, so the last exchange was dropped from my context; the conversation carries on from before it.";
     case 'exhausted':
       return (
         `⚠️ Anthropic's API refused that turn — their side, not ours` +

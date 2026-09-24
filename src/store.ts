@@ -38,7 +38,26 @@ export type AgentRecord = {
   spawnedBy: string | null;
   spawnedAt: number;
   lastActiveAt: number;
+  /** The last chain entry of the last turn that ended cleanly in `sessionId`, or empty when unknown. Where a safety stop forks from. */
+  resumeAt: string;
+  /** A safety stop the next session start must fork around and tell the agent about, or null. */
+  safetyStop: SafetyStop | null;
 };
+
+/** A turn Anthropic's safety classifier stopped: who sent what it was answering, and when. Never the content. */
+export type SafetyStop = {
+  /** `messages` for a Discord wake, `mail` for a mail wake. */
+  kind: 'messages' | 'mail';
+  /** The authors, as the agent knew them: Discord tags, or agent ids. */
+  from: string[];
+  /** When the newest of them was sent, epoch ms. */
+  at: number;
+};
+
+function parseSafetyStop(raw: unknown): SafetyStop | null {
+  if (typeof raw !== 'string' || raw === '') return null;
+  return JSON.parse(raw) as SafetyStop;
+}
 
 export type AgentIdentity = {
   crew: string;
@@ -48,7 +67,7 @@ export type AgentIdentity = {
 };
 
 const COLUMNS = `id, crew, role, session_id, workspace_path, status,
-                 spawned_by, spawned_at, last_active_at`;
+                 spawned_by, spawned_at, last_active_at, resume_at, safety_stop`;
 
 function toRecord(row: Record<string, unknown>): AgentRecord {
   return {
@@ -61,6 +80,8 @@ function toRecord(row: Record<string, unknown>): AgentRecord {
     spawnedBy: (row['spawned_by'] as string | null) ?? null,
     spawnedAt: row['spawned_at'] as number,
     lastActiveAt: row['last_active_at'] as number,
+    resumeAt: (row['resume_at'] as string | null) ?? '',
+    safetyStop: parseSafetyStop(row['safety_stop']),
   };
 }
 
@@ -88,7 +109,9 @@ export class AgentRegistry {
         status         TEXT NOT NULL DEFAULT 'live',
         spawned_by     TEXT,
         spawned_at     INTEGER NOT NULL,
-        last_active_at INTEGER NOT NULL
+        last_active_at INTEGER NOT NULL,
+        resume_at      TEXT NOT NULL DEFAULT '',
+        safety_stop    TEXT NOT NULL DEFAULT ''
       )
     `);
     this.#db.exec('CREATE INDEX IF NOT EXISTS idx_agents_crew ON agents (crew)');
@@ -96,6 +119,19 @@ export class AgentRegistry {
   }
 
   #migrate(): void {
+    // Columns added after the table first shipped. Checked by name rather than
+    // by `user_version`, which the legacy copy below already owns.
+    const present = new Set(
+      (this.#db.prepare('PRAGMA table_info(agents)').all() as Array<Record<string, unknown>>).map(
+        (column) => column['name'] as string,
+      ),
+    );
+    for (const column of ['resume_at', 'safety_stop']) {
+      if (!present.has(column)) {
+        this.#db.exec(`ALTER TABLE agents ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+      }
+    }
+
     const version = (
       this.#db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined
     )?.['user_version'] as number | undefined;
@@ -206,18 +242,26 @@ export class AgentRegistry {
   }
 
   /** Record the session the agent now runs under. An upsert whose conflict clause updates the session only: role, crew and spawned_by are identity. */
-  recordSession(id: string, sessionId: string, workspacePath: string, identity: AgentIdentity): void {
+  recordSession(
+    id: string,
+    sessionId: string,
+    workspacePath: string,
+    identity: AgentIdentity,
+    resume: { resumeAt: string; safetyStop: SafetyStop | null } = { resumeAt: '', safetyStop: null },
+  ): void {
     const now = Date.now();
     this.#db
       .prepare(
         `INSERT INTO agents
            (id, crew, role, session_id, workspace_path, status,
-            spawned_by, spawned_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?)
+            spawned_by, spawned_at, last_active_at, resume_at, safety_stop)
+         VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            session_id     = excluded.session_id,
            workspace_path = excluded.workspace_path,
-           last_active_at = excluded.last_active_at`,
+           last_active_at = excluded.last_active_at,
+           resume_at      = excluded.resume_at,
+           safety_stop    = excluded.safety_stop`,
       )
       .run(
         id,
@@ -228,6 +272,8 @@ export class AgentRegistry {
         identity.spawnedBy ?? null,
         now,
         now,
+        resume.resumeAt,
+        resume.safetyStop ? JSON.stringify(resume.safetyStop) : '',
       );
   }
 
@@ -241,7 +287,9 @@ export class AgentRegistry {
   }
 
   clearSession(id: string): void {
-    this.#db.prepare(`UPDATE agents SET session_id = '' WHERE id = ?`).run(id);
+    this.#db
+      .prepare(`UPDATE agents SET session_id = '', resume_at = '', safety_stop = '' WHERE id = ?`)
+      .run(id);
   }
 
   close(): void {

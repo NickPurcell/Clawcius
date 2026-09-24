@@ -131,6 +131,7 @@ export class MailWaker {
       channelId: agent.id,
       mail: renderMail(pending),
       count: pending.length,
+      senders: pending.map((message) => ({ author: message.author, at: message.sentAt })),
     };
 
     const ids = pending.map((message) => message.id);
