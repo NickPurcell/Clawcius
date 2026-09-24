@@ -424,11 +424,11 @@ test("a subagent's refusal does not end the main turn", async () => {
   const h = drive();
   try {
     h.session.wake(flagged, () => {});
-    await h.send({ ...classifierStop('toolu_1'), error: undefined });
+    await h.send(classifierStop('toolu_1'));
     await h.send(RESULT);
 
     const done = h.events.find((e) => e.kind === 'done');
-    assert.equal(done.apiError, null);
+    assert.notEqual(done.noRetryReason, 'safety-stop');
     assert.equal(h.session.safetyStop, null);
   } finally {
     h.restore();
@@ -563,15 +563,41 @@ test('a fork owes its notice until a clean turn, through a failed one', async ()
   const notice = 'SYSTEM: your previous turn was stopped';
   const h = drive({ resumeSessionId: PARENT, resume: { resumeAt: 'good-3', safetyNotice: notice } });
   try {
-    assert.equal(h.session.forkPending, true);
+    assert.equal(h.session.safetyNoticeOwed, true);
     h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'next', senders: [] }, () => {});
     await h.send(refusal('billing_error'));
     await h.send(RESULT);
-    assert.equal(h.session.forkPending, true, 'an ordinary failure is not a clean turn');
+    assert.equal(h.session.safetyNoticeOwed, true, 'an ordinary failure is not a clean turn');
 
     h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'again', senders: [] }, () => {});
     await h.send(RESULT);
-    assert.equal(h.session.forkPending, false);
+    assert.equal(h.session.safetyNoticeOwed, false);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a new turn forgets the senders of the last one', async () => {
+  const h = drive();
+  try {
+    h.session.wake({ ...flagged, messages: [{ ...flagged.messages[0], authorTag: 'earlier' }] }, () => {});
+    await h.send(RESULT);
+    h.session.wake(flagged, () => {});
+    await h.send(classifierStop());
+    await h.send(RESULT);
+    assert.deepEqual(h.session.safetyStop.from, ['someone']);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a refusal frame that is not an API error does not end the turn', async () => {
+  const h = drive();
+  try {
+    h.session.wake(flagged, () => {});
+    await h.send({ ...classifierStop(), error: undefined });
+    await h.send(RESULT);
+    assert.equal(h.session.safetyStop, null);
   } finally {
     h.restore();
   }

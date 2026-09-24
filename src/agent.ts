@@ -364,8 +364,8 @@ export class AgentSession {
     return this.#safetyStop;
   }
 
-  /** A fork taken after a safety stop that has not yet had a clean turn. `persist` leaves the row pointing at the parent, so a respawn forks again rather than lose the notice. */
-  get forkPending(): boolean {
+  /** A session started after a safety stop, forked or fresh, that has not yet had a clean turn. `persist` leaves the row pointing at the parent, so a respawn forks again rather than lose the notice. */
+  get safetyNoticeOwed(): boolean {
     return this.#safetyNotice !== null;
   }
 
@@ -493,7 +493,7 @@ export class AgentSession {
 
         // The safety classifier's stop, on the main thread. A subagent's does not end the turn.
         if (message.parent_tool_use_id === null) {
-          if (message.message.stop_reason === 'refusal') this.#safetyStopThisTurn = true;
+          if (message.error !== undefined && message.message.stop_reason === 'refusal') this.#safetyStopThisTurn = true;
           else this.#tip = message.uuid;
         }
 
@@ -904,7 +904,7 @@ export class SessionManager {
       return;
     }
 
-    if (session.forkPending) return;
+    if (session.safetyNoticeOwed) return;
 
     this.#registry.recordSession(channelId, session.sessionId, session.workspacePath, identity, {
       resumeAt: point.sessionId === session.sessionId ? point.resumeAt : '',

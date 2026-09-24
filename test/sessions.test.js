@@ -52,7 +52,7 @@ class FakeSession {
     /** What `persist` reads for a safety stop: none, and a fork point in this session. */
     this.safetyStop = null;
     this.resumePoint = { sessionId: this.sessionId, resumeAt: '' };
-    this.forkPending = false;
+    this.safetyNoticeOwed = false;
   }
 
   wake(context, onSettled = null) {
@@ -622,7 +622,7 @@ function stopPool() {
     session.resume = resume;
     session.safetyStop = null;
     session.resumePoint = { sessionId: resumeSessionId ?? '', resumeAt: resume.resumeAt };
-    session.forkPending = false;
+    session.safetyNoticeOwed = false;
     p.built.push(session);
     return session;
   };
@@ -723,7 +723,7 @@ test('a fork with no clean turn yet leaves the row on its parent, so a respawn f
   });
   const fork = manager.acquire('a', events);
   fork.sessionId = OTHER_UUID;
-  fork.forkPending = true;
+  fork.safetyNoticeOwed = true;
 
   manager.persist('a');
   const row = registry.get('a');
