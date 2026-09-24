@@ -364,7 +364,7 @@ export class AgentSession {
     return this.#safetyStop;
   }
 
-  /** A session started after a safety stop, forked or fresh, that has not yet had a clean turn. `persist` leaves the row pointing at the parent, so a respawn forks again rather than lose the notice. */
+  /** A session started after a safety stop, forked or fresh, that has not yet had a clean turn. */
   get safetyNoticeOwed(): boolean {
     return this.#safetyNotice !== null;
   }
@@ -491,7 +491,7 @@ export class AgentSession {
           this.#apiErrorKindThisTurn = message.error;
         }
 
-        // The safety classifier's stop, on the main thread. A subagent's does not end the turn.
+        // The safety classifier's stop, on the main thread.
         if (message.parent_tool_use_id === null) {
           if (message.error !== undefined && message.message.stop_reason === 'refusal') this.#safetyStopThisTurn = true;
           else this.#tip = message.uuid;

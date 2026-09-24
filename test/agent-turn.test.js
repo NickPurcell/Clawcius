@@ -420,7 +420,7 @@ test('the structured no-fallback notice alone is a classifier stop too', async (
   }
 });
 
-test("a subagent's refusal does not end the main turn", async () => {
+test("a subagent's refusal is not a safety stop", async () => {
   const h = drive();
   try {
     h.session.wake(flagged, () => {});
