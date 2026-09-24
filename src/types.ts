@@ -25,7 +25,7 @@ export type WakeContext =
       mail: string;
       count: number;
       /** Who sent each message and when, so a safety stop can name them without the content. */
-      senders?: Array<{ author: string; at: number }>;
+      senders: Array<{ author: string; at: number }>;
     };
 
 /** Why a refused turn has no retry coming. See `TurnSummary.noRetryReason`. */

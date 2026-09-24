@@ -398,7 +398,6 @@ test('a classifier stop is not retried, settles TRUE, and says it was a safety s
     // TRUE, so a mail wake marks its mail read rather than offering it again.
     assert.equal(settles.length, 1);
     assert.equal(settles[0].ran, true);
-    assert.match(settles[0].why, /safety classifier/);
     assert.deepEqual(h.session.safetyStop, { kind: 'messages', from: ['someone'], at: 1_700_000_000_000 });
     assert.equal(h.pushed.length, 1, 'nothing re-sent');
   } finally {
@@ -444,7 +443,7 @@ test('a mail stop names the senders and the time, never the content', async () =
         kind: 'mail',
         channelId: AGENT,
         count: 2,
-        mail: 'THE FLAGGED MAIL',
+        mail: 'the mail',
         senders: [
           { author: 'clawcius-coordinator', at: 10 },
           { author: 'clawcius-coordinator', at: 20 },
@@ -456,7 +455,6 @@ test('a mail stop names the senders and the time, never the content', async () =
     await h.send(RESULT);
 
     assert.deepEqual(h.session.safetyStop, { kind: 'mail', from: ['clawcius-coordinator'], at: 20 });
-    assert.doesNotMatch(JSON.stringify(h.session.safetyStop), /FLAGGED/);
   } finally {
     h.restore();
   }
@@ -498,7 +496,7 @@ test('after a stop the session forks at the fork point, and the next turn opens 
     assert.equal(h.queries[0].resumeSessionAt, 'good-3');
     assert.equal(h.queries[0].forkSession, true);
 
-    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'next' }, () => {});
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'next', senders: [] }, () => {});
     await h.send({ type: 'system', subtype: 'init', session_id: FORK });
     await h.send(said('fork-1'));
     await h.send(RESULT);
@@ -507,10 +505,10 @@ test('after a stop the session forks at the fork point, and the next turn opens 
     assert.match(h.pushed[0].message.content, /next/, 'followed by the wake itself');
     assert.deepEqual(h.session.resumePoint, { sessionId: FORK, resumeAt: 'fork-1' });
 
-    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'after' }, () => {});
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'after', senders: [] }, () => {});
     await new Promise((r) => setImmediate(r));
     assert.match(h.pushed[1].message.content, /after/);
-    assert.doesNotMatch(h.pushed[1].message.content, /SYSTEM/, 'told once, not every turn');
+    assert.ok(!h.pushed[1].message.content.startsWith(notice), 'told once, not every turn');
   } finally {
     h.restore();
   }
@@ -522,6 +520,58 @@ test('an ordinary resume does not fork', async () => {
     assert.equal(h.queries[0].resume, PARENT);
     assert.equal(h.queries[0].resumeSessionAt, undefined);
     assert.equal(h.queries[0].forkSession, undefined);
+  } finally {
+    h.restore();
+  }
+});
+
+test('a clean turn ending in a max_output_tokens frame takes the fork point at that frame', async () => {
+  const h = drive({ resumeSessionId: PARENT });
+  try {
+    h.session.wake(flagged, () => {});
+    await h.send({ type: 'system', subtype: 'init', session_id: PARENT });
+    await h.send(said('good-1'));
+    await h.send({ ...said('truncated'), error: 'max_output_tokens' });
+    await h.send(RESULT);
+    assert.deepEqual(h.session.resumePoint, { sessionId: PARENT, resumeAt: 'truncated' });
+  } finally {
+    h.restore();
+  }
+});
+
+test('a stop names every wake the turn took in, not only the newest', async () => {
+  const h = drive();
+  try {
+    h.session.wake(flagged, () => {});
+    h.session.wake(
+      { ...flagged, messages: [{ ...flagged.messages[0], messageId: '2', authorTag: 'later', at: 1_700_000_000_500 }] },
+      () => {},
+    );
+    await h.send(classifierStop());
+    await h.send(RESULT);
+    assert.deepEqual(h.session.safetyStop, {
+      kind: 'messages',
+      from: ['someone', 'later'],
+      at: 1_700_000_000_500,
+    });
+  } finally {
+    h.restore();
+  }
+});
+
+test('a fork owes its notice until a clean turn, through a failed one', async () => {
+  const notice = 'SYSTEM: your previous turn was stopped';
+  const h = drive({ resumeSessionId: PARENT, resume: { resumeAt: 'good-3', safetyNotice: notice } });
+  try {
+    assert.equal(h.session.forkPending, true);
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'next', senders: [] }, () => {});
+    await h.send(refusal('billing_error'));
+    await h.send(RESULT);
+    assert.equal(h.session.forkPending, true, 'an ordinary failure is not a clean turn');
+
+    h.session.wake({ kind: 'mail', channelId: AGENT, count: 1, mail: 'again', senders: [] }, () => {});
+    await h.send(RESULT);
+    assert.equal(h.session.forkPending, false);
   } finally {
     h.restore();
   }

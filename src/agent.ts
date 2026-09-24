@@ -104,21 +104,17 @@ export type ResumePoint = {
 
 const NO_RESUME_POINT: ResumePoint = { resumeAt: '', safetyNotice: null };
 
-/** Who a stopped turn was answering, and when. */
-export function safetyStopFrom(context: WakeContext | null, now = Date.now()): SafetyStop {
-  if (context === null) return { kind: 'messages', from: [], at: now };
-  if (context.kind === 'mail') {
-    const senders = context.senders ?? [];
-    return {
-      kind: 'mail',
-      from: [...new Set(senders.map((sender) => sender.author))],
-      at: senders.reduce((latest, sender) => Math.max(latest, sender.at), 0) || now,
-    };
-  }
+/** Who a stopped turn was answering, and when: every wake the turn took in, since any of them may be what tripped it. */
+function safetyStopFrom(contexts: readonly WakeContext[], now = Date.now()): SafetyStop {
+  const senders = contexts.flatMap((context) =>
+    context.kind === 'mail'
+      ? context.senders
+      : context.messages.map((message) => ({ author: message.authorTag, at: message.at })),
+  );
   return {
-    kind: 'messages',
-    from: [...new Set(context.messages.map((message) => message.authorTag))],
-    at: context.messages.reduce((latest, message) => Math.max(latest, message.at), 0) || now,
+    kind: contexts.length > 0 && contexts.every((context) => context.kind === 'mail') ? 'mail' : 'messages',
+    from: [...new Set(senders.map((sender) => sender.author))],
+    at: senders.reduce((latest, sender) => Math.max(latest, sender.at), 0) || now,
   };
 }
 
@@ -303,8 +299,9 @@ export class AgentSession {
   /** Where a safety stop forks from: the last clean turn's last entry, and the session holding it. */
   #lastGood: string | null;
   #forkBase: string | null;
-  /** Opens the next wake after a safety stop, until a turn ends cleanly. */
   #safetyNotice: string | null;
+  /** Every wake the turn in flight has taken in, the first and any folded into it. */
+  #turnContexts: WakeContext[] = [];
   #safetyStopThisTurn = false;
   /** Set when the last turn was stopped by the safety classifier; this session must not take another. */
   #safetyStop: SafetyStop | null = null;
@@ -365,6 +362,11 @@ export class AgentSession {
   /** The stop that ended the last turn, or null. A session holding one is spent: `SessionManager.persist` records it and releases the session. */
   get safetyStop(): SafetyStop | null {
     return this.#safetyStop;
+  }
+
+  /** A fork taken after a safety stop that has not yet had a clean turn. `persist` leaves the row pointing at the parent, so a respawn forks again rather than lose the notice. */
+  get forkPending(): boolean {
+    return this.#safetyNotice !== null;
   }
 
   /** Where a fork would be taken from: the session holding the last clean turn, and that turn's last entry. */
@@ -492,7 +494,7 @@ export class AgentSession {
         // The safety classifier's stop, on the main thread. A subagent's does not end the turn.
         if (message.parent_tool_use_id === null) {
           if (message.message.stop_reason === 'refusal') this.#safetyStopThisTurn = true;
-          else if (message.error === undefined) this.#tip = message.uuid;
+          else this.#tip = message.uuid;
         }
 
         for (const block of message.message.content) {
@@ -515,7 +517,7 @@ export class AgentSession {
           // However the SDK dressed it — an error kind, or none — this turn failed.
           this.#apiErrorThisTurn ??= "stopped by Anthropic's safety classifier";
           this.#apiErrorKindThisTurn ??= 'refusal';
-          this.#safetyStop = safetyStopFrom(this.#lastContext);
+          this.#safetyStop = safetyStopFrom(this.#turnContexts);
         }
         const { willRetry, delayMs: delay, noRetryReason } = classifyRetry({
           errorKind: this.#apiErrorKindThisTurn,
@@ -589,6 +591,8 @@ export class AgentSession {
     this.#settle.adopt(onSettled, SUPERSEDED);
     this.#cancelRetry();
     this.#lastContext = context;
+    if (!this.busy) this.#turnContexts = [];
+    this.#turnContexts.push(context);
     this.#retries = 0;
     // Only a genuine wake clears this: a retry must continue rather than replay.
     this.#actedSinceWake = false;
@@ -900,9 +904,9 @@ export class SessionManager {
       return;
     }
 
+    if (session.forkPending) return;
+
     this.#registry.recordSession(channelId, session.sessionId, session.workspacePath, identity, {
-      // A fork point belongs to one session. Until this one has a clean turn of
-      // its own, the point it has is its parent's.
       resumeAt: point.sessionId === session.sessionId ? point.resumeAt : '',
       safetyStop: null,
     });

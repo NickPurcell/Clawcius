@@ -56,11 +56,7 @@ export type SafetyStop = {
 
 function parseSafetyStop(raw: unknown): SafetyStop | null {
   if (typeof raw !== 'string' || raw === '') return null;
-  try {
-    return JSON.parse(raw) as SafetyStop;
-  } catch {
-    return null;
-  }
+  return JSON.parse(raw) as SafetyStop;
 }
 
 export type AgentIdentity = {

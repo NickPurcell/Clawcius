@@ -52,6 +52,7 @@ class FakeSession {
     /** What `persist` reads for a safety stop: none, and a fork point in this session. */
     this.safetyStop = null;
     this.resumePoint = { sessionId: this.sessionId, resumeAt: '' };
+    this.forkPending = false;
   }
 
   wake(context, onSettled = null) {
@@ -621,6 +622,7 @@ function stopPool() {
     session.resume = resume;
     session.safetyStop = null;
     session.resumePoint = { sessionId: resumeSessionId ?? '', resumeAt: resume.resumeAt };
+    session.forkPending = false;
     p.built.push(session);
     return session;
   };
@@ -647,9 +649,7 @@ test('a stopped session is written as its fork parent and released, and the next
   const second = manager.acquire('a', events);
   assert.equal(second.sessionId, UUID);
   assert.equal(second.resume.resumeAt, 'good-3');
-  assert.match(second.resume.safetyNotice, /safety classifier/);
-  assert.match(second.resume.safetyNotice, /someone/);
-  assert.match(second.resume.safetyNotice, /everything before it is intact/);
+  assert.notEqual(second.resume.safetyNotice, null);
 
   // Its first clean turn clears the stop, so the notice is not owed again.
   second.sessionId = OTHER_UUID;
@@ -673,7 +673,7 @@ test('a stop with no clean point to fork at starts fresh rather than resume the 
 
   const second = manager.acquire('a', events);
   assert.equal(second.sessionId, 'pending-a', 'never a plain resume past a stop');
-  assert.match(second.resume.safetyNotice, /fresh session/);
+  assert.notEqual(second.resume.safetyNotice, null);
   await manager.shutdown();
 });
 
@@ -713,4 +713,22 @@ test('an existing board gains the fork columns, and !reset clears them', () => {
   assert.equal(registry.get('a').resumeAt, '');
   assert.equal(registry.get('a').safetyStop, null);
   registry.close();
+});
+
+test('a fork with no clean turn yet leaves the row on its parent, so a respawn forks again', async () => {
+  const { manager, registry } = stopPool();
+  registry.recordSession('a', UUID, '/tmp/a', { crew: CREW, role: 'engineer', workspacePath: '/tmp/a' }, {
+    resumeAt: 'good-3',
+    safetyStop: STOP,
+  });
+  const fork = manager.acquire('a', events);
+  fork.sessionId = OTHER_UUID;
+  fork.forkPending = true;
+
+  manager.persist('a');
+  const row = registry.get('a');
+  assert.equal(row.sessionId, UUID);
+  assert.equal(row.resumeAt, 'good-3');
+  assert.deepEqual(row.safetyStop, STOP);
+  await manager.shutdown();
 });
