@@ -21,6 +21,11 @@ container:
 model: claude-opus-5-5[1m]
 modelByRole:
   updater: claude-haiku-4-5
+# Reasoning effort: low, medium, high, xhigh or max. Unset, the CLI runs at medium.
+effort: xhigh
+# null sends none: Haiku 4.5 takes no effort parameter.
+effortByRole:
+  updater: null
 # 0 = no per-turn cap; the agent decides when a turn is done.
 maxTurns: 0
 

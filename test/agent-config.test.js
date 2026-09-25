@@ -88,6 +88,15 @@ test('both shipped instance files load, each onto its own state directory', () =
   assert.notEqual(clawcius.container.githubTokenDir, hamachi.container.githubTokenDir);
   assert.equal(clawcius.model, hamachi.model);
   assert.deepEqual(clawcius.modelByRole, hamachi.modelByRole);
+  assert.equal(clawcius.effort, hamachi.effort);
+  assert.deepEqual(clawcius.effortByRole, hamachi.effortByRole);
+});
+
+test('the shipped base runs every role at xhigh but the Haiku updater, which is sent none', () => {
+  const config = loadAgentConfig(writeInstance(['crew: x']));
+  assert.equal(config.effort, 'xhigh');
+  assert.deepEqual(config.effortByRole, { updater: null });
+  assert.equal(config.modelByRole.updater, 'claude-haiku-4-5');
 });
 
 test('an instance file may carry container.enabled, and it defaults to true', () => {
@@ -256,6 +265,38 @@ test('modelByRole accepts the crew roles and refuses anything else', () => {
     assert.throws(
       () => loadAgentConfig(writeLayered((b) => (b.modelByRole = { updater: value }))),
       /modelByRole\.updater/,
+    );
+  }
+});
+
+test('effort takes a named level and nothing else', () => {
+  for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    assert.equal(loadAgentConfig(writeLayered((b) => (b.effort = level))).effort, level);
+  }
+  for (const value of ['XHIGH', 'extra-high', '', 3, null]) {
+    assert.throws(() => loadAgentConfig(writeLayered((b) => (b.effort = value))), /effort/);
+  }
+  assert.throws(() => loadAgentConfig(writeLayered((b) => delete b.effort)), /effort/);
+});
+
+test('effortByRole accepts the crew roles, a level or null, and refuses anything else', () => {
+  const config = loadAgentConfig(
+    writeLayered((b) => (b.effortByRole = { coordinator: 'max', engineer: 'high', updater: null })),
+  );
+  assert.equal(config.effortByRole.coordinator, 'max');
+  assert.equal(config.effortByRole.engineer, 'high');
+  assert.equal(config.effortByRole.updater, null);
+
+  assert.deepEqual(loadAgentConfig(writeLayered((b) => (b.effortByRole = {}))).effortByRole, {});
+
+  assert.throws(
+    () => loadAgentConfig(writeLayered((b) => (b.effortByRole = { updaters: 'low' }))),
+    /effortByRole\.updaters/,
+  );
+  for (const value of ['', 'huge', 3, [], {}]) {
+    assert.throws(
+      () => loadAgentConfig(writeLayered((b) => (b.effortByRole = { updater: value }))),
+      /effortByRole\.updater/,
     );
   }
 });

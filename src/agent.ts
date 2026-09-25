@@ -1,6 +1,6 @@
 /** Long-lived Claude Code sessions, one per Discord channel or thread. */
 
-import { query, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type EffortLevel, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
@@ -132,6 +132,16 @@ function linkSkills(workspacePath: string): void {
 }
 
 /** Git configuration for the agent, injected purely through the environment: `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`, so no file and no credential in the config itself. */
+/**
+ * The effort a role's sessions send, or undefined to send none. A role with no
+ * entry in `effortByRole` — an unrecognised one included — gets `effort`.
+ */
+export function effortFor(role: string): EffortLevel | undefined {
+  const byRole: Partial<Record<string, EffortLevel | null>> = config().agent.effortByRole;
+  const level = Object.hasOwn(byRole, role) ? byRole[role] : config().agent.effort;
+  return level ?? undefined;
+}
+
 export function gitEnv(): Record<string, string> {
   const entries: Array<[string, string]> = [
     ['user.name', config().agent.git.userName],
@@ -407,6 +417,12 @@ export class AgentSession {
     // which the SDK would read as "no turns allowed".
     if (config().agent.maxTurns > 0) {
       options.maxTurns = config().agent.maxTurns;
+    }
+
+    // Unsent, the CLI runs at medium. A level the model cannot take is downgraded by the CLI, not refused.
+    const effort = effortFor(this.#identity.role);
+    if (effort !== undefined) {
+      options.effort = effort;
     }
 
     if (isResumable(resumeSessionId)) {
