@@ -39,7 +39,7 @@ When you are done or blocked, DM {spawnedBy} and say which in the first line.
 If work is still in motion when your turn ends, arm \`remindMe\` before it ends.
 Push the branch, open the pull request or file the issue before you stop; nothing asks you first.`;
 
-/** The named levels `Options.effort` takes. Which of them a model honours is the CLI's business: it downgrades silently. */
+/** The named levels `Options.effort` takes. */
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
 
 export type AgentConfig = {

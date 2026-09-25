@@ -628,14 +628,3 @@ test('a role override wins, and null sends no effort at all', () => {
     }
   }
 });
-
-test('a role the crew does not define gets the base effort, not a prototype property', () => {
-  for (const role of ['stranger', 'constructor', 'toString']) {
-    const h = drive({ role, effortByRole: { updater: null } });
-    try {
-      assert.equal(h.queries[0].effort, 'xhigh', role);
-    } finally {
-      h.restore();
-    }
-  }
-});

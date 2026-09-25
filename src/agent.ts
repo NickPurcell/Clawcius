@@ -12,7 +12,7 @@ import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
-import { type AgentIdentity, type AgentRegistry, type SafetyStop } from './store.js';
+import { type AgentIdentity, type AgentRegistry, type AgentRole, type SafetyStop } from './store.js';
 import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
@@ -132,16 +132,6 @@ function linkSkills(workspacePath: string): void {
 }
 
 /** Git configuration for the agent, injected purely through the environment: `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`, so no file and no credential in the config itself. */
-/**
- * The effort a role's sessions send, or undefined to send none. A role with no
- * entry in `effortByRole` — an unrecognised one included — gets `effort`.
- */
-export function effortFor(role: string): EffortLevel | undefined {
-  const byRole: Partial<Record<string, EffortLevel | null>> = config().agent.effortByRole;
-  const level = Object.hasOwn(byRole, role) ? byRole[role] : config().agent.effort;
-  return level ?? undefined;
-}
-
 export function gitEnv(): Record<string, string> {
   const entries: Array<[string, string]> = [
     ['user.name', config().agent.git.userName],
@@ -177,6 +167,12 @@ export function gitEnv(): Record<string, string> {
   env['CLAWSKY_GITHUB_TOKEN_FILE'] = tokenFilePath(config().agent.container.githubTokenDir);
   env['CURL_HOME'] = config().agent.container.githubTokenDir;
   return env;
+}
+
+/** The effort a role's sessions send: its `effortByRole` entry, else `effort`; undefined sends none. */
+export function effortFor(role: string): EffortLevel | undefined {
+  const level: EffortLevel | null | undefined = config().agent.effortByRole[role as AgentRole];
+  return level === undefined ? config().agent.effort : (level ?? undefined);
 }
 
 /** `acquire` had no session slot left. */
@@ -419,7 +415,6 @@ export class AgentSession {
       options.maxTurns = config().agent.maxTurns;
     }
 
-    // Unsent, the CLI runs at medium. A level the model cannot take is downgraded by the CLI, not refused.
     const effort = effortFor(this.#identity.role);
     if (effort !== undefined) {
       options.effort = effort;

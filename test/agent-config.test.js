@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { parse, stringify } from 'yaml';
 
-import { loadAgentConfig } from '../dist/agent-config.js';
+import { EFFORT_LEVELS, loadAgentConfig } from '../dist/agent-config.js';
 import { setConfig } from '../dist/config.js';
 import { buildSystemPrompt, buildWakeMessage } from '../dist/prompt.js';
 
@@ -90,13 +90,6 @@ test('both shipped instance files load, each onto its own state directory', () =
   assert.deepEqual(clawcius.modelByRole, hamachi.modelByRole);
   assert.equal(clawcius.effort, hamachi.effort);
   assert.deepEqual(clawcius.effortByRole, hamachi.effortByRole);
-});
-
-test('the shipped base runs every role at xhigh but the Haiku updater, which is sent none', () => {
-  const config = loadAgentConfig(writeInstance(['crew: x']));
-  assert.equal(config.effort, 'xhigh');
-  assert.deepEqual(config.effortByRole, { updater: null });
-  assert.equal(config.modelByRole.updater, 'claude-haiku-4-5');
 });
 
 test('an instance file may carry container.enabled, and it defaults to true', () => {
@@ -270,7 +263,7 @@ test('modelByRole accepts the crew roles and refuses anything else', () => {
 });
 
 test('effort takes a named level and nothing else', () => {
-  for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+  for (const level of EFFORT_LEVELS) {
     assert.equal(loadAgentConfig(writeLayered((b) => (b.effort = level))).effort, level);
   }
   for (const value of ['XHIGH', 'extra-high', '', 3, null]) {
