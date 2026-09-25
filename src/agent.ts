@@ -170,7 +170,7 @@ export function gitEnv(): Record<string, string> {
 }
 
 /** The effort a role's sessions send: its `effortByRole` entry, else `effort`; undefined sends none. */
-export function effortFor(role: string): EffortLevel | undefined {
+function effortFor(role: string): EffortLevel | undefined {
   const level: EffortLevel | null | undefined = config().agent.effortByRole[role as AgentRole];
   return level === undefined ? config().agent.effort : (level ?? undefined);
 }
