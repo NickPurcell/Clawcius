@@ -1,6 +1,6 @@
 /** Long-lived Claude Code sessions, one per Discord channel or thread. */
 
-import { query, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type EffortLevel, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
@@ -12,7 +12,7 @@ import { buildMailServer } from './mail-tool.js';
 import { buildArmedTools, type ArmedToolOptions } from './armed-tool.js';
 import { buildSpawnTools } from './spawn-tool.js';
 import type { MailStore } from './mail.js';
-import { type AgentIdentity, type AgentRegistry, type SafetyStop } from './store.js';
+import { type AgentIdentity, type AgentRegistry, type AgentRole, type SafetyStop } from './store.js';
 import type { NoRetryReason, TurnSummary, WakeContext } from './types.js';
 import { SUPERSEDED } from './types.js';
 
@@ -167,6 +167,12 @@ export function gitEnv(): Record<string, string> {
   env['CLAWSKY_GITHUB_TOKEN_FILE'] = tokenFilePath(config().agent.container.githubTokenDir);
   env['CURL_HOME'] = config().agent.container.githubTokenDir;
   return env;
+}
+
+/** The effort a role's sessions send: its `effortByRole` entry, else `effort`; undefined sends none. */
+function effortFor(role: string): EffortLevel | undefined {
+  const level: EffortLevel | null | undefined = config().agent.effortByRole[role as AgentRole];
+  return level === undefined ? config().agent.effort : (level ?? undefined);
 }
 
 /** `acquire` had no session slot left. */
@@ -407,6 +413,11 @@ export class AgentSession {
     // which the SDK would read as "no turns allowed".
     if (config().agent.maxTurns > 0) {
       options.maxTurns = config().agent.maxTurns;
+    }
+
+    const effort = effortFor(this.#identity.role);
+    if (effort !== undefined) {
+      options.effort = effort;
     }
 
     if (isResumable(resumeSessionId)) {

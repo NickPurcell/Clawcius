@@ -12,7 +12,7 @@ const AGENT = 'hamachi-engineer1';
 
 const tempDir = (p) => mkdtempSync(join(tmpdir(), p));
 
-function installConfig() {
+function installConfig({ effort = 'xhigh', effortByRole = {} } = {}) {
   setConfig({
     discord: { token: 'unused', guildId: 'unused' },
     github: { token: '' },
@@ -21,6 +21,8 @@ function installConfig() {
       clawsky: { crew: CREW, wakeOnMail: true },
       model: 'model',
       modelByRole: {},
+      effort,
+      effortByRole,
       maxTurns: 0,
       // The prompt builders and the container spawner read these. Nothing here
       // is under test; they exist so the class can be constructed at all.
@@ -49,8 +51,8 @@ function installConfig() {
   });
 }
 
-function drive({ resumeSessionId = undefined, resume = undefined } = {}) {
-  installConfig();
+function drive({ resumeSessionId = undefined, resume = undefined, role = 'engineer', effort, effortByRole } = {}) {
+  installConfig({ effort, effortByRole });
 
   let emit = null;
   const pushed = [];
@@ -99,7 +101,7 @@ function drive({ resumeSessionId = undefined, resume = undefined } = {}) {
     events,
     null,
     undefined,
-    { id: AGENT, crew: CREW, role: 'engineer' },
+    { id: AGENT, crew: CREW, role },
     resume,
   );
 
@@ -600,5 +602,29 @@ test('a refusal frame that is not an API error does not end the turn', async () 
     assert.equal(h.session.safetyStop, null);
   } finally {
     h.restore();
+  }
+});
+
+// ── effort ──────────────────────────────────────────────────────────────────
+
+test('a session is started at the configured effort', () => {
+  const h = drive();
+  try {
+    assert.equal(h.queries[0].effort, 'xhigh');
+  } finally {
+    h.restore();
+  }
+});
+
+test('a role override wins, and null sends no effort at all', () => {
+  const effortByRole = { engineer: 'high', updater: null };
+  for (const [role, expected] of [['engineer', 'high'], ['updater', undefined], ['researcher', 'max']]) {
+    const h = drive({ role, effort: 'max', effortByRole });
+    try {
+      assert.equal(h.queries[0].effort, expected, role);
+      if (expected === undefined) assert.ok(!('effort' in h.queries[0]), `${role}: the key is absent, not undefined`);
+    } finally {
+      h.restore();
+    }
   }
 });

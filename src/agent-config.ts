@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
+import type { EffortLevel } from '@anthropic-ai/claude-agent-sdk';
 import { AGENT_ROLES, type AgentRole } from './store.js';
 import { REPO_NAME } from './github.js';
 
@@ -38,6 +39,9 @@ When you are done or blocked, DM {spawnedBy} and say which in the first line.
 If work is still in motion when your turn ends, arm \`remindMe\` before it ends.
 Push the branch, open the pull request or file the issue before you stop; nothing asks you first.`;
 
+/** The named levels `Options.effort` takes. */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
+
 export type AgentConfig = {
   crew: string;
   /** The crew's name as it says it — `Clawcius`, `Hamachi`. */
@@ -59,6 +63,10 @@ export type AgentConfig = {
   prompts: PromptTemplates;
   model: string;
   modelByRole: Readonly<Partial<Record<AgentRole, string>>>;
+  /** Reasoning effort sent with every session. */
+  effort: EffortLevel;
+  /** Per-role override; null sends no effort at all, leaving the CLI's default for that model. */
+  effortByRole: Readonly<Partial<Record<AgentRole, EffortLevel | null>>>;
   /** 0 means unlimited — no turn cap is sent to the SDK at all. */
   maxTurns: number;
   systemPrompt: {
@@ -153,6 +161,8 @@ const Base = z.strictObject({
   container: z.strictObject({ claudePath: z.string().min(1) }),
   model: z.string().min(1),
   modelByRole: z.partialRecord(z.enum(AGENT_ROLES), z.string().min(1)),
+  effort: z.enum(EFFORT_LEVELS),
+  effortByRole: z.partialRecord(z.enum(AGENT_ROLES), z.enum(EFFORT_LEVELS).nullable()),
   maxTurns: z.number().min(0),
   systemPrompt: z.strictObject({ useClaudeCodeDefault: z.boolean(), append: z.string() }),
   sessions: z.strictObject({
@@ -337,6 +347,8 @@ export function loadAgentConfig(configPath?: string): AgentConfig {
     prompts,
     model: base.model,
     modelByRole: base.modelByRole,
+    effort: base.effort,
+    effortByRole: base.effortByRole,
     maxTurns: base.maxTurns,
     systemPrompt: {
       useClaudeCodeDefault: base.systemPrompt.useClaudeCodeDefault,
